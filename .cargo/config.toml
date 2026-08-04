@@ -1,0 +1,2 @@
+[alias]
+coverage = "! tools/coverage.sh"

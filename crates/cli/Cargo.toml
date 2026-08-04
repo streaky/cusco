@@ -1,0 +1,12 @@
+[package]
+name = "cusco"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+cusco-executor = { path = "../executor" }
+cusco-model-registry = { path = "../model-registry" }
+serde_json.workspace = true

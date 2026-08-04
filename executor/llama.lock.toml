@@ -1,0 +1,9 @@
+[upstream]
+repository = "https://github.com/ggml-org/llama.cpp.git"
+tag = "b10273"
+revision = "a6aa6f5450eaad18b3c86631b5c3fff330f5a46e"
+[build]
+profile = "release"
+cmake_options = ["GGML_CUDA=OFF", "LLAMA_BUILD_TESTS=OFF", "LLAMA_BUILD_EXAMPLES=OFF"]
+[patches]
+manifest = "patches/series.toml"
