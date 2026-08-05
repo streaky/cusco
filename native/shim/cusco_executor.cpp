@@ -14,11 +14,13 @@
 struct cusco_checkpoint {
     std::vector<uint8_t> bytes;
     uint64_t model_identity;
+    size_t position;
 };
 
 struct cusco_prepared_restore {
     std::vector<uint8_t> bytes;
     uint64_t model_identity;
+    size_t position;
 };
 
 struct cusco_executor;
@@ -407,6 +409,7 @@ cusco_status cusco_executor_capture(
     *out = nullptr;
     auto checkpoint = std::make_unique<cusco_checkpoint>();
     checkpoint->model_identity = executor->model_identity;
+    checkpoint->position = executor->positions.at(executor->active_mapping);
     if (is_mock(executor)) {
         checkpoint->bytes.resize(executor->mock_state.size() * sizeof(int32_t));
         memcpy(
@@ -458,6 +461,7 @@ cusco_status cusco_executor_prepare_restore(
     auto prepared = std::make_unique<cusco_prepared_restore>();
     prepared->bytes = checkpoint->bytes;
     prepared->model_identity = checkpoint->model_identity;
+    prepared->position = checkpoint->position;
     *out = prepared.release();
     return CUSCO_OK;
 } catch (const std::bad_alloc &) {
@@ -484,6 +488,7 @@ cusco_status cusco_executor_commit_restore(
         std::vector<int32_t> replacement(prepared->bytes.size() / sizeof(int32_t));
         memcpy(replacement.data(), prepared->bytes.data(), prepared->bytes.size());
         executor->mock_state.swap(replacement);
+        executor->positions[executor->active_mapping] = prepared->position;
         return CUSCO_OK;
     }
 
@@ -498,6 +503,7 @@ cusco_status cusco_executor_commit_restore(
     const size_t restored = llama_state_set_data(
         executor->ctx, prepared->bytes.data(), prepared->bytes.size());
     if (restored == prepared->bytes.size()) {
+        executor->positions[executor->active_mapping] = prepared->position;
         return CUSCO_OK;
     }
 
@@ -643,6 +649,7 @@ cusco_status cusco_executor_replace_state_for_proof(
     } else {
         llama_memory_clear(llama_get_memory(executor->ctx), true);
     }
+    executor->positions[executor->active_mapping] = 0;
     if (count == 0) {
         return CUSCO_OK;
     }
@@ -654,8 +661,18 @@ cusco_status cusco_executor_replace_state_for_proof(
     return CUSCO_BACKEND;
 }
 
-void cusco_executor_cancel_next_decode_for_proof(cusco_executor * executor) {
+void cusco_executor_cancel(cusco_executor * executor) {
     if (executor) {
         executor->cancel = true;
     }
+}
+void cusco_executor_reset_cancel(cusco_executor * executor) {
+    if (executor) {
+        executor->cancel = false;
+    }
+}
+
+
+void cusco_executor_cancel_next_decode_for_proof(cusco_executor * executor) {
+    cusco_executor_cancel(executor);
 }

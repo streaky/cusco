@@ -6,19 +6,18 @@ The project separates responsibilities deliberately: Rust will manage logical co
 
 ## Current state
 
-Cusco has completed Phases 1 through 5 and the Phase 6A and 6B server
-milestones. The executor proof established exact checkpoint continuation for a
-hybrid/recurrent Gemma model, and the Rust layers now provide durable logical
-contexts, capacity-accounted physical state, transactional mapped activation,
-an authenticated HTTP API, and immutable model registration.
+Cusco has completed Phases 1 through 6. The executor proof established exact
+checkpoint continuation for a hybrid/recurrent Gemma model, and the Rust layers
+now provide durable logical contexts, capacity-accounted physical state,
+transactional mapped activation, an authenticated HTTP API, immutable model
+registration, and bounded live inference.
 
-Phase 6A connects those pieces on the live request path: one validated Gemma
-profile owns a process-persistent llama.cpp model and executor slot, and opaque
-context continuations reuse complete mapped blocks. Phase 6B replaces
-whole-request generation with one-token native decode and request-owned
-sampling, canonicalizes token-piece output at an incremental UTF-8 and
-stop-aware frontier, and streams through a bounded protocol-neutral event
-buffer. Phase 6C lifecycle and acceptance work remains next.
+Phase 6 keeps one validated Gemma model and executor slot process-persistent,
+reuses complete mapped blocks across opaque-context continuations, and performs
+request-owned incremental sampling through a bounded UTF-8 and stop-aware event
+frontier. Count-and-byte-bounded FIFO admission, pre-queue transport limits,
+native cancellation, separate wall and active deadlines, graceful shutdown,
+and durable-context-only restart recovery complete the fixed one-slot contract.
 
 ## Run the real-model inference integration test
 
@@ -52,23 +51,24 @@ activation, and writes staged-versus-mapped timing, bytes, and prompt work
 avoided to `results/phase5.json`. The proof does not claim graph/cache reuse:
 llama.cpp's public API does not expose whether its backend rebuilt a graph.
 
-## Run the real-model server report
+## Run the Phase 6C acceptance report
 
-To exercise authenticated HTTP inference and a successive opaque-context
-continuation through one persistent mapped executor, run:
+With the validation GGUF and NVIDIA runtime available, run:
 
 ```sh
-tools/server-inference-report.sh
+CUSCO_GPU_DEVICE_ID=0 tools/phase6c-report.sh
 ```
 
-The workflow verifies token streaming, durable context identity, and reuse of
-at least one complete mapped block on the second request. Its report separates
-tokenization, prefix lookup, mapped activation, uncached prefill, and total
-prompt-processing time, then derives cached, uncached, and effective prompt
-token rates for the initial request and mapped continuation. It writes the
-machine-readable evidence to `results/phase6b-server.json`. GPU 1 and port
-18082 are defaults; `CUSCO_GPU_DEVICE_ID`, `CUSCO_SERVER_REPORT_PORT`,
-`CUSCO_MODEL_DIR`, and `CUSCO_RESULT_DIR` override them.
+Choose an available GPU index. `CUSCO_MODEL_DIR`, `CUSCO_RESULT_DIR`, and
+`CUSCO_PHASE6C_REPORT_PORT` override the remaining defaults. The workflow runs
+the GPU-less 80%-per-file coverage gate, exact executor and mapped-execution
+proofs, and an authenticated live-server matrix. It injects cancellation,
+deadline, and queue overload, verifies mapped continuation and accounting,
+performs a graceful stop and restart, and confirms that durable contexts—but
+not ephemeral queue state—recover. Machine-readable evidence, including
+configuration, provenance, selected GPU UUID, exactness results, prompt phase
+timings, cache work, transfers, and device/host accounting, is written to
+`results/phase6c-server.json`.
 
 
 ## Run the minimal server
