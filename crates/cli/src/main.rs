@@ -113,17 +113,17 @@ fn proof(
     let mut contexts = Vec::new();
     for i in 0..4 {
         let tokens = executor.tokenize(&format!("{prefix} [{i}]"))?;
-        executor.replace(&tokens)?;
-        let checkpoint = executor.capture()?;
+        executor.replace_state_for_proof(&tokens)?;
+        let checkpoint = executor.capture_checkpoint()?;
         let continuation = tokens[tokens.len() - 1];
         let uninterrupted = executor.decode(&[continuation])?;
         contexts.push((checkpoint, continuation, uninterrupted));
     }
     let mut comparisons = Vec::new();
     for (checkpoint, continuation, expected) in &contexts {
-        executor.replace(&replacement)?;
-        let prepared = executor.prepare(checkpoint, checkpoint.checksum)?;
-        executor.commit(prepared)?;
+        executor.replace_state_for_proof(&replacement)?;
+        let prepared = executor.prepare_restore(checkpoint, checkpoint.checksum)?;
+        executor.commit_restore(prepared)?;
         let restored = executor.decode(&[*continuation])?;
         comparisons.push(json!({"token_equal":expected.token==restored.token,"logits_equal":logits_identical(&expected.logits,&restored.logits),"checkpoint_bytes":checkpoint.bytes,"checksum":checkpoint.checksum}));
     }
@@ -133,13 +133,13 @@ fn proof(
             .all(|v| v["token_equal"] == true && v["logits_equal"] == true),
         "restored execution differs"
     );
-    let cancellation_checkpoint = executor.capture()?;
+    let cancellation_checkpoint = executor.capture_checkpoint()?;
     let failure_continuation = replacement[0];
     let cancellation_expected = executor.decode(&[failure_continuation])?;
     let cancellation_restore =
-        executor.prepare(&cancellation_checkpoint, cancellation_checkpoint.checksum)?;
-    executor.commit(cancellation_restore)?;
-    executor.cancel_next();
+        executor.prepare_restore(&cancellation_checkpoint, cancellation_checkpoint.checksum)?;
+    executor.commit_restore(cancellation_restore)?;
+    executor.cancel_next_decode_for_proof();
     ensure!(
         executor.decode(&[failure_continuation]).is_err(),
         "cancellation did not fire"
@@ -152,14 +152,14 @@ fn proof(
         "cancellation changed the active binding"
     );
 
-    let promotion_checkpoint = executor.capture()?;
+    let promotion_checkpoint = executor.capture_checkpoint()?;
     let promotion_expected = executor.decode(&[failure_continuation])?;
     let promotion_restore =
-        executor.prepare(&promotion_checkpoint, promotion_checkpoint.checksum)?;
-    executor.commit(promotion_restore)?;
+        executor.prepare_restore(&promotion_checkpoint, promotion_checkpoint.checksum)?;
+    executor.commit_restore(promotion_restore)?;
     ensure!(
         executor
-            .prepare(&promotion_checkpoint, promotion_checkpoint.checksum ^ 1)
+            .prepare_restore(&promotion_checkpoint, promotion_checkpoint.checksum ^ 1)
             .is_err(),
         "corrupt promotion succeeded"
     );

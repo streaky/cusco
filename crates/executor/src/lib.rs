@@ -1,7 +1,8 @@
 use cusco_executor_sys as sys;
 use serde::Serialize;
-use std::{ffi::CString, ptr::NonNull, slice};
+use std::{ffi::CString, ptr::NonNull};
 use thiserror::Error;
+
 #[derive(Debug, Error, PartialEq)]
 pub enum Error {
     #[error("invalid path")]
@@ -13,6 +14,7 @@ pub enum Error {
     #[error("executor backend error {0}")]
     Backend(i32),
 }
+
 fn status(code: i32) -> Result<(), Error> {
     match code {
         sys::OK => Ok(()),
@@ -21,6 +23,7 @@ fn status(code: i32) -> Result<(), Error> {
         n => Err(Error::Backend(n)),
     }
 }
+
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Capabilities {
     pub abi_version: u32,
@@ -29,34 +32,41 @@ pub struct Capabilities {
     pub recurrent: bool,
     pub vocabulary: i32,
 }
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Decode {
     pub logits: Vec<f32>,
     pub token: i32,
 }
+
+/// Uniquely owns one native execution slot. The slot is mutated only through `&mut self`.
 pub struct Executor {
     raw: NonNull<sys::CuscoExecutor>,
 }
+
+/// An immutable, independently owned snapshot of one executor state.
 pub struct Checkpoint {
     raw: NonNull<sys::CuscoCheckpoint>,
     pub bytes: usize,
     pub checksum: u64,
 }
+
+/// A validated restore candidate. `commit_restore` consumes it exactly once.
 #[derive(Debug)]
-pub struct Prepared {
-    raw: NonNull<sys::CuscoCheckpoint>,
+pub struct PreparedRestore {
+    raw: NonNull<sys::CuscoPreparedRestore>,
 }
+
 impl Executor {
     pub fn open(path: &str, n_ctx: u32, gpu_layers: i32) -> Result<Self, Error> {
         let path = CString::new(path).map_err(|_| Error::InvalidPath)?;
-        let mut raw = std::ptr::null_mut();
-        status(unsafe { sys::cusco_executor_open(path.as_ptr(), n_ctx, gpu_layers, &mut raw) })?;
         Ok(Self {
-            raw: NonNull::new(raw).ok_or(Error::Backend(3))?,
+            raw: ffi::open(&path, n_ctx, gpu_layers)?,
         })
     }
+
     pub fn capabilities(&self) -> Capabilities {
-        let c = unsafe { sys::cusco_executor_capabilities(self.raw.as_ptr()) };
+        let c = ffi::capabilities(self.raw);
         Capabilities {
             abi_version: c.abi_version,
             global_kv: c.has_global_kv != 0,
@@ -65,100 +75,241 @@ impl Executor {
             vocabulary: c.n_vocab,
         }
     }
+
     pub fn tokenize(&mut self, text: &str) -> Result<Vec<i32>, Error> {
         let text = CString::new(text).map_err(|_| Error::InvalidPath)?;
-        let mut p = std::ptr::null_mut();
-        let mut n = 0;
+        ffi::tokenize(self.raw, &text)
+    }
+
+    pub fn decode(&mut self, tokens: &[i32]) -> Result<Decode, Error> {
+        let out = ffi::decode(self.raw, tokens)?;
+        Ok(Decode {
+            logits: out.logits,
+            token: out.token,
+        })
+    }
+
+    /// Capture the current binding without changing it.
+    pub fn capture_checkpoint(&mut self) -> Result<Checkpoint, Error> {
+        let raw = ffi::capture_checkpoint(self.raw)?;
+        Ok(Checkpoint {
+            bytes: ffi::checkpoint_size(raw),
+            checksum: ffi::checkpoint_checksum(raw),
+            raw,
+        })
+    }
+
+    /// Validate and copy a checkpoint without changing the active binding.
+    pub fn prepare_restore(
+        &mut self,
+        checkpoint: &Checkpoint,
+        checksum: u64,
+    ) -> Result<PreparedRestore, Error> {
+        Ok(PreparedRestore {
+            raw: ffi::prepare_restore(self.raw, checkpoint.raw, checksum)?,
+        })
+    }
+
+    /// Transactionally publish a prepared restore. On error the prior binding remains valid.
+    pub fn commit_restore(&mut self, prepared: PreparedRestore) -> Result<(), Error> {
+        let prepared = std::mem::ManuallyDrop::new(prepared);
+        let raw = prepared.raw;
+        ffi::commit_restore(self.raw, raw)
+    }
+
+    /// Phase 1 proof hook: clear the slot and decode unrelated state.
+    /// This is not a production state-management operation.
+    pub fn replace_state_for_proof(&mut self, tokens: &[i32]) -> Result<(), Error> {
+        ffi::replace_state_for_proof(self.raw, tokens)
+    }
+
+    /// Phase 1 proof hook: make the next decode return cancellation before mutation.
+    pub fn cancel_next_decode_for_proof(&mut self) {
+        ffi::cancel_next_decode_for_proof(self.raw)
+    }
+}
+
+impl Drop for Executor {
+    fn drop(&mut self) {
+        ffi::close(self.raw)
+    }
+}
+impl Drop for Checkpoint {
+    fn drop(&mut self) {
+        ffi::free_checkpoint(self.raw)
+    }
+}
+impl Drop for PreparedRestore {
+    fn drop(&mut self) {
+        ffi::free_prepared_restore(self.raw)
+    }
+}
+
+pub fn logits_identical(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+struct OwnedDecode {
+    logits: Vec<f32>,
+    token: i32,
+}
+
+/// The only module allowed to interpret native pointers and borrowed buffers.
+mod ffi {
+    use super::{Error, OwnedDecode, status};
+    use crate::sys;
+    use std::{ffi::CStr, ptr::NonNull, slice};
+
+    pub(super) fn open(
+        path: &CStr,
+        n_ctx: u32,
+        gpu_layers: i32,
+    ) -> Result<NonNull<sys::CuscoExecutor>, Error> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: path is NUL-terminated and out points to writable storage.
+        status(unsafe { sys::cusco_executor_open(path.as_ptr(), n_ctx, gpu_layers, &mut raw) })?;
+        NonNull::new(raw).ok_or(Error::Backend(3))
+    }
+
+    pub(super) fn close(raw: NonNull<sys::CuscoExecutor>) {
+        // SAFETY: raw is uniquely owned and this is its only close.
+        unsafe { sys::cusco_executor_close(raw.as_ptr()) }
+    }
+
+    pub(super) fn capabilities(raw: NonNull<sys::CuscoExecutor>) -> sys::Capabilities {
+        // SAFETY: raw is live for the duration of the call.
+        unsafe { sys::cusco_executor_capabilities(raw.as_ptr()) }
+    }
+
+    pub(super) fn tokenize(
+        raw: NonNull<sys::CuscoExecutor>,
+        text: &CStr,
+    ) -> Result<Vec<i32>, Error> {
+        let mut tokens = std::ptr::null_mut();
+        let mut count = 0;
+        // SAFETY: all pointers are live and outputs point to writable storage.
         status(unsafe {
-            sys::cusco_executor_tokenize(self.raw.as_ptr(), text.as_ptr(), &mut p, &mut n)
+            sys::cusco_executor_tokenize(raw.as_ptr(), text.as_ptr(), &mut tokens, &mut count)
         })?;
-        let v = if n == 0 {
+        let owned = if count == 0 {
             Vec::new()
         } else {
-            unsafe { slice::from_raw_parts(p, n) }.to_vec()
+            // SAFETY: the ABI returns count initialized i32 values on success.
+            unsafe { slice::from_raw_parts(tokens, count) }.to_vec()
         };
-        unsafe { sys::cusco_executor_tokens_free(p) };
-        Ok(v)
+        // SAFETY: the ABI permits NULL and this allocation is released exactly once.
+        unsafe { sys::cusco_executor_tokens_free(tokens) };
+        Ok(owned)
     }
-    pub fn decode(&mut self, tokens: &[i32]) -> Result<Decode, Error> {
+
+    pub(super) fn decode(
+        raw: NonNull<sys::CuscoExecutor>,
+        tokens: &[i32],
+    ) -> Result<OwnedDecode, Error> {
         let mut out = sys::DecodeResult {
             logits: std::ptr::null(),
             logits_len: 0,
             token: 0,
         };
+        // SAFETY: the token slice and output storage live through the call.
         status(unsafe {
-            sys::cusco_executor_decode(self.raw.as_ptr(), tokens.as_ptr(), tokens.len(), &mut out)
+            sys::cusco_executor_decode(raw.as_ptr(), tokens.as_ptr(), tokens.len(), &mut out)
         })?;
         let logits = if out.logits_len == 0 {
             Vec::new()
         } else {
+            // SAFETY: logits is borrowed from raw with out.logits_len elements. Copying it
+            // before another executor call makes the safe result independent of that borrow.
             unsafe { slice::from_raw_parts(out.logits, out.logits_len) }.to_vec()
         };
-        Ok(Decode {
+        Ok(OwnedDecode {
             logits,
             token: out.token,
         })
     }
-    pub fn capture(&mut self) -> Result<Checkpoint, Error> {
-        let mut p = std::ptr::null_mut();
-        status(unsafe { sys::cusco_executor_capture(self.raw.as_ptr(), &mut p) })?;
-        let raw = NonNull::new(p).ok_or(Error::Backend(3))?;
-        Ok(Checkpoint {
-            bytes: unsafe { sys::cusco_checkpoint_size(p) },
-            checksum: unsafe { sys::cusco_checkpoint_checksum(p) },
-            raw,
-        })
+
+    pub(super) fn capture_checkpoint(
+        raw: NonNull<sys::CuscoExecutor>,
+    ) -> Result<NonNull<sys::CuscoCheckpoint>, Error> {
+        let mut checkpoint = std::ptr::null_mut();
+        // SAFETY: raw is live and out points to writable storage.
+        status(unsafe { sys::cusco_executor_capture(raw.as_ptr(), &mut checkpoint) })?;
+        NonNull::new(checkpoint).ok_or(Error::Backend(3))
     }
-    pub fn prepare(&mut self, c: &Checkpoint, checksum: u64) -> Result<Prepared, Error> {
-        let mut p = std::ptr::null_mut();
+
+    pub(super) fn checkpoint_size(raw: NonNull<sys::CuscoCheckpoint>) -> usize {
+        // SAFETY: raw is a live immutable checkpoint.
+        unsafe { sys::cusco_checkpoint_size(raw.as_ptr()) }
+    }
+
+    pub(super) fn checkpoint_checksum(raw: NonNull<sys::CuscoCheckpoint>) -> u64 {
+        // SAFETY: raw is a live immutable checkpoint.
+        unsafe { sys::cusco_checkpoint_checksum(raw.as_ptr()) }
+    }
+
+    pub(super) fn prepare_restore(
+        executor: NonNull<sys::CuscoExecutor>,
+        checkpoint: NonNull<sys::CuscoCheckpoint>,
+        checksum: u64,
+    ) -> Result<NonNull<sys::CuscoPreparedRestore>, Error> {
+        let mut prepared = std::ptr::null_mut();
+        // SAFETY: both handles are live and out points to writable storage.
         status(unsafe {
-            sys::cusco_executor_prepare_restore(self.raw.as_ptr(), c.raw.as_ptr(), checksum, &mut p)
+            sys::cusco_executor_prepare_restore(
+                executor.as_ptr(),
+                checkpoint.as_ptr(),
+                checksum,
+                &mut prepared,
+            )
         })?;
-        Ok(Prepared {
-            raw: NonNull::new(p).ok_or(Error::Backend(3))?,
-        })
+        NonNull::new(prepared).ok_or(Error::Backend(3))
     }
-    pub fn commit(&mut self, p: Prepared) -> Result<(), Error> {
-        let raw = p.raw.as_ptr();
-        std::mem::forget(p);
-        status(unsafe { sys::cusco_executor_commit_restore(self.raw.as_ptr(), raw) })
+
+    pub(super) fn commit_restore(
+        executor: NonNull<sys::CuscoExecutor>,
+        prepared: NonNull<sys::CuscoPreparedRestore>,
+    ) -> Result<(), Error> {
+        // SAFETY: both handles are live. The ABI consumes prepared on every result.
+        status(unsafe { sys::cusco_executor_commit_restore(executor.as_ptr(), prepared.as_ptr()) })
     }
-    pub fn replace(&mut self, tokens: &[i32]) -> Result<(), Error> {
+
+    pub(super) fn replace_state_for_proof(
+        raw: NonNull<sys::CuscoExecutor>,
+        tokens: &[i32],
+    ) -> Result<(), Error> {
+        // SAFETY: raw and the token slice are live through the call.
         status(unsafe {
-            sys::cusco_executor_replace(self.raw.as_ptr(), tokens.as_ptr(), tokens.len())
+            sys::cusco_executor_replace_state_for_proof(raw.as_ptr(), tokens.as_ptr(), tokens.len())
         })
     }
-    pub fn cancel_next(&mut self) {
-        unsafe { sys::cusco_executor_cancel_next(self.raw.as_ptr()) }
+
+    pub(super) fn cancel_next_decode_for_proof(raw: NonNull<sys::CuscoExecutor>) {
+        // SAFETY: raw is live and uniquely borrowed by the caller.
+        unsafe { sys::cusco_executor_cancel_next_decode_for_proof(raw.as_ptr()) }
+    }
+
+    pub(super) fn free_checkpoint(raw: NonNull<sys::CuscoCheckpoint>) {
+        // SAFETY: raw is uniquely owned and released exactly once.
+        unsafe { sys::cusco_checkpoint_free(raw.as_ptr()) }
+    }
+
+    pub(super) fn free_prepared_restore(raw: NonNull<sys::CuscoPreparedRestore>) {
+        // SAFETY: raw is uniquely owned and released exactly once.
+        unsafe { sys::cusco_prepared_restore_free(raw.as_ptr()) }
     }
 }
-impl Drop for Executor {
-    fn drop(&mut self) {
-        unsafe { sys::cusco_executor_close(self.raw.as_ptr()) }
-    }
-}
-impl Drop for Checkpoint {
-    fn drop(&mut self) {
-        unsafe { sys::cusco_checkpoint_free(self.raw.as_ptr()) }
-    }
-}
-impl Drop for Prepared {
-    fn drop(&mut self) {
-        unsafe { sys::cusco_checkpoint_free(self.raw.as_ptr()) }
-    }
-}
-pub fn logits_identical(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn exact_logits_compare_bits() {
         assert!(logits_identical(&[0.0, -1.0], &[0.0, -1.0]));
         assert!(!logits_identical(&[0.0], &[-0.0]));
         assert!(!logits_identical(&[0.0], &[0.0, 1.0]));
     }
+
     #[test]
     fn maps_statuses() {
         assert_eq!(status(0), Ok(()));
@@ -166,31 +317,34 @@ mod tests {
         assert_eq!(status(5), Err(Error::Incompatible));
         assert_eq!(status(3), Err(Error::Backend(3)));
     }
+
     #[test]
     fn model_free_lifecycle_is_transactional() {
         let mut executor = Executor::open("mock://deterministic", 128, 0).unwrap();
         let capabilities = executor.capabilities();
         assert!(capabilities.global_kv && capabilities.swa && capabilities.recurrent);
         let prefix = executor.tokenize("prefix").unwrap();
-        executor.replace(&prefix).unwrap();
-        let checkpoint = executor.capture().unwrap();
+        executor.replace_state_for_proof(&prefix).unwrap();
+        let checkpoint = executor.capture_checkpoint().unwrap();
         assert!(checkpoint.bytes > 0);
         let continuation = [7];
         let expected = executor.decode(&continuation).unwrap();
         let unrelated = executor.tokenize("other").unwrap();
-        executor.replace(&unrelated).unwrap();
+        executor.replace_state_for_proof(&unrelated).unwrap();
         assert_eq!(
             executor
-                .prepare(&checkpoint, checkpoint.checksum ^ 1)
+                .prepare_restore(&checkpoint, checkpoint.checksum ^ 1)
                 .unwrap_err(),
             Error::Incompatible
         );
-        let prepared = executor.prepare(&checkpoint, checkpoint.checksum).unwrap();
-        executor.commit(prepared).unwrap();
+        let prepared = executor
+            .prepare_restore(&checkpoint, checkpoint.checksum)
+            .unwrap();
+        executor.commit_restore(prepared).unwrap();
         let actual = executor.decode(&continuation).unwrap();
         assert_eq!(actual.token, expected.token);
         assert!(logits_identical(&actual.logits, &expected.logits));
-        executor.cancel_next();
+        executor.cancel_next_decode_for_proof();
         assert_eq!(
             executor.decode(&continuation).unwrap_err(),
             Error::Cancelled

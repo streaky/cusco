@@ -12,6 +12,11 @@ struct cusco_checkpoint {
     uint64_t model_identity;
 };
 
+struct cusco_prepared_restore {
+    std::vector<uint8_t> bytes;
+    uint64_t model_identity;
+};
+
 struct cusco_executor {
     llama_model * model;
     llama_context * ctx;
@@ -39,9 +44,6 @@ static bool abort_decode(void * p) {
     return static_cast<cusco_executor *>(p)->cancel.exchange(false);
 }
 
-uint32_t cusco_executor_abi_version(void) {
-    return CUSCO_EXECUTOR_ABI_VERSION;
-}
 
 cusco_status cusco_executor_open(
     const char * path,
@@ -52,6 +54,7 @@ cusco_status cusco_executor_open(
         return CUSCO_INVALID;
     }
     *out = nullptr;
+    // Phase 1-only deterministic backend for model-free ABI lifecycle tests.
     if (strcmp(path, "mock://deterministic") == 0) {
         *out = new (std::nothrow) cusco_executor{
             nullptr,
@@ -286,7 +289,7 @@ cusco_status cusco_executor_prepare_restore(
     cusco_executor * executor,
     const cusco_checkpoint * checkpoint,
     uint64_t checksum,
-    cusco_checkpoint ** out) try {
+    cusco_prepared_restore ** out) try {
     if (!executor || !checkpoint || !out) {
         return CUSCO_INVALID;
     }
@@ -295,7 +298,9 @@ cusco_status cusco_executor_prepare_restore(
         || cusco_checkpoint_checksum(checkpoint) != checksum) {
         return CUSCO_INCOMPATIBLE;
     }
-    auto prepared = std::make_unique<cusco_checkpoint>(*checkpoint);
+    auto prepared = std::make_unique<cusco_prepared_restore>();
+    prepared->bytes = checkpoint->bytes;
+    prepared->model_identity = checkpoint->model_identity;
     *out = prepared.release();
     return CUSCO_OK;
 } catch (const std::bad_alloc &) {
@@ -304,10 +309,14 @@ cusco_status cusco_executor_prepare_restore(
     return CUSCO_BACKEND;
 }
 
+void cusco_prepared_restore_free(cusco_prepared_restore * prepared) {
+    delete prepared;
+}
+
 cusco_status cusco_executor_commit_restore(
     cusco_executor * executor,
-    cusco_checkpoint * prepared_raw) try {
-    std::unique_ptr<cusco_checkpoint> prepared(prepared_raw);
+    cusco_prepared_restore * prepared_raw) try {
+    std::unique_ptr<cusco_prepared_restore> prepared(prepared_raw);
     if (!executor || !prepared) {
         return CUSCO_INVALID;
     }
@@ -345,7 +354,7 @@ cusco_status cusco_executor_commit_restore(
     return CUSCO_BACKEND;
 }
 
-cusco_status cusco_executor_replace(
+cusco_status cusco_executor_replace_state_for_proof(
     cusco_executor * executor,
     const int32_t * tokens,
     size_t count) try {
@@ -365,7 +374,7 @@ cusco_status cusco_executor_replace(
     return CUSCO_BACKEND;
 }
 
-void cusco_executor_cancel_next(cusco_executor * executor) {
+void cusco_executor_cancel_next_decode_for_proof(cusco_executor * executor) {
     if (executor) {
         executor->cancel = true;
     }

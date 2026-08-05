@@ -12,31 +12,35 @@ fn displaced_host_round_trip_is_exact_and_transactional() {
         let tokens = executor
             .tokenize(&format!("deterministic prefix {index}"))
             .unwrap();
-        executor.replace(&tokens).unwrap();
-        let checkpoint = executor.capture().unwrap();
+        executor.replace_state_for_proof(&tokens).unwrap();
+        let checkpoint = executor.capture_checkpoint().unwrap();
         let continuation = *tokens.last().unwrap();
         let expected = executor.decode(&[continuation]).unwrap();
         contexts.push((checkpoint, continuation, expected));
     }
     for (checkpoint, continuation, expected) in &contexts {
-        executor.replace(&replacement).unwrap();
-        let host_copy = executor.prepare(checkpoint, checkpoint.checksum).unwrap();
-        executor.commit(host_copy).unwrap();
+        executor.replace_state_for_proof(&replacement).unwrap();
+        let host_copy = executor
+            .prepare_restore(checkpoint, checkpoint.checksum)
+            .unwrap();
+        executor.commit_restore(host_copy).unwrap();
         let actual = executor.decode(&[*continuation]).unwrap();
         assert_eq!(actual.token, expected.token);
         assert!(logits_identical(&actual.logits, &expected.logits));
     }
-    let prior = executor.capture().unwrap();
-    executor.cancel_next();
+    let prior = executor.capture_checkpoint().unwrap();
+    executor.cancel_next_decode_for_proof();
     assert_eq!(
         executor.decode(&[replacement[0]]).unwrap_err(),
         Error::Cancelled
     );
     assert_eq!(
-        executor.prepare(&prior, prior.checksum ^ 1).unwrap_err(),
+        executor
+            .prepare_restore(&prior, prior.checksum ^ 1)
+            .unwrap_err(),
         Error::Incompatible
     );
-    let prepared = executor.prepare(&prior, prior.checksum).unwrap();
-    executor.commit(prepared).unwrap();
+    let prepared = executor.prepare_restore(&prior, prior.checksum).unwrap();
+    executor.commit_restore(prepared).unwrap();
     assert!(executor.decode(&[replacement[0]]).is_ok());
 }
