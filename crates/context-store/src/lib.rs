@@ -563,6 +563,9 @@ fn sequence_matches_tokens(
     if expected.len() != represented_end {
         return false;
     }
+    if represented_end == 0 {
+        return true;
+    }
     let mut node = sequence.tail.as_deref();
     while node.is_some_and(|current| current.len > represented_end) {
         node = node.and_then(|current| current.parent.as_deref());
