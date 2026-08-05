@@ -89,6 +89,7 @@ pub struct Metrics {
     pub device_active: usize,
     pub device_growth_reserved: usize,
     pub device_transition_reserved: usize,
+    pub device_detached_transfer_reserved: usize,
     pub device_warm: usize,
     pub host_total: usize,
     pub host_used: usize,
@@ -736,7 +737,8 @@ impl PhysicalManager {
                 .transitions
                 .values()
                 .map(|transition| transition.reserved_bytes)
-                .sum::<usize>();
+                .sum::<usize>()
+            + self.detached_transfer_reserved_bytes();
         let required = protected
             .checked_add(reservations)
             .and_then(|value| value.checked_add(additional_guarded))
@@ -789,6 +791,14 @@ impl PhysicalManager {
             .sum()
     }
 
+    fn detached_transfer_reserved_bytes(&self) -> usize {
+        self.transfers
+            .values()
+            .filter(|transfer| transfer.detached && !transfer.completed)
+            .map(|transfer| transfer.bytes)
+            .sum()
+    }
+
     fn host_used(&self) -> usize {
         self.representations
             .values()
@@ -809,6 +819,7 @@ impl PhysicalManager {
             .values()
             .map(|transition| transition.reserved_bytes)
             .sum();
+        self.metrics.device_detached_transfer_reserved = self.detached_transfer_reserved_bytes();
         self.metrics.device_warm = self
             .representations
             .values()
@@ -963,6 +974,33 @@ mod tests {
                 .transfers,
             0
         );
+        assert_eq!(manager.metrics().device_detached_transfer_reserved, 0);
+    }
+
+    #[test]
+    fn detached_transfers_keep_device_capacity_reserved() {
+        let mut manager = PhysicalManager::new(Capacity {
+            device_bytes: 20,
+            host_bytes: 20,
+        });
+        let first = register_composite(&mut manager, mapping(1), Tier::Device, 1);
+        let (transition, _, _) = manager
+            .prepare_transition(context(2), 1, mapping(1), 32, all(), &first, false)
+            .unwrap();
+        manager.commit_transition(transition, 1).unwrap();
+        let next = register_composite(&mut manager, mapping(2), Tier::Host, 1);
+        let (transition, _, transfers) = manager
+            .prepare_transition(context(2), 1, mapping(2), 32, all(), &next, false)
+            .unwrap();
+
+        manager.abort_transition(transition).unwrap();
+
+        assert_eq!(manager.metrics().device_detached_transfer_reserved, 3);
+        assert_eq!(manager.reserve_growth(15), Err(Error::DeviceCapacity));
+        for transfer in transfers {
+            manager.complete_transfer(transfer, true).unwrap();
+        }
+        assert_eq!(manager.metrics().device_detached_transfer_reserved, 0);
     }
 
     #[test]
