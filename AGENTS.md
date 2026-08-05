@@ -10,11 +10,12 @@ Keep this `AGENTS.md` up to date whenever development workflows, architecture, s
 
 ## Current state
 
-Phases 1 and 2 are implemented. The real Gemma executor proof demonstrated exact token and bitwise-logit continuation after checkpoint capture, slot displacement, restoration, and a device-to-host-to-device round trip across four logical contexts. Cancellation and failed promotion preserve the prior binding. The Rust logical context store now owns persistent token-sequence branches, model and adapter epochs, dependency-valid evaluated-prefix mappings, longest-valid-prefix lookup, reference accounting, and transactional mapping publication.
+Phases 1 through 3 are implemented. The real Gemma executor proof demonstrated exact token and bitwise-logit continuation after checkpoint capture, slot displacement, restoration, and a device-to-host-to-device round trip across four logical contexts. Cancellation and failed promotion preserve the prior binding. The Rust logical context store owns persistent token-sequence branches, model and adapter epochs, dependency-valid evaluated-prefix mappings, longest-valid-prefix lookup, reference accounting, and revision-guarded transactional publication. The physical manager owns capacity-accounted device, host, and storage copies, guarded reservations, transfers, active bindings, prepared transitions, deterministic eviction, and capacity observability.
 
-There is no physical tier manager or production server yet. The repository currently contains:
+There is no production server yet. The repository currently contains:
 
 - `crates/context-store`: Rust logical contexts, structurally shared token sequences, and evaluated-prefix mappings;
+- `crates/physical-manager`: physical representations, tier capacity, ownership references, transfers, bindings, and transactional transitions;
 - `crates/executor-sys`: native FFI declarations and linking;
 - `crates/executor`: safe Rust executor and checkpoint wrappers;
 - `crates/model-registry`: immutable Hugging Face resolution and verified local registration;
@@ -23,7 +24,7 @@ There is no physical tier manager or production server yet. The repository curre
 - `executor`: upstream and patch metadata;
 - `tools`: fetch, verification, and coverage helpers.
 
-Do not represent later phases as implemented. The next architectural work is tiered physical state management, followed by a minimal server and scheduler.
+Do not represent later phases as implemented. The next architectural work is the minimal server and scheduler.
 
 ## Build and dependency conventions
 

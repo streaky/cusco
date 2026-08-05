@@ -112,20 +112,30 @@ fn proof(
     let replacement = executor.tokenize(replacement)?;
     let mut contexts = Vec::new();
     for i in 0..4 {
-        let tokens = executor.tokenize(&format!("{prefix} [{i}]"))?;
+        let prompt = format!("{prefix} [{i}]");
+        let tokens = executor.tokenize(&prompt)?;
         executor.replace_state_for_proof(&tokens)?;
         let checkpoint = executor.capture_checkpoint()?;
         let continuation = tokens[tokens.len() - 1];
         let uninterrupted = executor.decode(&[continuation])?;
-        contexts.push((checkpoint, continuation, uninterrupted));
+        contexts.push((i, prompt, checkpoint, continuation, uninterrupted));
     }
     let mut comparisons = Vec::new();
-    for (checkpoint, continuation, expected) in &contexts {
+    for (context_index, prompt, checkpoint, continuation, expected) in &contexts {
         executor.replace_state_for_proof(&replacement)?;
         let prepared = executor.prepare_restore(checkpoint, checkpoint.checksum)?;
         executor.commit_restore(prepared)?;
         let restored = executor.decode(&[*continuation])?;
-        comparisons.push(json!({"token_equal":expected.token==restored.token,"logits_equal":logits_identical(&expected.logits,&restored.logits),"checkpoint_bytes":checkpoint.bytes,"checksum":checkpoint.checksum}));
+        comparisons.push(json!({
+            "context_index": context_index,
+            "prompt": prompt,
+            "continuation_input_token": continuation,
+            "next_token": restored.token,
+            "token_equal": expected.token == restored.token,
+            "logits_equal": logits_identical(&expected.logits, &restored.logits),
+            "checkpoint_bytes": checkpoint.bytes,
+            "checksum": checkpoint.checksum
+        }));
     }
     ensure!(
         comparisons
@@ -224,6 +234,8 @@ mod tests {
         let artifact: serde_json::Value =
             serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
         assert_eq!(artifact["contexts"].as_array().unwrap().len(), 4);
+        assert_eq!(artifact["contexts"][0]["prompt"], "prefix [0]");
+        assert!(artifact["contexts"][0]["next_token"].is_number());
         assert_eq!(artifact["failed_promotion_preserved_binding"], true);
         fs::remove_dir_all(root).unwrap();
     }
