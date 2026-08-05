@@ -10,6 +10,24 @@ Cusco has completed its executor proof, Rust logical-context-store, and tiered p
 
 Phase 2 adds Rust-owned logical contexts with immutable, structurally shared token branches; model and adapter epochs; dependency-valid evaluated-prefix mappings; longest-valid-prefix lookup; explicit reference accounting; and revision-guarded transactional mapping publication. Phase 3 adds capacity-accounted device, pinned-host, and storage representations; guarded growth and transition reservations; asynchronous transfer ownership; atomic prepared transitions; deterministic warm-state eviction; and structured capacity metrics and traces. The repository also includes the native llama.cpp boundary, immutable model registration, reproducible container build, command-line proof driver, and coverage-enforced tests. It does not yet provide a network service or a stable user-facing API.
 
+## Run the real-model inference integration test
+
+With the validation GGUF at `models/gemma-4-e2b-it.gguf`, Docker's NVIDIA
+runtime configured, and GPU 1 available, run:
+
+```sh
+tools/inference-integration-test.sh
+```
+
+Set `CUSCO_GPU_DEVICE_ID`, `CUSCO_MODEL_DIR`, or `CUSCO_RESULT_DIR` to override
+those defaults. The command evaluates four prompts with the real Gemma model,
+captures each complete execution checkpoint, displaces the active slot,
+restores through host memory, and verifies both the inferred token and every
+logit bit against uninterrupted execution. It also verifies that cancellation
+and a deliberately failed restore preserve the prior binding. The command
+exits nonzero on any failed assertion and prints a short Markdown report with
+the prompts, inferred token IDs, checkpoint sizes, and exactness results.
+
 ## Future goals
 
 Development is planned to proceed from the proven executor boundary toward:
