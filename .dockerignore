@@ -2,4 +2,5 @@ target
 .git
 models
 results
+data
 vendor

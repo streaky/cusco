@@ -29,8 +29,8 @@ The server dynamically admits and reuses multiple model epochs within configured
 
 ## Build and dependency conventions
 
-- Docker Compose is the primary development, test, and proof interface. Keep CPU-only and GPU execution supported by the same image; CPU-only checks should omit GPU passthrough rather than use a separate build.
-- Compose services mount project-scoped `cargo-registry`, `cargo-git`, and `cargo-target` named volumes so `docker compose run --rm ...` reuses downloaded crates and compiled artifacts. Preserve these mounts on new Rust-running services; do not remove the volumes during routine cleanup.
+- Docker Compose is the primary development, test, proof, and production interface. `compose.test.yaml` owns development and verification services; every test or proof command must select it explicitly with `docker compose -f compose.test.yaml`. `compose.yaml` is reserved for the production-oriented `cusco` service, which runs the release binary with persistent bind mounts under the ignored `data/` tree. Keep CPU-only and GPU execution supported by the same image; CPU-only checks should omit GPU passthrough rather than use a separate build.
+- Test Compose services mount project-scoped `cargo-registry`, `cargo-git`, and `cargo-target` named volumes so repeated runs reuse downloaded crates and compiled artifacts. Preserve these mounts on new Rust-running test services; do not remove the volumes during routine cleanup. Production state must use the `data/models`, `data/state`, and `data/spill` bind mounts rather than named or anonymous volumes.
 - Local builds must support CUDA architectures `sm_61` and `sm_70`. Use `CUSCO_CUDA_ARCHITECTURES="61;70"` for normal local builds.
 - Reserve the broad, full CUDA architecture build for production releases. Do not spend local development time compiling every supported CUDA target unless release validation specifically requires it.
 - `llama.cpp-version.txt` is the sole source of truth for the llama.cpp version. It contains a release tag only. Build and fetch tooling must read it; never duplicate the tag or record the corresponding commit hash.
@@ -40,7 +40,7 @@ The server dynamically admits and reuses multiple model epochs within configured
 A normal local image build is:
 
 ```sh
-docker compose build --build-arg CUSCO_CUDA_ARCHITECTURES="61;70"
+docker compose -f compose.test.yaml build --build-arg CUSCO_CUDA_ARCHITECTURES="61;70"
 ```
 
 Select the proof GPU with `CUSCO_GPU_DEVICE_ID`; do not assume a particular host GPU index is available.
@@ -49,11 +49,11 @@ Select the proof GPU with `CUSCO_GPU_DEVICE_ID`; do not assume a particular host
 
 - Write behavioral tests alongside permanent changes.
 - Every measured Rust source file must maintain at least 80% line coverage. `tools/coverage.sh` runs the tests and enforces the per-file threshold.
-- Run the GPU-less coverage path with `docker compose run --rm test`.
+- Run the GPU-less coverage path with `docker compose -f compose.test.yaml run --rm test`.
 - Phase 6 lifecycle or live-executor changes require `CUSCO_GPU_DEVICE_ID=<index> tools/phase6c-report.sh`; it runs coverage plus the executor, mapped, cancellation/deadline/overload, graceful-shutdown, and restart gates and writes `results/phase6c-server.json`.
 - Phase 7 residency or model-lifecycle changes require `CUSCO_GPU_DEVICE_ID=<index> tools/phase7-report.sh`; it runs coverage plus the multi-model load/reuse/reload/remove/restart matrix and writes `results/phase7-server.json`.
 - Executor-boundary changes require the real model proof, not only the deterministic model-free tests. The proof uses the external `models/gemma-4-e2b-it.gguf` asset and writes a machine-readable result under `results/`.
-- Mapped-executor changes require `docker compose run --rm mapped-proof`; it writes staged-versus-mapped evidence to `results/phase5.json`.
+- Mapped-executor changes require `docker compose -f compose.test.yaml run --rm mapped-proof`; it writes staged-versus-mapped evidence to `results/phase5.json`.
 - Verify failure behavior transactionally: cancellation, preparation failure, transfer failure, validation failure, and commit failure must leave the prior binding usable.
 - For behavioral work, exercise the changed path end to end. A successful compile alone is not sufficient.
 

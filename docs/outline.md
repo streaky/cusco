@@ -1305,8 +1305,8 @@ Docker images and Docker Compose are the primary supported interfaces for buildi
 
 The repository provides one multi-stage `Dockerfile` with two complementary Compose files:
 
-- `compose.yaml` is the production-oriented runtime definition. Its default server service has an explicit restart policy and health check, runs from the runtime image rather than a compiler image, bind-mounts `./data/models` and `./data/db` read-write, and bind-mounts `./data/config.yaml`, `./data/user.yaml`, and `./data/user-models` read-only at stable container paths. It must not hide persistent state in anonymous or named Docker volumes.
-- `compose.test.yaml` is the development and verification definition. It contains CPU compilation and model-free tests, CUDA compilation and GPU tests, executor and mapped proofs, conformance and integration tests, benchmarks, reproducibility checks, and an explicitly development-only local server. Test result and external model mounts remain explicit and may be read-only where mutation is unnecessary.
+- `compose.yaml` is the production-oriented runtime definition. Its `cusco` service has an explicit restart policy and health check, runs the release binary from the production image target, and bind-mounts the ignored `./data/models`, `./data/state`, and `./data/spill` paths read-write at stable container paths. It does not hide persistent state in anonymous or named Docker volumes.
+- `compose.test.yaml` is the development and verification definition. It contains GPU-less coverage, executor and mapped proofs, the Phase 6C acceptance server, and the Phase 7 residency server. Test result and external model mounts remain explicit and may be read-only where mutation is unnecessary.
 
 The same build stages should be used locally and in CI. Compiler, Rust, CUDA, CMake, and Python/tooling versions must be pinned by image digest or another immutable lock, and the resulting provenance must record the base-image identity, executor source identity, patch manifest, build arguments, GPU architecture targets, and runtime image identity. BuildKit caches and mounted dependency caches may accelerate builds, but a clean build must not depend on untracked host state. Model weights, Hugging Face caches, benchmark outputs, compiler caches, and the ignored production `./data` tree must not be copied into image layers.
 
@@ -1318,8 +1318,8 @@ Canonical commands should remain short and explicit about which Compose contract
 
 ```text
 docker compose -f compose.test.yaml build
-docker compose -f compose.test.yaml run --rm test-cpu
-docker compose -f compose.test.yaml run --rm test-gpu
+docker compose -f compose.test.yaml run --rm test
+docker compose -f compose.test.yaml run --rm mapped-proof
 docker compose -f compose.test.yaml run --rm executor-proof
 docker compose up -d cusco
 ```

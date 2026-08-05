@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66 AS development
 ARG CUSCO_CUDA_ARCHITECTURES="61;70"
 RUN apt-get update && apt-get install -y --no-install-recommends ccache curl ca-certificates cmake ninja-build python3 clang llvm git build-essential pkg-config && rm -rf /var/lib/apt/lists/* && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85.0 && /root/.cargo/bin/cargo install cargo-llvm-cov --version 0.6.16 --locked
 RUN /root/.cargo/bin/rustup component add llvm-tools-preview
@@ -16,3 +16,5 @@ RUN cmake -S native -B /opt/cusco-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DL
 RUN ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
 COPY . .
 ENV CUSCO_NATIVE_LIB_DIR=/opt/cusco-install/lib CUSCO_LLAMA_LIB_DIR=/opt/llama-build/bin LD_LIBRARY_PATH=/opt/llama-build/bin:/usr/local/cuda/lib64/stubs
+FROM development AS production
+RUN cargo build --release -p cusco

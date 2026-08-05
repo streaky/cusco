@@ -43,7 +43,7 @@ the prompts, inferred token IDs, checkpoint sizes, and exactness results.
 With the validation GGUF and NVIDIA runtime available, run:
 
 ```sh
-docker compose run --rm mapped-proof
+docker compose -f compose.test.yaml run --rm mapped-proof
 ```
 
 The command forks four device-resident sequence mappings, activates and
@@ -85,6 +85,23 @@ reload, model removal, accounting checks, graceful restart, and post-restart
 inference. Machine-readable GPU, epoch, resident-set, capacity, lifecycle, and
 latency evidence is written to `results/phase7-server.json`.
 
+
+## Run the production Compose service
+
+Place the initial model at `data/models/gemma-4-e2b-it.gguf`, then provide an
+authentication token and start the release-binary service:
+
+```sh
+mkdir -p data/models data/state data/spill
+CUSCO_BEARER_TOKEN='replace-with-a-secret' docker compose up --build -d cusco
+```
+
+The production definition listens on `127.0.0.1:8080` by default, persists the
+catalog and contexts under `data/state`, and keeps bounded context spills under
+`data/spill`. `CUSCO_LISTEN_ADDRESS`, `CUSCO_PORT`, `CUSCO_GPU_DEVICE_ID`,
+`CUSCO_MODEL_FILE`, and the documented capacity environment variables can
+override the defaults. The entire `data/` tree is intentionally ignored by
+Git and excluded from image build contexts.
 
 ## Run the minimal server
 
