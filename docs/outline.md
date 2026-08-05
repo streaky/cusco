@@ -1174,6 +1174,7 @@ The server should expose native metrics for:
 - prepared, committed, aborted, and recomputed transitions;
 - hits by transition class;
 - valid represented tokens or units avoided;
+- per-request prompt tokenization, dependency-valid prefix lookup, mapped activation, uncached prefill, and total prompt-processing latency, with cached, uncached, and total prompt-token counts so reports can derive cache fraction and phase-specific throughput without conflating prefill with first-token or end-to-end latency;
 - device-to-device, host-to-device, device-to-host, and storage transfer bytes;
 - transfer latency and queue time;
 - device, host, and storage residency;
@@ -1556,7 +1557,7 @@ Phase 6 is complete only when one recorded end-to-end acceptance run, using the 
 8. graceful shutdown rejects new admissions, drains work within the configured period, coherently cancels the remainder, and restart recovers durable contexts and published state without attempting to recover the ephemeral queue, live sampler, slot, or prepared handles;
 9. exact continuation tokens and the applicable numeric-logit contract match isolated controls, prompt-work and transfer metrics prove the mapped reuse claimed, all changed-path model-free tests pass, and every measured Rust source file remains above the repository's 80% line-coverage floor.
 
-The acceptance artifact records the config values, resolved model/profile epoch inputs, pinned llama.cpp tag and patch identities, build provenance, selected device UUID, per-case terminal result, exact comparison outcome, cache-work counters, transfer bytes, and peak device and host accounting. Passing isolated unit tests or a compile-only check is not a substitute for this run.
+The acceptance artifact records the config values, resolved model/profile epoch inputs, pinned llama.cpp tag and patch identities, build provenance, selected device UUID, per-case terminal result, exact comparison outcome, cache-work counters, per-request cached/uncached/total prompt-token counts and phase timings, derived cached/uncached/effective prefill rates, transfer bytes, and peak device and host accounting. Passing isolated unit tests or a compile-only check is not a substitute for this run.
 
 
 ### Phase 7: residency and lifecycle scheduling

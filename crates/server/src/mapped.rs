@@ -1,4 +1,6 @@
-use crate::{EngineOutput, EngineRequest, Error, InferenceEngine};
+use crate::{
+    EngineOutput, EngineRequest, Error, FrontierControl, InferenceEngine, PrefillMetrics, TokenSink,
+};
 use cusco_context_store::{
     AdapterEpoch, ComponentMask, ContextStore, EvaluatedPrefixId, LogicalContextId, ModelEpoch,
     PersistentTokenSequence,
@@ -9,7 +11,7 @@ use cusco_physical_manager::{
 };
 use parking_lot::Mutex;
 use serde::Deserialize;
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
 
 const MODEL_EPOCH: ModelEpoch = ModelEpoch(1);
 const ADAPTER_EPOCH: AdapterEpoch = AdapterEpoch(0);
@@ -232,17 +234,24 @@ impl MappedEngine {
 }
 
 impl InferenceEngine for MappedEngine {
-    fn generate(&self, request: EngineRequest<'_>) -> Result<EngineOutput, Error> {
+    fn generate(
+        &self,
+        request: EngineRequest<'_>,
+        sink: &mut TokenSink<'_>,
+    ) -> Result<EngineOutput, Error> {
         if request.model.path.to_str() != Some(self.model_path()) {
             return Err(Error::State(
-                "Phase 6A admits only the process-owned model".into(),
+                "Phase 6B admits only the process-owned model".into(),
             ));
         }
+        let prompt_started = Instant::now();
         let mut state = self.state.lock();
+        let tokenization_started = Instant::now();
         let prompt = state
             .executor
             .tokenize(request.prompt)
             .map_err(state_error)?;
+        let tokenization_ns = elapsed_ns(tokenization_started);
         let input_tokens = prompt.len();
         let total = request
             .prior_tokens
@@ -260,18 +269,23 @@ impl InferenceEngine for MappedEngine {
         tokens.extend_from_slice(&prompt);
         let sequence = PersistentTokenSequence::default().append(&tokens);
         let logical_context = state.logical.create(sequence, MODEL_EPOCH, ADAPTER_EPOCH);
+        let prefix_lookup_started = Instant::now();
         let prefix = state
             .logical
             .longest_valid_prefix(logical_context)
             .map_err(state_error)?;
+        let prefix_lookup_ns = elapsed_ns(prefix_lookup_started);
         let cached = prefix.as_ref().map_or(0, |mapping| mapping.represented_end);
         let evaluated_tokens = tokens.len().saturating_sub(cached);
+        let mapping_activation_started = Instant::now();
         activate_prefix(&mut state, logical_context, prefix.as_deref())?;
 
         let mut active_mapping = state.executor.mapping_metrics().active;
         if cached == 0 {
             active_mapping = fork_and_activate(&mut state.executor, active_mapping)?;
         }
+        let mapping_activation_ns = elapsed_ns(mapping_activation_started);
+        let uncached_prefill_started = Instant::now();
         let mut evaluated = cached;
         let mut parent = prefix.as_ref().map(|mapping| mapping.id);
         let mut next = prefix
@@ -303,27 +317,45 @@ impl InferenceEngine for MappedEngine {
                 active_mapping = fork_and_activate(&mut state.executor, active_mapping)?;
             }
         }
+        let uncached_prefill_ns = elapsed_ns(uncached_prefill_started);
         if request.max_tokens > 0 && next.is_none() {
             return Err(Error::State(
                 "an exact cached prefix cannot supply uncached logits".into(),
             ));
         }
-
-        let mut pieces = Vec::with_capacity(request.max_tokens);
+        let prefill = PrefillMetrics {
+            total_tokens: tokens.len(),
+            cached_tokens: cached,
+            uncached_tokens: evaluated_tokens,
+            tokenization_ns,
+            prefix_lookup_ns,
+            mapping_activation_ns,
+            uncached_prefill_ns,
+            total_ns: elapsed_ns(prompt_started),
+        };
+        let mut sampler = state.executor.greedy_sampler().map_err(state_error)?;
+        let mut piece = Vec::with_capacity(32);
         for index in 0..request.max_tokens {
-            let sampled = next.take().expect("decode result exists").token;
-            pieces.push(
+            let sampled = sampler.sample(&mut state.executor).map_err(state_error)?;
+            let terminal_or_control = self.profile.terminal_tokens.contains(&sampled);
+            if terminal_or_control {
+                piece.clear();
+            } else {
                 state
                     .executor
-                    .token_to_piece(sampled)
-                    .map_err(state_error)?,
-            );
+                    .render_token(sampled, &mut piece)
+                    .map_err(state_error)?;
+            }
             tokens.push(sampled);
             state
                 .logical
                 .append(logical_context, &[sampled])
                 .map_err(state_error)?;
-            if self.profile.terminal_tokens.contains(&sampled) || index + 1 == request.max_tokens {
+            let control = sink(sampled, &piece, terminal_or_control)?;
+            if control == FrontierControl::Stop
+                || terminal_or_control
+                || index + 1 == request.max_tokens
+            {
                 break;
             }
             next = Some(state.executor.decode(&[sampled]).map_err(state_error)?);
@@ -349,11 +381,11 @@ impl InferenceEngine for MappedEngine {
         state.metrics.reference_switches = native_metrics.reference_switches;
         state.metrics.activation_bytes_copied = native_metrics.activation_bytes_copied;
         Ok(EngineOutput {
-            pieces,
             successor_tokens: tokens,
             input_tokens,
             cached_tokens: cached,
             evaluated_tokens,
+            prefill,
         })
     }
 }
@@ -574,6 +606,10 @@ fn release_representations(
     }
 }
 
+fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
 fn state_error(error: impl std::fmt::Display) -> Error {
     Error::State(error.to_string())
 }
@@ -591,6 +627,33 @@ mod tests {
             path: PathBuf::from("mock://deterministic"),
             sha256: "mock".into(),
             aliases: vec![],
+        }
+    }
+
+    #[derive(Debug)]
+    struct CollectedOutput {
+        pieces: Vec<Vec<u8>>,
+        successor_tokens: Vec<i32>,
+        cached_tokens: usize,
+        evaluated_tokens: usize,
+    }
+
+    trait GenerateCollected {
+        fn generate_collected(&self, request: EngineRequest<'_>) -> Result<CollectedOutput, Error>;
+    }
+    impl GenerateCollected for MappedEngine {
+        fn generate_collected(&self, request: EngineRequest<'_>) -> Result<CollectedOutput, Error> {
+            let mut pieces = Vec::new();
+            let output = self.generate(request, &mut |_, piece, _| {
+                pieces.push(piece.to_vec());
+                Ok(FrontierControl::Continue)
+            })?;
+            Ok(CollectedOutput {
+                pieces,
+                successor_tokens: output.successor_tokens,
+                cached_tokens: output.cached_tokens,
+                evaluated_tokens: output.evaluated_tokens,
+            })
         }
     }
 
@@ -612,9 +675,11 @@ mod tests {
         missing_kv
             .required_components
             .retain(|component| *component != ProfileComponent::Kv);
-        assert!(!missing_kv
-            .required_mask()
-            .contains(ComponentMask::GLOBAL_KV));
+        assert!(
+            !missing_kv
+                .required_mask()
+                .contains(ComponentMask::GLOBAL_KV)
+        );
         assert!(matches!(
             missing_kv.validate(),
             Err(Error::State(message))
@@ -635,7 +700,7 @@ mod tests {
         .unwrap();
         let model = model();
         let first = engine
-            .generate(EngineRequest {
+            .generate_collected(EngineRequest {
                 model: &model,
                 prompt: &"a".repeat(40),
                 max_tokens: 2,
@@ -643,7 +708,7 @@ mod tests {
             })
             .unwrap();
         let second = engine
-            .generate(EngineRequest {
+            .generate_collected(EngineRequest {
                 model: &model,
                 prompt: "z",
                 max_tokens: 1,
@@ -672,7 +737,7 @@ mod tests {
         .unwrap();
         let model = model();
         let error = engine
-            .generate(EngineRequest {
+            .generate_collected(EngineRequest {
                 model: &model,
                 prompt: &"x".repeat(65),
                 max_tokens: 1,
@@ -696,14 +761,14 @@ mod tests {
         .unwrap();
         let model = model();
         let first = engine
-            .generate(EngineRequest {
+            .generate_collected(EngineRequest {
                 model: &model,
                 prompt: &"a".repeat(40),
                 max_tokens: 1,
                 prior_tokens: &[],
             })
             .unwrap();
-        let failed = engine.generate(EngineRequest {
+        let failed = engine.generate_collected(EngineRequest {
             model: &model,
             prompt: &"b".repeat(25),
             max_tokens: 1,
@@ -711,7 +776,7 @@ mod tests {
         });
         assert!(failed.unwrap_err().to_string().contains("cannot publish"));
         let resumed = engine
-            .generate(EngineRequest {
+            .generate_collected(EngineRequest {
                 model: &model,
                 prompt: "c",
                 max_tokens: 1,
@@ -736,7 +801,7 @@ mod tests {
         .unwrap();
         let model = model();
         let primed = engine
-            .generate(EngineRequest {
+            .generate_collected(EngineRequest {
                 model: &model,
                 prompt: &"p".repeat(32),
                 max_tokens: 0,
@@ -744,7 +809,7 @@ mod tests {
             })
             .unwrap();
         let resumed = engine
-            .generate(EngineRequest {
+            .generate_collected(EngineRequest {
                 model: &model,
                 prompt: "",
                 max_tokens: 1,
@@ -788,6 +853,8 @@ mod tests {
                     context_id: None,
                     deadline_ms: None,
                     priority: 0,
+                    stop: vec![],
+                    raw_continuation: false,
                 },
             )
             .unwrap()
@@ -804,12 +871,29 @@ mod tests {
                     context_id: Some(durable.id),
                     deadline_ms: None,
                     priority: 0,
+                    stop: vec![],
+                    raw_continuation: false,
                 },
             )
             .unwrap()
             .0;
         assert!(second.usage.cached_tokens >= 32);
         assert!(second.usage.evaluated_tokens < durable.native_tokens.len());
+        for usage in [&first.usage, &second.usage] {
+            assert_eq!(usage.prefill.cached_tokens, usage.cached_tokens);
+            assert_eq!(usage.prefill.uncached_tokens, usage.evaluated_tokens);
+            assert_eq!(
+                usage.prefill.total_tokens,
+                usage.cached_tokens + usage.evaluated_tokens
+            );
+            assert!(usage.prefill.total_ns >= usage.prefill.tokenization_ns);
+            assert!(usage.prefill.total_ns >= usage.prefill.prefix_lookup_ns);
+            assert!(usage.prefill.total_ns >= usage.prefill.mapping_activation_ns);
+            assert!(usage.prefill.total_ns >= usage.prefill.uncached_prefill_ns);
+        }
+        assert!(
+            serde_json::to_value(&second.usage).unwrap()["prefill"]["total_ns"].is_u64()
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

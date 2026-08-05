@@ -81,6 +81,11 @@ pub struct PreparedMapping {
     raw: NonNull<sys::CuscoPreparedMapping>,
 }
 
+/// A request-owned native sampler. Sampling requires the executor that created it.
+pub struct GreedySampler {
+    raw: NonNull<sys::CuscoSampler>,
+}
+
 impl Executor {
     pub fn open(path: &str, n_ctx: u32, gpu_layers: i32) -> Result<Self, Error> {
         let path = CString::new(path).map_err(|_| Error::InvalidPath)?;
@@ -106,9 +111,25 @@ impl Executor {
         let text = CString::new(text).map_err(|_| Error::InvalidPath)?;
         ffi::tokenize(self.raw, &text)
     }
+    pub fn render_token<'a>(
+        &mut self,
+        token: i32,
+        buffer: &'a mut Vec<u8>,
+    ) -> Result<&'a [u8], Error> {
+        ffi::render_token(self.raw, token, buffer)?;
+        Ok(buffer)
+    }
+
     pub fn token_to_piece(&mut self, token: i32) -> Result<String, Error> {
-        let bytes = ffi::token_to_piece(self.raw, token)?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        let mut buffer = Vec::with_capacity(32);
+        self.render_token(token, &mut buffer)?;
+        Ok(String::from_utf8_lossy(&buffer).into_owned())
+    }
+
+    pub fn greedy_sampler(&mut self) -> Result<GreedySampler, Error> {
+        Ok(GreedySampler {
+            raw: ffi::greedy_sampler(self.raw)?,
+        })
     }
 
     pub fn decode(&mut self, tokens: &[i32]) -> Result<Decode, Error> {
@@ -185,6 +206,12 @@ impl Executor {
     }
 }
 
+impl GreedySampler {
+    pub fn sample(&mut self, executor: &mut Executor) -> Result<i32, Error> {
+        ffi::sample(self.raw, executor.raw)
+    }
+}
+
 impl Drop for Executor {
     fn drop(&mut self) {
         ffi::close(self.raw)
@@ -203,6 +230,11 @@ impl Drop for PreparedRestore {
 impl Drop for PreparedMapping {
     fn drop(&mut self) {
         ffi::free_prepared_mapping(self.raw)
+    }
+}
+impl Drop for GreedySampler {
+    fn drop(&mut self) {
+        ffi::free_sampler(self.raw)
     }
 }
 
@@ -263,25 +295,63 @@ mod ffi {
         Ok(owned)
     }
 
-    pub(super) fn token_to_piece(
+    pub(super) fn render_token(
         raw: NonNull<sys::CuscoExecutor>,
         token: i32,
-    ) -> Result<Vec<u8>, Error> {
-        let mut piece = std::ptr::null_mut();
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        if buffer.capacity() == 0 {
+            buffer.reserve(32);
+        }
+        buffer.resize(buffer.capacity(), 0);
         let mut size = 0;
-        // SAFETY: raw is live and both outputs point to writable storage.
-        status(unsafe {
-            sys::cusco_executor_token_to_piece(raw.as_ptr(), token, &mut piece, &mut size)
-        })?;
-        let owned = if size == 0 {
-            Vec::new()
-        } else {
-            // SAFETY: the ABI returns size initialized bytes on success.
-            unsafe { slice::from_raw_parts(piece.cast::<u8>(), size) }.to_vec()
+        // SAFETY: raw is live and the vector exposes capacity initialized writable bytes.
+        let mut code = unsafe {
+            sys::cusco_executor_render_token(
+                raw.as_ptr(),
+                token,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut size,
+            )
         };
-        // SAFETY: the ABI permits NULL and this allocation is released exactly once.
-        unsafe { sys::cusco_executor_piece_free(piece) };
-        Ok(owned)
+        if code == sys::BUFFER_TOO_SMALL {
+            buffer.resize(size, 0);
+            // SAFETY: resizing provides at least the capacity requested by the ABI.
+            code = unsafe {
+                sys::cusco_executor_render_token(
+                    raw.as_ptr(),
+                    token,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    &mut size,
+                )
+            };
+        }
+        status(code)?;
+        buffer.truncate(size);
+        Ok(())
+    }
+
+    pub(super) fn greedy_sampler(
+        raw: NonNull<sys::CuscoExecutor>,
+    ) -> Result<NonNull<sys::CuscoSampler>, Error> {
+        let mut sampler = std::ptr::null_mut();
+        // SAFETY: raw is live and the output points to writable storage.
+        status(unsafe { sys::cusco_sampler_greedy(raw.as_ptr(), &mut sampler) })?;
+        NonNull::new(sampler).ok_or(Error::Backend(3))
+    }
+
+    pub(super) fn sample(
+        sampler: NonNull<sys::CuscoSampler>,
+        executor: NonNull<sys::CuscoExecutor>,
+    ) -> Result<i32, Error> {
+        let mut token = 0;
+        // SAFETY: both uniquely owned handles are live for the call.
+        status(unsafe {
+            sys::cusco_sampler_sample(sampler.as_ptr(), executor.as_ptr(), &mut token)
+        })?;
+        Ok(token)
     }
 
     pub(super) fn decode(
@@ -427,6 +497,11 @@ mod ffi {
         unsafe { sys::cusco_executor_cancel_next_decode_for_proof(raw.as_ptr()) }
     }
 
+    pub(super) fn free_sampler(raw: NonNull<sys::CuscoSampler>) {
+        // SAFETY: raw is uniquely owned and released exactly once.
+        unsafe { sys::cusco_sampler_free(raw.as_ptr()) }
+    }
+
     pub(super) fn free_checkpoint(raw: NonNull<sys::CuscoCheckpoint>) {
         // SAFETY: raw is uniquely owned and released exactly once.
         unsafe { sys::cusco_checkpoint_free(raw.as_ptr()) }
@@ -496,6 +571,26 @@ mod tests {
             Executor::open("bad\0path", 1, 0),
             Err(Error::InvalidPath)
         ));
+    }
+
+    #[test]
+    fn native_sampler_and_renderer_are_request_owned() {
+        let mut executor = Executor::open("mock://deterministic", 128, 0).unwrap();
+        let decoded = executor.decode(&[11]).unwrap();
+        let mut sampler = executor.greedy_sampler().unwrap();
+        assert_eq!(sampler.sample(&mut executor).unwrap(), decoded.token);
+
+        let mut piece = Vec::with_capacity(32);
+        executor.render_token(decoded.token, &mut piece).unwrap();
+        let allocation = piece.as_ptr();
+        assert_eq!(piece, decoded.token.to_string().as_bytes());
+        executor.render_token(-1234, &mut piece).unwrap();
+        assert_eq!(piece, b"-1234");
+        assert_eq!(piece.as_ptr(), allocation);
+
+        let mut other = Executor::open("mock://deterministic", 128, 0).unwrap();
+        other.decode(&[11]).unwrap();
+        assert_eq!(sampler.sample(&mut other), Err(Error::Backend(1)));
     }
     #[test]
     fn mapped_forks_publish_transactionally_and_switch_by_reference() {

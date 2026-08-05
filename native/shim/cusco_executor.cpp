@@ -2,6 +2,7 @@
 #include "llama.h"
 
 #include <atomic>
+#include <charconv>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -46,6 +47,11 @@ struct cusco_executor {
     uint64_t reference_switches;
     uint64_t mapped_bytes_copied;
     std::atomic_bool cancel;
+};
+
+struct cusco_sampler {
+    cusco_executor * owner;
+    llama_sampler * raw;
 };
 
 static uint64_t hash_bytes(const uint8_t * p, size_t n) {
@@ -222,49 +228,105 @@ void cusco_executor_tokens_free(int32_t * tokens) {
     delete[] tokens;
 }
 
-cusco_status cusco_executor_token_to_piece(
+cusco_status cusco_executor_render_token(
     cusco_executor * executor,
     int32_t token,
-    char ** out,
+    uint8_t * buffer,
+    size_t capacity,
     size_t * size) try {
-    if (!executor || !out || !size) {
+    if (!executor || !size || (!buffer && capacity != 0)) {
         return CUSCO_INVALID;
     }
-    *out = nullptr;
-    *size = 0;
-    std::string piece;
     if (is_mock(executor)) {
-        piece = std::to_string(token);
-    } else {
-        int32_t required =
-            llama_token_to_piece(executor->vocab, token, nullptr, 0, 0, true);
-        if (required >= 0) {
+        char encoded[32];
+        const auto result = std::to_chars(encoded, encoded + sizeof(encoded), token);
+        if (result.ec != std::errc()) {
             return CUSCO_BACKEND;
         }
-        piece.resize(static_cast<size_t>(-required));
-        const int32_t written = llama_token_to_piece(
-            executor->vocab, token, piece.data(), piece.size(), 0, true);
-        if (written < 0) {
-            return CUSCO_BACKEND;
+        const size_t required = static_cast<size_t>(result.ptr - encoded);
+        *size = required;
+        if (capacity < required) {
+            return CUSCO_BUFFER_TOO_SMALL;
         }
-        piece.resize(static_cast<size_t>(written));
+        memcpy(buffer, encoded, required);
+        return CUSCO_OK;
     }
-    auto * bytes = new (std::nothrow) char[piece.size()];
-    if (!bytes && !piece.empty()) {
-        return CUSCO_NOMEM;
+    const int32_t required =
+        llama_token_to_piece(executor->vocab, token, nullptr, 0, 0, true);
+    if (required >= 0) {
+        return CUSCO_BACKEND;
     }
-    memcpy(bytes, piece.data(), piece.size());
-    *out = bytes;
-    *size = piece.size();
+    *size = static_cast<size_t>(-required);
+    if (capacity < *size) {
+        return CUSCO_BUFFER_TOO_SMALL;
+    }
+    const int32_t written = llama_token_to_piece(
+        executor->vocab, token, reinterpret_cast<char *>(buffer), capacity, 0, true);
+    if (written < 0) {
+        return CUSCO_BACKEND;
+    }
+    *size = static_cast<size_t>(written);
     return CUSCO_OK;
-} catch (const std::bad_alloc &) {
-    return CUSCO_NOMEM;
 } catch (...) {
     return CUSCO_BACKEND;
 }
 
-void cusco_executor_piece_free(char * piece) {
-    delete[] piece;
+cusco_status cusco_sampler_greedy(
+    cusco_executor * executor,
+    cusco_sampler ** out) try {
+    if (!executor || !out) {
+        return CUSCO_INVALID;
+    }
+    *out = nullptr;
+    llama_sampler * raw = is_mock(executor) ? nullptr : llama_sampler_init_greedy();
+    if (!is_mock(executor) && !raw) {
+        return CUSCO_NOMEM;
+    }
+    auto * sampler = new (std::nothrow) cusco_sampler{executor, raw};
+    if (!sampler) {
+        llama_sampler_free(raw);
+        return CUSCO_NOMEM;
+    }
+    *out = sampler;
+    return CUSCO_OK;
+} catch (...) {
+    return CUSCO_BACKEND;
+}
+
+void cusco_sampler_free(cusco_sampler * sampler) {
+    if (sampler) {
+        if (sampler->raw) {
+            llama_sampler_free(sampler->raw);
+        }
+        delete sampler;
+    }
+}
+
+cusco_status cusco_sampler_sample(
+    cusco_sampler * sampler,
+    cusco_executor * executor,
+    int32_t * token) try {
+    if (!sampler || !executor || !token || sampler->owner != executor) {
+        return CUSCO_INVALID;
+    }
+    if (is_mock(executor)) {
+        if (executor->logits.empty()) {
+            return CUSCO_INVALID;
+        }
+        size_t selected = 0;
+        for (size_t i = 1; i < executor->logits.size(); ++i) {
+            if (executor->logits[i] > executor->logits[selected]) {
+                selected = i;
+            }
+        }
+        *token = static_cast<int32_t>(selected);
+    } else {
+        *token = llama_sampler_sample(sampler->raw, executor->ctx, -1);
+        llama_sampler_accept(sampler->raw, *token);
+    }
+    return CUSCO_OK;
+} catch (...) {
+    return CUSCO_BACKEND;
 }
 
 cusco_status cusco_executor_decode(
@@ -286,10 +348,14 @@ cusco_status cusco_executor_decode(
             reinterpret_cast<const uint8_t *>(executor->mock_state.data()),
             executor->mock_state.size() * sizeof(int32_t));
         executor->logits.resize(8);
+        size_t token = 0;
         for (size_t i = 0; i < executor->logits.size(); ++i) {
             executor->logits[i] = static_cast<float>((hash >> (i * 8)) & 255) / 255.0f;
+            if (executor->logits[i] > executor->logits[token]) {
+                token = i;
+            }
         }
-        *out = {executor->logits.data(), executor->logits.size(), static_cast<int32_t>(hash % 256)};
+        *out = {executor->logits.data(), executor->logits.size(), static_cast<int32_t>(token)};
         return CUSCO_OK;
     }
 

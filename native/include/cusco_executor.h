@@ -6,13 +6,14 @@
 extern "C" {
 #endif
 
-#define CUSCO_EXECUTOR_ABI_VERSION 3u
+#define CUSCO_EXECUTOR_ABI_VERSION 4u
 
 /* Opaque, uniquely owned handles. None is thread-safe. */
 typedef struct cusco_executor cusco_executor;
 typedef struct cusco_checkpoint cusco_checkpoint;
 typedef struct cusco_prepared_restore cusco_prepared_restore;
 typedef struct cusco_prepared_mapping cusco_prepared_mapping;
+typedef struct cusco_sampler cusco_sampler;
 
 typedef struct {
     uint32_t abi_version;
@@ -39,7 +40,8 @@ typedef enum {
     CUSCO_BACKEND = 3,
     CUSCO_CANCELLED = 4,
     CUSCO_INCOMPATIBLE = 5,
-    CUSCO_ROLLBACK_FAILED = 6
+    CUSCO_ROLLBACK_FAILED = 6,
+    CUSCO_BUFFER_TOO_SMALL = 7
 } cusco_status;
 
 /* On success, writes a uniquely owned executor to out. The caller must close it. */
@@ -51,12 +53,15 @@ cusco_capabilities cusco_executor_capabilities(const cusco_executor *);
  * zero). Release it exactly once with cusco_executor_tokens_free. */
 cusco_status cusco_executor_tokenize(cusco_executor *, const char *, int32_t ** tokens, size_t * count);
 void cusco_executor_tokens_free(int32_t * tokens);
-/* Converts one token to an owned UTF-8 byte sequence. Release it exactly once
- * with cusco_executor_piece_free. */
-cusco_status cusco_executor_token_to_piece(
-    cusco_executor *, int32_t token, char ** piece, size_t * size);
-void cusco_executor_piece_free(char * piece);
+/* Renders one token into caller-owned reusable storage. On
+ * CUSCO_BUFFER_TOO_SMALL, size receives the required capacity. */
+cusco_status cusco_executor_render_token(
+    cusco_executor *, int32_t token, uint8_t * buffer, size_t capacity, size_t * size);
 
+/* A sampler is request-owned and tied to the executor that created it. */
+cusco_status cusco_sampler_greedy(cusco_executor *, cusco_sampler ** out);
+void cusco_sampler_free(cusco_sampler *);
+cusco_status cusco_sampler_sample(cusco_sampler *, cusco_executor *, int32_t * token);
 /* Mutates executor state. Input tokens are borrowed for the duration of the call. */
 cusco_status cusco_executor_decode(cusco_executor *, const int32_t *, size_t, cusco_decode_result *);
 
