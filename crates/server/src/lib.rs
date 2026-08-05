@@ -254,7 +254,7 @@ pub fn select_slot(candidates: &[SlotCandidate]) -> Option<usize> {
                 .saturating_add(c.growth_bytes);
             (
                 costs.saturating_sub(c.valid_prefix * 1024),
-                -c.priority,
+                std::cmp::Reverse(c.priority),
                 std::cmp::Reverse(c.wait_ms),
                 c.decode_tokens,
                 c.slot,
@@ -1043,6 +1043,12 @@ mod tests {
             },
         ];
         assert_eq!(select_slot(&c), Some(2));
+        let mut low = c[1].clone();
+        low.priority = i32::MIN;
+        let mut high = low.clone();
+        high.slot = 3;
+        high.priority = i32::MAX;
+        assert_eq!(select_slot(&[low, high]), Some(3));
         assert_eq!(select_slot(&[]), None)
     }
     #[tokio::test]
