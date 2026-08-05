@@ -26,10 +26,10 @@ services:
       - >-
         chmod a+rwx /results &&
         nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader
-        > /results/phase4-gpu.csv &&
-        cargo run -p cusco -- serve --listen 0.0.0.0:8080
-        --state /results/phase4-state.json
-        --bearer-token phase4-report-token
+        > /results/phase6a-gpu.csv &&
+        cargo run -p cusco -- serve /models/gemma-4-e2b-it.gguf --listen 0.0.0.0:8080
+        --state /results/phase6a-state.json
+        --bearer-token phase6a-report-token
     environment:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"

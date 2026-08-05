@@ -6,6 +6,12 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+cusco-context-store = { path = "../context-store" }
+cusco-executor = { path = "../executor" }
+cusco-physical-manager = { path = "../physical-manager" }
+hex.workspace = true
+jsonschema.workspace = true
+serde_yaml = "0.9.34"
 cusco-model-registry = { path = "../model-registry" }
 futures-util.workspace = true
 parking_lot.workspace = true

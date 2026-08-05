@@ -107,6 +107,7 @@ impl PersistentTokenSequence {
         result
     }
 
+    #[cfg(test)]
     fn shares_prefix_node(&self, other: &Self, len: usize) -> bool {
         match (self.prefix(len), other.prefix(len)) {
             (Some(left), Some(right)) => match (left.tail, right.tail) {
@@ -171,6 +172,12 @@ pub struct PreparedPublication {
     expected_revision: u64,
     expected_current: Option<EvaluatedPrefixId>,
     mapping: EvaluatedPrefix,
+}
+
+impl PreparedPublication {
+    pub fn mapping_id(&self) -> EvaluatedPrefixId {
+        self.mapping.id
+    }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
