@@ -11,6 +11,8 @@ pub enum Error {
     Cancelled,
     #[error("incompatible checkpoint")]
     Incompatible,
+    #[error("restore failed and the prior binding could not be recovered")]
+    RollbackFailed,
     #[error("executor backend error {0}")]
     Backend(i32),
 }
@@ -20,6 +22,7 @@ fn status(code: i32) -> Result<(), Error> {
         sys::OK => Ok(()),
         sys::CANCELLED => Err(Error::Cancelled),
         sys::INCOMPATIBLE => Err(Error::Incompatible),
+        sys::ROLLBACK_FAILED => Err(Error::RollbackFailed),
         n => Err(Error::Backend(n)),
     }
 }
@@ -315,6 +318,7 @@ mod tests {
         assert_eq!(status(0), Ok(()));
         assert_eq!(status(4), Err(Error::Cancelled));
         assert_eq!(status(5), Err(Error::Incompatible));
+        assert_eq!(status(6), Err(Error::RollbackFailed));
         assert_eq!(status(3), Err(Error::Backend(3)));
     }
 

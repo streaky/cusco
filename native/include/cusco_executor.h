@@ -35,7 +35,8 @@ typedef enum {
     CUSCO_NOMEM = 2,
     CUSCO_BACKEND = 3,
     CUSCO_CANCELLED = 4,
-    CUSCO_INCOMPATIBLE = 5
+    CUSCO_INCOMPATIBLE = 5,
+    CUSCO_ROLLBACK_FAILED = 6
 } cusco_status;
 
 /* On success, writes a uniquely owned executor to out. The caller must close it. */
@@ -63,7 +64,8 @@ cusco_status cusco_executor_prepare_restore(cusco_executor *, const cusco_checkp
 void cusco_prepared_restore_free(cusco_prepared_restore *);
 
 /* Always consumes prepared, on success or failure. Publication is transactional:
- * success installs the prepared state; failure leaves the prior binding valid. */
+ * success installs the prepared state; ordinary failure leaves the prior binding
+ * valid. CUSCO_ROLLBACK_FAILED reports that restoring the prior binding also failed. */
 cusco_status cusco_executor_commit_restore(cusco_executor *, cusco_prepared_restore * prepared);
 
 /* Phase 1 proof hooks, not production executor operations. */

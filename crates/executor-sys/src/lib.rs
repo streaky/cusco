@@ -30,6 +30,7 @@ pub struct DecodeResult {
 pub const OK: i32 = 0;
 pub const CANCELLED: i32 = 4;
 pub const INCOMPATIBLE: i32 = 5;
+pub const ROLLBACK_FAILED: i32 = 6;
 
 unsafe extern "C" {
     pub fn cusco_executor_open(

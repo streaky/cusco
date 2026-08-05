@@ -346,8 +346,7 @@ cusco_status cusco_executor_commit_restore(
 
     const size_t rolled_back = llama_state_set_data(
         executor->ctx, prior.data(), prior.size());
-    (void) rolled_back;
-    return CUSCO_BACKEND;
+    return rolled_back == prior.size() ? CUSCO_BACKEND : CUSCO_ROLLBACK_FAILED;
 } catch (const std::bad_alloc &) {
     return CUSCO_NOMEM;
 } catch (...) {
