@@ -10,7 +10,7 @@ Keep this `AGENTS.md` up to date whenever development workflows, architecture, s
 
 ## Current state
 
-Phases 1 through 6 are implemented. The real Gemma executor proof demonstrated exact checkpoint continuation. The logical context store owns shared token branches and transactional mappings. The physical manager owns tier capacity, representations, transfers, bindings, prepared transitions, eviction, observability, and committed device block tables. The server adds durable opaque external context IDs, atomic state recovery, model lifecycle APIs, bounded transition-cost scheduling, shared incremental streaming, canonical usage, authentication policy, OpenAI completion/chat adapters, and checked OpenAPI. Phase 5 adds transactional llama.cpp sequence mappings, reference-only activation, graph-reuse and byte-copy metrics, and a real-GPU staged-versus-mapped proof. Phase 6 integrates one persistent mapped Gemma executor with count-and-byte-bounded FIFO admission, pre-queue transport limits, native cancellation, separate wall and active deadlines, graceful shutdown, restart recovery, and a real-GPU acceptance artifact.
+Phases 1 through 7 are implemented. The real Gemma executor proof demonstrated exact checkpoint continuation. The logical context store owns shared token branches and transactional mappings. The physical manager owns tier capacity, representations, transfers, bindings, prepared transitions, eviction, observability, and committed device block tables. The server adds durable opaque external context IDs, atomic state recovery, model lifecycle APIs, bounded transition-cost scheduling, shared incremental streaming, canonical usage, authentication policy, OpenAI completion/chat adapters, and checked OpenAPI. Phase 5 adds transactional llama.cpp sequence mappings, reference-only activation, graph-reuse and byte-copy metrics, and a real-GPU staged-versus-mapped proof. Phase 6 adds the persistent mapped live executor, bounded lifecycle controls, and its real-GPU acceptance report. Phase 7 adds executor-reported operating points, capacity-admitted multi-model residency, transactional immutable model epochs, active-reference draining, pressure-driven idle LRU eviction, bounded local mapped-context spill/restore, and residency observability.
 
 The repository currently contains:
 
@@ -25,7 +25,7 @@ The repository currently contains:
 - `executor`: upstream and patch metadata;
 - `tools`: fetch, verification, integration-report, and coverage helpers.
 
-The server has one persistent mapped Gemma executor path and deliberately remains limited to one loaded model and one native execution slot. Phase 7 residency and lifecycle scheduling is the next architectural work. Dynamic residency, concurrent native execution, compatibility breadth, and production hardening remain later work and must not be represented as implemented.
+The server dynamically admits and reuses multiple model epochs within configured device, host, and storage budgets. Each resident model currently owns one native execution slot, so requests for the same model serialize at that slot while distinct resident models can execute independently. Phase 8 workload scheduling and operational hardening is next. Broader compatibility and production hardening remain later work and must not be represented as implemented.
 
 ## Build and dependency conventions
 
@@ -34,7 +34,7 @@ The server has one persistent mapped Gemma executor path and deliberately remain
 - Local builds must support CUDA architectures `sm_61` and `sm_70`. Use `CUSCO_CUDA_ARCHITECTURES="61;70"` for normal local builds.
 - Reserve the broad, full CUDA architecture build for production releases. Do not spend local development time compiling every supported CUDA target unless release validation specifically requires it.
 - `llama.cpp-version.txt` is the sole source of truth for the llama.cpp version. It contains a release tag only. Build and fetch tooling must read it; never duplicate the tag or record the corresponding commit hash.
-- Keep llama.cpp changes behind the versioned C ABI in `native/include/cusco_executor.h` (currently ABI version 4). Rust should not depend directly on unstable llama.cpp internals.
+- Keep llama.cpp changes behind the versioned C ABI in `native/include/cusco_executor.h` (currently ABI version 6). Rust should not depend directly on unstable llama.cpp internals.
 - Model files and generated proof results are local artifacts and must not be committed.
 
 A normal local image build is:
@@ -51,6 +51,7 @@ Select the proof GPU with `CUSCO_GPU_DEVICE_ID`; do not assume a particular host
 - Every measured Rust source file must maintain at least 80% line coverage. `tools/coverage.sh` runs the tests and enforces the per-file threshold.
 - Run the GPU-less coverage path with `docker compose run --rm test`.
 - Phase 6 lifecycle or live-executor changes require `CUSCO_GPU_DEVICE_ID=<index> tools/phase6c-report.sh`; it runs coverage plus the executor, mapped, cancellation/deadline/overload, graceful-shutdown, and restart gates and writes `results/phase6c-server.json`.
+- Phase 7 residency or model-lifecycle changes require `CUSCO_GPU_DEVICE_ID=<index> tools/phase7-report.sh`; it runs coverage plus the multi-model load/reuse/reload/remove/restart matrix and writes `results/phase7-server.json`.
 - Executor-boundary changes require the real model proof, not only the deterministic model-free tests. The proof uses the external `models/gemma-4-e2b-it.gguf` asset and writes a machine-readable result under `results/`.
 - Mapped-executor changes require `docker compose run --rm mapped-proof`; it writes staged-versus-mapped evidence to `results/phase5.json`.
 - Verify failure behavior transactionally: cancellation, preparation failure, transfer failure, validation failure, and commit failure must leave the prior binding usable.

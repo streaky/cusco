@@ -32,6 +32,17 @@ pub struct Capabilities {
     pub max_mappings: c_uint,
 }
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct OperatingPoint {
+    pub model_bytes: u64,
+    pub context_bytes: u64,
+    pub device_bytes: u64,
+    pub host_bytes: u64,
+    pub gpu_layers: c_int,
+    pub model_layers: c_int,
+    pub competent: c_uint,
+}
+#[repr(C)]
 pub struct DecodeResult {
     pub logits: *const f32,
     pub logits_len: usize,
@@ -52,6 +63,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn cusco_executor_close(executor: *mut CuscoExecutor);
     pub fn cusco_executor_capabilities(executor: *const CuscoExecutor) -> Capabilities;
+    pub fn cusco_executor_operating_point(executor: *const CuscoExecutor) -> OperatingPoint;
     pub fn cusco_executor_tokenize(
         executor: *mut CuscoExecutor,
         text: *const c_char,
@@ -111,13 +123,31 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn cusco_executor_activate_mapping(executor: *mut CuscoExecutor, mapping: c_uint) -> c_int;
     pub fn cusco_executor_remove_mapping(executor: *mut CuscoExecutor, mapping: c_uint) -> c_int;
+    pub fn cusco_executor_mapping_state_size(
+        executor: *mut CuscoExecutor,
+        mapping: c_uint,
+    ) -> usize;
+    pub fn cusco_executor_export_mapping(
+        executor: *mut CuscoExecutor,
+        mapping: c_uint,
+        buffer: *mut u8,
+        capacity: usize,
+        written: *mut usize,
+        position: *mut usize,
+    ) -> c_int;
+    pub fn cusco_executor_import_mapping(
+        executor: *mut CuscoExecutor,
+        buffer: *const u8,
+        size: usize,
+        position: usize,
+        mapping: *mut c_uint,
+    ) -> c_int;
     pub fn cusco_executor_active_mapping(executor: *const CuscoExecutor) -> c_uint;
     pub fn cusco_executor_mapping_count(executor: *const CuscoExecutor) -> usize;
     pub fn cusco_executor_reference_switches(executor: *const CuscoExecutor) -> c_ulonglong;
     pub fn cusco_executor_mapped_bytes_copied(executor: *const CuscoExecutor) -> c_ulonglong;
     pub fn cusco_executor_cancel(executor: *mut CuscoExecutor);
     pub fn cusco_executor_reset_cancel(executor: *mut CuscoExecutor);
-
 
     pub fn cusco_executor_replace_state_for_proof(
         executor: *mut CuscoExecutor,

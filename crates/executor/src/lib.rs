@@ -38,6 +38,17 @@ pub struct Capabilities {
     pub max_mappings: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct OperatingPoint {
+    pub model_bytes: u64,
+    pub context_bytes: u64,
+    pub device_bytes: u64,
+    pub host_bytes: u64,
+    pub gpu_layers: i32,
+    pub model_layers: i32,
+    pub competent: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Decode {
     pub logits: Vec<f32>,
@@ -46,6 +57,12 @@ pub struct Decode {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct MappingId(pub u32);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MappingState {
+    pub bytes: Vec<u8>,
+    pub position: usize,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct MappingMetrics {
@@ -142,6 +159,18 @@ impl Executor {
             max_mappings: c.max_mappings,
         }
     }
+    pub fn operating_point(&self) -> OperatingPoint {
+        let point = unsafe { sys::cusco_executor_operating_point(self.raw.as_ptr()) };
+        OperatingPoint {
+            model_bytes: point.model_bytes,
+            context_bytes: point.context_bytes,
+            device_bytes: point.device_bytes,
+            host_bytes: point.host_bytes,
+            gpu_layers: point.gpu_layers,
+            model_layers: point.model_layers,
+            competent: point.competent != 0,
+        }
+    }
     pub fn cancellation_handle(&self) -> CancellationHandle {
         CancellationHandle {
             raw: self.raw,
@@ -151,8 +180,6 @@ impl Executor {
     pub fn reset_cancellation(&mut self) {
         ffi::reset_cancel(self.raw);
     }
-
-
 
     pub fn tokenize(&mut self, text: &str) -> Result<Vec<i32>, Error> {
         let text = CString::new(text).map_err(|_| Error::InvalidPath)?;
@@ -235,6 +262,14 @@ impl Executor {
 
     pub fn remove_mapping(&mut self, mapping: MappingId) -> Result<(), Error> {
         ffi::remove_mapping(self.raw, mapping.0)
+    }
+
+    pub fn export_mapping(&mut self, mapping: MappingId) -> Result<MappingState, Error> {
+        ffi::export_mapping(self.raw, mapping.0)
+    }
+
+    pub fn import_mapping(&mut self, state: &MappingState) -> Result<MappingId, Error> {
+        ffi::import_mapping(self.raw, state).map(MappingId)
     }
 
     pub fn mapping_metrics(&self) -> MappingMetrics {
@@ -507,6 +542,48 @@ mod ffi {
         status(unsafe { sys::cusco_executor_remove_mapping(executor.as_ptr(), mapping) })
     }
 
+    pub(super) fn export_mapping(
+        executor: NonNull<sys::CuscoExecutor>,
+        mapping: u32,
+    ) -> Result<super::MappingState, Error> {
+        // SAFETY: executor is live and uniquely borrowed by the caller.
+        let size = unsafe { sys::cusco_executor_mapping_state_size(executor.as_ptr(), mapping) };
+        let mut bytes = vec![0; size];
+        let mut written = size;
+        let mut position = 0;
+        // SAFETY: the output buffer and scalar outputs remain writable through the call.
+        status(unsafe {
+            sys::cusco_executor_export_mapping(
+                executor.as_ptr(),
+                mapping,
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &mut written,
+                &mut position,
+            )
+        })?;
+        bytes.truncate(written);
+        Ok(super::MappingState { bytes, position })
+    }
+
+    pub(super) fn import_mapping(
+        executor: NonNull<sys::CuscoExecutor>,
+        state: &super::MappingState,
+    ) -> Result<u32, Error> {
+        let mut mapping = 0;
+        // SAFETY: executor and the immutable payload are live through the call.
+        status(unsafe {
+            sys::cusco_executor_import_mapping(
+                executor.as_ptr(),
+                state.bytes.as_ptr(),
+                state.bytes.len(),
+                state.position,
+                &mut mapping,
+            )
+        })?;
+        Ok(mapping)
+    }
+
     pub(super) fn mapping_metrics(executor: NonNull<sys::CuscoExecutor>) -> super::MappingMetrics {
         // SAFETY: executor is live for all read-only metric calls.
         unsafe {
@@ -542,8 +619,6 @@ mod ffi {
         // SAFETY: the caller exclusively borrows the executor.
         unsafe { sys::cusco_executor_reset_cancel(raw.as_ptr()) }
     }
-
-
 
     pub(super) fn cancel_next_decode_for_proof(raw: NonNull<sys::CuscoExecutor>) {
         // SAFETY: raw is live and uniquely borrowed by the caller.
@@ -681,7 +756,10 @@ mod tests {
         assert_eq!(executor.mapping_metrics().resident_mappings, 2);
         let continuation = [7, 8];
         let staged = executor.decode(&continuation).unwrap();
-        executor.activate_mapping(branch).unwrap();
+        let spilled = executor.export_mapping(branch).unwrap();
+        executor.remove_mapping(branch).unwrap();
+        let restored = executor.import_mapping(&spilled).unwrap();
+        executor.activate_mapping(restored).unwrap();
         let mapped = executor.decode(&continuation).unwrap();
         assert_eq!(mapped.token, staged.token);
         assert!(logits_identical(&mapped.logits, &staged.logits));
@@ -690,7 +768,7 @@ mod tests {
         assert_eq!(metrics.reference_switches, 1);
         assert_eq!(metrics.activation_bytes_copied, 0);
         executor.activate_mapping(MappingId(0)).unwrap();
-        executor.remove_mapping(branch).unwrap();
+        executor.remove_mapping(restored).unwrap();
         assert_eq!(executor.mapping_metrics().resident_mappings, 1);
     }
 }

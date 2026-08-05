@@ -6,18 +6,19 @@ The project separates responsibilities deliberately: Rust will manage logical co
 
 ## Current state
 
-Cusco has completed Phases 1 through 6. The executor proof established exact
+Cusco has completed Phases 1 through 7. The executor proof established exact
 checkpoint continuation for a hybrid/recurrent Gemma model, and the Rust layers
 now provide durable logical contexts, capacity-accounted physical state,
 transactional mapped activation, an authenticated HTTP API, immutable model
-registration, and bounded live inference.
+epochs, bounded live inference, and dynamic model residency.
 
-Phase 6 keeps one validated Gemma model and executor slot process-persistent,
-reuses complete mapped blocks across opaque-context continuations, and performs
-request-owned incremental sampling through a bounded UTF-8 and stop-aware event
-frontier. Count-and-byte-bounded FIFO admission, pre-queue transport limits,
-native cancellation, separate wall and active deadlines, graceful shutdown,
-and durable-context-only restart recovery complete the fixed one-slot contract.
+Phase 7 replaces the one-model process with a capacity-admitted residency
+scheduler. Executor-reported operating points account model weights, context
+capacity, and device/host placement; model loads, epoch reloads, retirement,
+and unload use transactional publication and active-reference draining.
+Pressure selects idle LRU victims, inactive mapped contexts can spill through
+the native sequence-state ABI and restore exactly, and `/native/status`
+reports configured budgets, resident epochs, and lifecycle/tier metrics.
 
 ## Run the real-model inference integration test
 
@@ -70,6 +71,20 @@ configuration, provenance, selected GPU UUID, exactness results, prompt phase
 timings, cache work, transfers, and device/host accounting, is written to
 `results/phase6c-server.json`.
 
+## Run the Phase 7 residency report
+
+With the validation GGUF and NVIDIA runtime available, run:
+
+```sh
+CUSCO_GPU_DEVICE_ID=0 tools/phase7-report.sh
+```
+
+The workflow runs the GPU-less per-file coverage gate, then exercises the live
+resident server with two immutable model identities, a transactional epoch
+reload, model removal, accounting checks, graceful restart, and post-restart
+inference. Machine-readable GPU, epoch, resident-set, capacity, lifecycle, and
+latency evidence is written to `results/phase7-server.json`.
+
 
 ## Run the minimal server
 
@@ -94,12 +109,10 @@ implicitly fetch models.
 
 ## Future goals
 
-Development is planned to proceed from the proven mapped-execution boundary
-toward:
+Development now proceeds from dynamic residency toward:
 
-- integration of mapped execution with live server scheduling;
-- production hardening of the inference and model-management server;
-- broader compatibility, operational hardening, and recovery behavior;
+- workload scheduling and operational hardening;
+- broader protocol and model compatibility, recovery, and deployment behavior;
 - optional semantic context compaction once the underlying state system is proven reliable.
 
 Each stage is intended to remain gated by correctness and measurable capacity results. The full design and phased acceptance criteria are documented in `docs/outline.md`.

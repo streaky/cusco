@@ -665,6 +665,23 @@ impl PhysicalManager {
         Ok(binding)
     }
 
+    pub fn release_binding(&mut self, context: LogicalContextId) -> Result<(), Error> {
+        let binding = self
+            .bindings
+            .remove(&context)
+            .ok_or(Error::BindingNotFound)?;
+        self.block_tables.remove(&context);
+        for representation in binding.representations {
+            self.representations
+                .get_mut(&representation)
+                .expect("binding references a live representation")
+                .references
+                .active -= 1;
+        }
+        self.refresh_capacity_metrics();
+        Ok(())
+    }
+
     pub fn abort_transition(&mut self, id: PreparedTransitionId) -> Result<(), Error> {
         let mut transition = self
             .transitions
@@ -709,6 +726,30 @@ impl PhysicalManager {
         }
         let representation = self.representations.get_mut(&id).unwrap();
         representation.host = true;
+        if representation.device {
+            representation.device = false;
+            self.metrics.demotions += 1;
+            self.events.push(TraceEvent::Demoted {
+                representation: id,
+                bytes,
+            });
+        }
+        self.refresh_capacity_metrics();
+        Ok(())
+    }
+
+    pub fn demote_to_storage(&mut self, id: PhysicalRepresentationId) -> Result<(), Error> {
+        let representation = self
+            .representations
+            .get(&id)
+            .ok_or(Error::RepresentationNotFound)?;
+        if representation.references.protected() {
+            return Err(Error::Protected);
+        }
+        let bytes = representation.bytes;
+        let representation = self.representations.get_mut(&id).unwrap();
+        representation.storage = true;
+        representation.host = false;
         if representation.device {
             representation.device = false;
             self.metrics.demotions += 1;

@@ -1566,7 +1566,7 @@ The acceptance artifact records the config values, resolved model/profile epoch 
 
 ### Phase 7: residency and lifecycle scheduling
 
-Generalize the live Phase 6 path from one statically admitted model into transactional dynamic resource ownership:
+Implemented by generalizing the live Phase 6 path from one statically admitted model into transactional dynamic resource ownership:
 
 - make the model-residency scheduler account for real device and host memory occupied by model weights, executor pools, mapped contexts, prepared transitions, and non-evictable work;
 - choose among executor-reported native operating points under operator policy, keep the selected competent model floor distinct from elastic layer or expert residency, and prevent elastic native allocations from silently consuming capacity protected for context cache;
@@ -1577,6 +1577,19 @@ Generalize the live Phase 6 path from one statically admitted model into transac
 - coordinate load, tier movement, and unload with active requests, queued work, cancellation, deadlines, prepared transitions, and delayed native fences;
 - handle model removal, alias replacement, transactional reload, and revision changes while requests, contexts, or mappings still reference an old immutable model epoch;
 - prove through lifecycle races and fault injection that failed load, movement, eviction, reload, or unload leaves the prior usable state intact.
+
+The implemented contract uses executor-reported operating points selected by
+the operator's fixed competent floor, explicit device/host/storage and context
+reserve budgets, one independently locked native slot per resident model
+epoch, pressure-driven idle LRU eviction, monotonically assigned durable model
+epochs, and bounded local spill of inactive native sequence mappings. Load and
+reload prepare the replacement before durable publication; retirement drains
+active references before reclamation. `/native/status` exposes the configured
+budgets, resident epochs, effective operating points, and lifecycle/tier
+counters. `tools/phase7-report.sh` records the real-GPU multi-model
+load/reuse/reload/remove/restart artifact in `results/phase7-server.json`;
+model-free race, rollback, pressure, and exact spill/restore tests remain part
+of the per-file coverage gate.
 
 ### Phase 8: workload scheduling and operational hardening
 

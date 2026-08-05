@@ -60,6 +60,8 @@ enum Command {
         model: PathBuf,
         #[arg(long, default_value = "gemma-4-e2b-it")]
         model_id: String,
+        #[arg(long, default_value = "gemma-4-e2b-it")]
+        model_family: String,
         #[arg(long, default_value_t = 4096)]
         context: u32,
         #[arg(long, default_value_t = 99)]
@@ -68,6 +70,14 @@ enum Command {
         device_bytes: usize,
         #[arg(long, default_value_t = 17_179_869_184)]
         host_bytes: usize,
+        #[arg(long, default_value_t = 68_719_476_736)]
+        storage_bytes: u64,
+        #[arg(long, default_value_t = 1_073_741_824)]
+        context_reserve_bytes: u64,
+        #[arg(long, default_value = "/data/cusco-spill")]
+        spill_directory: PathBuf,
+        #[arg(long)]
+        require_competent: bool,
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: SocketAddr,
         #[arg(long, default_value = "/data/cusco-state.json")]
@@ -76,7 +86,7 @@ enum Command {
         bearer_token: Option<String>,
         #[arg(long)]
         unsafe_public_unauthenticated: bool,
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 4)]
         active_requests: usize,
         #[arg(long, default_value_t = 32)]
         queue_count: usize,
@@ -142,10 +152,15 @@ fn run(command: Command) -> Result<()> {
         Command::Serve {
             model,
             model_id,
+            model_family,
             context,
             gpu_layers,
             device_bytes,
             host_bytes,
+            storage_bytes,
+            context_reserve_bytes,
+            spill_directory,
+            require_competent,
             listen,
             state,
             bearer_token,
@@ -163,8 +178,8 @@ fn run(command: Command) -> Result<()> {
             shutdown_grace_ms,
         } => {
             use cusco_server::{
-                AnonymousAdmin, AuthProvider, BearerAuth, MappedEngine, ModelRecord, Server,
-                ServerConfig,
+                AnonymousAdmin, AuthProvider, BearerAuth, ModelRecord, ResidencyConfig,
+                ResidentEngine, Server, ServerConfig,
             };
             let anonymous = bearer_token.is_none();
             let auth: Arc<dyn AuthProvider> = match bearer_token {
@@ -172,13 +187,17 @@ fn run(command: Command) -> Result<()> {
                 None => Arc::new(AnonymousAdmin),
             };
             let registered = register_local(&model, &model_id, None)?;
-            let engine = MappedEngine::open(
-                &model_id,
-                &registered.path,
-                context,
-                gpu_layers,
-                device_bytes,
-                host_bytes,
+            let engine = ResidentEngine::open_with_spill(
+                ResidencyConfig {
+                    device_bytes: device_bytes as u64,
+                    host_bytes: host_bytes as u64,
+                    storage_bytes,
+                    context_reserve_bytes,
+                    n_ctx: context,
+                    gpu_layers,
+                    require_competent,
+                },
+                spill_directory,
             )?;
             let server = Server::open(state, auth, engine)?;
             server.configure(ServerConfig {
@@ -195,11 +214,14 @@ fn run(command: Command) -> Result<()> {
                 shutdown_grace_ms,
             })?;
             server.register_model(ModelRecord {
-                id: model_id,
+                id: model_id.clone(),
                 revision: registered.sha256.clone(),
                 path: registered.path,
                 sha256: registered.sha256,
                 aliases: vec![],
+                family: model_family,
+                size_bytes: registered.size,
+                epoch: 0,
             })?;
             tokio::runtime::Runtime::new()?.block_on(cusco_server::serve(
                 server,
@@ -519,10 +541,15 @@ mod tests {
             run(Command::Serve {
                 model: PathBuf::from("mock://deterministic"),
                 model_id: "gemma-4-e2b-it".into(),
+                model_family: "gemma-4-e2b-it".into(),
                 context: 128,
                 gpu_layers: 0,
                 device_bytes: 1 << 20,
                 host_bytes: 1 << 20,
+                storage_bytes: 1 << 20,
+                context_reserve_bytes: 1,
+                spill_directory: root.join("spill"),
+                require_competent: false,
                 listen: public,
                 state: root.join("server.json"),
                 bearer_token: None,
@@ -545,10 +572,15 @@ mod tests {
         let unsupported = run(Command::Serve {
             model: root.join("local.gguf"),
             model_id: "unsupported".into(),
+            model_family: "unsupported".into(),
             context: 128,
             gpu_layers: 0,
             device_bytes: 1 << 20,
             host_bytes: 1 << 20,
+            storage_bytes: 1 << 20,
+            context_reserve_bytes: 1,
+            spill_directory: root.join("unsupported-spill"),
+            require_competent: false,
             listen: loopback,
             state: root.join("unsupported-server.json"),
             bearer_token: None,

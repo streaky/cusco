@@ -25,6 +25,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+mod residency;
 use thiserror::Error;
 use uuid::Uuid;
 mod generation;
@@ -35,6 +36,7 @@ pub use generation::{
     StopAlignment,
 };
 pub use mapped::{ExecutionProfile, MappedEngine, MappedMetrics};
+pub use residency::{ResidencyConfig, ResidencyMetrics, ResidentEngine, ResidentModelStatus};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -146,13 +148,30 @@ pub struct ModelRecord {
     pub revision: String,
     pub path: PathBuf,
     pub sha256: String,
+    #[serde(default)]
     pub aliases: Vec<String>,
+    #[serde(default = "default_model_family")]
+    pub family: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub epoch: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DurableState {
     installation: Uuid,
     contexts: HashMap<ContextId, ContextRecord>,
     models: HashMap<String, ModelRecord>,
+    #[serde(default = "initial_model_epoch")]
+    next_model_epoch: u64,
+}
+
+fn initial_model_epoch() -> u64 {
+    1
+}
+
+fn default_model_family() -> String {
+    "gemma-4-e2b-it".into()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -258,9 +277,11 @@ impl IntoResponse for Error {
             Self::UnsafeListener(_) | Self::State(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let retry = matches!(self, Self::Busy).then_some("1");
-        let mut response =
-            (status, Json(json!({"error":{"code":self.code(),"message":self.to_string()}})))
-                .into_response();
+        let mut response = (
+            status,
+            Json(json!({"error":{"code":self.code(),"message":self.to_string()}})),
+        )
+            .into_response();
         if let Some(value) = retry {
             response
                 .headers_mut()
@@ -338,10 +359,7 @@ impl RequestControl {
         self.state.load(Ordering::Acquire) == CONTROL_COMPLETE
     }
 
-    fn register_abort(
-        &self,
-        abort: Arc<dyn Fn() + Send + Sync>,
-    ) -> AbortRegistration<'_> {
+    fn register_abort(&self, abort: Arc<dyn Fn() + Send + Sync>) -> AbortRegistration<'_> {
         *self.abort.lock() = Some(abort.clone());
         if self.check().is_err() {
             abort();
@@ -432,6 +450,22 @@ pub trait InferenceEngine: Send + Sync {
         request: EngineRequest<'_>,
         sink: &mut TokenSink<'_>,
     ) -> Result<EngineOutput, Error>;
+
+    fn prepare_model(&self, _model: &ModelRecord) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn commit_model(&self, _model: &ModelRecord, _replaced_epoch: Option<u64>) {}
+
+    fn retire_model(&self, _id: &str, _epoch: u64) {}
+
+    fn demote_inactive(&self) -> Result<usize, Error> {
+        Ok(0)
+    }
+
+    fn residency_status(&self) -> Option<Value> {
+        None
+    }
 }
 #[derive(Default)]
 pub struct DeterministicEngine;
@@ -569,8 +603,7 @@ impl PrequeueGate {
             let increase = limit - state.limit;
             let cancelled_retirements = increase.min(state.retire_on_drop);
             state.retire_on_drop -= cancelled_retirements;
-            self.semaphore
-                .add_permits(increase - cancelled_retirements);
+            self.semaphore.add_permits(increase - cancelled_retirements);
         }
         state.limit = limit;
     }
@@ -600,6 +633,7 @@ pub struct Server {
     state_path: PathBuf,
     inner: Arc<Mutex<Inner>>,
     pre_queue: Arc<PrequeueGate>,
+    model_lifecycle: Arc<Mutex<()>>,
     auth: Arc<dyn AuthProvider>,
     engine: Arc<dyn InferenceEngine>,
 }
@@ -626,15 +660,24 @@ impl Server {
         engine: Arc<dyn InferenceEngine>,
     ) -> Result<Self, Error> {
         let path = path.as_ref().to_owned();
-        let durable = if path.exists() {
+        let mut durable: DurableState = if path.exists() {
             serde_json::from_slice(&fs::read(&path).map_err(state_err)?).map_err(state_err)?
         } else {
             DurableState {
                 installation: Uuid::new_v4(),
                 contexts: HashMap::new(),
                 models: HashMap::new(),
+                next_model_epoch: initial_model_epoch(),
             }
         };
+        durable.next_model_epoch = durable
+            .models
+            .values()
+            .map(|model| model.epoch)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(durable.next_model_epoch);
         let config = ServerConfig::default();
         let server = Self {
             state_path: path,
@@ -651,6 +694,7 @@ impl Server {
                 config,
             })),
             pre_queue: PrequeueGate::new(config.pre_queue_concurrency),
+            model_lifecycle: Arc::new(Mutex::new(())),
             auth,
             engine,
         };
@@ -759,14 +803,69 @@ impl Server {
         self.persist()
     }
     pub fn register_model(&self, mut model: ModelRecord) -> Result<ModelRecord, Error> {
+        let _lifecycle = self.model_lifecycle.lock();
         model.aliases.sort();
         model.aliases.dedup();
-        self.inner
+        if model.family.is_empty() {
+            model.family = default_model_family();
+        }
+        if model.size_bytes == 0 {
+            model.size_bytes = fs::metadata(&model.path).map_err(state_err)?.len();
+        }
+        let existing = self
+            .inner
             .lock()
             .durable
             .models
-            .insert(model.id.clone(), model.clone());
-        self.persist()?;
+            .get(&model.id)
+            .cloned()
+            .filter(|existing| {
+                existing.revision == model.revision
+                    && existing.path == model.path
+                    && existing.sha256 == model.sha256
+                    && existing.family == model.family
+                    && existing.size_bytes == model.size_bytes
+            });
+        if let Some(existing) = existing {
+            self.engine.prepare_model(&existing)?;
+            return Ok(existing);
+        }
+        let (epoch, previous, previous_models) = {
+            let mut guard = self.inner.lock();
+            let epoch = guard.durable.next_model_epoch;
+            guard.durable.next_model_epoch = epoch
+                .checked_add(1)
+                .ok_or_else(|| Error::State("model epoch space exhausted".into()))?;
+            (
+                epoch,
+                guard.durable.models.get(&model.id).cloned(),
+                guard.durable.models.clone(),
+            )
+        };
+        model.epoch = epoch;
+        if let Err(error) = self.engine.prepare_model(&model) {
+            self.inner.lock().durable.next_model_epoch = epoch;
+            return Err(error);
+        }
+        {
+            let mut guard = self.inner.lock();
+            for existing in guard.durable.models.values_mut() {
+                existing
+                    .aliases
+                    .retain(|alias| !model.aliases.contains(alias));
+            }
+            guard.durable.models.insert(model.id.clone(), model.clone());
+        }
+        if let Err(error) = self.persist() {
+            let mut guard = self.inner.lock();
+            guard.durable.models = previous_models;
+            guard.durable.next_model_epoch = epoch;
+            drop(guard);
+            self.engine.retire_model(&model.id, model.epoch);
+            return Err(error);
+        }
+        self.engine
+            .commit_model(&model, previous.as_ref().map(|record| record.epoch));
         Ok(model)
     }
     pub fn models(&self) -> Vec<ModelRecord> {
@@ -789,28 +888,45 @@ impl Server {
             .ok_or_else(|| Error::ModelNotFound(id.into()))
     }
     pub fn alias_model(&self, id: &str, alias: String) -> Result<ModelRecord, Error> {
+        let _lifecycle = self.model_lifecycle.lock();
         let mut guard = self.inner.lock();
-        let model = guard
-            .durable
-            .models
-            .get_mut(id)
-            .ok_or_else(|| Error::ModelNotFound(id.into()))?;
-        if !model.aliases.contains(&alias) {
-            model.aliases.push(alias);
+        if !guard.durable.models.contains_key(id) {
+            return Err(Error::ModelNotFound(id.into()));
         }
+        let previous = guard.durable.models.clone();
+        for model in guard.durable.models.values_mut() {
+            model.aliases.retain(|existing| existing != &alias);
+        }
+        let model = guard.durable.models.get_mut(id).unwrap();
+        model.aliases.push(alias);
+        model.aliases.sort();
         let out = model.clone();
         drop(guard);
-        self.persist()?;
+        if let Err(error) = self.persist() {
+            self.inner.lock().durable.models = previous;
+            return Err(error);
+        }
         Ok(out)
     }
     pub fn remove_model(&self, id: &str) -> Result<(), Error> {
-        self.inner
+        let _lifecycle = self.model_lifecycle.lock();
+        let model = self
+            .inner
             .lock()
             .durable
             .models
             .remove(id)
             .ok_or_else(|| Error::ModelNotFound(id.into()))?;
-        self.persist()
+        if let Err(error) = self.persist() {
+            self.inner
+                .lock()
+                .durable
+                .models
+                .insert(model.id.clone(), model);
+            return Err(error);
+        }
+        self.engine.retire_model(&model.id, model.epoch);
+        Ok(())
     }
     pub fn verify_model(&self, id: &str) -> Result<bool, Error> {
         let model = self.model(id)?;
@@ -889,7 +1005,6 @@ impl Server {
         &self,
         request_id: &str,
         req: InferRequest,
-
     ) -> Result<(InferResponse, Vec<StreamEvent>), Error> {
         let control = Arc::new(RequestControl::new());
         let admission = self.try_admit(request_id, control)?;
@@ -950,13 +1065,12 @@ impl Server {
         tokio::task::spawn_blocking(move || {
             let _admission = admission;
             let emit_control = control.clone();
-            let result =
-                server.infer_admitted(&request_id, req, successor_id, frontier, |event| {
-                    sender.blocking_send(event).map_err(|_| {
-                        emit_control.cancel();
-                        Error::Cancelled
-                    })
-                });
+            let result = server.infer_admitted(&request_id, req, successor_id, frontier, |event| {
+                sender.blocking_send(event).map_err(|_| {
+                    emit_control.cancel();
+                    Error::Cancelled
+                })
+            });
             let event = match result {
                 Ok((_, terminal)) => terminal,
                 Err(error) => StreamEvent::Error {
@@ -1262,12 +1376,13 @@ struct RegisterRequest {
     revision: String,
     path: PathBuf,
     sha256: String,
+    #[serde(default = "default_model_family")]
+    family: String,
     #[serde(default)]
     aliases: Vec<String>,
 }
 #[derive(Clone, Deserialize)]
 struct FetchRequest {
-
     uri: String,
     cache: PathBuf,
     #[serde(default)]
@@ -1288,11 +1403,14 @@ where
 
     async fn from_request(request: Request, state: &Server) -> Result<Self, Self::Rejection> {
         let config = state.config();
-        let header_bytes = request.headers().iter().fold(0usize, |total, (name, value)| {
-            total
-                .saturating_add(name.as_str().len())
-                .saturating_add(value.as_bytes().len())
-        });
+        let header_bytes = request
+            .headers()
+            .iter()
+            .fold(0usize, |total, (name, value)| {
+                total
+                    .saturating_add(name.as_str().len())
+                    .saturating_add(value.as_bytes().len())
+            });
         if header_bytes > config.header_bytes {
             return Err(Error::HeadersTooLarge);
         }
@@ -1306,8 +1424,8 @@ where
         .map_err(|_| Error::BodyTimeout)?
         .map_err(|_| Error::PayloadTooLarge)?;
         let retained_bytes = bytes.len();
-        let value = serde_json::from_slice(&bytes)
-            .map_err(|error| Error::BadRequest(error.to_string()))?;
+        let value =
+            serde_json::from_slice(&bytes).map_err(|error| Error::BadRequest(error.to_string()))?;
         Ok(Self {
             headers: parts.headers,
             value,
@@ -1553,9 +1671,7 @@ async fn infer_response(
         priority: 0,
     };
     if streaming {
-        let (started, receiver) = server
-            .infer_stream_reserved(id, request, admission)
-            .await?;
+        let (started, receiver) = server.infer_stream_reserved(id, request, admission).await?;
         let first = stream::once(async move { started });
         let disconnect = DisconnectGuard::new(control);
         let rest = stream::unfold(
@@ -1610,6 +1726,9 @@ async fn register_model(
         path: r.path,
         sha256: r.sha256,
         aliases: r.aliases,
+        family: r.family,
+        size_bytes: 0,
+        epoch: 0,
     })?))
 }
 async fn fetch_model(
@@ -1633,6 +1752,9 @@ async fn fetch_model(
         path: fetched.path,
         sha256: fetched.sha256,
         aliases: vec![],
+        family: "gemma-phase6".into(),
+        size_bytes: fetched.size,
+        epoch: 0,
     })?))
 }
 async fn inspect_model(
@@ -1651,6 +1773,7 @@ async fn native_status(
     Ok(Json(json!({
         "config": server.config(),
         "admission": server.admission_metrics(),
+        "residency": server.engine.residency_status(),
     })))
 }
 async fn verify_model(
@@ -1851,6 +1974,9 @@ mod tests {
             path: model,
             sha256: hex_digest(b"model"),
             aliases: vec!["latest".into()],
+            family: "gemma-4-e2b-it".into(),
+            size_bytes: 5,
+            epoch: 0,
         })
         .unwrap();
         (s, d)
@@ -2004,7 +2130,7 @@ mod tests {
                     priority: 0,
                     stop: vec![],
                     raw_continuation: false,
-                },
+                }
             ),
             Err(Error::State(_))
         ));
@@ -2017,8 +2143,35 @@ mod tests {
         assert!(s.verify_model("m").unwrap());
         assert!(!s.check_update("m", "r1").unwrap());
         assert!(s.check_update("m", "r2").unwrap());
+        let original = s.model("m").unwrap();
+        assert_eq!(
+            s.register_model(original.clone()).unwrap().epoch,
+            original.epoch
+        );
+
+        let second_path = d.join("second.gguf");
+        fs::write(&second_path, b"second").unwrap();
+        s.register_model(ModelRecord {
+            id: "second".into(),
+            revision: "r2".into(),
+            path: second_path,
+            sha256: hex_digest(b"second"),
+            aliases: vec!["latest".into()],
+            family: "gemma-4-e2b-it".into(),
+            size_bytes: 6,
+            epoch: 0,
+        })
+        .unwrap();
         s.alias_model("m", "stable".into()).unwrap();
         assert_eq!(s.model("stable").unwrap().id, "m");
+        assert_eq!(s.model("latest").unwrap().id, "second");
+        assert!(
+            s.model("m")
+                .unwrap()
+                .aliases
+                .iter()
+                .all(|alias| alias != "latest")
+        );
         s.remove_model("m").unwrap();
         assert!(matches!(s.model("m"), Err(Error::ModelNotFound(_))));
         let public = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 8080);
@@ -2172,14 +2325,15 @@ mod tests {
                 StatusCode::OK,
             ),
         ] {
-            assert_eq!(
-                app.clone()
-                    .oneshot(request(method, uri, body))
-                    .await
-                    .unwrap()
-                    .status(),
-                expected
-            );
+            let response = app
+                .clone()
+                .oneshot(request(method, uri, body))
+                .await
+                .unwrap();
+            if response.status() != expected {
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                panic!("{method} {uri}: {}", String::from_utf8_lossy(&bytes));
+            }
         }
         assert_eq!(
             app.clone()
@@ -2869,19 +3023,10 @@ mod tests {
     async fn wall_and_active_deadline_watchdogs_abort_owned_work() {
         let wall = Arc::new(RequestControl::new());
         let active = Arc::new(RequestControl::new());
-        start_deadline_watchdogs(
-            &wall,
-            Duration::from_millis(5),
-            Duration::from_secs(1),
-        );
-        start_deadline_watchdogs(
-            &active,
-            Duration::from_secs(1),
-            Duration::from_millis(5),
-        );
+        start_deadline_watchdogs(&wall, Duration::from_millis(5), Duration::from_secs(1));
+        start_deadline_watchdogs(&active, Duration::from_secs(1), Duration::from_millis(5));
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(matches!(wall.check(), Err(Error::Deadline)));
         assert!(matches!(active.check(), Err(Error::Deadline)));
     }
-
 }

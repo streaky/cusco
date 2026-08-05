@@ -1,6 +1,7 @@
 #include "cusco_executor.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <cstring>
@@ -49,6 +50,7 @@ struct cusco_executor {
     uint64_t reference_switches;
     uint64_t mapped_bytes_copied;
     std::atomic_bool cancel;
+    int32_t gpu_layers;
 };
 
 struct cusco_sampler {
@@ -73,7 +75,6 @@ static bool abort_decode(void * p) {
     return static_cast<cusco_executor *>(p)->cancel.exchange(false);
 }
 
-
 cusco_status cusco_executor_open(
     const char * path,
     uint32_t n_ctx,
@@ -97,6 +98,7 @@ cusco_status cusco_executor_open(
         executor->active_mapping = 0;
         executor->next_mapping = 1;
         executor->next_sequence = 1;
+        executor->gpu_layers = 0;
         executor->mapping_epoch = 1;
         *out = executor;
         return CUSCO_OK;
@@ -139,6 +141,7 @@ cusco_status cusco_executor_open(
     executor->active_mapping = 0;
     executor->next_mapping = 1;
     executor->next_sequence = 1;
+    executor->gpu_layers = gpu_layers;
     executor->mapping_epoch = 1;
     llama_set_abort_callback(context, abort_decode, executor);
     *out = executor;
@@ -172,6 +175,34 @@ cusco_capabilities cusco_executor_capabilities(const cusco_executor * executor) 
         llama_vocab_n_tokens(executor->vocab),
         1,
         64,
+    };
+}
+
+cusco_operating_point cusco_executor_operating_point(const cusco_executor * executor) {
+    if (is_mock(executor)) {
+        return {0, 0, 0, 0, 0, 0, 1};
+    }
+    const uint64_t model_bytes = llama_model_size(executor->model);
+    const uint64_t context_bytes = llama_state_get_size(executor->ctx);
+    const int32_t model_layers = llama_model_n_layer(executor->model);
+    const int32_t placed_layers =
+        std::max(0, std::min(executor->gpu_layers, model_layers));
+    const uint64_t device_model_bytes = model_layers == 0
+        ? 0
+        : model_bytes * static_cast<uint64_t>(placed_layers)
+            / static_cast<uint64_t>(model_layers);
+    const uint64_t device_bytes =
+        placed_layers == 0 ? 0 : device_model_bytes + context_bytes;
+    const uint64_t host_bytes = model_bytes - device_model_bytes
+        + (placed_layers == 0 ? context_bytes : 0);
+    return {
+        model_bytes,
+        context_bytes,
+        device_bytes,
+        host_bytes,
+        executor->gpu_layers,
+        model_layers,
+        placed_layers >= model_layers ? 1u : 0u,
     };
 }
 
@@ -622,6 +653,113 @@ cusco_status cusco_executor_remove_mapping(
     executor->positions.erase(mapping);
     executor->mock_mappings.erase(mapping);
     return CUSCO_OK;
+}
+
+size_t cusco_executor_mapping_state_size(
+    cusco_executor * executor, uint32_t mapping) {
+    if (!executor || executor->published_mappings.count(mapping) == 0) {
+        return 0;
+    }
+    if (is_mock(executor)) {
+        const auto & state = mapping == executor->active_mapping
+            ? executor->mock_state
+            : executor->mock_mappings.at(mapping);
+        return state.size() * sizeof(int32_t);
+    }
+    return llama_state_seq_get_size(
+        executor->ctx, executor->block_table.at(mapping));
+}
+
+cusco_status cusco_executor_export_mapping(
+    cusco_executor * executor,
+    uint32_t mapping,
+    uint8_t * buffer,
+    size_t capacity,
+    size_t * written,
+    size_t * position) try {
+    if (!executor || !written || !position
+        || executor->published_mappings.count(mapping) == 0) {
+        return CUSCO_INVALID;
+    }
+    const size_t required = cusco_executor_mapping_state_size(executor, mapping);
+    *written = required;
+    *position = executor->positions.at(mapping);
+    if (capacity < required || (required != 0 && !buffer)) {
+        return CUSCO_BUFFER_TOO_SMALL;
+    }
+    if (is_mock(executor)) {
+        const auto & state = mapping == executor->active_mapping
+            ? executor->mock_state
+            : executor->mock_mappings.at(mapping);
+        if (required != 0) {
+            memcpy(buffer, state.data(), required);
+        }
+        return CUSCO_OK;
+    }
+    const size_t copied = llama_state_seq_get_data(
+        executor->ctx,
+        buffer,
+        capacity,
+        executor->block_table.at(mapping));
+    return copied == required ? CUSCO_OK : CUSCO_BACKEND;
+} catch (...) {
+    return CUSCO_BACKEND;
+}
+
+cusco_status cusco_executor_import_mapping(
+    cusco_executor * executor,
+    const uint8_t * buffer,
+    size_t size,
+    size_t position,
+    uint32_t * out) try {
+    if (!executor || !out || (size != 0 && !buffer)
+        || executor->block_table.size() >= 64) {
+        return CUSCO_INVALID;
+    }
+    *out = 0;
+    const uint32_t mapping = executor->next_mapping++;
+    const int32_t sequence = executor->next_sequence++;
+    bool restored = false;
+    if (is_mock(executor)) {
+        if (size % sizeof(int32_t) != 0) {
+            return CUSCO_INCOMPATIBLE;
+        }
+        std::vector<int32_t> state(size / sizeof(int32_t));
+        if (size != 0) {
+            memcpy(state.data(), buffer, size);
+        }
+        executor->mock_mappings.emplace(mapping, std::move(state));
+        restored = true;
+    } else {
+        restored = llama_state_seq_set_data(
+            executor->ctx, buffer, size, sequence) == size;
+        if (!restored) {
+            llama_memory_seq_rm(
+                llama_get_memory(executor->ctx), sequence, -1, -1);
+            return CUSCO_INCOMPATIBLE;
+        }
+    }
+    try {
+        executor->block_table.emplace(mapping, sequence);
+        executor->positions.emplace(mapping, position);
+        executor->published_mappings.insert(mapping);
+    } catch (...) {
+        if (!is_mock(executor) && restored) {
+            llama_memory_seq_rm(
+                llama_get_memory(executor->ctx), sequence, -1, -1);
+        }
+        executor->block_table.erase(mapping);
+        executor->positions.erase(mapping);
+        executor->mock_mappings.erase(mapping);
+        executor->published_mappings.erase(mapping);
+        throw;
+    }
+    *out = mapping;
+    return CUSCO_OK;
+} catch (const std::bad_alloc &) {
+    return CUSCO_NOMEM;
+} catch (...) {
+    return CUSCO_BACKEND;
 }
 
 uint32_t cusco_executor_active_mapping(const cusco_executor * executor) {
