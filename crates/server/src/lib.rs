@@ -512,9 +512,9 @@ impl Server {
         if self.inner.lock().cancelled.remove(request_id).is_some() {
             return Err(Error::Cancelled);
         }
-        let context = match req.context_id {
-            Some(ref id) => self.context(id)?,
-            None => self.create_context()?,
+        let context = match &req.context_id {
+            Some(id) => Some(self.context(id)?),
+            None => None,
         };
         let generated = self.engine.generate(&model, &req.prompt, req.max_tokens)?;
         if self.inner.lock().cancelled.remove(request_id).is_some() {
@@ -526,13 +526,32 @@ impl Server {
         {
             return Err(Error::Deadline);
         }
-        let mut guard = self.inner.lock();
-        let stored = guard.durable.contexts.get_mut(&context.id).unwrap();
         let input: Vec<_> = req.prompt.split_whitespace().map(str::to_owned).collect();
-        stored.tokens.extend(input.iter().cloned());
-        stored.tokens.extend(generated.iter().cloned());
-        stored.revision += 1;
-        let revision = stored.revision;
+        let mut guard = self.inner.lock();
+        let (context_id, revision) = if let Some(context) = context {
+            let stored = guard
+                .durable
+                .contexts
+                .get_mut(&context.id)
+                .ok_or(Error::ContextNotFound)?;
+            stored.tokens.extend(input.iter().cloned());
+            stored.tokens.extend(generated.iter().cloned());
+            stored.revision += 1;
+            (stored.id.clone(), stored.revision)
+        } else {
+            let id = ContextId::new();
+            let mut tokens = input.clone();
+            tokens.extend(generated.iter().cloned());
+            guard.durable.contexts.insert(
+                id.clone(),
+                ContextRecord {
+                    id: id.clone(),
+                    revision: 1,
+                    tokens,
+                },
+            );
+            (id, 1)
+        };
         drop(guard);
         self.persist()?;
         let usage = Usage {
@@ -542,13 +561,13 @@ impl Server {
             cached_tokens: 0,
             model: model.id,
             model_revision: model.revision,
-            context_id: context.id.clone(),
+            context_id: context_id.clone(),
             latency_ms: started.elapsed().as_millis(),
             status: "completed".into(),
         };
         let mut events = vec![StreamEvent::Started {
             request_id: request_id.into(),
-            context_id: context.id,
+            context_id,
         }];
         events.extend(
             generated
@@ -926,6 +945,13 @@ mod tests {
         .unwrap();
         (s, d)
     }
+
+    struct FailingEngine;
+    impl InferenceEngine for FailingEngine {
+        fn generate(&self, _: &ModelRecord, _: &str, _: usize) -> Result<Vec<String>, Error> {
+            Err(Error::State("generation failed".into()))
+        }
+    }
     #[test]
     fn persistence_branching_and_ids_survive_restart() {
         let (s, d) = setup(Arc::new(AnonymousAdmin));
@@ -1006,6 +1032,29 @@ mod tests {
             ),
             Err(Error::Busy)
         ));
+        let contexts_before = s.contexts();
+        drop(s);
+        let failing = Server::open(
+            d.join("state.json"),
+            Arc::new(AnonymousAdmin),
+            Arc::new(FailingEngine),
+        )
+        .unwrap();
+        assert!(matches!(
+            failing.infer(
+                "failed",
+                InferRequest {
+                    model: "m".into(),
+                    prompt: "x".into(),
+                    max_tokens: 1,
+                    context_id: None,
+                    deadline_ms: None,
+                    priority: 0,
+                },
+            ),
+            Err(Error::State(_))
+        ));
+        assert_eq!(failing.contexts(), contexts_before);
         fs::remove_dir_all(d).unwrap()
     }
     #[test]
