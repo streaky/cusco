@@ -10,10 +10,11 @@ Keep this `AGENTS.md` up to date whenever development workflows, architecture, s
 
 ## Current state
 
-Phase 1, the executor proof, is implemented. The real Gemma proof has demonstrated exact token and bitwise-logit continuation after checkpoint capture, slot displacement, restoration, and a device-to-host-to-device round trip across four logical contexts. Cancellation and failed promotion preserve the prior binding.
+Phases 1 and 2 are implemented. The real Gemma executor proof demonstrated exact token and bitwise-logit continuation after checkpoint capture, slot displacement, restoration, and a device-to-host-to-device round trip across four logical contexts. Cancellation and failed promotion preserve the prior binding. The Rust logical context store now owns persistent token-sequence branches, model and adapter epochs, dependency-valid evaluated-prefix mappings, longest-valid-prefix lookup, reference accounting, and transactional mapping publication.
 
-There is no production server yet. The repository currently contains:
+There is no physical tier manager or production server yet. The repository currently contains:
 
+- `crates/context-store`: Rust logical contexts, structurally shared token sequences, and evaluated-prefix mappings;
 - `crates/executor-sys`: native FFI declarations and linking;
 - `crates/executor`: safe Rust executor and checkpoint wrappers;
 - `crates/model-registry`: immutable Hugging Face resolution and verified local registration;
@@ -22,7 +23,7 @@ There is no production server yet. The repository currently contains:
 - `executor`: upstream and patch metadata;
 - `tools`: fetch, verification, and coverage helpers.
 
-Do not represent later phases as implemented. The next architectural work is the Rust logical context store, followed by tiered physical state management and then a minimal server and scheduler.
+Do not represent later phases as implemented. The next architectural work is tiered physical state management, followed by a minimal server and scheduler.
 
 ## Build and dependency conventions
 
