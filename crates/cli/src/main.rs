@@ -26,6 +26,10 @@ enum Command {
     },
     Proof {
         model: PathBuf,
+        #[arg(long, required_unless_present = "allow_unverified_model")]
+        sha256: Option<String>,
+        #[arg(long, hide = true)]
+        allow_unverified_model: bool,
         #[arg(long, default_value_t = 4096)]
         context: u32,
         #[arg(long, default_value_t = 99)]
@@ -53,17 +57,30 @@ fn run(command: Command) -> Result<()> {
         ),
         Command::Proof {
             model,
+            sha256,
+            allow_unverified_model,
             context,
             gpu_layers,
             prefix,
             replacement,
             output,
-        } => proof(model, context, gpu_layers, &prefix, &replacement, output)?,
+        } => proof(
+            model,
+            sha256.as_deref(),
+            allow_unverified_model,
+            context,
+            gpu_layers,
+            &prefix,
+            &replacement,
+            output,
+        )?,
     }
     Ok(())
 }
 fn proof(
     model: PathBuf,
+    expected_sha256: Option<&str>,
+    allow_unverified_model: bool,
     n_ctx: u32,
     gpu_layers: i32,
     prefix: &str,
@@ -80,7 +97,11 @@ fn proof(
             size: 0,
         }
     } else {
-        register_local(&model, "phase1", None)?
+        ensure!(
+            expected_sha256.is_some() || allow_unverified_model,
+            "the Phase 1 proof requires --sha256 for the pinned Gemma artifact"
+        );
+        register_local(&model, GEMMA_URI, expected_sha256)?
     };
     let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
     let capabilities = executor.capabilities();
@@ -112,17 +133,44 @@ fn proof(
             .all(|v| v["token_equal"] == true && v["logits_equal"] == true),
         "restored execution differs"
     );
-    let before = executor.capture()?;
+    let cancellation_checkpoint = executor.capture()?;
+    let failure_continuation = replacement[0];
+    let cancellation_expected = executor.decode(&[failure_continuation])?;
+    let cancellation_restore =
+        executor.prepare(&cancellation_checkpoint, cancellation_checkpoint.checksum)?;
+    executor.commit(cancellation_restore)?;
     executor.cancel_next();
     ensure!(
-        executor.decode(&[replacement[0]]).is_err(),
+        executor.decode(&[failure_continuation]).is_err(),
         "cancellation did not fire"
     );
+    let cancellation_actual = executor.decode(&[failure_continuation])?;
+    let cancellation_preserved = cancellation_expected.token == cancellation_actual.token
+        && logits_identical(&cancellation_expected.logits, &cancellation_actual.logits);
     ensure!(
-        executor.prepare(&before, before.checksum ^ 1).is_err(),
+        cancellation_preserved,
+        "cancellation changed the active binding"
+    );
+
+    let promotion_checkpoint = executor.capture()?;
+    let promotion_expected = executor.decode(&[failure_continuation])?;
+    let promotion_restore =
+        executor.prepare(&promotion_checkpoint, promotion_checkpoint.checksum)?;
+    executor.commit(promotion_restore)?;
+    ensure!(
+        executor
+            .prepare(&promotion_checkpoint, promotion_checkpoint.checksum ^ 1)
+            .is_err(),
         "corrupt promotion succeeded"
     );
-    let artifact = json!({"model":record,"capabilities":capabilities,"contexts":comparisons,"host_round_trip":true,"cancellation_preserved_binding":true,"failed_promotion_preserved_binding":true,"elapsed_ms":started.elapsed().as_millis()});
+    let promotion_actual = executor.decode(&[failure_continuation])?;
+    let failed_promotion_preserved = promotion_expected.token == promotion_actual.token
+        && logits_identical(&promotion_expected.logits, &promotion_actual.logits);
+    ensure!(
+        failed_promotion_preserved,
+        "failed promotion changed the active binding"
+    );
+    let artifact = json!({"model":record,"capabilities":capabilities,"contexts":comparisons,"host_round_trip":true,"cancellation_preserved_binding":cancellation_preserved,"failed_promotion_preserved_binding":failed_promotion_preserved,"elapsed_ms":started.elapsed().as_millis()});
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?
     }
@@ -164,6 +212,8 @@ mod tests {
         let output = root.join("proof.json");
         run(Command::Proof {
             model: PathBuf::from("mock://deterministic"),
+            sha256: None,
+            allow_unverified_model: true,
             context: 128,
             gpu_layers: 0,
             prefix: "prefix".into(),

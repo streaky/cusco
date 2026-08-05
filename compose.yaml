@@ -4,7 +4,7 @@ services:
     command: ["tools/coverage.sh"]
   executor-proof:
     build: .
-    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid --format=csv,noheader && cargo run -p cusco -- proof /models/gemma-4-e2b-it.gguf"]
+    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid --format=csv,noheader && cargo run -p cusco -- proof /models/gemma-4-e2b-it.gguf --sha256 90293b8cdaf9c973012bf4df8a1e92bde7d74ad66a4fe56cf905ccd563d660c5"]
     environment: { CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}" }
     volumes: ["${CUSCO_MODEL_DIR:-./models}:/models:ro", "${CUSCO_RESULT_DIR:-./results}:/results"]
     deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }

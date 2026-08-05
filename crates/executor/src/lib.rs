@@ -72,7 +72,11 @@ impl Executor {
         status(unsafe {
             sys::cusco_executor_tokenize(self.raw.as_ptr(), text.as_ptr(), &mut p, &mut n)
         })?;
-        let v = unsafe { slice::from_raw_parts(p, n) }.to_vec();
+        let v = if n == 0 {
+            Vec::new()
+        } else {
+            unsafe { slice::from_raw_parts(p, n) }.to_vec()
+        };
         unsafe { sys::cusco_executor_tokens_free(p) };
         Ok(v)
     }
@@ -85,8 +89,13 @@ impl Executor {
         status(unsafe {
             sys::cusco_executor_decode(self.raw.as_ptr(), tokens.as_ptr(), tokens.len(), &mut out)
         })?;
+        let logits = if out.logits_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { slice::from_raw_parts(out.logits, out.logits_len) }.to_vec()
+        };
         Ok(Decode {
-            logits: unsafe { slice::from_raw_parts(out.logits, out.logits_len) }.to_vec(),
+            logits,
             token: out.token,
         })
     }
