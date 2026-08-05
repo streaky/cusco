@@ -23,19 +23,27 @@ fn main() {
 ",
         )
         .unwrap();
-        std::process::Command::new("cc")
+        let cc_status = std::process::Command::new("cc")
             .args(["-c", stub.to_str().unwrap(), "-o"])
             .arg(stub.with_extension("o"))
             .status()
-            .unwrap();
-        std::process::Command::new("ar")
+            .expect("failed to start cc for executor stub");
+        assert!(
+            cc_status.success(),
+            "cc failed to compile executor stub: {cc_status}"
+        );
+        let ar_status = std::process::Command::new("ar")
             .args([
                 "crs",
                 stub.with_file_name("libcusco_executor.a").to_str().unwrap(),
                 stub.with_extension("o").to_str().unwrap(),
             ])
             .status()
-            .unwrap();
+            .expect("failed to start ar for executor stub");
+        assert!(
+            ar_status.success(),
+            "ar failed to archive executor stub: {ar_status}"
+        );
         println!(
             "cargo:rustc-link-search=native={}",
             stub.parent().unwrap().display()
