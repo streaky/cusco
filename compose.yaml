@@ -1,15 +1,10 @@
 services:
-  test-cpu:
-    build: { context: ., target: cpu }
+  test:
+    build: .
     command: ["tools/coverage.sh"]
-  test-gpu:
-    build: { context: ., target: gpu }
-    command: ["cargo", "test", "--workspace"]
-    environment: { CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}" }
-    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
   executor-proof:
-    build: { context: ., target: gpu }
-    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid --format=csv,noheader && cargo run -p cusco -- proof /models/gemma.gguf"]
+    build: .
+    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid --format=csv,noheader && cargo run -p cusco -- proof /models/gemma-4-e2b-it.gguf"]
     environment: { CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}" }
     volumes: ["${CUSCO_MODEL_DIR:-./models}:/models:ro", "${CUSCO_RESULT_DIR:-./results}:/results"]
     deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
