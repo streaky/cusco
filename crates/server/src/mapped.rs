@@ -1,4 +1,6 @@
-use crate::{EngineOutput, EngineRequest, Error, FrontierControl, InferenceEngine, TokenSink};
+use crate::{
+    EngineOutput, EngineRequest, Error, FrontierControl, InferenceEngine, PrefillMetrics, TokenSink,
+};
 use cusco_context_store::{
     AdapterEpoch, ComponentMask, ContextStore, EvaluatedPrefixId, LogicalContextId, ModelEpoch,
     PersistentTokenSequence,
@@ -9,7 +11,7 @@ use cusco_physical_manager::{
 };
 use parking_lot::Mutex;
 use serde::Deserialize;
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
 
 const MODEL_EPOCH: ModelEpoch = ModelEpoch(1);
 const ADAPTER_EPOCH: AdapterEpoch = AdapterEpoch(0);
@@ -242,11 +244,14 @@ impl InferenceEngine for MappedEngine {
                 "Phase 6A admits only the process-owned model".into(),
             ));
         }
+        let prompt_started = Instant::now();
         let mut state = self.state.lock();
+        let tokenization_started = Instant::now();
         let prompt = state
             .executor
             .tokenize(request.prompt)
             .map_err(state_error)?;
+        let tokenization_ns = elapsed_ns(tokenization_started);
         let input_tokens = prompt.len();
         let total = request
             .prior_tokens
@@ -264,18 +269,23 @@ impl InferenceEngine for MappedEngine {
         tokens.extend_from_slice(&prompt);
         let sequence = PersistentTokenSequence::default().append(&tokens);
         let logical_context = state.logical.create(sequence, MODEL_EPOCH, ADAPTER_EPOCH);
+        let prefix_lookup_started = Instant::now();
         let prefix = state
             .logical
             .longest_valid_prefix(logical_context)
             .map_err(state_error)?;
+        let prefix_lookup_ns = elapsed_ns(prefix_lookup_started);
         let cached = prefix.as_ref().map_or(0, |mapping| mapping.represented_end);
         let evaluated_tokens = tokens.len().saturating_sub(cached);
+        let mapping_activation_started = Instant::now();
         activate_prefix(&mut state, logical_context, prefix.as_deref())?;
 
         let mut active_mapping = state.executor.mapping_metrics().active;
         if cached == 0 {
             active_mapping = fork_and_activate(&mut state.executor, active_mapping)?;
         }
+        let mapping_activation_ns = elapsed_ns(mapping_activation_started);
+        let uncached_prefill_started = Instant::now();
         let mut evaluated = cached;
         let mut parent = prefix.as_ref().map(|mapping| mapping.id);
         let mut next = prefix
@@ -307,11 +317,22 @@ impl InferenceEngine for MappedEngine {
                 active_mapping = fork_and_activate(&mut state.executor, active_mapping)?;
             }
         }
+        let uncached_prefill_ns = elapsed_ns(uncached_prefill_started);
         if request.max_tokens > 0 && next.is_none() {
             return Err(Error::State(
                 "an exact cached prefix cannot supply uncached logits".into(),
             ));
         }
+        let prefill = PrefillMetrics {
+            total_tokens: tokens.len(),
+            cached_tokens: cached,
+            uncached_tokens: evaluated_tokens,
+            tokenization_ns,
+            prefix_lookup_ns,
+            mapping_activation_ns,
+            uncached_prefill_ns,
+            total_ns: elapsed_ns(prompt_started),
+        };
         let mut sampler = state.executor.greedy_sampler().map_err(state_error)?;
         let mut piece = Vec::with_capacity(32);
         for index in 0..request.max_tokens {
@@ -364,6 +385,7 @@ impl InferenceEngine for MappedEngine {
             input_tokens,
             cached_tokens: cached,
             evaluated_tokens,
+            prefill,
         })
     }
 }
@@ -582,6 +604,10 @@ fn release_representations(
     for representation in representations {
         let _ = physical.release_logical_reference(*representation);
     }
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
 fn state_error(error: impl std::fmt::Display) -> Error {
@@ -853,6 +879,21 @@ mod tests {
             .0;
         assert!(second.usage.cached_tokens >= 32);
         assert!(second.usage.evaluated_tokens < durable.native_tokens.len());
+        for usage in [&first.usage, &second.usage] {
+            assert_eq!(usage.prefill.cached_tokens, usage.cached_tokens);
+            assert_eq!(usage.prefill.uncached_tokens, usage.evaluated_tokens);
+            assert_eq!(
+                usage.prefill.total_tokens,
+                usage.cached_tokens + usage.evaluated_tokens
+            );
+            assert!(usage.prefill.total_ns >= usage.prefill.tokenization_ns);
+            assert!(usage.prefill.total_ns >= usage.prefill.prefix_lookup_ns);
+            assert!(usage.prefill.total_ns >= usage.prefill.mapping_activation_ns);
+            assert!(usage.prefill.total_ns >= usage.prefill.uncached_prefill_ns);
+        }
+        assert!(
+            serde_json::to_value(&second.usage).unwrap()["prefill"]["total_ns"].is_u64()
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

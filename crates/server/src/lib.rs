@@ -55,12 +55,25 @@ pub enum Scope {
     Admin,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrefillMetrics {
+    pub total_tokens: usize,
+    pub cached_tokens: usize,
+    pub uncached_tokens: usize,
+    pub tokenization_ns: u64,
+    pub prefix_lookup_ns: u64,
+    pub mapping_activation_ns: u64,
+    pub uncached_prefill_ns: u64,
+    pub total_ns: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: usize,
     pub generated_tokens: usize,
     pub evaluated_tokens: usize,
     pub cached_tokens: usize,
+    pub prefill: PrefillMetrics,
     pub model: String,
     pub model_revision: String,
     pub context_id: ContextId,
@@ -256,6 +269,7 @@ pub struct EngineOutput {
     pub input_tokens: usize,
     pub cached_tokens: usize,
     pub evaluated_tokens: usize,
+    pub prefill: PrefillMetrics,
 }
 
 pub trait InferenceEngine: Send + Sync {
@@ -296,6 +310,11 @@ impl InferenceEngine for DeterministicEngine {
             input_tokens,
             cached_tokens: 0,
             evaluated_tokens: input_tokens,
+            prefill: PrefillMetrics {
+                total_tokens: input_tokens,
+                uncached_tokens: input_tokens,
+                ..PrefillMetrics::default()
+            },
         })
     }
 }
@@ -837,6 +856,7 @@ impl Server {
             input_tokens,
             cached_tokens,
             evaluated_tokens,
+            prefill,
         } = generated;
         let mut guard = self.inner.lock();
         let context_id = if let Some(context) = context {
@@ -871,6 +891,7 @@ impl Server {
             generated_tokens: frontier.generated_tokens,
             evaluated_tokens,
             cached_tokens,
+            prefill,
             model: model.id,
             model_revision: model.revision,
             context_id: context_id.clone(),
@@ -1407,6 +1428,11 @@ mod tests {
                 input_tokens: request.prompt.split_whitespace().count(),
                 cached_tokens: 0,
                 evaluated_tokens: request.prompt.split_whitespace().count(),
+                prefill: PrefillMetrics {
+                    total_tokens: request.prompt.split_whitespace().count(),
+                    uncached_tokens: request.prompt.split_whitespace().count(),
+                    ..PrefillMetrics::default()
+                },
             })
         }
     }

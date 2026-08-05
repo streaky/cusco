@@ -63,6 +63,40 @@ def stream_completion(body):
                 first_token_ms = round((time.perf_counter() - started) * 1000, 2)
     return events, first_token_ms, round((time.perf_counter() - started) * 1000, 2)
 
+def prefill_rates(usage):
+    prefill = usage.get("prefill", {})
+    total = prefill.get("total_tokens", 0)
+    cached = prefill.get("cached_tokens", 0)
+    uncached = prefill.get("uncached_tokens", 0)
+
+    def tokens_per_second(tokens, duration_ns):
+        if not tokens or not duration_ns:
+            return None
+        return round(tokens * 1_000_000_000 / duration_ns, 3)
+
+    return {
+        **prefill,
+        "cache_fraction": round(cached / total, 6) if total else None,
+        "cached_tokens_per_second": tokens_per_second(
+            cached, prefill.get("mapping_activation_ns", 0)
+        ),
+        "uncached_tokens_per_second": tokens_per_second(
+            uncached, prefill.get("uncached_prefill_ns", 0)
+        ),
+        "effective_tokens_per_second": tokens_per_second(
+            total, prefill.get("total_ns", 0)
+        ),
+    }
+
+
+def milliseconds(nanoseconds):
+    return nanoseconds / 1_000_000
+
+
+def display_rate(rate):
+    return "n/a" if rate is None else f"{rate:.3f}"
+
+
 wait_for_server()
 try:
     request("GET", "/native/models", authenticated=False)
@@ -113,6 +147,8 @@ continuation_usage = (
     continuation_finished_events[-1]["usage"] if continuation_finished_events else {}
 )
 continuation_text = "".join(event["token"] for event in continuation_tokens)
+initial_prefill = prefill_rates(usage)
+continuation_prefill = prefill_rates(continuation_usage)
 
 artifact = {
     "model": registered,
@@ -134,6 +170,10 @@ artifact = {
         "generated_tokens_per_second": round(generated / (server_ms / 1000), 3)
         if server_ms
         else None,
+    },
+    "prefill": {
+        "initial": initial_prefill,
+        "continuation": continuation_prefill,
     },
     "usage": usage,
     "stream": {
@@ -165,6 +205,28 @@ artifact = {
         "continuation reports generated text and usage": bool(continuation_text.strip())
         and 0 < len(continuation_tokens)
         <= continuation_usage.get("generated_tokens", -1),
+        "initial request records uncached prefill timing": initial_prefill.get(
+            "uncached_tokens", 0
+        )
+        > 0
+        and initial_prefill.get("uncached_prefill_ns", 0) > 0
+        and initial_prefill.get("uncached_tokens_per_second") is not None,
+        "mapped continuation records cache activation timing": continuation_prefill.get(
+            "cached_tokens", 0
+        )
+        >= 32
+        and continuation_prefill.get("mapping_activation_ns", 0) > 0
+        and continuation_prefill.get("cached_tokens_per_second") is not None,
+        "overall prompt timing covers measured phases": all(
+            prefill.get("total_ns", 0)
+            >= max(
+                prefill.get("tokenization_ns", 0),
+                prefill.get("prefix_lookup_ns", 0),
+                prefill.get("mapping_activation_ns", 0),
+                prefill.get("uncached_prefill_ns", 0),
+            )
+            for prefill in (initial_prefill, continuation_prefill)
+        ),
     },
 }
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
@@ -184,6 +246,29 @@ print("| Client wall | First streamed token | Server end-to-end | Generated toke
 print("|---:|---:|---:|---:|---:|")
 rate = artifact["timing"]["generated_tokens_per_second"]
 print(f"| {wall_ms:.2f} ms | {first_token_ms:.2f} ms | {server_ms} ms | {generated} | {rate:.3f} |")
+print("\n## Prefill work\n")
+print(
+    "| Case | Total tokens | Cached | Uncached | Cache fraction | Tokenization | Lookup | "
+    "Mapping activation | Uncached prefill | Prompt total | Cached tok/s | Uncached tok/s | "
+    "Effective tok/s |"
+)
+print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+for name, prefill in (
+    ("Initial", initial_prefill),
+    ("Continuation", continuation_prefill),
+):
+    print(
+        f"| {name} | {prefill['total_tokens']} | {prefill['cached_tokens']} | "
+        f"{prefill['uncached_tokens']} | {prefill['cache_fraction']:.3f} | "
+        f"{milliseconds(prefill['tokenization_ns']):.3f} ms | "
+        f"{milliseconds(prefill['prefix_lookup_ns']):.3f} ms | "
+        f"{milliseconds(prefill['mapping_activation_ns']):.3f} ms | "
+        f"{milliseconds(prefill['uncached_prefill_ns']):.3f} ms | "
+        f"{milliseconds(prefill['total_ns']):.3f} ms | "
+        f"{display_rate(prefill['cached_tokens_per_second'])} | "
+        f"{display_rate(prefill['uncached_tokens_per_second'])} | "
+        f"{display_rate(prefill['effective_tokens_per_second'])} |"
+    )
 print("\n## Assertions")
 failed = []
 for name, passed in artifact["checks"].items():

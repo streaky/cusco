@@ -62,7 +62,10 @@ tools/server-inference-report.sh
 ```
 
 The workflow verifies token streaming, durable context identity, and reuse of
-at least one complete mapped block on the second request. It writes the
+at least one complete mapped block on the second request. Its report separates
+tokenization, prefix lookup, mapped activation, uncached prefill, and total
+prompt-processing time, then derives cached, uncached, and effective prompt
+token rates for the initial request and mapped continuation. It writes the
 machine-readable evidence to `results/phase6b-server.json`. GPU 1 and port
 18082 are defaults; `CUSCO_GPU_DEVICE_ID`, `CUSCO_SERVER_REPORT_PORT`,
 `CUSCO_MODEL_DIR`, and `CUSCO_RESULT_DIR` override them.
