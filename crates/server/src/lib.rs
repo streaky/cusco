@@ -14,6 +14,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     fs,
+    io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -461,8 +462,17 @@ impl Server {
     }
     pub fn verify_model(&self, id: &str) -> Result<bool, Error> {
         let model = self.model(id)?;
-        let bytes = fs::read(&model.path).map_err(state_err)?;
-        Ok(hex_digest(&bytes) == model.sha256)
+        let mut file = fs::File::open(model.path).map_err(state_err)?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0; 1024 * 1024];
+        loop {
+            let count = file.read(&mut buffer).map_err(state_err)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        Ok(format!("{:x}", digest.finalize()) == model.sha256)
     }
     pub fn check_update(&self, id: &str, revision: &str) -> Result<bool, Error> {
         Ok(self.model(id)?.revision != revision)
