@@ -490,7 +490,11 @@ fn branch_hash(parent: BranchId, token: Token, len: usize) -> BranchId {
     hash.update(b"cusco-sequence-v1");
     hash.update(parent.0);
     hash.update(token.to_le_bytes());
-    hash.update(len.to_le_bytes());
+    hash.update(
+        u64::try_from(len)
+            .expect("token sequence length exceeds the portable identity format")
+            .to_le_bytes(),
+    );
     BranchId(hash.finalize().into())
 }
 
@@ -521,7 +525,11 @@ fn mapping_id(
     hash.update(adapter.0.to_le_bytes());
     hash.update(parent.map_or([0; 32], |id| id.0));
     hash.update(branch.0);
-    hash.update(end.to_le_bytes());
+    hash.update(
+        u64::try_from(end)
+            .expect("evaluated prefix length exceeds the portable identity format")
+            .to_le_bytes(),
+    );
     hash.update([components.0]);
     hash.update(parameters);
     hash.update(lineage.0);
