@@ -1499,6 +1499,10 @@ Implementation is divided into three dependency-ordered, independently reviewabl
 | **6B: incremental generation frontier** | one-token decode quanta, request-owned native greedy sampler, bounded protocol-neutral event buffer, native token-piece rendering, incremental UTF-8 and stop matching, presentation normalization, canonical finish reasons, usage, and sampled-token successor selection | slow-consumer, split-UTF-8, whitespace, terminal/control-token, and token-aligned/cross-token/intra-token stop fixtures pass without unbounded buffering or token-history fabrication |
 | **6C: bounded lifecycle and integrated proof** | count-and-byte-bounded FIFO admission, pre-queue transport limits, cancellation and disconnect propagation, wall and active deadlines, graceful shutdown, restart behavior, and the recorded end-to-end acceptance artifact | overload rejects before expensive work; every terminal-state injection preserves transactional ownership; shutdown/restart semantics pass; the complete real-Gemma/GPU acceptance matrix and coverage gate pass |
 
+All three milestones and the combined Phase 6 gate are implemented. The
+recorded workflow is `tools/phase6c-report.sh`; its generated
+`results/phase6c-server.json` artifact is intentionally not committed.
+
 Each milestone must be mergeable with its own changed-path behavioral tests and must leave the server usable under the narrower contract it has reached. A milestone may introduce only the interfaces required by the next one; passing 6A or 6B does not satisfy the Phase 6 exit criterion. The detailed requirements below remain the combined normative contract.
 
 - connect server admission to the physical manager and mapped executor;
@@ -1829,14 +1833,19 @@ The executor-proof, logical-store, mapped-execution, and Phase 6 design question
 
 ## Recommendation
 
-Proceed with Phase 6 live execution integration through the three independently reviewable milestones defined above: persistent mapped execution, the incremental generation frontier, and bounded lifecycle integration with one final acceptance artifact.
+Phase 6 live execution integration is complete through its three milestones:
+persistent mapped execution, the incremental generation frontier, and bounded
+lifecycle integration with the combined acceptance workflow.
 
 The original recommendation to begin with a minimal Rust-controlled executor proof is now historical rationale. That proof succeeded, as did the logical-store, physical-manager, minimal-server, and mapped-execution gates in Phases 2 through 5. Their result is the implemented foundation, not a remaining prerequisite.
 
-The next decisive gate is:
+The next decisive gate is Phase 7: generalize the proven single-model,
+single-slot ownership contract into transactional residency and lifecycle
+scheduling without weakening Phase 6's bounded admission or exact-state
+guarantees.
 
-> A real, incrementally streaming Gemma server can keep one model and executor slot alive across requests, reuse mapped logical state without recomputing valid prefixes, and preserve exact output and prior bindings across bounded admission, backpressure, cancellation, deadline, capacity, shutdown, and restart paths.
-
-If that succeeds, Phase 7 can safely generalize resource ownership and residency. If it fails, the failure remains localized to the live coordinator, generation frontier, or native execution boundary before dynamic lifecycle and concurrency multiply the state space.
+Phase 7 can now generalize resource ownership and residency from the completed
+live coordinator, generation frontier, and native execution boundary before
+dynamic lifecycle and concurrency multiply the state space.
 
 The long-term target remains a Rust context operating system around a narrower llama.cpp execution engine: logical branches and resource policy outside, architecture-specific tensors and optimized inference inside.

@@ -1,24 +1,28 @@
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State},
-    http::{HeaderMap, StatusCode},
+    body::to_bytes,
+    extract::{FromRequest, Path as AxumPath, Request, State},
+    http::{HeaderMap, StatusCode, header::RETRY_AFTER},
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{delete, get, post},
 };
 use futures_util::{StreamExt, stream};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     fs,
     future::Future,
     io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -65,6 +69,9 @@ pub struct PrefillMetrics {
     pub mapping_activation_ns: u64,
     pub uncached_prefill_ns: u64,
     pub total_ns: u64,
+    pub transfer_bytes: u64,
+    pub device_bytes: usize,
+    pub host_bytes: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -154,6 +161,11 @@ pub struct ServerConfig {
     pub queue_count: usize,
     pub queue_bytes: usize,
     pub request_bytes: usize,
+    pub pre_queue_concurrency: usize,
+    pub header_bytes: usize,
+    pub body_timeout_ms: u64,
+    pub wall_time_ms: u64,
+    pub active_time_ms: u64,
     pub stream_buffer: usize,
     pub shutdown_grace_ms: u64,
 }
@@ -162,10 +174,15 @@ impl Default for ServerConfig {
         Self {
             active_requests: 1,
             queue_count: 32,
-            queue_bytes: 1 << 20,
-            request_bytes: 1 << 18,
+            queue_bytes: 16 << 20,
+            request_bytes: 1 << 20,
+            pre_queue_concurrency: 16,
+            header_bytes: 32 << 10,
+            body_timeout_ms: 10_000,
+            wall_time_ms: 300_000,
+            active_time_ms: 240_000,
             stream_buffer: 8,
-            shutdown_grace_ms: 5_000,
+            shutdown_grace_ms: 30_000,
         }
     }
 }
@@ -177,7 +194,7 @@ pub struct AdmissionMetrics {
 }
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("authentication required")]
+    #[error("unauthorized")]
     Unauthorized,
     #[error("admin scope required")]
     Forbidden,
@@ -191,26 +208,162 @@ pub enum Error {
     Cancelled,
     #[error("scheduler admission capacity exhausted")]
     Busy,
+    #[error("server is shutting down")]
+    ShuttingDown,
     #[error("request exceeds the configured byte limit")]
     PayloadTooLarge,
+    #[error("request headers exceed the configured byte limit")]
+    HeadersTooLarge,
+    #[error("request body timed out")]
+    BodyTimeout,
+    #[error("invalid request: {0}")]
+    BadRequest(String),
     #[error("unsafe unauthenticated listener: {0}")]
     UnsafeListener(SocketAddr),
     #[error("state error: {0}")]
     State(String),
 }
+impl Error {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::ModelNotFound(_) => "model_not_found",
+            Self::ContextNotFound => "context_not_found",
+            Self::Deadline => "deadline_exceeded",
+            Self::Cancelled => "cancelled",
+            Self::Busy => "queue_overloaded",
+            Self::ShuttingDown => "server_shutting_down",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::HeadersTooLarge => "headers_too_large",
+            Self::BodyTimeout => "body_timeout",
+            Self::BadRequest(_) => "invalid_request",
+            Self::UnsafeListener(_) => "unsafe_listener",
+            Self::State(_) => "state_error",
+        }
+    }
+}
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let status = match self {
+        let status = match &self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::ModelNotFound(_) | Self::ContextNotFound => StatusCode::NOT_FOUND,
-            Self::Deadline => StatusCode::REQUEST_TIMEOUT,
+            Self::Deadline | Self::BodyTimeout => StatusCode::REQUEST_TIMEOUT,
+            Self::Cancelled | Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Busy => StatusCode::TOO_MANY_REQUESTS,
+            Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::Cancelled => StatusCode::CONFLICT,
-            _ => StatusCode::BAD_REQUEST,
+            Self::HeadersTooLarge => StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            Self::UnsafeListener(_) | Self::State(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, Json(json!({"error": self.to_string()}))).into_response()
+        let retry = matches!(self, Self::Busy).then_some("1");
+        let mut response =
+            (status, Json(json!({"error":{"code":self.code(),"message":self.to_string()}})))
+                .into_response();
+        if let Some(value) = retry {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, value.parse().expect("static header value"));
+        }
+        response
+    }
+}
+
+const CONTROL_RUNNING: u8 = 0;
+const CONTROL_CANCELLED: u8 = 1;
+const CONTROL_DEADLINE: u8 = 2;
+const CONTROL_COMPLETE: u8 = 3;
+
+pub struct RequestControl {
+    state: AtomicU8,
+    abort: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+impl RequestControl {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(CONTROL_RUNNING),
+            abort: Mutex::new(None),
+        }
+    }
+
+    pub fn check(&self) -> Result<(), Error> {
+        match self.state.load(Ordering::Acquire) {
+            CONTROL_RUNNING => Ok(()),
+            CONTROL_DEADLINE => Err(Error::Deadline),
+            _ => Err(Error::Cancelled),
+        }
+    }
+
+    fn cancel(&self) {
+        if self
+            .state
+            .compare_exchange(
+                CONTROL_RUNNING,
+                CONTROL_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.abort();
+        }
+    }
+
+    fn expire(&self) {
+        if self
+            .state
+            .compare_exchange(
+                CONTROL_RUNNING,
+                CONTROL_DEADLINE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.abort();
+        }
+    }
+
+    fn complete(&self) {
+        let _ = self.state.compare_exchange(
+            CONTROL_RUNNING,
+            CONTROL_COMPLETE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn is_complete(&self) -> bool {
+        self.state.load(Ordering::Acquire) == CONTROL_COMPLETE
+    }
+
+    fn register_abort(
+        &self,
+        abort: Arc<dyn Fn() + Send + Sync>,
+    ) -> AbortRegistration<'_> {
+        *self.abort.lock() = Some(abort.clone());
+        if self.check().is_err() {
+            abort();
+        }
+        AbortRegistration { control: self }
+    }
+
+    fn abort(&self) {
+        let abort = self.abort.lock().clone();
+        if let Some(abort) = abort {
+            abort();
+        }
+    }
+}
+
+struct AbortRegistration<'a> {
+    control: &'a RequestControl,
+}
+
+impl Drop for AbortRegistration<'_> {
+    fn drop(&mut self) {
+        self.control.abort.lock().take();
     }
 }
 
@@ -259,6 +412,7 @@ pub struct EngineRequest<'a> {
     pub prompt: &'a str,
     pub max_tokens: usize,
     pub prior_tokens: &'a [i32],
+    pub control: &'a RequestControl,
 }
 
 pub type TokenSink<'a> = dyn FnMut(i32, &[u8], bool) -> Result<FrontierControl, Error> + 'a;
@@ -287,6 +441,7 @@ impl InferenceEngine for DeterministicEngine {
         request: EngineRequest<'_>,
         sink: &mut TokenSink<'_>,
     ) -> Result<EngineOutput, Error> {
+        request.control.check()?;
         let input_tokens = request.prompt.split_whitespace().count();
         for (index, piece) in request
             .prompt
@@ -296,6 +451,7 @@ impl InferenceEngine for DeterministicEngine {
             .take(request.max_tokens)
             .enumerate()
         {
+            request.control.check()?;
             let piece = if index == 0 {
                 piece.to_owned()
             } else {
@@ -353,35 +509,114 @@ pub fn select_slot(candidates: &[SlotCandidate]) -> Option<usize> {
 
 struct QueueEntry {
     ticket: u64,
+    request_id: String,
     bytes: usize,
     ready: tokio::sync::oneshot::Sender<()>,
 }
 struct Inner {
     durable: DurableState,
-    cancelled: HashMap<String, bool>,
+    controls: HashMap<String, Arc<RequestControl>>,
+    pending_cancelled: HashSet<String>,
     active: usize,
     admission_limit: usize,
     queue: VecDeque<QueueEntry>,
     queued_bytes: usize,
     next_ticket: u64,
+    shutting_down: bool,
     config: ServerConfig,
 }
+struct PrequeueState {
+    limit: usize,
+    retire_on_drop: usize,
+}
+
+struct PrequeueGate {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    state: Mutex<PrequeueState>,
+}
+
+impl PrequeueGate {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
+            state: Mutex::new(PrequeueState {
+                limit,
+                retire_on_drop: 0,
+            }),
+        })
+    }
+
+    async fn acquire(self: &Arc<Self>) -> Result<PrequeuePermit, Error> {
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::ShuttingDown)?;
+        Ok(PrequeuePermit {
+            gate: self.clone(),
+            permit: Some(permit),
+        })
+    }
+
+    fn set_limit(&self, limit: usize) {
+        let mut state = self.state.lock();
+        if limit < state.limit {
+            let reduction = state.limit - limit;
+            let retired = self.semaphore.forget_permits(reduction);
+            state.retire_on_drop += reduction - retired;
+        } else {
+            let increase = limit - state.limit;
+            let cancelled_retirements = increase.min(state.retire_on_drop);
+            state.retire_on_drop -= cancelled_retirements;
+            self.semaphore
+                .add_permits(increase - cancelled_retirements);
+        }
+        state.limit = limit;
+    }
+}
+
+struct PrequeuePermit {
+    gate: Arc<PrequeueGate>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for PrequeuePermit {
+    fn drop(&mut self) {
+        let permit = self.permit.take().expect("pre-queue permit exists");
+        let mut state = self.gate.state.lock();
+        if state.retire_on_drop == 0 {
+            drop(state);
+            drop(permit);
+        } else {
+            state.retire_on_drop -= 1;
+            permit.forget();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Server {
     state_path: PathBuf,
     inner: Arc<Mutex<Inner>>,
+    pre_queue: Arc<PrequeueGate>,
     auth: Arc<dyn AuthProvider>,
     engine: Arc<dyn InferenceEngine>,
 }
 struct AdmissionGuard {
     server: Server,
     ticket: Option<u64>,
+    request_id: Option<String>,
+    control: Arc<RequestControl>,
     active: bool,
 }
 impl Drop for AdmissionGuard {
     fn drop(&mut self) {
-        self.server
-            .release_or_cancel_admission(self.ticket.take(), self.active);
+        self.server.release_or_cancel_admission(
+            self.ticket.take(),
+            self.request_id.take(),
+            self.active,
+        );
     }
 }
 impl Server {
@@ -400,18 +635,22 @@ impl Server {
                 models: HashMap::new(),
             }
         };
+        let config = ServerConfig::default();
         let server = Self {
             state_path: path,
             inner: Arc::new(Mutex::new(Inner {
                 durable,
-                cancelled: HashMap::new(),
+                controls: HashMap::new(),
+                pending_cancelled: HashSet::new(),
                 active: 0,
-                admission_limit: ServerConfig::default().active_requests,
+                admission_limit: config.active_requests,
                 queue: VecDeque::new(),
                 queued_bytes: 0,
                 next_ticket: 0,
-                config: ServerConfig::default(),
+                shutting_down: false,
+                config,
             })),
+            pre_queue: PrequeueGate::new(config.pre_queue_concurrency),
             auth,
             engine,
         };
@@ -591,7 +830,21 @@ impl Server {
         Ok(self.model(id)?.revision != revision)
     }
     pub fn cancel(&self, request: &str) {
-        self.inner.lock().cancelled.insert(request.into(), true);
+        let mut guard = self.inner.lock();
+        if let Some(control) = guard.controls.get(request).cloned() {
+            control.cancel();
+        } else {
+            guard.pending_cancelled.insert(request.to_owned());
+        }
+        if let Some(index) = guard
+            .queue
+            .iter()
+            .position(|entry| entry.request_id == request)
+        {
+            let entry = guard.queue.remove(index).expect("queued request exists");
+            guard.queued_bytes -= entry.bytes;
+        }
+        Self::promote_queued(&mut guard);
     }
     pub fn set_admission_limit(&self, limit: usize) {
         let mut guard = self.inner.lock();
@@ -601,13 +854,21 @@ impl Server {
     }
     pub fn configure(&self, config: ServerConfig) -> Result<(), Error> {
         if config.active_requests == 0
+            || config.queue_count == 0
+            || config.queue_bytes == 0
             || config.request_bytes == 0
+            || config.pre_queue_concurrency == 0
+            || config.header_bytes == 0
+            || config.body_timeout_ms == 0
+            || config.wall_time_ms == 0
+            || config.active_time_ms == 0
             || config.stream_buffer == 0
             || config.shutdown_grace_ms == 0
         {
             return Err(Error::State("server limits must be nonzero".into()));
         }
         let mut guard = self.inner.lock();
+        self.pre_queue.set_limit(config.pre_queue_concurrency);
         guard.admission_limit = config.active_requests;
         guard.config = config;
         Self::promote_queued(&mut guard);
@@ -628,11 +889,25 @@ impl Server {
         &self,
         request_id: &str,
         req: InferRequest,
+
     ) -> Result<(InferResponse, Vec<StreamEvent>), Error> {
-        self.try_admit()?;
+        let control = Arc::new(RequestControl::new());
+        let admission = self.try_admit(request_id, control)?;
         let result = self.infer_reserved(request_id, req);
-        self.finish_admission();
+        drop(admission);
         result
+    }
+    fn begin_shutdown(&self) {
+        self.inner.lock().shutting_down = true;
+    }
+
+    fn cancel_remaining(&self) {
+        let mut guard = self.inner.lock();
+        for control in guard.controls.values() {
+            control.cancel();
+        }
+        guard.queue.clear();
+        guard.queued_bytes = 0;
     }
 
     fn infer_reserved(
@@ -671,11 +946,16 @@ impl Server {
         let stream_buffer = self.inner.lock().config.stream_buffer;
         let (sender, receiver) = tokio::sync::mpsc::channel(stream_buffer);
         let server = self.clone();
+        let control = admission.control.clone();
         tokio::task::spawn_blocking(move || {
             let _admission = admission;
+            let emit_control = control.clone();
             let result =
                 server.infer_admitted(&request_id, req, successor_id, frontier, |event| {
-                    sender.blocking_send(event).map_err(|_| Error::Cancelled)
+                    sender.blocking_send(event).map_err(|_| {
+                        emit_control.cancel();
+                        Error::Cancelled
+                    })
                 });
             let event = match result {
                 Ok((_, terminal)) => terminal,
@@ -688,17 +968,30 @@ impl Server {
         Ok((started, receiver))
     }
 
-    fn try_admit(&self) -> Result<(), Error> {
+    fn try_admit(
+        &self,
+        request_id: &str,
+        control: Arc<RequestControl>,
+    ) -> Result<AdmissionGuard, Error> {
         let mut guard = self.inner.lock();
+        if guard.pending_cancelled.remove(request_id) {
+            return Err(Error::Cancelled);
+        }
+        if guard.shutting_down {
+            return Err(Error::ShuttingDown);
+        }
         if guard.active >= guard.admission_limit || !guard.queue.is_empty() {
             return Err(Error::Busy);
         }
         guard.active += 1;
-        Ok(())
-    }
-
-    fn finish_admission(&self) {
-        self.release_or_cancel_admission(None, true);
+        guard.controls.insert(request_id.into(), control.clone());
+        Ok(AdmissionGuard {
+            server: self.clone(),
+            ticket: None,
+            request_id: Some(request_id.into()),
+            control,
+            active: true,
+        })
     }
 
     fn promote_queued(guard: &mut Inner) {
@@ -713,8 +1006,18 @@ impl Server {
         }
     }
 
-    fn release_or_cancel_admission(&self, ticket: Option<u64>, active: bool) {
+    fn release_or_cancel_admission(
+        &self,
+        ticket: Option<u64>,
+        request_id: Option<String>,
+        active: bool,
+    ) {
         let mut guard = self.inner.lock();
+        if let Some(request_id) = request_id {
+            if let Some(control) = guard.controls.remove(&request_id) {
+                control.complete();
+            }
+        }
         if active {
             guard.active = guard.active.saturating_sub(1);
         } else if let Some(ticket) = ticket {
@@ -730,32 +1033,50 @@ impl Server {
 
     async fn reserve_admission(
         &self,
+        request_id: &str,
+        control: Arc<RequestControl>,
         bytes: usize,
-        deadline: Option<Duration>,
+        deadline: Duration,
     ) -> Result<AdmissionGuard, Error> {
         let (ticket, receiver) = {
             let mut guard = self.inner.lock();
+            if guard.pending_cancelled.remove(request_id) {
+                return Err(Error::Cancelled);
+            }
+            if guard.shutting_down {
+                return Err(Error::ShuttingDown);
+            }
             if bytes > guard.config.request_bytes {
                 return Err(Error::PayloadTooLarge);
             }
+            guard
+                .controls
+                .insert(request_id.to_owned(), control.clone());
             if guard.active < guard.admission_limit && guard.queue.is_empty() {
                 guard.active += 1;
                 return Ok(AdmissionGuard {
                     server: self.clone(),
                     ticket: None,
+                    request_id: Some(request_id.to_owned()),
+                    control,
                     active: true,
                 });
             }
             if guard.queue.len() >= guard.config.queue_count
                 || bytes > guard.config.queue_bytes.saturating_sub(guard.queued_bytes)
             {
+                guard.controls.remove(request_id);
                 return Err(Error::Busy);
             }
             let ticket = guard.next_ticket;
-            guard.next_ticket = guard.next_ticket.wrapping_add(1);
+            guard.next_ticket = guard
+                .next_ticket
+                .checked_add(1)
+                .ok_or_else(|| Error::State("admission ticket space exhausted".into()))?;
             let (ready, receiver) = tokio::sync::oneshot::channel();
             guard.queue.push_back(QueueEntry {
                 ticket,
+                request_id: request_id.to_owned(),
                 bytes,
                 ready,
             });
@@ -765,19 +1086,26 @@ impl Server {
         let mut admission = AdmissionGuard {
             server: self.clone(),
             ticket: Some(ticket),
+            request_id: Some(request_id.to_owned()),
+            control: control.clone(),
             active: false,
         };
-        if let Some(deadline) = deadline {
-            tokio::time::timeout(deadline, receiver)
-                .await
-                .map_err(|_| Error::Deadline)?
-                .map_err(|_| Error::Cancelled)?;
-        } else {
-            receiver.await.map_err(|_| Error::Cancelled)?;
+        match tokio::time::timeout(deadline, receiver).await {
+            Ok(Ok(())) => {
+                control.check()?;
+                admission.ticket = None;
+                admission.active = true;
+                Ok(admission)
+            }
+            Ok(Err(_)) => {
+                admission.ticket = None;
+                control.check().and(Err(Error::Cancelled))
+            }
+            Err(_) => {
+                control.expire();
+                Err(Error::Deadline)
+            }
         }
-        admission.ticket = None;
-        admission.active = true;
-        Ok(admission)
     }
 
     fn infer_admitted(
@@ -795,10 +1123,15 @@ impl Server {
         if req.deadline_ms == Some(0) {
             return Err(Error::Deadline);
         }
+        let control = self
+            .inner
+            .lock()
+            .controls
+            .get(request_id)
+            .cloned()
+            .ok_or(Error::Cancelled)?;
+        control.check()?;
         let model = self.model(&req.model)?;
-        if self.inner.lock().cancelled.remove(request_id).is_some() {
-            return Err(Error::Cancelled);
-        }
         let context = match &req.context_id {
             Some(id) => Some(self.context(id)?),
             None => None,
@@ -814,14 +1147,13 @@ impl Server {
                 prompt: &req.prompt,
                 max_tokens: req.max_tokens,
                 prior_tokens,
+                control: &control,
             },
             &mut |_id, piece, terminal_or_control| {
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Err(Error::Deadline);
+                    control.expire();
                 }
-                if self.inner.lock().cancelled.remove(request_id).is_some() {
-                    return Err(Error::Cancelled);
-                }
+                control.check()?;
                 frontier.push(piece, terminal_or_control, |delta| {
                     let token = delta.to_owned();
                     emit(StreamEvent::Token {
@@ -844,9 +1176,7 @@ impl Server {
             generated_pieces.push(token);
             Ok(())
         })?;
-        if self.inner.lock().cancelled.remove(request_id).is_some() {
-            return Err(Error::Cancelled);
-        }
+        control.check()?;
         if req
             .deadline_ms
             .is_some_and(|ms| started.elapsed() > Duration::from_millis(ms))
@@ -937,10 +1267,54 @@ struct RegisterRequest {
 }
 #[derive(Clone, Deserialize)]
 struct FetchRequest {
+
     uri: String,
     cache: PathBuf,
     #[serde(default)]
     sha256: Option<String>,
+}
+struct PrequeueJson<T> {
+    headers: HeaderMap,
+    value: T,
+    retained_bytes: usize,
+    _permit: PrequeuePermit,
+}
+
+impl<T> FromRequest<Server> for PrequeueJson<T>
+where
+    T: DeserializeOwned,
+{
+    type Rejection = Error;
+
+    async fn from_request(request: Request, state: &Server) -> Result<Self, Self::Rejection> {
+        let config = state.config();
+        let header_bytes = request.headers().iter().fold(0usize, |total, (name, value)| {
+            total
+                .saturating_add(name.as_str().len())
+                .saturating_add(value.as_bytes().len())
+        });
+        if header_bytes > config.header_bytes {
+            return Err(Error::HeadersTooLarge);
+        }
+        let permit = state.pre_queue.acquire().await?;
+        let (parts, body) = request.into_parts();
+        let bytes = tokio::time::timeout(
+            Duration::from_millis(config.body_timeout_ms),
+            to_bytes(body, config.request_bytes),
+        )
+        .await
+        .map_err(|_| Error::BodyTimeout)?
+        .map_err(|_| Error::PayloadTooLarge)?;
+        let retained_bytes = bytes.len();
+        let value = serde_json::from_slice(&bytes)
+            .map_err(|error| Error::BadRequest(error.to_string()))?;
+        Ok(Self {
+            headers: parts.headers,
+            value,
+            retained_bytes,
+            _permit: permit,
+        })
+    }
 }
 #[derive(Deserialize)]
 struct ImportContextRequest {
@@ -1035,10 +1409,16 @@ fn auth(server: &Server, headers: &HeaderMap, scope: Scope) -> Result<RequestCon
 }
 async fn completion(
     State(s): State<Server>,
-    headers: HeaderMap,
-    Json(r): Json<CompletionRequest>,
+    PrequeueJson {
+        headers,
+        value: r,
+        retained_bytes,
+        _permit: permit,
+    }: PrequeueJson<CompletionRequest>,
 ) -> Result<Response, Error> {
     auth(&s, &headers, Scope::Inference)?;
+    s.model(&r.model)?;
+    drop(permit);
     infer_response(
         s,
         r.model,
@@ -1049,15 +1429,22 @@ async fn completion(
         r.stop.map(StopInput::into_vec).unwrap_or_default(),
         r.raw_continuation,
         r.deadline_ms,
+        retained_bytes,
     )
     .await
 }
 async fn chat(
     State(s): State<Server>,
-    headers: HeaderMap,
-    Json(r): Json<ChatRequest>,
+    PrequeueJson {
+        headers,
+        value: r,
+        retained_bytes,
+        _permit: permit,
+    }: PrequeueJson<ChatRequest>,
 ) -> Result<Response, Error> {
     auth(&s, &headers, Scope::Inference)?;
+    s.model(&r.model)?;
+    drop(permit);
     infer_response(
         s,
         r.model,
@@ -1072,9 +1459,52 @@ async fn chat(
         r.stop.map(StopInput::into_vec).unwrap_or_default(),
         false,
         r.deadline_ms,
+        retained_bytes,
     )
     .await
 }
+struct DisconnectGuard {
+    control: Arc<RequestControl>,
+    armed: bool,
+}
+
+impl DisconnectGuard {
+    fn new(control: Arc<RequestControl>) -> Self {
+        Self {
+            control,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DisconnectGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.control.cancel();
+        }
+    }
+}
+
+fn start_deadline_watchdogs(
+    control: &Arc<RequestControl>,
+    wall_remaining: Duration,
+    active_limit: Duration,
+) {
+    for deadline in [wall_remaining, active_limit] {
+        let control = control.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(deadline).await;
+            if !control.is_complete() {
+                control.expire();
+            }
+        });
+    }
+}
+
 async fn infer_response(
     server: Server,
     model: String,
@@ -1085,53 +1515,75 @@ async fn infer_response(
     stop: Vec<String>,
     raw_continuation: bool,
     deadline_ms: Option<u64>,
+    retained_bytes: usize,
 ) -> Result<Response, Error> {
+    server.model(&model)?;
     let id = Uuid::new_v4().to_string();
-    let request_bytes = model
-        .len()
-        .saturating_add(prompt.len())
-        .saturating_add(stop.iter().map(String::len).sum::<usize>());
+    let config = server.config();
+    let wall_limit = Duration::from_millis(
+        deadline_ms
+            .unwrap_or(config.wall_time_ms)
+            .min(config.wall_time_ms),
+    );
     let waiting_since = Instant::now();
+    let control = Arc::new(RequestControl::new());
     let admission = server
-        .reserve_admission(request_bytes, deadline_ms.map(Duration::from_millis))
+        .reserve_admission(&id, control.clone(), retained_bytes, wall_limit)
         .await?;
-    let mut request = InferRequest {
+    let wall_remaining = wall_limit
+        .checked_sub(waiting_since.elapsed())
+        .ok_or(Error::Deadline)?;
+    start_deadline_watchdogs(
+        &control,
+        wall_remaining,
+        Duration::from_millis(config.active_time_ms),
+    );
+    let request = InferRequest {
         model,
         prompt,
         max_tokens: max_tokens.unwrap_or_else(default_tokens),
         context_id,
-        deadline_ms,
+        deadline_ms: Some(
+            u64::try_from(wall_remaining.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1),
+        ),
         stop,
         raw_continuation,
         priority: 0,
     };
-    if let Some(total_ms) = deadline_ms {
-        let remaining = Duration::from_millis(total_ms)
-            .checked_sub(waiting_since.elapsed())
-            .ok_or(Error::Deadline)?;
-        request.deadline_ms = Some(
-            u64::try_from(remaining.as_millis())
-                .unwrap_or(u64::MAX)
-                .max(1),
-        );
-    }
     if streaming {
-        let (started, receiver) = server.infer_stream_reserved(id, request, admission).await?;
+        let (started, receiver) = server
+            .infer_stream_reserved(id, request, admission)
+            .await?;
         let first = stream::once(async move { started });
-        let rest = stream::unfold(receiver, |mut receiver| async move {
-            receiver.recv().await.map(|event| (event, receiver))
-        });
+        let disconnect = DisconnectGuard::new(control);
+        let rest = stream::unfold(
+            (receiver, disconnect),
+            |(mut receiver, mut disconnect)| async move {
+                match receiver.recv().await {
+                    Some(event) => Some((event, (receiver, disconnect))),
+                    None => {
+                        disconnect.disarm();
+                        None
+                    }
+                }
+            },
+        );
         let rows = first
             .chain(rest)
             .map(|event| Ok::<_, Infallible>(Event::default().json_data(event).unwrap()));
         Ok(Sse::new(rows).into_response())
     } else {
-        let (response, _) = tokio::task::spawn_blocking(move || {
+        let mut disconnect = DisconnectGuard::new(control);
+        let result = tokio::task::spawn_blocking(move || {
             let _admission = admission;
             server.infer_reserved(&id, request)
         })
         .await
-        .map_err(state_err)??;
+        .map_err(state_err)?;
+        disconnect.disarm();
+        let (response, _) = result?;
         Ok(Json(json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text}],"usage":response.usage})).into_response())
     }
 }
@@ -1329,6 +1781,7 @@ async fn serve_until(
 ) -> Result<(), Error> {
     Server::validate_listener(addr, anonymous, unsafe_public)?;
     let grace = Duration::from_millis(server.config().shutdown_grace_ms);
+    let lifecycle = server.clone();
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(state_err)?;
@@ -1344,11 +1797,15 @@ async fn serve_until(
     tokio::select! {
         result = &mut serving => result.map_err(state_err),
         () = shutdown => {
+            lifecycle.begin_shutdown();
             let _ = begin_shutdown.send(());
-            tokio::time::timeout(grace, &mut serving)
-                .await
-                .map_err(|_| Error::State("shutdown grace period elapsed".into()))?
-                .map_err(state_err)
+            match tokio::time::timeout(grace, &mut serving).await {
+                Ok(result) => result.map_err(state_err),
+                Err(_) => {
+                    lifecycle.cancel_remaining();
+                    (&mut serving).await.map_err(state_err)
+                }
+            }
         }
     }
 }
@@ -1374,7 +1831,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use axum::{
-        body::{Body, to_bytes},
+        body::{Body, Bytes, to_bytes},
         http::Request,
     };
     use std::net::IpAddr;
@@ -1836,15 +2293,32 @@ mod tests {
                 request_bytes: 16,
                 stream_buffer: 2,
                 shutdown_grace_ms: 100,
+                ..ServerConfig::default()
             })
             .unwrap();
-        let first = server.reserve_admission(1, None).await.unwrap();
+        let first = server
+            .reserve_admission(
+                "first",
+                Arc::new(RequestControl::new()),
+                1,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
 
         let (second_acquired_tx, second_acquired_rx) = tokio::sync::oneshot::channel();
         let (second_release_tx, second_release_rx) = tokio::sync::oneshot::channel();
         let second_server = server.clone();
         let second = tokio::spawn(async move {
-            let _admission = second_server.reserve_admission(2, None).await.unwrap();
+            let _admission = second_server
+                .reserve_admission(
+                    "second",
+                    Arc::new(RequestControl::new()),
+                    2,
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
             second_acquired_tx.send(()).unwrap();
             second_release_rx.await.unwrap();
         });
@@ -1854,7 +2328,15 @@ mod tests {
         let (third_release_tx, third_release_rx) = tokio::sync::oneshot::channel();
         let third_server = server.clone();
         let third = tokio::spawn(async move {
-            let _admission = third_server.reserve_admission(3, None).await.unwrap();
+            let _admission = third_server
+                .reserve_admission(
+                    "third",
+                    Arc::new(RequestControl::new()),
+                    3,
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
             third_acquired_tx.send(()).unwrap();
             third_release_rx.await.unwrap();
         });
@@ -1887,7 +2369,14 @@ mod tests {
         let (server, dir) = setup(Arc::new(AnonymousAdmin));
         assert!(server.configure(ServerConfig::default()).is_ok());
         assert!(matches!(
-            server.reserve_admission(1024 * 1024 + 1, None).await,
+            server
+                .reserve_admission(
+                    "large",
+                    Arc::new(RequestControl::new()),
+                    1024 * 1024 + 1,
+                    Duration::from_secs(1),
+                )
+                .await,
             Err(Error::PayloadTooLarge)
         ));
         server
@@ -1898,12 +2387,26 @@ mod tests {
                 request_bytes: 8,
                 stream_buffer: 1,
                 shutdown_grace_ms: 100,
+                ..ServerConfig::default()
             })
             .unwrap();
-        let active = server.reserve_admission(1, None).await.unwrap();
+        let active = server
+            .reserve_admission(
+                "active",
+                Arc::new(RequestControl::new()),
+                1,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
         assert!(matches!(
             server
-                .reserve_admission(2, Some(Duration::from_millis(5)))
+                .reserve_admission(
+                    "timeout",
+                    Arc::new(RequestControl::new()),
+                    2,
+                    Duration::from_millis(5),
+                )
                 .await,
             Err(Error::Deadline)
         ));
@@ -1912,12 +2415,24 @@ mod tests {
         let queued_server = server.clone();
         let queued = tokio::spawn(async move {
             queued_server
-                .reserve_admission(4, Some(Duration::from_secs(1)))
+                .reserve_admission(
+                    "queued",
+                    Arc::new(RequestControl::new()),
+                    4,
+                    Duration::from_secs(1),
+                )
                 .await
         });
         wait_for_queue(&server, 1).await;
         assert!(matches!(
-            server.reserve_admission(1, None).await,
+            server
+                .reserve_admission(
+                    "busy",
+                    Arc::new(RequestControl::new()),
+                    1,
+                    Duration::from_secs(1),
+                )
+                .await,
             Err(Error::Busy)
         ));
         queued.abort();
@@ -1939,9 +2454,18 @@ mod tests {
                 request_bytes: 1024,
                 stream_buffer: 1,
                 shutdown_grace_ms: 100,
+                ..ServerConfig::default()
             })
             .unwrap();
-        let admission = server.reserve_admission(16, None).await.unwrap();
+        let admission = server
+            .reserve_admission(
+                "disconnect",
+                Arc::new(RequestControl::new()),
+                16,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
         let (_, receiver) = server
             .infer_stream_reserved(
                 "disconnect".into(),
@@ -1980,7 +2504,15 @@ mod tests {
                 ..ServerConfig::default()
             })
             .unwrap();
-        let admission = server.reserve_admission(16, None).await.unwrap();
+        let admission = server
+            .reserve_admission(
+                "bounded-stream",
+                Arc::new(RequestControl::new()),
+                16,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
         let (_, mut receiver) = server
             .infer_stream_reserved(
                 "bounded-stream".into(),
@@ -2089,4 +2621,267 @@ mod tests {
         .unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn phase6c_defaults_match_the_fixed_operating_contract() {
+        assert_eq!(
+            ServerConfig::default(),
+            ServerConfig {
+                active_requests: 1,
+                queue_count: 32,
+                queue_bytes: 16 << 20,
+                request_bytes: 1 << 20,
+                pre_queue_concurrency: 16,
+                header_bytes: 32 << 10,
+                body_timeout_ms: 10_000,
+                wall_time_ms: 300_000,
+                active_time_ms: 240_000,
+                stream_buffer: 8,
+                shutdown_grace_ms: 30_000,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn overload_is_canonical_and_model_resolution_precedes_admission() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        server
+            .configure(ServerConfig {
+                queue_count: 1,
+                queue_bytes: 1024,
+                request_bytes: 1024,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        let active = server
+            .reserve_admission(
+                "active",
+                Arc::new(RequestControl::new()),
+                1,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let queued_server = server.clone();
+        let queued = tokio::spawn(async move {
+            queued_server
+                .reserve_admission(
+                    "queued",
+                    Arc::new(RequestControl::new()),
+                    1,
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        wait_for_queue(&server, 1).await;
+
+        let invalid = router(server.clone())
+            .oneshot(
+                Request::post("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"missing","prompt":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
+
+        let overloaded = router(server.clone())
+            .oneshot(
+                Request::post("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"m","prompt":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(overloaded.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(overloaded.headers()[RETRY_AFTER], "1");
+        let body = to_bytes(overloaded.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"]["code"],
+            "queue_overloaded"
+        );
+
+        server.cancel("queued");
+        assert!(matches!(queued.await.unwrap(), Err(Error::Cancelled)));
+        drop(active);
+        assert_eq!(server.admission_metrics(), AdmissionMetrics::default());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_limits_reject_before_admission() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        server
+            .configure(ServerConfig {
+                header_bytes: 16,
+                request_bytes: 32,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        let headers = router(server.clone())
+            .oneshot(
+                Request::post("/v1/completions")
+                    .header("content-type", "application/json")
+                    .header("x-oversized", "01234567890123456789")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            headers.status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+        assert_eq!(server.admission_metrics(), AdmissionMetrics::default());
+
+        server
+            .configure(ServerConfig {
+                header_bytes: 1024,
+                request_bytes: 32,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        let body = router(server.clone())
+            .oneshot(
+                Request::post("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("x".repeat(33)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(server.admission_metrics(), AdmissionMetrics::default());
+
+        server
+            .configure(ServerConfig {
+                body_timeout_ms: 5,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        let slow_body = Body::from_stream(futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok::<_, Infallible>(Bytes::from_static(b"{}"))
+        }));
+        let timed_out = router(server.clone())
+            .oneshot(
+                Request::post("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(slow_body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(timed_out.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(server.admission_metrics(), AdmissionMetrics::default());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prequeue_reconfiguration_preserves_configured_capacity_with_active_permits() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        server
+            .configure(ServerConfig {
+                pre_queue_concurrency: 3,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        let first = server.pre_queue.acquire().await.unwrap();
+        let second = server.pre_queue.acquire().await.unwrap();
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 1);
+
+        server
+            .configure(ServerConfig {
+                pre_queue_concurrency: 3,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 1);
+
+        server
+            .configure(ServerConfig {
+                pre_queue_concurrency: 1,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 0);
+        drop(first);
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 0);
+        drop(second);
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 1);
+
+        let third = server.pre_queue.acquire().await.unwrap();
+        server
+            .configure(ServerConfig {
+                pre_queue_concurrency: 3,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 2);
+        drop(third);
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 3);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_new_work_and_restart_recovers_only_durable_state() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let context = server.create_context().unwrap();
+        let active = server
+            .reserve_admission(
+                "live",
+                Arc::new(RequestControl::new()),
+                1,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        server.begin_shutdown();
+        assert!(matches!(
+            server
+                .reserve_admission(
+                    "late",
+                    Arc::new(RequestControl::new()),
+                    1,
+                    Duration::from_secs(1),
+                )
+                .await,
+            Err(Error::ShuttingDown)
+        ));
+        server.cancel_remaining();
+        assert!(matches!(active.control.check(), Err(Error::Cancelled)));
+        drop(active);
+
+        let restarted = Server::open(
+            dir.join("state.json"),
+            Arc::new(AnonymousAdmin),
+            Arc::new(DeterministicEngine),
+        )
+        .unwrap();
+        assert_eq!(restarted.context(&context.id).unwrap(), context);
+        assert_eq!(restarted.admission_metrics(), AdmissionMetrics::default());
+        assert!(!restarted.inner.lock().shutting_down);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn wall_and_active_deadline_watchdogs_abort_owned_work() {
+        let wall = Arc::new(RequestControl::new());
+        let active = Arc::new(RequestControl::new());
+        start_deadline_watchdogs(
+            &wall,
+            Duration::from_millis(5),
+            Duration::from_secs(1),
+        );
+        start_deadline_watchdogs(
+            &active,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(wall.check(), Err(Error::Deadline)));
+        assert!(matches!(active.check(), Err(Error::Deadline)));
+    }
+
 }

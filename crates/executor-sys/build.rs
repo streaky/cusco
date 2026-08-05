@@ -4,8 +4,11 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-env-changed=CUSCO_NATIVE_LIB_DIR");
     println!("cargo:rerun-if-env-changed=CUSCO_LLAMA_LIB_DIR");
+    println!("cargo:rerun-if-changed=../../native/include/cusco_executor.h");
+    println!("cargo:rerun-if-changed=../../native/shim/cusco_executor.cpp");
     if let Ok(dir) = env::var("CUSCO_NATIVE_LIB_DIR") {
         println!("cargo:rustc-link-search=native={dir}");
+        println!("cargo:rerun-if-changed={dir}/libcusco_executor.a");
         println!("cargo:rustc-link-lib=static=cusco_executor");
         if let Ok(llama) = env::var("CUSCO_LLAMA_LIB_DIR") {
             println!("cargo:rustc-link-search=native={llama}");

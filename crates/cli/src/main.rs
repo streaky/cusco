@@ -80,13 +80,23 @@ enum Command {
         active_requests: usize,
         #[arg(long, default_value_t = 32)]
         queue_count: usize,
-        #[arg(long, default_value_t = 1_048_576)]
+        #[arg(long, default_value_t = 16_777_216)]
         queue_bytes: usize,
-        #[arg(long, default_value_t = 262_144)]
+        #[arg(long, default_value_t = 1_048_576)]
         request_bytes: usize,
+        #[arg(long, default_value_t = 16)]
+        pre_queue_concurrency: usize,
+        #[arg(long, default_value_t = 32_768)]
+        header_bytes: usize,
+        #[arg(long, default_value_t = 10_000)]
+        body_timeout_ms: u64,
+        #[arg(long, default_value_t = 300_000)]
+        wall_time_ms: u64,
+        #[arg(long, default_value_t = 240_000)]
+        active_time_ms: u64,
         #[arg(long, default_value_t = 8)]
         stream_buffer: usize,
-        #[arg(long, default_value_t = 5_000)]
+        #[arg(long, default_value_t = 30_000)]
         shutdown_grace_ms: u64,
     },
 }
@@ -144,6 +154,11 @@ fn run(command: Command) -> Result<()> {
             queue_count,
             queue_bytes,
             request_bytes,
+            pre_queue_concurrency,
+            header_bytes,
+            body_timeout_ms,
+            wall_time_ms,
+            active_time_ms,
             stream_buffer,
             shutdown_grace_ms,
         } => {
@@ -171,6 +186,11 @@ fn run(command: Command) -> Result<()> {
                 queue_count,
                 queue_bytes,
                 request_bytes,
+                pre_queue_concurrency,
+                header_bytes,
+                body_timeout_ms,
+                wall_time_ms,
+                active_time_ms,
                 stream_buffer,
                 shutdown_grace_ms,
             })?;
@@ -511,6 +531,11 @@ mod tests {
                 queue_count: 1,
                 queue_bytes: 1024,
                 request_bytes: 1024,
+                pre_queue_concurrency: 16,
+                header_bytes: 32 << 10,
+                body_timeout_ms: 10_000,
+                wall_time_ms: 300_000,
+                active_time_ms: 240_000,
                 stream_buffer: 1,
                 shutdown_grace_ms: 100,
             })
@@ -532,6 +557,11 @@ mod tests {
             queue_count: 1,
             queue_bytes: 1024,
             request_bytes: 1024,
+            pre_queue_concurrency: 16,
+            header_bytes: 32 << 10,
+            body_timeout_ms: 10_000,
+            wall_time_ms: 300_000,
+            active_time_ms: 240_000,
             stream_buffer: 1,
             shutdown_grace_ms: 100,
         })

@@ -1,6 +1,6 @@
 use cusco_executor_sys as sys;
 use serde::Serialize;
-use std::{ffi::CString, ptr::NonNull};
+use std::{ffi::CString, ptr::NonNull, sync::Arc};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -56,11 +56,45 @@ pub struct MappingMetrics {
 }
 
 /// Uniquely owns one native execution slot. The slot is mutated only through `&mut self`.
-pub struct Executor {
+struct ExecutorLifetime {
     raw: NonNull<sys::CuscoExecutor>,
 }
-// The native slot has unique ownership and all mutation requires `&mut self`.
-// Moving that ownership between threads is safe; concurrent access is not.
+
+// SAFETY: the lifetime object never accesses the executor except to close it
+// after every owner is gone. Native request cancellation is independently
+// atomic; all other executor access remains uniquely borrowed through Executor.
+unsafe impl Send for ExecutorLifetime {}
+unsafe impl Sync for ExecutorLifetime {}
+
+impl Drop for ExecutorLifetime {
+    fn drop(&mut self) {
+        ffi::close(self.raw);
+    }
+}
+
+/// A thread-safe signal handle that cannot outlive its native executor.
+#[derive(Clone)]
+pub struct CancellationHandle {
+    raw: NonNull<sys::CuscoExecutor>,
+    _lifetime: Arc<ExecutorLifetime>,
+}
+
+// SAFETY: CancellationHandle exposes only the native atomic cancel signal.
+unsafe impl Send for CancellationHandle {}
+unsafe impl Sync for CancellationHandle {}
+
+impl CancellationHandle {
+    pub fn cancel(&self) {
+        ffi::cancel(self.raw);
+    }
+}
+
+pub struct Executor {
+    raw: NonNull<sys::CuscoExecutor>,
+    lifetime: Arc<ExecutorLifetime>,
+}
+/// The native slot has unique ownership and all mutation requires `&mut self`.
+/// Moving that ownership between threads is safe; concurrent access is not.
 unsafe impl Send for Executor {}
 
 /// An immutable, independently owned snapshot of one executor state.
@@ -89,8 +123,10 @@ pub struct GreedySampler {
 impl Executor {
     pub fn open(path: &str, n_ctx: u32, gpu_layers: i32) -> Result<Self, Error> {
         let path = CString::new(path).map_err(|_| Error::InvalidPath)?;
+        let raw = ffi::open(&path, n_ctx, gpu_layers)?;
         Ok(Self {
-            raw: ffi::open(&path, n_ctx, gpu_layers)?,
+            raw,
+            lifetime: Arc::new(ExecutorLifetime { raw }),
         })
     }
 
@@ -106,6 +142,17 @@ impl Executor {
             max_mappings: c.max_mappings,
         }
     }
+    pub fn cancellation_handle(&self) -> CancellationHandle {
+        CancellationHandle {
+            raw: self.raw,
+            _lifetime: self.lifetime.clone(),
+        }
+    }
+    pub fn reset_cancellation(&mut self) {
+        ffi::reset_cancel(self.raw);
+    }
+
+
 
     pub fn tokenize(&mut self, text: &str) -> Result<Vec<i32>, Error> {
         let text = CString::new(text).map_err(|_| Error::InvalidPath)?;
@@ -212,11 +259,6 @@ impl GreedySampler {
     }
 }
 
-impl Drop for Executor {
-    fn drop(&mut self) {
-        ffi::close(self.raw)
-    }
-}
 impl Drop for Checkpoint {
     fn drop(&mut self) {
         ffi::free_checkpoint(self.raw)
@@ -491,6 +533,17 @@ mod ffi {
             sys::cusco_executor_replace_state_for_proof(raw.as_ptr(), tokens.as_ptr(), tokens.len())
         })
     }
+    pub(super) fn cancel(raw: NonNull<sys::CuscoExecutor>) {
+        // SAFETY: the cancellation handle retains executor lifetime and this
+        // production operation only sets the native atomic abort flag.
+        unsafe { sys::cusco_executor_cancel(raw.as_ptr()) }
+    }
+    pub(super) fn reset_cancel(raw: NonNull<sys::CuscoExecutor>) {
+        // SAFETY: the caller exclusively borrows the executor.
+        unsafe { sys::cusco_executor_reset_cancel(raw.as_ptr()) }
+    }
+
+
 
     pub(super) fn cancel_next_decode_for_proof(raw: NonNull<sys::CuscoExecutor>) {
         // SAFETY: raw is live and uniquely borrowed by the caller.
@@ -571,6 +624,22 @@ mod tests {
             Executor::open("bad\0path", 1, 0),
             Err(Error::InvalidPath)
         ));
+    }
+
+    #[test]
+    fn production_cancellation_handle_is_thread_safe_and_retains_executor() {
+        let mut executor = Executor::open("mock://deterministic", 64, 0).unwrap();
+        let cancellation = executor.cancellation_handle();
+        let worker = std::thread::spawn({
+            let cancellation = cancellation.clone();
+            move || cancellation.cancel()
+        });
+        worker.join().unwrap();
+        assert_eq!(executor.decode(&[1]).unwrap_err(), Error::Cancelled);
+        executor.reset_cancellation();
+        assert!(executor.decode(&[1]).is_ok());
+        drop(executor);
+        cancellation.cancel();
     }
 
     #[test]

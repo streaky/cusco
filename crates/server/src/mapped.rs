@@ -239,6 +239,7 @@ impl InferenceEngine for MappedEngine {
         request: EngineRequest<'_>,
         sink: &mut TokenSink<'_>,
     ) -> Result<EngineOutput, Error> {
+        request.control.check()?;
         if request.model.path.to_str() != Some(self.model_path()) {
             return Err(Error::State(
                 "Phase 6B admits only the process-owned model".into(),
@@ -246,11 +247,18 @@ impl InferenceEngine for MappedEngine {
         }
         let prompt_started = Instant::now();
         let mut state = self.state.lock();
+        state.executor.reset_cancellation();
+        let cancellation = state.executor.cancellation_handle();
+        let _abort = request.control.register_abort(Arc::new(move || {
+            cancellation.cancel();
+        }));
+        request.control.check()?;
         let tokenization_started = Instant::now();
         let prompt = state
             .executor
             .tokenize(request.prompt)
             .map_err(state_error)?;
+        request.control.check()?;
         let tokenization_ns = elapsed_ns(tokenization_started);
         let input_tokens = prompt.len();
         let total = request
@@ -279,6 +287,7 @@ impl InferenceEngine for MappedEngine {
         let evaluated_tokens = tokens.len().saturating_sub(cached);
         let mapping_activation_started = Instant::now();
         activate_prefix(&mut state, logical_context, prefix.as_deref())?;
+        request.control.check()?;
 
         let mut active_mapping = state.executor.mapping_metrics().active;
         if cached == 0 {
@@ -293,6 +302,7 @@ impl InferenceEngine for MappedEngine {
             .and_then(|mapping| state.resident.get(&mapping.id))
             .map(|resident| resident.continuation.clone());
         while evaluated < tokens.len() {
+            request.control.check()?;
             let end = tokens
                 .len()
                 .min(((evaluated / self.profile.block_size) + 1) * self.profile.block_size);
@@ -302,6 +312,7 @@ impl InferenceEngine for MappedEngine {
                     .decode(&tokens[evaluated..end])
                     .map_err(state_error)?,
             );
+            request.control.check()?;
             state.metrics.decoded_tokens += (end - evaluated) as u64;
             evaluated = end;
             if evaluated % self.profile.block_size == 0 {
@@ -323,7 +334,7 @@ impl InferenceEngine for MappedEngine {
                 "an exact cached prefix cannot supply uncached logits".into(),
             ));
         }
-        let prefill = PrefillMetrics {
+        let mut prefill = PrefillMetrics {
             total_tokens: tokens.len(),
             cached_tokens: cached,
             uncached_tokens: evaluated_tokens,
@@ -332,10 +343,12 @@ impl InferenceEngine for MappedEngine {
             mapping_activation_ns,
             uncached_prefill_ns,
             total_ns: elapsed_ns(prompt_started),
+            ..PrefillMetrics::default()
         };
         let mut sampler = state.executor.greedy_sampler().map_err(state_error)?;
         let mut piece = Vec::with_capacity(32);
         for index in 0..request.max_tokens {
+            request.control.check()?;
             let sampled = sampler.sample(&mut state.executor).map_err(state_error)?;
             let terminal_or_control = self.profile.terminal_tokens.contains(&sampled);
             if terminal_or_control {
@@ -346,6 +359,7 @@ impl InferenceEngine for MappedEngine {
                     .render_token(sampled, &mut piece)
                     .map_err(state_error)?;
             }
+            request.control.check()?;
             tokens.push(sampled);
             state
                 .logical
@@ -359,6 +373,7 @@ impl InferenceEngine for MappedEngine {
                 break;
             }
             next = Some(state.executor.decode(&[sampled]).map_err(state_error)?);
+            request.control.check()?;
             state.metrics.decoded_tokens += 1;
             evaluated += 1;
             if evaluated % self.profile.block_size == 0 {
@@ -374,12 +389,17 @@ impl InferenceEngine for MappedEngine {
                 active_mapping = fork_and_activate(&mut state.executor, active_mapping)?;
             }
         }
+        request.control.check()?;
         let native_metrics = state.executor.mapping_metrics();
         state.metrics.requests += 1;
         state.metrics.cached_tokens += cached as u64;
         state.metrics.cache_hits += u64::from(cached != 0);
         state.metrics.reference_switches = native_metrics.reference_switches;
         state.metrics.activation_bytes_copied = native_metrics.activation_bytes_copied;
+        let physical_metrics = state.physical.metrics();
+        prefill.transfer_bytes = physical_metrics.transfer_bytes;
+        prefill.device_bytes = physical_metrics.device_total;
+        prefill.host_bytes = physical_metrics.host_used;
         Ok(EngineOutput {
             successor_tokens: tokens,
             input_tokens,
@@ -705,6 +725,7 @@ mod tests {
                 prompt: &"a".repeat(40),
                 max_tokens: 2,
                 prior_tokens: &[],
+                control: &crate::RequestControl::new(),
             })
             .unwrap();
         let second = engine
@@ -713,6 +734,7 @@ mod tests {
                 prompt: "z",
                 max_tokens: 1,
                 prior_tokens: &first.successor_tokens,
+                control: &crate::RequestControl::new(),
             })
             .unwrap();
         assert!(!second.pieces.is_empty());
@@ -742,6 +764,7 @@ mod tests {
                 prompt: &"x".repeat(65),
                 max_tokens: 1,
                 prior_tokens: &[],
+                control: &crate::RequestControl::new(),
             })
             .unwrap_err();
         assert!(error.to_string().contains("context capacity"));
@@ -766,6 +789,7 @@ mod tests {
                 prompt: &"a".repeat(40),
                 max_tokens: 1,
                 prior_tokens: &[],
+                control: &crate::RequestControl::new(),
             })
             .unwrap();
         let failed = engine.generate_collected(EngineRequest {
@@ -773,6 +797,7 @@ mod tests {
             prompt: &"b".repeat(25),
             max_tokens: 1,
             prior_tokens: &first.successor_tokens,
+            control: &crate::RequestControl::new(),
         });
         assert!(failed.unwrap_err().to_string().contains("cannot publish"));
         let resumed = engine
@@ -781,6 +806,7 @@ mod tests {
                 prompt: "c",
                 max_tokens: 1,
                 prior_tokens: &first.successor_tokens,
+                control: &crate::RequestControl::new(),
             })
             .unwrap();
         assert_eq!(resumed.pieces.len(), 1);
@@ -806,6 +832,7 @@ mod tests {
                 prompt: &"p".repeat(32),
                 max_tokens: 0,
                 prior_tokens: &[],
+                control: &crate::RequestControl::new(),
             })
             .unwrap();
         let resumed = engine
@@ -814,6 +841,7 @@ mod tests {
                 prompt: "",
                 max_tokens: 1,
                 prior_tokens: &primed.successor_tokens,
+                control: &crate::RequestControl::new(),
             })
             .unwrap();
         assert_eq!(resumed.pieces.len(), 1);

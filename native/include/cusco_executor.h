@@ -98,6 +98,14 @@ uint32_t cusco_executor_active_mapping(const cusco_executor *);
 size_t cusco_executor_mapping_count(const cusco_executor *);
 uint64_t cusco_executor_reference_switches(const cusco_executor *);
 uint64_t cusco_executor_mapped_bytes_copied(const cusco_executor *);
+/* Thread-safe request abort signal. The next active or subsequent decode
+ * observes cancellation at llama.cpp's abort callback without mutating the
+ * last completed sequence state. */
+void cusco_executor_cancel(cusco_executor *);
+/* Clear a stale abort signal while the caller exclusively owns the executor. */
+void cusco_executor_reset_cancel(cusco_executor *);
+
+
 
 /* Phase 1 proof hooks, not production executor operations. */
 cusco_status cusco_executor_replace_state_for_proof(cusco_executor *, const int32_t *, size_t);
