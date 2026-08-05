@@ -5,6 +5,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <string>
 #include <vector>
 
 struct cusco_checkpoint {
@@ -188,6 +189,51 @@ cusco_status cusco_executor_tokenize(
 
 void cusco_executor_tokens_free(int32_t * tokens) {
     delete[] tokens;
+}
+
+cusco_status cusco_executor_token_to_piece(
+    cusco_executor * executor,
+    int32_t token,
+    char ** out,
+    size_t * size) try {
+    if (!executor || !out || !size) {
+        return CUSCO_INVALID;
+    }
+    *out = nullptr;
+    *size = 0;
+    std::string piece;
+    if (is_mock(executor)) {
+        piece = std::to_string(token);
+    } else {
+        int32_t required =
+            llama_token_to_piece(executor->vocab, token, nullptr, 0, 0, true);
+        if (required >= 0) {
+            return CUSCO_BACKEND;
+        }
+        piece.resize(static_cast<size_t>(-required));
+        const int32_t written = llama_token_to_piece(
+            executor->vocab, token, piece.data(), piece.size(), 0, true);
+        if (written < 0) {
+            return CUSCO_BACKEND;
+        }
+        piece.resize(static_cast<size_t>(written));
+    }
+    auto * bytes = new (std::nothrow) char[piece.size()];
+    if (!bytes && !piece.empty()) {
+        return CUSCO_NOMEM;
+    }
+    memcpy(bytes, piece.data(), piece.size());
+    *out = bytes;
+    *size = piece.size();
+    return CUSCO_OK;
+} catch (const std::bad_alloc &) {
+    return CUSCO_NOMEM;
+} catch (...) {
+    return CUSCO_BACKEND;
+}
+
+void cusco_executor_piece_free(char * piece) {
+    delete[] piece;
 }
 
 cusco_status cusco_executor_decode(
