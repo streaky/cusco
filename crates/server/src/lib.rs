@@ -640,16 +640,18 @@ impl Server {
         request_id: &str,
         req: InferRequest,
     ) -> Result<(InferResponse, Vec<StreamEvent>), Error> {
-        GenerationFrontier::new(&req.stop, req.raw_continuation).map_err(state_err)?;
+        let frontier =
+            GenerationFrontier::new(&req.stop, req.raw_continuation).map_err(state_err)?;
         let successor_id = req.context_id.clone().unwrap_or_else(ContextId::new);
         let mut events = vec![StreamEvent::Started {
             request_id: request_id.into(),
             context_id: successor_id.clone(),
         }];
-        let (response, terminal) = self.infer_admitted(request_id, req, successor_id, |event| {
-            events.push(event);
-            Ok(())
-        })?;
+        let (response, terminal) =
+            self.infer_admitted(request_id, req, successor_id, frontier, |event| {
+                events.push(event);
+                Ok(())
+            })?;
         events.push(terminal);
         Ok((response, events))
     }
@@ -659,7 +661,8 @@ impl Server {
         req: InferRequest,
         admission: AdmissionGuard,
     ) -> Result<(StreamEvent, tokio::sync::mpsc::Receiver<StreamEvent>), Error> {
-        GenerationFrontier::new(&req.stop, req.raw_continuation).map_err(state_err)?;
+        let frontier =
+            GenerationFrontier::new(&req.stop, req.raw_continuation).map_err(state_err)?;
         let successor_id = req.context_id.clone().unwrap_or_else(ContextId::new);
         let started = StreamEvent::Started {
             request_id: request_id.clone(),
@@ -670,9 +673,10 @@ impl Server {
         let server = self.clone();
         tokio::task::spawn_blocking(move || {
             let _admission = admission;
-            let result = server.infer_admitted(&request_id, req, successor_id, |event| {
-                sender.blocking_send(event).map_err(|_| Error::Cancelled)
-            });
+            let result =
+                server.infer_admitted(&request_id, req, successor_id, frontier, |event| {
+                    sender.blocking_send(event).map_err(|_| Error::Cancelled)
+                });
             let event = match result {
                 Ok((_, terminal)) => terminal,
                 Err(error) => StreamEvent::Error {
@@ -781,6 +785,7 @@ impl Server {
         request_id: &str,
         req: InferRequest,
         successor_id: ContextId,
+        mut frontier: GenerationFrontier,
         mut emit: impl FnMut(StreamEvent) -> Result<(), Error>,
     ) -> Result<(InferResponse, StreamEvent), Error> {
         let started = Instant::now();
@@ -801,8 +806,6 @@ impl Server {
         let prior_tokens = context
             .as_ref()
             .map_or(&[][..], |record| record.native_tokens.as_slice());
-        let mut frontier =
-            GenerationFrontier::new(&req.stop, req.raw_continuation).map_err(state_err)?;
         let mut generated_pieces = Vec::new();
         let mut delta_index = 0;
         let generated = self.engine.generate(
