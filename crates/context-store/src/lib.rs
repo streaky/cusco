@@ -458,23 +458,25 @@ impl ContextStore {
     }
 
     fn reclaim(&mut self, id: EvaluatedPrefixId) {
-        let removable = self.mappings.get(&id).is_some_and(|entry| {
-            entry.references.catalog == 0
-                && entry.references.contexts == 0
-                && entry.references.dependents == 0
-        });
-        if !removable {
-            return;
-        }
-        let parent = self
-            .mappings
-            .remove(&id)
-            .and_then(|entry| entry.mapping.parent);
-        if let Some(parent) = parent {
-            if let Some(entry) = self.mappings.get_mut(&parent) {
-                entry.references.dependents = entry.references.dependents.saturating_sub(1);
+        let mut candidate = Some(id);
+        while let Some(id) = candidate {
+            let removable = self.mappings.get(&id).is_some_and(|entry| {
+                entry.references.catalog == 0
+                    && entry.references.contexts == 0
+                    && entry.references.dependents == 0
+            });
+            if !removable {
+                break;
             }
-            self.reclaim(parent);
+            candidate = self
+                .mappings
+                .remove(&id)
+                .and_then(|entry| entry.mapping.parent);
+            if let Some(parent) = candidate {
+                if let Some(entry) = self.mappings.get_mut(&parent) {
+                    entry.references.dependents = entry.references.dependents.saturating_sub(1);
+                }
+            }
         }
     }
 }
