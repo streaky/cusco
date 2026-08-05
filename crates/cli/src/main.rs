@@ -76,6 +76,18 @@ enum Command {
         bearer_token: Option<String>,
         #[arg(long)]
         unsafe_public_unauthenticated: bool,
+        #[arg(long, default_value_t = 1)]
+        active_requests: usize,
+        #[arg(long, default_value_t = 32)]
+        queue_count: usize,
+        #[arg(long, default_value_t = 1_048_576)]
+        queue_bytes: usize,
+        #[arg(long, default_value_t = 262_144)]
+        request_bytes: usize,
+        #[arg(long, default_value_t = 8)]
+        stream_buffer: usize,
+        #[arg(long, default_value_t = 5_000)]
+        shutdown_grace_ms: u64,
     },
 }
 fn main() -> Result<()> {
@@ -128,9 +140,16 @@ fn run(command: Command) -> Result<()> {
             state,
             bearer_token,
             unsafe_public_unauthenticated,
+            active_requests,
+            queue_count,
+            queue_bytes,
+            request_bytes,
+            stream_buffer,
+            shutdown_grace_ms,
         } => {
             use cusco_server::{
                 AnonymousAdmin, AuthProvider, BearerAuth, MappedEngine, ModelRecord, Server,
+                ServerConfig,
             };
             let anonymous = bearer_token.is_none();
             let auth: Arc<dyn AuthProvider> = match bearer_token {
@@ -147,6 +166,14 @@ fn run(command: Command) -> Result<()> {
                 host_bytes,
             )?;
             let server = Server::open(state, auth, engine)?;
+            server.configure(ServerConfig {
+                active_requests,
+                queue_count,
+                queue_bytes,
+                request_bytes,
+                stream_buffer,
+                shutdown_grace_ms,
+            })?;
             server.register_model(ModelRecord {
                 id: model_id,
                 revision: registered.sha256.clone(),
@@ -356,6 +383,51 @@ fn proof(
 mod tests {
     use super::*;
     #[test]
+    fn serve_cli_parses_bounded_lifecycle_configuration() {
+        let args = Args::try_parse_from([
+            "cusco",
+            "serve",
+            "model.gguf",
+            "--active-requests",
+            "2",
+            "--queue-count",
+            "3",
+            "--queue-bytes",
+            "4096",
+            "--request-bytes",
+            "2048",
+            "--stream-buffer",
+            "4",
+            "--shutdown-grace-ms",
+            "250",
+        ])
+        .unwrap();
+        let Command::Serve {
+            active_requests,
+            queue_count,
+            queue_bytes,
+            request_bytes,
+            stream_buffer,
+            shutdown_grace_ms,
+            ..
+        } = args.command
+        else {
+            panic!("serve command expected")
+        };
+        assert_eq!(
+            (
+                active_requests,
+                queue_count,
+                queue_bytes,
+                request_bytes,
+                stream_buffer,
+                shutdown_grace_ms,
+            ),
+            (2, 3, 4096, 2048, 4, 250)
+        );
+    }
+
+    #[test]
     fn commands_and_proof_execute_model_free() {
         let root = std::env::temp_dir().join(format!("cusco-cli-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
@@ -435,6 +507,12 @@ mod tests {
                 state: root.join("server.json"),
                 bearer_token: None,
                 unsafe_public_unauthenticated: false,
+                active_requests: 1,
+                queue_count: 1,
+                queue_bytes: 1024,
+                request_bytes: 1024,
+                stream_buffer: 1,
+                shutdown_grace_ms: 100,
             })
             .is_err()
         );
@@ -450,6 +528,12 @@ mod tests {
             state: root.join("unsupported-server.json"),
             bearer_token: None,
             unsafe_public_unauthenticated: false,
+            active_requests: 1,
+            queue_count: 1,
+            queue_bytes: 1024,
+            request_bytes: 1024,
+            stream_buffer: 1,
+            shutdown_grace_ms: 100,
         })
         .unwrap_err();
         assert!(unsupported.to_string().contains("unsupported model family"));

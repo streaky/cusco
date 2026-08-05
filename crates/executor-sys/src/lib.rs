@@ -17,6 +17,10 @@ pub struct CuscoPreparedMapping {
     _private: [u8; 0],
 }
 #[repr(C)]
+pub struct CuscoSampler {
+    _private: [u8; 0],
+}
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Capabilities {
     pub abi_version: c_uint,
@@ -37,6 +41,7 @@ pub const OK: i32 = 0;
 pub const CANCELLED: i32 = 4;
 pub const INCOMPATIBLE: i32 = 5;
 pub const ROLLBACK_FAILED: i32 = 6;
+pub const BUFFER_TOO_SMALL: i32 = 7;
 
 unsafe extern "C" {
     pub fn cusco_executor_open(
@@ -54,13 +59,21 @@ unsafe extern "C" {
         count: *mut usize,
     ) -> c_int;
     pub fn cusco_executor_tokens_free(tokens: *mut i32);
-    pub fn cusco_executor_token_to_piece(
+    pub fn cusco_executor_render_token(
         executor: *mut CuscoExecutor,
         token: i32,
-        piece: *mut *mut c_char,
+        buffer: *mut u8,
+        capacity: usize,
         size: *mut usize,
     ) -> c_int;
-    pub fn cusco_executor_piece_free(piece: *mut c_char);
+    pub fn cusco_sampler_greedy(executor: *mut CuscoExecutor, out: *mut *mut CuscoSampler)
+    -> c_int;
+    pub fn cusco_sampler_free(sampler: *mut CuscoSampler);
+    pub fn cusco_sampler_sample(
+        sampler: *mut CuscoSampler,
+        executor: *mut CuscoExecutor,
+        token: *mut i32,
+    ) -> c_int;
     pub fn cusco_executor_decode(
         executor: *mut CuscoExecutor,
         tokens: *const i32,

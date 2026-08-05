@@ -10,7 +10,7 @@ import urllib.request
 BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18082"
 RESULT_DIR = pathlib.Path(sys.argv[2] if len(sys.argv) > 2 else "results")
 MODEL = pathlib.Path(sys.argv[3] if len(sys.argv) > 3 else "models/gemma-4-e2b-it.gguf")
-TOKEN = "phase6a-report-token"
+TOKEN = "phase6b-report-token"
 PROMPT = (
     "A distributed inference system preserves model execution checkpoints across GPU and host memory. "
     "In exactly three concise sentences, explain why transactional restore, cancellation safety, and "
@@ -88,9 +88,9 @@ events, first_token_ms, wall_ms = stream_completion(
     {"model": model["id"], "prompt": PROMPT, "max_tokens": 72, "stream": True}
 )
 token_events = [event for event in events if event.get("type") == "token"]
-usage_events = [event for event in events if event.get("type") == "usage"]
+finished_events = [event for event in events if event.get("type") == "finished"]
 response_text = "".join(event["token"] for event in token_events)
-usage = usage_events[-1]["usage"] if usage_events else {}
+usage = finished_events[-1]["usage"] if finished_events else {}
 generated = usage.get("generated_tokens", len(token_events))
 server_ms = usage.get("latency_ms", 0)
 
@@ -106,17 +106,17 @@ continuation_events, continuation_first_ms, continuation_wall_ms = stream_comple
 continuation_tokens = [
     event for event in continuation_events if event.get("type") == "token"
 ]
-continuation_usage_events = [
-    event for event in continuation_events if event.get("type") == "usage"
+continuation_finished_events = [
+    event for event in continuation_events if event.get("type") == "finished"
 ]
 continuation_usage = (
-    continuation_usage_events[-1]["usage"] if continuation_usage_events else {}
+    continuation_finished_events[-1]["usage"] if continuation_finished_events else {}
 )
 continuation_text = "".join(event["token"] for event in continuation_tokens)
 
 artifact = {
     "model": registered,
-    "gpu": (RESULT_DIR / "phase6a-gpu.csv").read_text(encoding="utf-8").strip(),
+    "gpu": (RESULT_DIR / "phase6b-gpu.csv").read_text(encoding="utf-8").strip(),
     "prompt": PROMPT,
     "response": response_text,
     "continuation": {
@@ -125,6 +125,7 @@ artifact = {
         "usage": continuation_usage,
         "client_wall_ms": continuation_wall_ms,
         "first_streamed_token_ms": continuation_first_ms,
+        "token_event_count": len(continuation_tokens),
     },
     "timing": {
         "client_wall_ms": wall_ms,
@@ -147,11 +148,11 @@ artifact = {
             route in openapi["paths"]
             for route in ("/v1/completions", "/native/contexts")
         ),
-        "stream emitted one event per generated token": len(token_events)
-        == generated
-        and generated > 0,
-        "stream completed with usage": bool(usage_events)
-        and events[-1].get("type") == "finished",
+        "visible stream tokens are bounded by sampled tokens": 0
+        < len(token_events)
+        <= generated,
+        "stream completed with usage": bool(finished_events)
+        and bool(events[-1].get("usage")),
         "response contains generated text": bool(response_text.strip()),
         "server recorded timing and model identity": server_ms > 0
         and usage.get("model_revision") == model["revision"],
@@ -162,15 +163,15 @@ artifact = {
         )
         >= 32,
         "continuation reports generated text and usage": bool(continuation_text.strip())
-        and len(continuation_tokens)
-        == continuation_usage.get("generated_tokens", -1),
+        and 0 < len(continuation_tokens)
+        <= continuation_usage.get("generated_tokens", -1),
     },
 }
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
-output = RESULT_DIR / "phase6a-server.json"
+output = RESULT_DIR / "phase6b-server.json"
 output.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
 
-print("# Cusco Phase 6A persistent mapped server report")
+print("# Cusco Phase 6B incremental generation server report")
 print(f"\nModel: `{model['id']}@{model['revision']}`")
 print(f"Digest: `{model_sha256}`")
 print(f"GPU: `{artifact['gpu']}`")

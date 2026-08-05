@@ -6,19 +6,19 @@ The project separates responsibilities deliberately: Rust will manage logical co
 
 ## Current state
 
-Cusco has completed Phases 1 through 5 and the Phase 6A persistent mapped-core
-milestone. The executor proof established exact checkpoint continuation for a
+Cusco has completed Phases 1 through 5 and the Phase 6A and 6B server
+milestones. The executor proof established exact checkpoint continuation for a
 hybrid/recurrent Gemma model, and the Rust layers now provide durable logical
 contexts, capacity-accounted physical state, transactional mapped activation,
 an authenticated HTTP API, and immutable model registration.
 
 Phase 6A connects those pieces on the live request path: one validated Gemma
-profile owns a process-persistent llama.cpp model and executor slot; opaque
-context continuations reuse complete mapped blocks without model reload or
-valid-prefix reevaluation; and admission accounts for context, prompt, output,
-device, and host capacity before decode. Phase 6B will add the incremental
-generation frontier, followed by bounded lifecycle and acceptance work in
-Phase 6C.
+profile owns a process-persistent llama.cpp model and executor slot, and opaque
+context continuations reuse complete mapped blocks. Phase 6B replaces
+whole-request generation with one-token native decode and request-owned
+sampling, canonicalizes token-piece output at an incremental UTF-8 and
+stop-aware frontier, and streams through a bounded protocol-neutral event
+buffer. Phase 6C lifecycle and acceptance work remains next.
 
 ## Run the real-model inference integration test
 
@@ -63,7 +63,7 @@ tools/server-inference-report.sh
 
 The workflow verifies token streaming, durable context identity, and reuse of
 at least one complete mapped block on the second request. It writes the
-machine-readable evidence to `results/phase6a-server.json`. GPU 1 and port
+machine-readable evidence to `results/phase6b-server.json`. GPU 1 and port
 18082 are defaults; `CUSCO_GPU_DEVICE_ID`, `CUSCO_SERVER_REPORT_PORT`,
 `CUSCO_MODEL_DIR`, and `CUSCO_RESULT_DIR` override them.
 
