@@ -13,7 +13,7 @@ Phase 2 adds Rust-owned logical contexts with immutable, structurally shared tok
 ## Run the real-model inference integration test
 
 With the validation GGUF at `models/gemma-4-e2b-it.gguf`, Docker's NVIDIA
-runtime configured, and GPU 1 available, run:
+runtime configured, and an available NVIDIA GPU, run:
 
 ```sh
 tools/inference-integration-test.sh
