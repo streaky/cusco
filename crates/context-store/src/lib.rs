@@ -141,6 +141,8 @@ pub struct LogicalContext {
     pub model_epoch: ModelEpoch,
     pub adapter_epoch: AdapterEpoch,
     pub evaluated: Option<EvaluatedPrefixId>,
+    /// Monotonic semantic revision used to reject stale prepared publications.
+    pub revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,6 +168,7 @@ struct MappingLookupKey {
 #[derive(Debug)]
 pub struct PreparedPublication {
     context: LogicalContextId,
+    expected_revision: u64,
     expected_current: Option<EvaluatedPrefixId>,
     mapping: EvaluatedPrefix,
 }
@@ -214,6 +217,7 @@ impl ContextStore {
                 tokens,
                 model_epoch,
                 adapter_epoch,
+                revision: 0,
                 evaluated: None,
             },
         );
@@ -235,7 +239,13 @@ impl ContextStore {
             .contexts
             .get_mut(&context)
             .ok_or(Error::ContextNotFound)?;
-        context.tokens = context.tokens.append(tokens);
+        if !tokens.is_empty() {
+            context.tokens = context.tokens.append(tokens);
+            context.revision = context
+                .revision
+                .checked_add(1)
+                .expect("logical context revision exhausted");
+        }
         Ok(())
     }
 
@@ -258,9 +268,16 @@ impl ContextStore {
         adapter_epoch: AdapterEpoch,
     ) -> Result<(), Error> {
         let context = self.contexts.get_mut(&id).ok_or(Error::ContextNotFound)?;
+        if context.model_epoch == model_epoch && context.adapter_epoch == adapter_epoch {
+            return Ok(());
+        }
         let old = context.evaluated.take();
         context.model_epoch = model_epoch;
         context.adapter_epoch = adapter_epoch;
+        context.revision = context
+            .revision
+            .checked_add(1)
+            .expect("logical context revision exhausted");
         if let Some(mapping) = old {
             self.adjust_context_refs(mapping, false);
         }
@@ -318,6 +335,7 @@ impl ContextStore {
         Ok(PreparedPublication {
             context: context_id,
             expected_current: context.evaluated,
+            expected_revision: context.revision,
             mapping: EvaluatedPrefix {
                 id,
                 branch: prefix.id(),
@@ -338,12 +356,12 @@ impl ContextStore {
         &mut self,
         prepared: PreparedPublication,
     ) -> Result<Arc<EvaluatedPrefix>, Error> {
-        let current = self
+        let context = self
             .contexts
             .get(&prepared.context)
-            .ok_or(Error::ContextNotFound)?
-            .evaluated;
-        if current != prepared.expected_current {
+            .ok_or(Error::ContextNotFound)?;
+        let current = context.evaluated;
+        if current != prepared.expected_current || context.revision != prepared.expected_revision {
             return Err(Error::PublicationConflict);
         }
         let context = self.contexts.get(&prepared.context).unwrap();
@@ -352,13 +370,11 @@ impl ContextStore {
         {
             return Err(Error::IncompatibleEpoch);
         }
-        if context
-            .tokens
-            .prefix(prepared.mapping.represented_end)
-            .unwrap()
-            .tokens()
-            != prepared.mapping.tokens
-        {
+        if !sequence_matches_tokens(
+            &context.tokens,
+            prepared.mapping.represented_end,
+            &prepared.mapping.tokens,
+        ) {
             return Err(Error::PublicationConflict);
         }
         let id = prepared.mapping.id;
@@ -398,11 +414,18 @@ impl ContextStore {
                 self.adjust_context_refs(old, false);
             }
             self.adjust_context_refs(id, true);
-            self.contexts.get_mut(&prepared.context).unwrap().evaluated = Some(id);
+            let context = self.contexts.get_mut(&prepared.context).unwrap();
+            context.evaluated = Some(id);
+            context.revision = context
+                .revision
+                .checked_add(1)
+                .expect("logical context revision exhausted");
         }
         Ok(self.mappings[&id].mapping.clone())
     }
 
+    /// Returns immutable mapping metadata. The returned `Arc` does not retain
+    /// catalog membership or, in later phases, any physical representation.
     pub fn longest_valid_prefix(
         &self,
         context_id: LogicalContextId,
@@ -421,10 +444,14 @@ impl ContextStore {
         Ok(self.valid_mapping_for_branch(context, empty_branch_id()))
     }
 
+    /// Reports store-owned logical references; external `Arc` clones are
+    /// metadata snapshots and intentionally are not included.
     pub fn references(&self, id: EvaluatedPrefixId) -> Option<ReferenceCounts> {
         self.mappings.get(&id).map(|entry| entry.references)
     }
 
+    /// Releases the catalog's ownership reference. Caller-held metadata
+    /// snapshots do not keep this mapping discoverable.
     pub fn release_mapping(&mut self, id: EvaluatedPrefixId) -> Result<(), Error> {
         let entry = self.mappings.get_mut(&id).ok_or(Error::MappingNotFound)?;
         entry.references.catalog = entry.references.catalog.saturating_sub(1);
@@ -446,6 +473,7 @@ impl ContextStore {
             || mapping.represented_end > context.tokens.len()
             || child_end.is_some_and(|end| mapping.represented_end > end)
             || context.tokens.prefix(mapping.represented_end).unwrap().id() != mapping.branch
+            || !sequence_matches_tokens(&context.tokens, mapping.represented_end, &mapping.tokens)
         {
             return false;
         }
@@ -525,6 +553,33 @@ impl ContextStore {
             }
         }
     }
+}
+
+fn sequence_matches_tokens(
+    sequence: &PersistentTokenSequence,
+    represented_end: usize,
+    expected: &[Token],
+) -> bool {
+    if expected.len() != represented_end {
+        return false;
+    }
+    if represented_end == 0 {
+        return true;
+    }
+    let mut node = sequence.tail.as_deref();
+    while node.is_some_and(|current| current.len > represented_end) {
+        node = node.and_then(|current| current.parent.as_deref());
+    }
+    for expected_token in expected.iter().rev() {
+        let Some(current) = node else {
+            return false;
+        };
+        if current.token != *expected_token {
+            return false;
+        }
+        node = current.parent.as_deref();
+    }
+    node.is_none()
 }
 
 fn empty_branch_id() -> BranchId {
@@ -629,7 +684,11 @@ mod tests {
             .unwrap();
         assert!(store.longest_valid_prefix(id).unwrap().is_none());
         store.append(id, &[4]).unwrap();
-        let mapping = store.commit_publication(prepared).unwrap();
+        assert_eq!(
+            store.commit_publication(prepared).unwrap_err(),
+            Error::PublicationConflict
+        );
+        let mapping = publish(&mut store, id, 2, None);
         assert_eq!(
             store.longest_valid_prefix(id).unwrap().unwrap().id,
             mapping.id
@@ -660,6 +719,60 @@ mod tests {
             Error::PublicationConflict
         );
         assert_eq!(store.context(id).unwrap().evaluated, Some(committed.id));
+    }
+
+    #[test]
+    fn publication_revision_rejects_aba_binding_changes() {
+        let mut store = ContextStore::default();
+        let id = store.create(
+            PersistentTokenSequence::default().append(&[1, 2, 3]),
+            ModelEpoch(1),
+            AdapterEpoch(1),
+        );
+        let first = store
+            .prepare_publication(id, 1, None, components(), components(), [1; 32])
+            .unwrap();
+        let first = store.commit_publication(first).unwrap();
+        let stale = store
+            .prepare_publication(id, 3, None, components(), components(), [3; 32])
+            .unwrap();
+        let second = store
+            .prepare_publication(id, 2, None, components(), components(), [2; 32])
+            .unwrap();
+        store.commit_publication(second).unwrap();
+        let restore_first = store
+            .prepare_publication(id, 1, None, components(), components(), [1; 32])
+            .unwrap();
+        assert_eq!(
+            store.commit_publication(restore_first).unwrap().id,
+            first.id
+        );
+        assert_eq!(
+            store.commit_publication(stale).unwrap_err(),
+            Error::PublicationConflict
+        );
+    }
+
+    #[test]
+    fn longest_lookup_confirms_tokens_after_hash_match() {
+        let mut store = ContextStore::default();
+        let source = store.create(
+            PersistentTokenSequence::default().append(&[1, 2]),
+            ModelEpoch(1),
+            AdapterEpoch(1),
+        );
+        publish(&mut store, source, 2, None);
+        let published_tail = store.context(source).unwrap().tokens.tail.clone().unwrap();
+        let colliding_sequence = PersistentTokenSequence {
+            tail: Some(Arc::new(SequenceNode {
+                parent: published_tail.parent.clone(),
+                token: 99,
+                len: published_tail.len,
+                hash: published_tail.hash,
+            })),
+        };
+        let collision = store.create(colliding_sequence, ModelEpoch(1), AdapterEpoch(1));
+        assert!(store.longest_valid_prefix(collision).unwrap().is_none());
     }
 
     #[test]

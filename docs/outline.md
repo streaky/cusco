@@ -1319,7 +1319,9 @@ Implement:
 - model and adapter epochs;
 - longest dependency-valid prefix lookup;
 - immutable mapping publication;
-- logical reference accounting.
+- logical reference accounting;
+- monotonic logical-context revisions for ABA-safe prepared publication;
+- hash-indexed lookup with allocation-free literal-token confirmation.
 
 Initially, physical execution may still use a staged arena.
 
@@ -1333,6 +1335,8 @@ Implement:
 - promotion and demotion;
 - transfer and reservation references;
 - prepared transition state machines;
+- a single-writer logical coordinator that performs transfers outside its critical section and commits only against the prepared logical-context revision;
+- typed transfer, reservation, binding, and transition ownership whose lifetimes, rather than metadata `Arc` clones, protect physical residency;
 - eviction policy;
 - metrics and traces.
 
@@ -1343,6 +1347,8 @@ Implement:
 - protocol-neutral inference and model-management services;
 - the useful OpenAI-compatible `/v1` completion and chat surface plus its OpenAPI document;
 - native model fetch, local registration, list, inspect, update-check, verify, alias, and removal APIs;
+- opaque durable logical-context identifiers that cannot be reused across restart, restore, import, or multiple server processes;
+- durable logical-context and revision recovery with atomic restoration of the next externally visible identifier state;
 - request streaming through the shared event abstraction;
 - context and branch APIs;
 - the anonymous-administrator authentication provider and policy checks at every protected operation;
