@@ -179,7 +179,7 @@ Rust should own:
 - authentication and authorization interfaces, even when the initial implementation supplies only an anonymous administrator;
 - implementation-independent usage accounting for prompt, generated, cached, and evaluated work;
 
-Rust may eventually own sampling and token streaming, but that is optional. Keeping sampling in llama.cpp initially reduces compatibility work.
+Rust owns scheduling, decode-quantum boundaries, cancellation, deadlines, stopping policy, and canonical streaming/usage facts. Native execution owns model-compatible sampling primitives and sampler state. A request's sampler state must be suspendable with the request between decode quanta; native code returns selected tokens and the execution facts Rust needs for streaming, usage, and finish reasons. This keeps scheduling preemptible without recreating model-specific sampling behavior in Rust.
 
 ### llama.cpp executor
 
@@ -187,7 +187,7 @@ The native executor should continue to own:
 
 - model loading and architecture metadata;
 - tokenizer and vocabulary semantics;
-- chat-template support, at least initially;
+- chat-template application and token-piece rendering;
 - model tensor definitions;
 - graph construction;
 - backend buffer allocation;
@@ -196,7 +196,7 @@ The native executor should continue to own:
 - architecture-specific memory dependencies;
 - recurrent checkpoint capture and binding;
 - execution of token batches against a supplied valid memory binding;
-- sampling until or unless it is deliberately moved outward.
+- model-compatible sampling primitives and suspendable sampler state.
 
 ### Native ABI shim
 
@@ -226,7 +226,11 @@ In staged execution, physical preparation may assemble a conventional contiguous
 
 External compatibility should be a shim layer over a protocol-neutral application API, not a set of alternate request paths wired directly into scheduling or the executor. To avoid confusion with the native C ABI shim, this proposal calls these modules **protocol adapters**.
 
-The first-class external protocol should be an explicitly versioned local-inference profile of the OpenAI-compatible `/v1` API, described by a generated and checked OpenAPI document. The initial profile should start from the subset that Ollama has demonstrated across common OpenAI clients—model discovery, chat and text completion, streaming, reproducible sampling controls, structured output, tools where supported, embeddings when the server gains that capability, and the stateless Responses shape—then narrow or extend it deliberately according to this project's implementation. Ollama's current compatibility matrix is a useful evidence base, not a normative dependency or a promise to reproduce every field: <https://docs.ollama.com/api/openai-compatibility>. “Compatible” does not mean copying unrelated hosted-service features such as billing, organization administration, fine-tuning, or cloud-resource APIs.
+The first-class external protocols are an explicitly versioned local-inference profile of the OpenAI-compatible API under `/openai/v1/*` and the Ollama native API under `/ollama/api/*`. Cusco-specific lifecycle extensions occupy `/cusco/v1/*`. All three surfaces must be described by generated, checked OpenAPI documents and must normalize into the same protocol-neutral services. The compatibility clients Cusco targets must accept a configured subdirectory base URL; conformance tests must exercise the prefixed paths through representative clients, with Open WebUI configuration through both its OpenAI-compatible and native Ollama connection types as an explicit acceptance check. If that assumption proves materially incompatible in practice, the prefixes may be revised before the production contract is frozen rather than retaining duplicate aliases. Ollama's current OpenAI compatibility matrix is useful evidence, not a normative dependency or a promise to reproduce every field: <https://docs.ollama.com/api/openai-compatibility>. “Compatible” does not mean copying unrelated hosted-service features such as billing, organization administration, fine-tuning, or cloud-resource APIs.
+
+The Phase 9 OpenAI profile must be fixed before implementation and tested as a behavioral contract. It includes model discovery, text and chat completion, streaming, deterministic and commonly used sampling controls, stop handling, structured output, tool calls where the selected model supports them, embeddings once the executor exposes them, and the stateless Responses shape. Compatibility covers request defaults and validation, model-name resolution, chat-template application, terminal-token suppression, whitespace semantics, finish and stop reasons, usage accounting, error envelopes, cancellation, and streaming framing—not merely endpoint names or JSON shapes. Durable contexts, branches, cache policy, extended usage, model administration, billing, organization administration, and other hosted-service control planes are outside the OpenAI surface and use the appropriate Cusco or Ollama contract.
+
+Phase 9 multimodal input is deliberately limited to text plus images for chat and stateless Responses requests on models whose llama.cpp executor path exposes a compatible vision projector. The OpenAI adapter accepts typed content parts and `image_url` data URIs; the Ollama adapter accepts its native inline image representation. Remote URL fetching, audio, video, image generation, and cross-model media pipelines are later work. Image bytes must be size-bounded, content-addressed for request and cache identity, decoded once, and tied to the model/projector epoch; unsupported media or models fail before admission rather than silently degrading to text.
 
 The internal boundary should normalize each adapter into the same operations and event stream:
 
@@ -265,17 +269,17 @@ trait ContextLifecycleService {
 
 Protocol adapters may map native fields or extension objects onto these canonical operations. A selected strategy is part of request and context policy, not model identity, and authorization policy must govern strategy enumeration, selection, registration, and execution.
 
-The OpenAI-compatible adapter will itself require documented local extensions for capabilities that the hosted protocol does not model, including durable logical contexts, branch selection, cache policy, extended usage, and possibly context-strategy selection. Those extensions should occupy an explicit versioned namespace or native companion endpoint, remain visible in the generated OpenAPI document, and degrade predictably for unextended OpenAI clients. They must not be smuggled into unrelated standard fields.
+Capabilities that neither compatibility protocol models—including durable logical contexts, branch selection and import, cache and compaction policy, activity hints, extended usage, and explicit request cancellation—belong to the versioned `/cusco/v1/*` API. They must remain visible in the generated OpenAPI document and must not be smuggled into unrelated OpenAI or Ollama fields. The final Phase 9 surface contains no `/native/*` routes.
 
 Canonical request types must preserve information needed by the implemented OpenAI profile and by plausible future protocol families without embedding any protocol's JSON schema into `server-core`. The adapter owns field names, defaults, error envelopes, streaming framing, and protocol-specific model-name syntax. The core owns validation, scheduling, context semantics, execution, and usage facts.
 
-Protocol research should account for three families even though only one adapter is initially committed:
+Two adapters are committed through Phase 9, while a third remains a post-completion compatibility option:
 
-1. **OpenAI-compatible `/v1`:** first-class in the minimal server and the reference compatibility contract. Ollama's implemented OpenAI subset is a pragmatic starting profile because it identifies fields and endpoint shapes already useful to local-inference clients.
-2. **Ollama native API:** a source of requirements for a quality local-inference boundary, particularly administrative model pull, list, show, and remove operations that OpenAI and Anthropic inference APIs do not model. Cusco's native administrative API should express those capabilities whether or not an Ollama wire adapter is ever shipped.
-3. **Anthropic Messages API:** a source of requirements for canonical messages, content blocks, tool use, stop reasons, usage, and streaming semantics. An Anthropic adapter is optional, but the core should not make it needlessly expensive or lossy.
+1. **OpenAI-compatible `/openai/v1`:** first-class in the reference compatibility contract. The minimal server's existing `/v1` surface migrates to this namespace during the Phase 9 clean cutover.
+2. **Ollama native `/ollama/api`:** the canonical public local-inference and model-lifecycle adapter. Its Phase 9 contract includes native generate, chat, embeddings when supported, model list/show, pull, copy, and delete behavior, including streaming and error semantics, without creating a second scheduler, registry, or executor path. Pull is convergent rather than create-only: it resolves the requested symbolic revision, compares it with the installed immutable identity, verifies every existing artifact before reuse, repairs incomplete or corrupt content, and transactionally publishes an updated record when the resolved identity changes.
+3. **Anthropic Messages API:** a source of requirements for canonical messages, content blocks, tool use, stop reasons, usage, and streaming semantics. Its wire adapter is deferred to the post-completion roadmap; the core should still avoid making a later high-quality adapter needlessly expensive or lossy.
 
-Studying a protocol is not a commitment to implement its adapter. The purpose is to distinguish broadly useful application semantics from wire-specific conventions early enough that a later adapter, if justified, remains a thin and high-quality shim rather than a second execution path.
+Protocol study still does not justify leaking wire schemas into the core. Its purpose is to distinguish broadly useful application semantics from wire-specific conventions so every adapter remains a thin shim rather than a second execution path.
 
 Efficiency requires more than translating JSON. Adapters should share zero-copy or bounded-copy request bodies where practical, use one backpressure-aware internal event stream, avoid retokenizing merely to populate compatibility fields, and derive all usage views from one execution record. Chat templates and tool schemas may require protocol-specific normalization before tokenization, but tokenization and model execution must happen only once.
 
@@ -306,14 +310,51 @@ hf://models/organization/model@revision/path/to/model.gguf
 The `model` field accepted by inference APIs and the CLI should resolve:
 
 - an installed model's `hf://` identifier;
-- an explicit local alias assigned at fetch or registration time; or
-- an installed local-file model record whose source was registered from an absolute or explicitly resolved path.
+- an alias published by Ollama pull or copy; or
+- a configured local model name declared in `data/user.yaml`.
 
-Hugging Face is the preferred acquisition path, but it is not the only loading path. A local GGUF must be usable without copying it into the Hub cache or pretending that it has an `hf://` identity. Local-file registration is an administrator operation that canonicalizes the path, verifies that the file is regular and readable, computes or records its content digest, probes executor metadata, and atomically publishes a `ModelRecord`. Inference still addresses that installed record by alias or immutable model ID; arbitrary request-supplied filesystem paths must not bypass registration, authorization, provenance, or compatibility checks.
+Hugging Face is the preferred acquisition path, but it is not the only loading path. Operator-owned GGUF and projector files are mounted read-only under `/models/user` and declared in the read-only `/etc/cusco/user.yaml`; every configured file path is relative to that model root. They are never registered through an HTTP API, copied into the managed Hub cache, or assigned a fictitious `hf://` identity. Arbitrary request-supplied filesystem paths must not bypass configuration, provenance, compatibility checks, or the mounted path boundary.
 
-If no alias is supplied for a Hub model, the normalized `hf://` URI is the model's public name. A local-file registration should require an alias or assign a stable content-derived model ID rather than exposing host paths as public protocol identifiers. `ModelRecord` should distinguish `HubSnapshot` and `LocalFile` source provenance; a local record retains its canonical path, size, digest, registration time, and last verification time, while a Hub record retains repository and revision provenance.
+For a Hub-backed model, resolution must pin the repository to its immutable commit and record the identities of every selected metadata artifact alongside the GGUF. Cusco should consume declarative repository files when present—including model configuration, tokenizer and special-token configuration, tokenizer vocabulary/model data, generation configuration, and chat templates—as candidate profile inputs rather than discarding the first-class metadata surrounding the weight file. It must not import or execute repository Python, `trust_remote_code`, custom kernels, or arbitrary template extensions. Repository metadata is not independently authoritative: converted GGUF repositories may omit it, carry files from a different source revision, or disagree with the tokenizer and template embedded in the selected GGUF. Cusco therefore compares its tokenizer/vocabulary fingerprint, special-token IDs, rendered template fixtures, architecture metadata, and declared limits with the loaded GGUF and executor probe and fails closed on a correctness-relevant mismatch. Effective context capacity remains the minimum of trustworthy repository/model metadata, the operator cap, and the executor's usable runtime capacity; Hub metadata cannot describe current backend allocation limits.
 
-Inference is lookup-only with respect to model installation: it must never initiate, enqueue, or wait for a network fetch, and it must not implicitly register a local path. An unavailable reference returns a stable “model not installed” error with the canonical identifier. Model acquisition and local registration are separate administrator-only operations on the native model-management API, with their own authorization, progress where applicable, cancellation, capacity checks, and failure lifecycle.
+The local-model declaration should require only a public name and path. Cusco must derive everything safely available from the GGUF and executor probe—including architecture, tokenizer and vocabulary identity, embedded chat template, training context, RoPE metadata, quantization, tensor layout, and supported capabilities—and persist the resulting immutable identity in SQLite. Optional declarations may pin `sha256`, cap `max_context_length`, override a chat template, identify a vision projector, or reference a configured draft model. A context cap may reduce an inferred limit but must not expand a model or executor limit. Execution placement such as GPU layers, tier budgets, and concurrency belongs to runtime policy, not model identity.
+
+Cusco may extend model support from above through a versioned Rust-owned execution profile selected from verified Hub repository metadata when available, GGUF metadata, and executor capabilities. Profile selection may use declarative family signatures such as architecture/model type, tokenizer identity, special-token layout, chat-template structure, and executor capability descriptors. This deliberately allows later built-in family support to be expressed as data and validation rules rather than model-name conditionals: an unknown Hub model may match a known family profile only after its required predicates and conformance fixtures pass, while an unmatched model may use a generic profile only when the native executor exposes every required fact. A profile may supply declarative interpretation that the executor can already express: chat templates, role and turn markers, terminal and control-token sets, tokenizer configuration, model-family aliases, capability declarations, output normalization, projector association, and validated metadata corrections. The immutable profile identity includes the resolved Hub metadata artifact identities, selected profile version, validated declarations, GGUF identity, and executor compatibility epoch, so changing any correctness-relevant input invalidates evaluated state and resident compatibility.
+
+Built-in family support should have one repository-owned, schema-versioned declarative source such as `model-profiles/families.yaml`. This catalog is the review and contribution interface for family support that needs no new execution mechanics. Each entry has a stable profile ID and version; bounded, non-executable match predicates over Hub, GGUF, tokenizer, and executor facts; deterministic ambiguity/precedence rules; permitted metadata interpretations and source precedence; template and role-marker declarations; terminal/control-token invariants; output-normalization policy; capacity constraints that can only narrow probed limits; and references to conformance fixtures. The schema forbids arbitrary expressions, code hooks, remote includes, and silent unknown fields. A pull request that adds a family must make its claimed match surface and behavioral evidence reviewable in this catalog rather than scattering model-name checks through Rust.
+
+A deterministic repository tool validates the YAML, rejects overlapping or under-specified matches, checks fixture identities and expected template/token behavior, and compiles the catalog into a static Rust representation included in the server binary. Normal Cargo and container builds must require no network access or model download for this compilation, and CI must verify that generated output is reproducible and current. A companion scaffolding command may resolve a pinned `hf://` model, download its declarative metadata, probe an available GGUF through the native executor, and propose a new catalog entry and fixtures, but generated claims remain untrusted until schema checks, exact fixtures, executor capability checks, and review pass. If a candidate requires new tensor, graph, kernel, or checkpoint mechanics, the tool must report that boundary rather than manufacturing a family profile.
+
+The model registry remains responsible only for immutable resolution, acquisition, hashing, provenance, and artifact publication. It stores repository metadata files as verified opaque artifacts and does not interpret them into execution policy. A separate profile-catalog component lazily decodes only the metadata needed for a selected model, combines it with the GGUF and executor probe, validates the compiled family schema, and produces the immutable execution profile. This keeps network/artifact identity separate from model semantics and avoids parsing large tokenizer metadata during unrelated registry operations.
+
+This extension mechanism must not become a parallel model executor. Tensor layouts, architecture-specific recurrent state, attention and RoPE mechanics, graph construction, expert routing, checkpoint tensor semantics, and kernels remain llama.cpp responsibilities. When a new model requires those mechanics, Cusco should carry a narrow, reviewable llama.cpp patch or wait for upstream support rather than reconstructing execution in Rust.
+
+This creates three explicit support levels. **Declarative family support** covers variants whose tensor and tokenizer mechanics llama.cpp already executes; Cusco may recognize, validate, template, normalize, cap, and release-gate those variants entirely through the compiled catalog. **Native-boundary enablement** covers an already-implemented llama.cpp mechanic that is missing a capability probe, stable descriptor, checkpoint component, or narrow metadata correction; Cusco may carry a small versioned shim or executor patch behind its C ABI. **New execution mechanics** cover unsupported tensor layouts, graph operations, attention/recurrent behavior, quantization, expert routing, or backend kernels; these require an upstream implementation or a deliberately maintained llama.cpp patch and cannot be manufactured by profile data. The pinned executor tag, patch series, capability fixtures, and profile conformance tests let Cusco choose when support enters or leaves its release rather than inheriting upstream claims automatically, but they do not remove the maintenance cost of native architecture support.
+
+The automation target is that ordinary additions stop at the declarative level and most native-boundary gaps disappear through one sufficiently generic ABI rather than recurring family patches. Catalog entries declare required native capabilities and component invariants; they never assert that an executor implements them. The native probe reports those facts using a family-neutral descriptor vocabulary, and the catalog compiler generates matching and validation code around that probe. If the executor already implements all requested mechanics, adding a family changes only YAML and fixtures. If a new model exposes another instance of an existing capability category, the generic probe or generated descriptor table should cover it without handwritten family dispatch. Only a genuinely new primitive or descriptor kind extends the ABI once for all families. The contributor tool should classify failures as catalog-only, metadata/probe exposure, or missing execution mechanics and generate the catalog and fixture portions while refusing to disguise the last category as data.
+
+Missing execution mechanics are therefore not necessarily blocked on upstream release timing. Cusco's pinned llama.cpp patch series is the supported downstream extension path. The profile tool may use the resolved model metadata, GGUF inspection, failed capability checks, fixture traces, and analogous supported architectures to produce an evidence bundle and, where sufficiently constrained, a candidate native patch, ABI descriptor update, and conformance tests. A profile may reference a repository-owned native-extension identifier, but YAML must never embed C++, fetch executable patch code, or mark the capability as present. The implementation remains a separately reviewed patch under `executor/patches`, applied reproducibly to the pinned tag; only the patched executor's capability probe and exact native fixtures can enable the profile. This can remove upstream release latency and automate much of diagnosis and scaffolding, while keeping model-specific kernel and state-transition correctness subject to native review and proof.
+
+Phase 6 does not require automated native-patch synthesis or a generalized extension marketplace. The initial escape hatch is intentionally manual: add a reviewed patch to the existing ordered series, expose its capability through the generic ABI, attach exact fixtures, and reference that capability from the family profile. More automated diagnosis or patch proposals are justified only if repeated real model additions demonstrate that they save maintenance effort.
+
+Compatibility epochs are derived from canonical immutable semantic inputs—the catalog schema and selected profile contents, resolved Hub commit and artifact digests, GGUF identity, validated declarations, and executor compatibility version—not from generated Rust source, `OUT_DIR` bytes, object layout, compiler identity, or other build-environment artifacts. The generated catalog is an implementation representation whose reproducibility is checked independently; equivalent inputs must produce the same compatibility identity across builders.
+
+For example:
+
+```yaml
+models:
+  my-gemma:
+    path: my-gemma.gguf
+    sha256: 0123456789abcdef… # optional integrity pin
+    max_context_length: 8192  # optional cap
+    projector: my-gemma-mmproj.gguf # optional
+```
+
+At startup Cusco requires every configured model, projector, and draft-model path to be relative, joins it beneath `/models/user`, canonicalizes the result, and rejects absolute paths, `..` traversal, symlink escape, and non-regular or unreadable files. It then computes and optionally checks digests, probes model metadata, and transactionally reconciles derived `LocalFile` records with SQLite. `user.yaml` is the source of truth for the configured set; deleting a declaration removes the record only when no active reference prevents reconciliation. Phase 6 does not live-reload or watch these files: operators replace files while the service is stopped and restart it, so bytes cannot change beneath an active model mapping.
+
+If no alias is supplied for a Hub model, the normalized `hf://` URI is the model's public name. `ModelRecord` distinguishes `HubSnapshot` and configured `LocalFile` provenance; a local record retains its configured name, canonical path, size, digest, discovery time, and derived metadata, while a Hub record retains repository and revision provenance.
+
+Inference remains lookup-only with respect to model installation: it never initiates, enqueues, or waits for a network fetch and never accepts an undeclared local path. An unavailable reference returns a stable “model not installed” error with the canonical identifier. Through Phase 5, the implemented native registration API remains transitional. Phase 9 removes it and makes Ollama's model-lifecycle routes plus startup reconciliation from `user.yaml` the complete public model-discovery and installation contract.
 
 The Rust model service should use the Hugging Face Hub client rather than scrape web pages or shell out to a CLI. The current `hf-hub` client supports repository metadata, revision-aware snapshot downloads, conditional requests, atomic cache writes, and cache inspection. If a required Hub feature is temporarily absent from the Rust client, it should be implemented behind the model-source trait or delegated to a small isolated helper, not leaked into inference handlers.
 
@@ -360,21 +401,19 @@ That lane is valuable because speculative execution stresses checkpoint identity
 
 Symbolic branches and tags are convenient acquisition requests, but a loaded model epoch must bind to the resolved commit and exact artifact set. Updating `main` therefore installs a new record and invalidates compatible execution state through an epoch change; it must never mutate the identity beneath a running model.
 
-The administrator-only native Cusco API and its CLI client should support:
+The canonical Phase 9 model-lifecycle API is Ollama's:
 
-- fetch or refresh a Hub repository revision;
-- register an explicit local model file without copying it;
-- list installed models, revisions, source types, aliases, sizes, and load state;
-- inspect provenance and executor metadata;
-- check whether a symbolic Hub revision resolves to a newer commit;
-- verify Hub-cached artifacts and detect a changed or missing local file;
-- assign or change an alias without changing immutable model identity;
-- remove a model record or clear eligible Hub cache content;
-- report why a record or artifact cannot be removed because it is loaded, pinned, or referenced.
+- `GET /ollama/api/tags` lists installed models, immutable revisions, aliases, sizes, and load state;
+- `POST /ollama/api/show` reports source provenance and executor metadata;
+- `POST /ollama/api/pull` installs or converges a model to the requested source identity;
+- `POST /ollama/api/copy` assigns another public name without changing immutable model identity;
+- `DELETE /ollama/api/delete` removes a model record and eligible artifact content, or reports why loaded, pinned, or referenced state prevents removal.
 
-Downloads, updates, and deletions require per-model coordination, temporary-file cleanup, atomic publication, capacity checks, and cancellation. Cache management must distinguish the Hugging Face artifact cache from the evaluated model-state cache described elsewhere in this proposal.
+`/ollama/api/pull` carries update checking and verification as mandatory lifecycle behavior rather than exposing them as separate public maintenance operations. Every pull resolves symbolic Hub revisions to immutable identities, validates cached sizes and digests before reuse, resumes or repairs incomplete content, and no-ops only when the installed record is both current and valid. A changed identity is prepared as a new immutable record and published atomically; it must not mutate the identity beneath active mappings or in-flight requests.
 
-Cusco's native model-management API is intentionally an extension beyond OpenAI- and Anthropic-compatible inference surfaces. A future Ollama adapter can map its pull and model-management semantics onto the same `ModelService`; protocol adapters must not become independent model stores.
+Local files require no native registration exception: they are discovered exclusively from `user.yaml` and exposed through the same model list and show views as pulled artifacts. Separate native register, list, show, pull/fetch, update-check, verify, alias/copy, and delete routes should be removed once their Ollama equivalents and startup reconciliation are complete.
+
+Downloads, updates, verification, repair, and deletions require per-model coordination, temporary-file cleanup, atomic publication, capacity checks, and cancellation. Cache management must distinguish the Hugging Face artifact cache from the evaluated model-state cache described elsewhere in this proposal. Both Ollama routes and the CLI call the same protocol-neutral `ModelService`; neither owns an independent model store.
 
 ## Command-line interface
 
@@ -385,20 +424,17 @@ cusco serve
 cusco run <model-reference>
 cusco chat <model-reference>
 cusco complete <model-reference>
-cusco model fetch <hf-uri> [--alias NAME]
-cusco model register <local-path> --alias NAME
+cusco model pull <hf-uri> [--alias NAME]
 cusco model list
-cusco model inspect <model>
-cusco model check-update <model>
-cusco model update <model>
-cusco model verify <model>
-cusco model remove <model>
+cusco model show <model>
+cusco model copy <source> <destination>
+cusco model delete <model>
 cusco cache status
 cusco context list
 cusco context inspect <context-id>
 ```
 
-Before the HTTP server exists, commands may invoke the application services in-process. Once the daemon exists, the same CLI should default to the native administrative API, with an explicit local/in-process mode for proofs and recovery. Output should support stable machine-readable JSON in addition to human-readable tables. Destructive operations require confirmation unless a non-interactive flag is supplied.
+Before the HTTP server exists, commands may invoke the application services in-process. Once the daemon exists, the same CLI should default to the Ollama and Cusco extension APIs, with an explicit local/in-process mode for proofs and recovery. Configured local models are edited declaratively in `data/user.yaml`, not registered imperatively by the CLI. Output should support stable machine-readable JSON in addition to human-readable tables. Destructive operations require confirmation unless a non-interactive flag is supplied.
 
 The CLI provides the earliest usable path for loading a Hub model, running inference, exercising capture and restore, inspecting usage, and managing local artifacts. HTTP adapters should be built over those already-tested service contracts rather than becoming the first integration point.
 
@@ -529,18 +565,23 @@ Speculative compaction must have its own admission class. It may consume only ca
 
 ## Token identity is not evaluated-state identity
 
-A token block can be identified from its literal tokens. An evaluated block must also encode the history and model configuration on which its state depends.
+A token payload can be identified from its literal tokens, but its position in a logical context must also name its exact ancestry. Every model/profile epoch begins at one canonical zero-token root. Every non-root logical block is an immutable parent-relative token delta with exactly one parent:
 
 ```text
-token block identity = hash(tokens)
+token payload identity = hash(tokens)
 
-evaluated block identity = hash(
-    model epoch,
-    adapter epoch,
-    parent dependency identity,
-    token block identity,
+logical block identity = hash(
+    root identity,
+    parent logical block identity,
+    token payload identity
+)
+
+evaluated mapping identity = hash(
+    model and profile epochs,
+    logical block identity,
     evaluation parameters,
-    component dependency summary
+    component dependency summary,
+    executor and representation compatibility epochs
 )
 ```
 
@@ -554,46 +595,66 @@ in general, even when the suffix tokens are identical.
 
 Exact matching prefixes remain the primary reusable unit. Finite-window components may permit additional reuse, but only when their complete dependency identities match.
 
+## Logical block tree and physical materializations
+
+Logical contexts form an immutable, structurally shared, copy-on-write tree rooted at the zero-token initial sequence state. A branch is a head plus the unique parent walk to that root; forking adds a new suffix and never copies or mutates shared ancestors. The root may be a symbolic executor initial-state factory rather than a serialized buffer, and model-global weights are not part of it.
+
+Logical blocks contain parent identity and tokens, not a mandated byte-level difference of native state. “Delta” describes their parent-relative semantic position: ordinary KV may naturally have interval representations, while a recurrent transition may require replay or an opaque cumulative native state. A logical block may exist without any evaluated representation.
+
+Evaluated state is an optional, independently managed acceleration associated with a logical tree position. It may be cumulative, block-mapped, replayable, or architecture-specific; cumulative materializations at arbitrary heads act as restoration shortcuts without becoming different logical node types. Retaining a descendant preserves cheap logical ancestry but does not pin ancestor device, host, or storage representations. Only preparation for execution must establish a valid executable dependency closure, using a compatible cumulative materialization when available or reconstructing forward from an ancestor or the root. Promotion, demotion, transfer, persistence, and eviction otherwise operate on physical representations independently.
+
 ## Composite evaluated state
 
-A block or checkpoint should identify one coherent evaluated interval across every model-state component required by the architecture.
+An evaluated mapping should identify one coherent logical prefix across every model-state component required by the architecture.
 
 Conceptually:
 
 ```rust
-struct EvaluatedBlock {
-    logical_id: EvaluatedBlockId,
+struct EvaluatedMapping {
+    logical_head: LogicalBlockId,
     lineage: DependencyHash,
-    begin: Position,
-    end: Position,
+    represented_end: Position,
     capabilities: ComponentMask,
     global_kv: Option<PhysicalRepresentationId>,
     swa: Option<PhysicalRepresentationId>,
-    recurrent: Option<RecurrentCheckpointId>,
+    recurrent: Option<PhysicalRepresentationId>,
     dependencies: DependencySummary,
     completion: CompletionFence,
 }
 ```
 
-The logical block does not contain raw addresses. Each component points to a physical representation that may have device, host, or storage copies.
+The mapping contains no raw addresses. Each component names a physical representation that may have device, host, or storage copies and may cover one interval or a cumulative prefix according to the executor capability contract.
 
-Every component in a composite block must refer to the same logical lineage and represented boundary. A block is executable only when all architecture-required components are present, complete, and dependency-valid.
+Logical-block completeness and evaluated-mapping completeness are distinct. A full logical block is complete once its canonical token interval is immutable. An evaluated mapping is publishable only when every architecture-required component refers to the same logical lineage and ending boundary, its declared dependencies are valid, and its native completion fence has completed. No parent physical representation is required merely to retain or move the mapping; an executable dependency closure is required only when preparing to run from it.
 
 ## Canonical block geometry
 
-A logical block should use one canonical token interval across all participating components. With a 32-token logical block:
+A logical block should use one canonical token interval. With a 32-token logical block:
 
 ```text
-logical block 417 = token positions [13344, 13376)
+logical block 417 = parent block 416 + token positions [13344, 13376)
 
-base KV layer 0:       [13344, 13376)
-base KV layer 1:       [13344, 13376)
-...
-SWA representation:   dependency-valid representation for this interval
-recurrent component:  checkpoint required to continue at boundary 13376
+possible physical accelerations associated with its head:
+base KV interval:       [13344, 13376)
+SWA representation:    dependency-valid interval or cumulative state
+recurrent component:   replay transition or cumulative boundary state
 ```
 
-The physical layout may differ by component, but the logical lineage and boundary must agree. Allowing each component to choose unrelated block boundaries would make atomic composition, reference accounting, and dependency validation significantly more difficult.
+Physical component layouts and cumulative materialization cadence may differ, but every evaluated mapping must identify the same logical lineage and ending boundary. The logical tree must not require byte-level native deltas or a standalone recurrent checkpoint at every block. Executor capabilities describe how the required closure is assembled; physical policy may retain periodic cumulative anchors to bound replay cost without changing the tree.
+
+### Publication of completed blocks
+
+Prefill and generation extend one continuous request-private successor branch; cache identity does not distinguish tokens replayed from an existing logical tail, supplied by the new prompt, or selected during decode. Whenever that stream fills a canonical logical block and its dependency-valid evaluated mapping completes, the coordinator may transactionally publish both immediately rather than waiting for generation or terminal response completion. A block assembled across a prior tail and new input is ordinary once full. Publishing reusable evaluated state does not select the successor as the caller-visible durable continuation and never mutates the source branch.
+
+Partial tails are computed as necessary inside the live execution but are not published into the evaluated-state cache, serialized, or retained after request cleanup. If later input fills the interval, the server reevaluates the saved logical tail tokens and publishes the resulting full block; it never inserts model-visible padding tokens or invents a logical boundary merely to make a tail cacheable. After cancellation, deadline expiry, or an observed disconnect, the request coordinator stops admitting new work, abandons incomplete state, and releases its references without issuing cache rollback, demotion, or eviction. Complete published blocks remain detached ordinary cache state under the independent physical-manager lifecycle: exact-prefix lookup may reuse all or part of them for a later request, including a non-bit-identical retry with a matching prefix, while normal reference accounting, placement, demotion, and eviction decide their value and reclaim them. Any future partial-tail optimization is post-completion work and must preserve exact token, length, lineage, model/profile epoch, and representation-compatibility checks without weakening the canonical full-block contract; variable-length tail identities, packing multiple tails into larger physical pages, or allocator padding that is invisible to model execution remain possible implementation choices.
+
+### Request termination and transport delivery
+
+The HTTP response task owns an observable liveness signal carried through queue admission, coordination, and the native abort callback. Cancellation, deadline expiry, or a detected disconnect before completion stops further planning, promotion, mapping preparation, prefill, and decode at the earliest transactionally safe boundary. The server should check liveness before each expensive transition and decode quantum; already-submitted native work may quiesce behind its fence, but it cannot publish incomplete state or mutate the immutable source. This contract acts on server-observed liveness only: successful delivery or client-side processing cannot be proven and is not part of server correctness.
+
+Successful completion linearizes when the coordinator has stopped generation, finalized canonical output, finish reason, and usage, validated the expected source revision, reserved bounded response-buffer capacity for the terminal event, and atomically selected the caller-visible logical successor. A disconnect or cancellation observed before that commit prevents successor selection; one observed after it may prevent delivery but does not roll back the committed logical result. The terminal event is enqueued immediately after the commit from the already-reserved capacity.
+
+The selected logical successor records the exact completed sampled-token sequence even when generation ends between canonical block boundaries. This includes profile-declared terminal or control tokens suppressed from presentation and the complete token whose rendered piece first completes a caller-supplied textual stop sequence; Cusco must not retokenize the visible substring or fabricate a token history the model did not sample. Every retained sampled token consumes the request's token limit and contributes to canonical generated-token usage, while delivered text is accounted separately. A server-owned opaque context therefore continues the exact native path. A stateless client that later replays only visible text may diverge at the final token and receives reuse only through the longest literally matching prefix; this is an expected semantic branch, not permission to attach incompatible state. Retaining logical history is distinct from caching evaluated state: the durable evaluated mapping ends at the last complete published block, so a later continuation reevaluates any uncached logical tail before appending new input. Request termination releases request-owned references and incomplete state, while published blocks remain entirely under ordinary physical-manager policy.
 
 ## Model capability descriptors
 
@@ -687,33 +748,67 @@ discardable
 
 These states have different reclaimability. A device-only block is not immediately reclaimable if preserving the logical branch would first require a host copy. A block whose exact host representation already exists can surrender its device pages much more quickly.
 
-## Capacity policy
+## Capacity policy and native operating points
 
-The allocator should distinguish committed execution capacity from opportunistic warm-cache capacity.
+Device memory is not a single least-recently-used pool. The allocator and residency scheduler must distinguish memory required for correct execution, the operator-selected model operating point, request reservations, reusable context state, and optional native acceleration. In particular, the maximum VRAM a model could profitably consume is not its admission requirement.
+
+For each loaded model on a device, capacity is divided conceptually into:
+
+1. **Correctness floor:** mandatory weights, backend state, and other allocations below which native execution cannot run correctly.
+2. **Competent model floor:** the selected placement configuration considered operationally acceptable, including the correctness floor and any additional resident layers or experts needed to avoid an operator-defined pathological offload mode.
+3. **Admitted execution reserve:** per-slot graph workspace, scratch, architecture-required KV/SWA/recurrent growth through each request's admitted maximum continuation, sampler state, and publication or rollback headroom.
+4. **Request-required mapped state:** representations pinned by current bindings or prepared transitions.
+5. **Protected context cache:** reusable evaluated blocks that the Cusco residency policy has deliberately retained on the device.
+6. **Uncommitted elastic capacity:** the remainder, which native model residency, context promotion, prefetch, or other accelerations may borrow only under an explicit budget and reclamation contract.
+
+The correctness and competent floors are different. A large MoE model may be technically executable with extensive expert offload, competent at a bounded device placement, and capable of consuming the entire device if allowed to retain every expert. Rust policy selects the competent operating point; the native executor implements its tensor, expert-routing, and kernel mechanics. Cusco may evict optional context cache to establish the selected competent floor and the reserves required by admitted execution, but it must not evict valuable context cache merely to improve native model residency beyond that operating point.
+
+The same rule applies to dense layer offload, CUDA graph caches, multimodal projectors, adapters, and future draft models. Rust should consume normalized native capability data rather than branch on model-family names. Conceptually, the executor should expose feasible operating points with fields equivalent to:
+
+```rust
+struct NativeOperatingPoint {
+    placement: NativePlacementDescriptor,
+    required_model_bytes: u64,
+    required_slot_bytes: u64,
+    request_growth_geometry: RequestGrowthGeometry,
+    elastic_limit_bytes: u64,
+    reclaimability: NativeReclaimability,
+}
+```
+
+Native code is authoritative for architecture-specific geometry and must either provide a conservative bound, execute within a fixed preallocated pool, or expose a bounded paging and trimming contract. If routing-dependent or backend allocation cannot be bounded for a configuration, that configuration is not admissible. “Competent” remains operator policy informed by executor-provided placements and measurements; it is not inferred from a model name and should eventually be expressed through a latency or placement objective rather than hidden constants.
 
 Let:
 
-- $C$ be total device block capacity;
-- $A$ be blocks pinned by active bindings;
-- $G$ be blocks reserved for active growth;
-- $T$ be blocks reserved by in-flight transitions;
-- $W$ be inactive warm blocks.
+- $C$ be usable device capacity after non-Cusco driver overhead and allocator headroom;
+- $M$ be the selected competent model floor;
+- $E$ be admitted per-slot and per-request execution reserves;
+- $A$ be request-required active mappings;
+- $T$ be prepared-transition and delayed-fence reservations;
+- $W$ be protected or opportunistic context-cache residency;
+- $X$ be elastic native residency above the selected operating point.
 
-The safety invariant is approximately:
-
-$$
-A + G + T \leq C
-$$
-
-Warm blocks may consume the remainder:
+The hard admission invariant is:
 
 $$
-W \leq C - (A + G + T)
+M + E + A + T \leq C
 $$
 
-but must be reclaimable before an active request reaches its reserved limit.
+The remaining allocations must obey:
 
-This supports the premium deployment mode: if a model and its maximum active context require only part of device memory, spare VRAM can hold additional branch blocks. Those blocks accelerate revisits without endangering the capacity guaranteed to the active workload.
+$$
+W + X \leq C - (M + E + A + T)
+$$
+
+but $X$ has no automatic priority over $W$. The residency policy explicitly decides how much of the remainder is protected for reusable context state. Native execution may consume only its assigned elastic budget; it must not allocate through the protected-cache boundary merely because free physical pages are momentarily visible.
+
+Before admitting a request, Rust obtains the native execution requirement for the selected operating point and request geometry, adds transition and allocator headroom, plans any necessary cache demotion, completes and validates those transitions, and atomically establishes the reservations. Reclamation should prefer speculative or prefetched state, inexpensive host-backed duplicates, low-value inactive blocks, and then other safely demotable mappings. State required by the admitted request should not be evicted merely to reconstruct it immediately through a slower path.
+
+An unexpected native allocation failure is a transactional fault, not ordinary scheduling control flow. The operation must abort without invalidating the prior binding. Rust may refresh capacity information, reclaim remaining optional state, and retry only when the operation is explicitly retry-safe and a new reservation has been established. Repeated underestimation or an executor that exceeds its declared budget makes that model operating point unhealthy.
+
+Phase 6 may use one statically configured operating point and fixed executor-pool budget. Phase 7 owns dynamic selection, model load and unload, and competition between native elastic residency and context-cache value. Later measurement may tune that competition, but correctness must never depend on learning the required floor by provoking an out-of-memory failure.
+
+This supports the premium deployment mode: when the selected competent model placement and maximum admitted execution use only part of a device, spare VRAM can retain additional branch blocks. Those blocks accelerate revisits without endangering execution, and they are not displaced merely because the model could use more memory as an optional acceleration.
 
 ## Active bindings
 
@@ -995,6 +1090,8 @@ The dedicated declaration endpoint requires authorization for the referenced con
 
 The scheduler should not choose a slot solely by least-recent use when another slot can bind the target with substantially less state movement.
 
+Backpressure is an execution-admission condition, not permission to accumulate unbounded output. Each request has a small bounded outbound event buffer. A request whose buffer cannot accept another decode quantum is ineligible for further token generation or speculative prefill until output drains; the executor quantum is relinquished so other admitted work can run. Completed generated blocks remain eligible for transactional publication under the successor rules above. How long an output-blocked request retains a mapped slot, and the exact disconnect timeout and displacement policy, remain Phase 7 and Phase 8 scheduling decisions.
+
 ## Eviction and demotion
 
 Physical blocks are the eviction unit, but logical dependency structure determines their value.
@@ -1055,6 +1152,16 @@ The storage tier may retain:
 
 Recovery must treat physical payloads as untrusted until their checksums, epochs, sizes, and component descriptors validate. Missing payloads should reduce evaluated coverage rather than corrupt the logical token sequence.
 
+The production container layout must keep mutable data outside image layers and Docker-managed named volumes. Its default host inputs are:
+
+- `./data/models` mounted read-write for artifacts managed by Ollama pull and delete;
+- `./data/db` mounted read-write for the initial SQLite catalog containing model-registry identities and digests, logical contexts, branches, mappings, lifecycle records, and other durable server metadata;
+- `./data/config.yaml` mounted as `/etc/cusco/config.yaml` read-only for versioned server, HTTP, scheduler, queue, executor, tier-capacity, shutdown, and observability policy;
+- `./data/user.yaml` mounted as `/etc/cusco/user.yaml` read-only for operator-declared local models and optional overrides;
+- `./data/user-models` mounted as `/models/user` read-only for the custom GGUF, projector, and draft-model files referenced by `user.yaml`.
+
+All paths are under the ignored `./data` tree. Managed model payloads, read-only operator files, runtime configuration, and transactional metadata remain distinct: database backup and migration do not copy weights, Ollama cannot mutate user-owned files, and a later PostgreSQL backend can replace SQLite without changing either model store. `config.yaml` and `user.yaml` are declarative startup inputs, not mutable database state. The server must validate their versioned schemas before opening listeners, reject unknown or inconsistent fields, and require restart for changes until an explicitly transactional reload contract exists. Environment variables must not form a second field-by-field configuration surface; the initial bootstrap may select the config path through an explicit CLI option, while secrets are supplied by configured file or provider references rather than embedded in ordinary runtime policy.
+
 ## Observability
 
 The server should expose native metrics for:
@@ -1112,10 +1219,11 @@ The first usable server should remain deliberately narrow:
 
 - one loaded local model per process, acquired primarily from Hugging Face Hub;
 - CLI model fetch, inspection, verification, removal, completion, and chat;
-- text completion and basic chat through a documented OpenAI-compatible `/v1` profile initially informed by Ollama's exercised compatibility subset;
-- explicit versioned native extensions or companion endpoints for logical contexts, branch and cache policy, extended usage, and model administration;
-- a generated OpenAPI description for the complete implemented HTTP surface;
-- protocol-neutral request, streaming, error, and usage types informed by Ollama and Anthropic semantics without promising either adapter;
+- text completion and basic chat through the minimal server's documented OpenAI-compatible `/v1` profile, migrated in Phase 9 to the complete `/openai/v1/*` compatibility boundary defined above;
+- a native Ollama protocol adapter under `/ollama/api/*` delivered in Phase 9 over the same protocol-neutral services;
+- an explicit versioned `/cusco/v1/*` extension API for logical contexts, branches, cache and compaction policy, activity hints, extended usage, and explicit cancellation; model installation is fully covered by Ollama lifecycle routes and read-only `user.yaml` discovery;
+- generated, checked OpenAPI descriptions for the `/openai/v1/*`, `/ollama/api/*`, and `/cusco/v1/*` surfaces;
+- protocol-neutral request, streaming, error, usage, and multimodal content types informed by OpenAI, Ollama, and Anthropic semantics without promising an Anthropic wire adapter;
 - deterministic sampling mode;
 - continuous batching;
 - explicit logical context IDs;
@@ -1127,7 +1235,7 @@ The first usable server should remain deliberately narrow:
 - model, inference, cache, and usage metrics and traces;
 - authentication and authorization interfaces backed initially by an anonymous administrator.
 
-Broader llama-server compatibility and additional protocol adapters should follow only after the executor/cache contract is proven. Potential later features include the Ollama native API, an Anthropic adapter if demand justifies it, adapters, grammars, speculative decoding, embeddings, reranking, multimodal inputs, multi-model routing, storage-tier persistence, and multi-GPU placement.
+Broader llama-server compatibility should follow only after the executor/cache contract is proven. Phase 9 adds the required Ollama adapter, the declared OpenAI profile, image input, storage persistence, and the other compatibility and packaging work listed below. Potential post-completion features include an Anthropic adapter, configured authentication providers and roles, multi-GPU placement, speculative decoding, model adapters, grammars, reranking, additional media types, multi-model routing, and broader hosted-protocol surfaces.
 
 ## Project source layout
 
@@ -1137,8 +1245,9 @@ The repository should make the ownership boundary visible rather than hiding it 
 /
 ├── Cargo.toml                 Rust workspace
 ├── Dockerfile                 multi-stage CPU and CUDA development/build image
-├── compose.yaml               primary build, test, proof, and local-run interface
-├── .dockerignore              explicit build-context boundary
+├── compose.yaml               production runtime interface with bind-mounted data
+├── compose.test.yaml          build, test, proof, benchmark, and local-dev services
+├── .dockerignore              explicit build-context and data-directory boundary
 ├── crates/
 │   ├── api-types/             canonical requests, events, errors, usage records
 │   ├── auth/                  principal providers and authorization policy seam
@@ -1151,8 +1260,8 @@ The repository should make the ownership boundary visible rather than hiding it 
 │   ├── server-core/           protocol-neutral application services
 │   ├── server-api/            HTTP routing, streaming, and native admin API
 │   ├── api-openai/            first-class OpenAI-compatible /v1 adapter
-│   ├── api-ollama/            optional Ollama native adapter
-│   ├── api-anthropic/         optional Anthropic adapter
+│   ├── api-ollama/            required Phase 9 Ollama native adapter
+│   ├── api-anthropic/         post-completion optional Anthropic adapter
 │   ├── telemetry/             metrics, traces, usage, decision explanations
 │   ├── context-strategy/      policy, registry, built-ins, and worker protocol
 │   └── cli/                   proof, inference, model, cache, and server commands
@@ -1181,31 +1290,27 @@ Crate boundaries are dependency rules, not merely organization. `context-store` 
 
 ## Container-first build and test interface
 
-Docker images and Docker Compose are the primary supported interfaces for building, testing, benchmarking, and running Cusco during development. Contributors and automation should not install compiler toolchains, CUDA development packages, patched llama.cpp artifacts, or project dependencies directly on the development host. A host build may exist as an explicitly unsupported expert escape hatch, but documentation, CI, acceptance commands, and generated provenance must use the container path.
+Docker images and Docker Compose are the primary supported interfaces for building, testing, benchmarking, and running Cusco. Contributors and automation should not install compiler toolchains, CUDA development packages, patched llama.cpp artifacts, or project dependencies directly on the development host. A host build may exist as an explicitly unsupported expert escape hatch, but documentation, CI, acceptance commands, and generated provenance must use the container path.
 
-The repository should provide a multi-stage `Dockerfile` and a checked-in `compose.yaml` with named services or profiles for at least:
+The repository provides one multi-stage `Dockerfile` with two complementary Compose files:
 
-- CPU compilation and model-free tests;
-- CUDA compilation and GPU tests;
-- the Phase 1 executor proof;
-- conformance and integration tests;
-- benchmarks and a local Cusco server;
-- reproducibility checks for the pinned source and patch series.
+- `compose.yaml` is the production-oriented runtime definition. Its default server service has an explicit restart policy and health check, runs from the runtime image rather than a compiler image, bind-mounts `./data/models` and `./data/db` read-write, and bind-mounts `./data/config.yaml`, `./data/user.yaml`, and `./data/user-models` read-only at stable container paths. It must not hide persistent state in anonymous or named Docker volumes.
+- `compose.test.yaml` is the development and verification definition. It contains CPU compilation and model-free tests, CUDA compilation and GPU tests, executor and mapped proofs, conformance and integration tests, benchmarks, reproducibility checks, and an explicitly development-only local server. Test result and external model mounts remain explicit and may be read-only where mutation is unnecessary.
 
-The same build stages should be used locally and in CI. Compiler, Rust, CUDA, CMake, and Python/tooling versions must be pinned by image digest or another immutable lock, and the resulting provenance must record the base-image identity, executor source identity, patch manifest, build arguments, GPU architecture targets, and runtime image identity. BuildKit caches and mounted dependency caches may accelerate builds, but a clean build must not depend on untracked host state. Model weights, Hugging Face caches, benchmark outputs, and compiler caches should enter through explicit mounts and must not be copied into image layers.
+The same build stages should be used locally and in CI. Compiler, Rust, CUDA, CMake, and Python/tooling versions must be pinned by image digest or another immutable lock, and the resulting provenance must record the base-image identity, executor source identity, patch manifest, build arguments, GPU architecture targets, and runtime image identity. BuildKit caches and mounted dependency caches may accelerate builds, but a clean build must not depend on untracked host state. Model weights, Hugging Face caches, benchmark outputs, compiler caches, and the ignored production `./data` tree must not be copied into image layers.
 
-The default early GPU test configuration must pass through **host NVIDIA GPU ID 1, not GPU ID 0**. Compose should select the host device explicitly—for example through an NVIDIA device reservation with `device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"]`—rather than relying only on enumeration inside the container. The selected device may appear as CUDA device `0` within a container that exposes only that GPU; provenance and test output must still record that host GPU ID 1 was requested and the physical GPU UUID actually used.
+The default early GPU test configuration in `compose.test.yaml` must pass through **host NVIDIA GPU ID 1, not GPU ID 0**. Compose should select the host device explicitly—for example through an NVIDIA device reservation with `device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"]`—rather than relying only on enumeration inside the container. The selected device may appear as CUDA device `0` within a container that exposes only that GPU; provenance and test output must still record that host GPU ID 1 was requested and the physical GPU UUID actually used.
 
-This default is intentionally temporary development policy, not a permanent product assumption. `CUSCO_GPU_DEVICE_ID` should permit an explicit override from the beginning, and later scheduler and deployment work should remove the single-device default in favor of declared device sets and placement policy. Early tests must nevertheless choose GPU 1 out of the box so an unconfigured run does not contend with work expected on host GPU 0.
+This default is intentionally temporary test policy, not a production assumption. `CUSCO_GPU_DEVICE_ID` should permit an explicit override from the beginning. Production `compose.yaml` declares one selected accelerator; multi-GPU device sets and placement policy are post-completion work. Early tests must nevertheless choose GPU 1 out of the box so an unconfigured run does not contend with work expected on host GPU 0.
 
-Canonical developer commands should be short Compose operations, with exact service names fixed during bootstrap, along the lines of:
+Canonical commands should remain short and explicit about which Compose contract they use:
 
 ```text
-docker compose build
-docker compose run --rm test-cpu
-docker compose run --rm test-gpu
-docker compose run --rm executor-proof
-docker compose up cusco
+docker compose -f compose.test.yaml build
+docker compose -f compose.test.yaml run --rm test-cpu
+docker compose -f compose.test.yaml run --rm test-gpu
+docker compose -f compose.test.yaml run --rm executor-proof
+docker compose up -d cusco
 ```
 
 Project scripts may wrap these commands for ergonomics, but must not create a second host-native build path with different dependency resolution, build flags, tests, or runtime behavior.
@@ -1371,25 +1476,112 @@ After the staged design is correct and measurable:
 - reduce device-resident branch switches toward reference-only publication;
 - measure the delta between staged and mapped execution.
 
-### Phase 6: compatibility and production hardening
+### Phase 6: live execution integration
 
-Expand support based on actual demand:
+Replace the minimal server's per-request executor path with the architecture proven in Phases 2 through 5. This phase is deliberately limited to one loaded model, one active native execution, and bounded static admission so that execution correctness is established before dynamic lifecycle, execution concurrency, and compatibility breadth are added:
 
-- additional architectures;
-- an Ollama native protocol adapter only if demand justifies it; Ollama-derived model-management requirements remain part of the native API regardless;
-- an Anthropic Messages adapter only if demand justifies it; Anthropic-derived canonical message and streaming requirements remain regardless;
-- configured authentication providers, least-privilege roles, and deployment controls;
-- adapters and model reloads;
-- storage persistence;
-- speculative decoding;
-- multimodal inputs;
-- multi-GPU scheduling;
-- crash recovery;
-- broader OpenAI-compatible behavior.
+- connect server admission to the physical manager and mapped executor;
+- keep one loaded model instance and one executor slot alive across requests;
+- after authentication, request-size enforcement, parsing, structural validation, and model-name resolution, assign an immutable monotonic admission ticket and place the request into a count-and-retained-byte-bounded FIFO queue before template application, tokenization, context lookup, cache promotion, mapping preparation, or executor reservation. Phase 6 executes strictly by ticket order; later planners may reorder only under their documented fairness contract while retaining the ticket for age, bypass, and decision accounting. Reject saturation immediately as canonical `queue_overloaded`, mapped to HTTP `429 Too Many Requests` and a defensible `Retry-After` when available; count queue time against deadlines and remove cancelled or disconnected work promptly;
+- give queued requests no executor slot, physical mapping, GPU reservation, or permission to mutate durable context state; when the head request reaches the executor, normalize and tokenize it, validate its exact bound, reserve capacity, and transactionally activate its mapped logical context;
+- bound pre-queue HTTP work separately with header and body-size limits, body-read and connection timeouts, and a cap on requests concurrently being parsed or authenticated; on graceful shutdown, stop accepting and enqueueing new work, allow queued and executing requests to finish only within a configured grace period, then cancel the remainder coherently. Queue state is ephemeral and is not recovered across process restart;
+- preserve separate ownership boundaries for model residency, context placement, and request ordering, even though one coordinating event loop may initially make all three decisions;
+- replace buffered whole-request generation with incremental decode quanta and backpressure-aware token streaming; use a small bounded outbound event buffer, make an output-blocked request ineligible for generation and speculative prefill until it drains, and relinquish its execution quantum rather than accumulating output;
+- normalize standalone generated output for API consumers rather than exposing tokenizer-oriented continuation fragments: remove incidental leading whitespace, suppress model control pieces such as turn and end-of-sequence markers, and preserve deliberate whitespace only when the selected protocol operation explicitly requests raw continuation semantics;
+- recognize profile-declared terminal token IDs before presentation and suppress them from delivered content without deleting them from the exact sampled-token successor; distinguish natural or requested `stop` completion from exhausted `length`, with a stop observed on the final permitted token taking precedence, and derive canonical finish reasons and generated-token usage from every sampled token retained in that successor;
+- perform detokenization and normalization once at the Rust generation frontier, before the bounded outbound queue: classify model-defined terminal and control token IDs before rendering; have the native tokenizer render accepted token pieces into a reusable byte buffer; incrementally retain only incomplete UTF-8 and possible cross-piece stop-sequence suffixes; apply the operation's stateful presentation policy; and enqueue only finalized protocol-neutral text deltas. Stop detection and finish-reason selection occur at this frontier, atomically with the final deliverable delta and already-reserved terminal event. Protocol adapters only frame and escape these canonical events and must not detokenize or independently normalize them. Capacity for a bounded delta is reserved before starting the decode step and returned when a control token, incomplete character, or held stop prefix emits no event, so generation cannot outrun backpressure;
+- for a caller-supplied textual stop that ends within a rendered token piece, withhold the stop and following bytes from delivery but retain the complete sampled token in a server-owned logical successor. Do not retokenize the visible prefix. Stateless replay of visible output may consequently fork at that final token and may reuse only its exact matching ancestry; record token-aligned, cross-token, and intra-token stop matches plus the resulting recomputed-token count so any later optimization is driven by measured cost;
+- treat `max_tokens` as an upper bound rather than a generation target; after applying the selected chat template and tokenizing, hard-reject before scheduling any request for which `existing continuation position + new input tokens + requested maximum output` exceeds the effective context limit, except that a protocol may explicitly define a smaller capped output;
+- derive the effective context limit as the minimum of trusted model/profile metadata, an optional operator cap, and the active executor's supported capacity, including architecture-specific usable KV or recurrent sequence-cell limits; an operator cap may reduce but never increase model or executor capacity, and branch-aware validation uses the actual continuation position rather than the total tokens stored across sibling branches;
+- select and enforce one statically configured native operating point; reserve its competent model floor plus prompt, output, mapping, executor-state, and prepared-transition capacity before decode, evicting optional GPU cache when necessary to establish those requirements but never merely to enlarge elastic native residency; preserve the prior context binding after unexpected backend exhaustion;
+- reject a request before decode when its exact continuation cannot fit the configured executor slot, without silently truncating, decoding beyond usable capacity, or relying on backend allocation failure;
+- propagate server-observed cancellation, deadline, and connection liveness through the queue, coordinator, and native abort callback; stop new physical work and decode at the earliest safe boundary, preserve published complete blocks under independent cache policy, and make caller-visible completion linearize at atomic logical-successor selection only after canonical result facts and terminal-event buffer capacity are secured.
+- enforce separately configured request wall-time and active-execution-time limits from `config.yaml`. Wall time begins when a valid request receives its bounded-queue ticket and includes queueing, planning, execution, output backpressure, and finalization; active execution time accumulates only while request-owned native evaluation, mapping, reconstruction, or transfer work is running or awaiting its fence. Before starting each operation, the coordinator checks both budgets and passes the remaining deadline plus the shared cancellation flag to the native abort callback. Expiry prevents new work and caller-visible successor selection immediately, but an already-submitted backend operation may run until its next native safe point and must quiesce before its resources are reclaimed. Phase 6 therefore guarantees a hard bound on request admission, publication, and delivery semantics, not a false bound on the duration of an uninterruptible accelerator kernel; forcibly terminating or resetting a hung executor belongs to later worker-isolation hardening.
 
-### Phase 7: semantic context compaction
+The result is a real, incrementally streaming Gemma server whose logical and physical state survives across requests. Dynamic model loading, tier policy, concurrent native execution, and workload fairness remain explicit follow-on work rather than being approximated inside this cutover.
 
-Implement only after the executor/cache contract and minimal server pass their semantic and capacity gates:
+#### Phase 6 fixed defaults and acceptance proof
+
+Phase 6 begins from one explicit, deliberately conservative configuration rather than leaving correctness-affecting tuning choices implicit. `config.yaml` exposes these values and validation rejects zero, overflow, or internally inconsistent bounds. The shipped defaults are:
+
+| Setting | Phase 6 default |
+|---|---:|
+| canonical logical block size | 32 tokens |
+| cumulative recurrent anchor cadence | every 8 complete blocks, with reconstruction from the nearest compatible anchor |
+| decode quantum | 1 sampled token |
+| maximum queued requests | 32 |
+| maximum retained queued-request bytes | 16 MiB |
+| concurrent pre-queue parse/authentication limit | 16 |
+| maximum HTTP header bytes | 32 KiB |
+| maximum HTTP request-body bytes | 1 MiB |
+| body-read timeout | 10 seconds |
+| request wall-time limit | 300 seconds |
+| active-execution-time limit | 240 seconds |
+| graceful-shutdown drain period | 30 seconds |
+| outbound data-event capacity | 8, plus one separately reserved terminal event |
+| caller-supplied stop sequences | at most 4, each at most 256 UTF-8 bytes |
+| default maximum generated tokens | 16 |
+
+The active model and native operating point are required configuration, not guesses: startup fails if the selected model/profile cannot be resolved, its compiled profile and executor capabilities disagree, or its competent floor and fixed execution reserves cannot be established. The operator context cap defaults to absent and therefore can only be introduced as an additional reduction. Phase 6 supports deterministic native greedy sampling only; unsupported sampling fields are rejected rather than ignored. The native sampler remains request-owned and live across decode quanta and output backpressure, but Phase 6 requires no sampler serialization, cloning, cross-process recovery, or migration. The initial 32-token block and eight-block recurrent-anchor cadence are operational defaults, not compatibility identity; changing them may change cache layout and replay cost but must not change tokens. An output-blocked request retains the sole mapped slot only until it drains, disconnects, or reaches its wall-time limit; displacement and multi-slot fairness begin in later phases.
+
+Phase 6 is complete only when one recorded end-to-end acceptance run, using the pinned real Gemma asset and selected GPU, proves all of the following together:
+
+1. the family catalog compiles reproducibly without network access, the Gemma profile matches its immutable Hub/GGUF identities, and incompatible metadata or missing executor capabilities fail before model publication;
+2. one process loads exactly one model and creates exactly one executor slot, then successive opaque-context requests reuse committed mapped state without reloading the model or reevaluating the valid prefix;
+3. full logical blocks assembled across prior tails, new prompt tokens, and generated tokens publish transactionally, while incomplete tails are neither padded nor published and are reconstructed correctly on a later continuation;
+4. queue count and retained-byte saturation return `queue_overloaded` before template application, tokenization, context lookup, physical preparation, or native reservation, and ticket order remains FIFO;
+5. exact continuation-capacity rejection occurs after authoritative template application and tokenization but before mapping mutation or decode, and an injected late native allocation failure preserves the prior binding;
+6. incremental output remains bounded under a stalled consumer and correctly handles token-aligned, cross-token, and intra-token stops, split UTF-8, suppressed profile control tokens, leading-whitespace policy, `stop` versus `length` precedence, exact sampled-token successors, and canonical usage;
+7. cancellation, disconnect, wall-time expiry, and active-time expiry are injected while queued, preparing, prefilling, decoding, and output-blocked; no pre-commit terminal path selects a successor or damages the source context, already published complete blocks remain ordinary cache state, and native resources are reclaimed only after fences quiesce;
+8. graceful shutdown rejects new admissions, drains work within the configured period, coherently cancels the remainder, and restart recovers durable contexts and published state without attempting to recover the ephemeral queue, live sampler, slot, or prepared handles;
+9. exact continuation tokens and the applicable numeric-logit contract match isolated controls, prompt-work and transfer metrics prove the mapped reuse claimed, all changed-path model-free tests pass, and every measured Rust source file remains above the repository's 80% line-coverage floor.
+
+The acceptance artifact records the config values, resolved model/profile epoch inputs, pinned llama.cpp tag and patch identities, build provenance, selected device UUID, per-case terminal result, exact comparison outcome, cache-work counters, transfer bytes, and peak device and host accounting. Passing isolated unit tests or a compile-only check is not a substitute for this run.
+
+
+### Phase 7: residency and lifecycle scheduling
+
+Generalize the live Phase 6 path from one statically admitted model into transactional dynamic resource ownership:
+
+- make the model-residency scheduler account for real device and host memory occupied by model weights, executor pools, mapped contexts, prepared transitions, and non-evictable work;
+- choose among executor-reported native operating points under operator policy, keep the selected competent model floor distinct from elastic layer or expert residency, and prevent elastic native allocations from silently consuming capacity protected for context cache;
+- require every native elastic pool to have a hard budget or a bounded trim/reclamation contract before allowing it to borrow uncommitted device capacity;
+- make the context scheduler decide when inactive durable contexts remain device-mapped, move to host, spill to storage, or are reconstructed from logical token history;
+- load model instances and create executor slots only after capacity admission, reusing compatible resident instances whenever possible;
+- unload idle models transactionally and reclaim their executor slots, sequence mappings, device block tables, host representations, and reserved transfers without invalidating active references;
+- coordinate load, tier movement, and unload with active requests, queued work, cancellation, deadlines, prepared transitions, and delayed native fences;
+- handle model removal, alias replacement, transactional reload, and revision changes while requests, contexts, or mappings still reference an old immutable model epoch;
+- prove through lifecycle races and fault injection that failed load, movement, eviction, reload, or unload leaves the prior usable state intact.
+
+### Phase 8: workload scheduling and operational hardening
+
+Harden request ordering and make resource decisions explainable under sustained mixed workloads:
+
+- make the request scheduler choose which admitted decode quantum runs next without conflating request priority with model residency or context placement;
+- prevent one large model, long context, or bulk request from starving smaller, older, or explicitly higher-priority work while preserving bounded interactive latency;
+- apply cancellation and deadlines consistently to queued, loading, transferring, and executing work, reclaiming resources only after ownership and native-fence obligations end;
+- report model residency, executor-slot occupancy, context placement, queue state and age, capacity reservations, transition costs, eviction and unload reasons, and scheduler decisions;
+- validate multi-model and mixed-context pressure, repeated load/unload cycles, cancellation storms, deadline expiry, and sustained operation against capacity, fairness, leak, and latency gates.
+
+### Phase 9: compatibility, persistence, and production packaging
+
+Freeze and deliver the external product contract only after the live execution and scheduling architecture is measurable:
+
+- deliver the required Ollama native protocol adapter under `/ollama/api/*` over the same canonical services as the OpenAI adapter, including convergent pull with integrated update resolution, verification, and repair;
+- reconcile read-only `user.yaml` local-model declarations at startup, then remove every native model register, list, show, fetch, update-check, verify, alias, and delete route;
+- deliver the complete OpenAI-compatible behavior under `/openai/v1/*` declared in the adapter architecture section, with conformance fixtures for configurable subdirectory base URLs, request defaults, streaming, errors, output semantics, usage, tools, structured output, embeddings when supported, and stateless Responses;
+- migrate durable context, branch, import, cache and compaction policy, activity, extended-usage, and request-cancellation operations to `/cusco/v1/*`;
+- remove the minimal server's unprefixed `/v1/*` and `/native/*` routes rather than retaining aliases;
+- support text-and-image input within the declared model, projector, content-part, size, and transport boundaries;
+- provide SQLite-backed logical and lifecycle persistence under `./data/db`, separately bind-mounted managed model storage under `./data/models`, read-only runtime policy under `./data/config.yaml`, and read-only local-model configuration and files under `./data/user.yaml` and `./data/user-models`;
+- prove restart and crash recovery, schema migrations, backup and restore, and corruption handling without silently accepting incomplete or mismatched state;
+- ship production runtime images and `compose.yaml`, complemented by `compose.test.yaml` for all build, test, proof, benchmark, and development services.
+
+The Phase 9 release profile supports the proven Gemma family and any other architecture required by its explicit compatibility fixtures; architecture breadth is not itself a release goal. Configured authentication providers, least-privilege roles, multi-GPU scheduling, the Anthropic wire adapter, speculative decoding, model adapters, and broader media or hosted-service surfaces remain post-completion work.
+
+### Phase 10: semantic context compaction
+
+Implement only after the live executor, residency, context-placement, request schedulers, persistence, and public lifecycle contracts pass their semantic and capacity gates:
 
 - a versioned strategy registry and one deterministic built-in trimming strategy;
 - the shared Rust trait and sandboxed out-of-process worker protocol, with Python as the first reference worker;
@@ -1399,6 +1591,22 @@ Implement only after the executor/cache contract and minimal server pass their s
 - cache-block-aware target planning without weakening semantic constraints;
 - cancellation, obsolescence, resource accounting, provenance, and operator controls;
 - opt-in per-context policy; no automatic semantic rewriting by default.
+
+## Post-completion roadmap
+
+After Phases 1 through 10 satisfy their exit gates, prioritize additional work from measured deployment demand:
+
+- configured authentication providers, secret handling, least-privilege roles, policy administration, and hardened deployment controls;
+- multi-GPU tensor placement, device-set admission, scheduling, failure recovery, and physical block descriptors;
+- an Anthropic Messages adapter with full content-block, tool-use, stop-reason, usage, error, and streaming conformance;
+- speculative decoding, draft-model lifecycle, model adapters, and transactional adapter reloads;
+- additional model architectures selected from demonstrated demand rather than compatibility speculation;
+- remote image retrieval with explicit SSRF controls, audio and video inputs, realtime media, and other multimodal surfaces;
+- broader hosted-service compatibility, additional model sources, grammars, reranking, and multi-model routing.
+- locality-aware queue planning after the FIFO and fairness baselines are proven: within a bounded planning window, estimate model-residency, mapped-context, reusable-prefix, uncached-prefill, and transition costs, then reorder only where priority, deadlines, tenant isolation, age, and starvation bounds permit. The planner may adapt its estimates from observed phase timings for each bounded model/executor/device compatibility class, including model load or switch cost and prefill cost by uncached token and context geometry, but must expose uncertainty, use a deterministic fallback when evidence is sparse or stale, and invalidate learned data across relevant model, executor, configuration, or hardware changes. Planning must not mutate context state or reserve physical resources, and transactional admission must revalidate every estimate.
+- concurrent prefix coalescing only after multi-request execution is correct and measurable: detect requests whose dependency-valid immutable prefixes coincide, share referenced physical blocks without coupling their samplers or successor branches, and evaluate identical missing prefill at most once when cancellation, deadlines, copy-on-write publication, native fences, and tenant isolation can all remain independent. Treat this as a measured optimization rather than a prerequisite for execution concurrency.
+
+These additions must continue to use the protocol-neutral services, transactional state transitions, and canonical usage/event records established by the completed phases.
 
 ## Phase deliverables and exit criteria
 
@@ -1411,12 +1619,15 @@ Each phase must end in a usable artifact and a decision, not merely merged infra
 | 3. Tiered physical manager | reservation, residency, transfer, and eviction subsystem | active-growth guarantees survive full warm capacity; cancellation and delayed fences produce no leaks or premature reuse |
 | 4. Minimal server | runnable OpenAI-compatible streaming server, native model-management API, context APIs, CLI, and scheduler | four concurrent branch revisits match isolated controls; committed hits avoid measured prompt work; protocol, accounting, anonymous-auth, and immutable model-install contracts pass |
 | 5. Mapped execution | block-table-capable executor path | semantic gates remain green and measured resident-switch cost improves enough to justify backend complexity |
-| 6. Production hardening | supported compatibility and operations profile | declared protocol, model-source, architecture, recovery, security, and deployment matrices pass their release gates |
-| 7. Semantic compaction | strategy registry, built-in strategy, worker protocol, speculative scheduler, and explicit client declaration API | original contexts survive every failure and race; accepted declarations start eligible work without predictive guessing; abandoned successors demote normally; committed successors execute correctly; interactive latency and guarded capacity are not regressed; strategy sandboxes and authorization pass their gates |
+| 6. Live execution integration | mapped server execution, one persistent Gemma instance and executor slot, early bounded FIFO admission, and normalized incremental generation | successive requests reuse live mapped state; queue saturation rejects before expensive planning; impossible generation bounds fail before decode; terminal tokens, control pieces, whitespace, finish reasons, and usage are correct; cancellation and capacity failures preserve prior bindings |
+| 7. Residency and lifecycle scheduling | capacity-aware model residency, context tiering, transactional load/reload/unload, and immutable model-epoch ownership | measured device and host admission remains within capacity; load, movement, revision, removal, eviction, reload, and unload races preserve active references and prior usable bindings without leaks |
+| 8. Workload and operational hardening | distinct request-ordering policy, starvation protection, lifecycle-aware cancellation and deadlines, scheduler observability, and sustained-load validation | mixed workloads satisfy bounded fairness, capacity, cancellation, deadline, latency, and reclamation gates while every residency and scheduling decision is attributable |
+| 9. Compatibility, persistence, and packaging | supported OpenAI, Ollama, and Cusco profiles, local and managed model lifecycle, bounded image input, durable recovery, and production/test container contracts | declared protocol and model-lifecycle conformance fixtures pass; restarts, crashes, migrations, backup/restore, and corrupt state preserve transactional guarantees; production deployment exercises the live scheduled path |
+| 10. Semantic compaction | strategy registry, built-in strategy, worker protocol, speculative scheduler, and explicit client declaration API | original contexts survive every failure and race; accepted declarations start eligible work without predictive guessing; abandoned successors demote normally; committed successors execute correctly; interactive latency and guarded capacity are not regressed; strategy sandboxes and authorization pass their gates |
 
 Phase 1 has an explicit go/no-go boundary. If complete recurrent capture and restoration cannot be expressed without exposing unstable model internals, the project pauses for an executor-boundary redesign before server work begins. Phase 5 is optional unless staged measurements show that physical assembly is a material bottleneck.
 
-Phase 4 reserves and persists the extension contract but does not execute it. Phase 7 turns it on only after fault injection proves that strategy crashes, malformed output, cancellation, expired or disconnected declarations, late results, and next-turn races cannot mutate the source context or delay admitted interactive work. Third-party workers require explicit operator enablement; the first release should support allowlisted local executables rather than arbitrary uploaded code.
+Phase 4 reserves and persists the extension contract but does not execute it. Phase 10 turns it on only after fault injection proves that strategy crashes, malformed output, cancellation, expired or disconnected declarations, late results, and next-turn races cannot mutate the source context or delay admitted interactive work. Third-party workers require explicit operator enablement; the first release should support allowlisted local executables rather than arbitrary uploaded code.
 
 ## Definition of a cache hit
 
@@ -1468,9 +1679,17 @@ Run the same equivalence check for:
 - storage-to-host-to-device restoration, when a storage tier has been implemented;
 - forced allocation failure and abort.
 
-### Capacity gate
+### Capacity and native-budget gate
 
 Fill warm VRAM to its policy limit, then grow an active context to its guarded reservation. The active request must not fail because opportunistic warm blocks consumed reserved capacity.
+
+For a model with multiple feasible placements, including an MoE fixture or deterministic stand-in, select a competent operating point below its maximum profitable residency. Verify both directions of the policy:
+
+- optional cache is demoted when required to establish the selected model floor and an admitted request's execution reserve;
+- valuable context cache remains resident when native code requests only elastic placement above the selected operating point;
+- native allocations cannot cross their elastic budget or the protected-cache boundary;
+- trimming or unloading elastic native residency returns the declared capacity;
+- an injected underestimate or late allocation failure aborts transactionally, preserves the prior binding, and does not enter an unbounded evict-and-retry loop.
 
 ### Lifetime gate
 
@@ -1574,19 +1793,18 @@ Mitigation: keep third-party strategies out of process; pass bounded structured 
 
 ## Open questions
 
-1. What is the smallest executor ABI that can capture and restore complete Gemma recurrent state without exposing model internals?
-2. Should tokenization and chat templates remain in the native executor or move to Rust after the first milestone?
-3. Should sampling remain native to preserve compatibility, or move outward to simplify streamed scheduling?
-4. What canonical block size balances prefix sharing, metadata cost, transfer fragmentation, and kernel efficiency?
-5. Can staged execution bind existing device representations without a full copy for ordinary KV?
-6. What changes are required for block-table addressing in each relevant attention backend?
-7. How should recurrent checkpoint cadence interact with logical block boundaries?
-8. Which state components can be reconstructed cheaply enough that storing them is not worthwhile?
-9. How should multi-GPU tensor placement be represented in a physical block descriptor?
-10. What persistent checkpoint format can survive executor upgrades without freezing llama.cpp internals prematurely?
-11. Which endpoints, fields, and behavioral details from Ollama's exercised OpenAI-compatible subset should define the initial compatibility profile, and which project-specific context, cache, usage, and administration capabilities belong in versioned extensions or native companion endpoints?
-12. Which built-in compaction strategies and semantic-quality suites are sufficient before enabling external workers?
-13. Which worker isolation mechanisms are required on each supported deployment platform, especially for user-authored Python and Rust strategies?
+The executor-proof, logical-store, mapped-execution, and Phase 6 design questions have been closed by the implemented gates and the fixed Phase 6 contract above. The remaining questions are explicitly post-Phase-6 tuning or later-phase scope:
+
+1. **Compatibility breadth (Phase 9):** which additional native sampler algorithms are required by the declared protocol matrix, and what cloning, serialization, restart, or migration guarantees are justified beyond Phase 6's live in-process greedy sampler?
+2. **Measured cache tuning (Phase 7+):** after collecting Phase 6 replay, storage, transfer, and publication data, should the 32-token logical block size or eight-block recurrent-anchor cadence change for particular compatibility classes?
+3. **Reconstruction policy (Phase 7):** which evaluated-state components are cheap enough to reconstruct that retaining their physical representations is not worthwhile?
+4. **Multi-GPU representation (post-Phase 9):** how should tensor placement be represented in a physical block descriptor?
+5. **Cross-upgrade persistence (Phase 9+):** what persistent checkpoint format, if any, can survive executor upgrades without freezing llama.cpp internals prematurely?
+6. **Semantic compaction (Phase 10):** which built-in strategies and semantic-quality suites are sufficient before enabling external workers?
+7. **Worker hardening (Phase 10):** which isolation mechanisms are required on each supported deployment platform, especially for user-authored Python and Rust strategies?
+8. **Output-blocked displacement (Phases 7 and 8):** once multiple slots or runnable requests exist, how long may a blocked request retain mapped state and what disconnect and displacement policy preserves fairness without unsafe reclamation?
+9. **Partial-tail retention (post-Phase 6 measurement):** is durable retention of incomplete generated tails worth its storage and recovery complexity after complete-block publication has been measured?
+10. **Competent operating points (Phase 7):** should operators select an explicit placement preset, a measured latency objective, or both, and under what transactional policy may the residency scheduler change it?
 
 ## Recommendation
 
