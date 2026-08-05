@@ -6,9 +6,19 @@ The project separates responsibilities deliberately: Rust will manage logical co
 
 ## Current state
 
-Cusco has completed its executor proof, Rust logical-context-store, tiered physical-manager, and minimal server phases. The Phase 1 proof established the project’s central technical premise on a hybrid/recurrent Gemma model: captured execution state can be replaced, moved through host memory, restored, and continued with identical tokens and bitwise-identical logits. The proof also covers concurrent logical contexts and verifies that cancellation or failed promotion does not destroy the previously valid state.
+Cusco has completed its executor proof, Rust logical-context-store, tiered
+physical-manager, minimal server, and mapped-execution phases. The Phase 1
+proof established the project’s central technical premise on a
+hybrid/recurrent Gemma model: captured execution state can be replaced, moved
+through host memory, restored, and continued with identical tokens and
+bitwise-identical logits.
 
-Phase 2 adds Rust-owned logical contexts and transactional evaluated-prefix publication. Phase 3 adds capacity-accounted physical representations, transfers, transitions, eviction, and observability. Phase 4 adds a protocol-neutral inference core, transition-cost scheduler, durable opaque contexts, model lifecycle operations, canonical usage and streaming events, cancellation and deadlines, authenticated native APIs, useful OpenAI completion/chat adapters, and a checked OpenAPI document. `cusco serve` uses the native llama.cpp executor; inference only resolves models already installed through the administrative API.
+Phase 2 adds Rust-owned logical contexts and transactional evaluated-prefix
+publication. Phase 3 adds capacity-accounted physical representations and
+transactional tier transitions. Phase 4 adds the authenticated inference and
+model-management server. Phase 5 adds transactional device-resident sequence
+mappings, reference-only activation, physical block-table publication, and
+mapped-versus-staged measurements without exposing llama.cpp internals to Rust.
 
 ## Run the real-model inference integration test
 
@@ -27,6 +37,19 @@ logit bit against uninterrupted execution. It also verifies that cancellation
 and a deliberately failed restore preserve the prior binding. The command
 exits nonzero on any failed assertion and prints a short Markdown report with
 the prompts, inferred token IDs, checkpoint sizes, and exactness results.
+
+## Run the mapped-execution proof
+
+With the validation GGUF and NVIDIA runtime available, run:
+
+```sh
+docker compose run --rm mapped-proof
+```
+
+The command forks four device-resident sequence mappings, activates and
+continues each one with identical results, verifies graph reuse and zero bytes
+copied by activation, and writes staged-versus-mapped timing, bytes, and prompt
+work avoided to `results/phase5.json`.
 
 ## Run the real-model server report
 
@@ -70,11 +93,11 @@ implicitly fetch models.
 
 ## Future goals
 
-Development is planned to proceed from the proven executor boundary toward:
+Development is planned to proceed from the proven mapped-execution boundary
+toward:
 
-- integration of the minimal scheduler with increasingly efficient physical context movement;
+- integration of mapped execution with live server scheduling;
 - production hardening of the inference and model-management server;
-- improved mapped execution to reduce the cost of switching active contexts;
 - broader compatibility, operational hardening, and recovery behavior;
 - optional semantic context compaction once the underlying state system is proven reliable.
 

@@ -34,12 +34,26 @@ pub struct Capabilities {
     pub swa: bool,
     pub recurrent: bool,
     pub vocabulary: i32,
+    pub mapped_execution: bool,
+    pub max_mappings: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Decode {
     pub logits: Vec<f32>,
     pub token: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct MappingId(pub u32);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct MappingMetrics {
+    pub active: MappingId,
+    pub resident_mappings: usize,
+    pub graph_epoch: u64,
+    pub reference_switches: u64,
+    pub activation_bytes_copied: u64,
 }
 
 /// Uniquely owns one native execution slot. The slot is mutated only through `&mut self`.
@@ -60,6 +74,11 @@ pub struct PreparedRestore {
     raw: NonNull<sys::CuscoPreparedRestore>,
 }
 
+#[derive(Debug)]
+pub struct PreparedMapping {
+    raw: NonNull<sys::CuscoPreparedMapping>,
+}
+
 impl Executor {
     pub fn open(path: &str, n_ctx: u32, gpu_layers: i32) -> Result<Self, Error> {
         let path = CString::new(path).map_err(|_| Error::InvalidPath)?;
@@ -76,6 +95,8 @@ impl Executor {
             swa: c.has_swa != 0,
             recurrent: c.has_recurrent != 0,
             vocabulary: c.n_vocab,
+            mapped_execution: c.has_mapped_execution != 0,
+            max_mappings: c.max_mappings,
         }
     }
 
@@ -124,6 +145,32 @@ impl Executor {
         ffi::commit_restore(self.raw, raw)
     }
 
+    /// Prepare an unpublished device-resident sequence mapping fork.
+    pub fn prepare_mapping_fork(&mut self, source: MappingId) -> Result<PreparedMapping, Error> {
+        Ok(PreparedMapping {
+            raw: ffi::prepare_mapping_fork(self.raw, source.0)?,
+        })
+    }
+
+    /// Publish a prepared mapping. The mapping cannot be activated before this call.
+    pub fn commit_mapping(&mut self, prepared: PreparedMapping) -> Result<MappingId, Error> {
+        let prepared = std::mem::ManuallyDrop::new(prepared);
+        ffi::commit_mapping(self.raw, prepared.raw).map(MappingId)
+    }
+
+    /// Select a resident mapping without restoring checkpoint bytes.
+    pub fn activate_mapping(&mut self, mapping: MappingId) -> Result<(), Error> {
+        ffi::activate_mapping(self.raw, mapping.0)
+    }
+
+    pub fn remove_mapping(&mut self, mapping: MappingId) -> Result<(), Error> {
+        ffi::remove_mapping(self.raw, mapping.0)
+    }
+
+    pub fn mapping_metrics(&self) -> MappingMetrics {
+        ffi::mapping_metrics(self.raw)
+    }
+
     /// Phase 1 proof hook: clear the slot and decode unrelated state.
     /// This is not a production state-management operation.
     pub fn replace_state_for_proof(&mut self, tokens: &[i32]) -> Result<(), Error> {
@@ -149,6 +196,11 @@ impl Drop for Checkpoint {
 impl Drop for PreparedRestore {
     fn drop(&mut self) {
         ffi::free_prepared_restore(self.raw)
+    }
+}
+impl Drop for PreparedMapping {
+    fn drop(&mut self) {
+        ffi::free_prepared_mapping(self.raw)
     }
 }
 
@@ -301,6 +353,64 @@ mod ffi {
         status(unsafe { sys::cusco_executor_commit_restore(executor.as_ptr(), prepared.as_ptr()) })
     }
 
+    pub(super) fn prepare_mapping_fork(
+        executor: NonNull<sys::CuscoExecutor>,
+        source: u32,
+    ) -> Result<NonNull<sys::CuscoPreparedMapping>, Error> {
+        let mut prepared = std::ptr::null_mut();
+        // SAFETY: executor is live and out points to writable storage.
+        status(unsafe {
+            sys::cusco_executor_prepare_mapping_fork(executor.as_ptr(), source, &mut prepared)
+        })?;
+        NonNull::new(prepared).ok_or(Error::Backend(3))
+    }
+
+    pub(super) fn commit_mapping(
+        executor: NonNull<sys::CuscoExecutor>,
+        prepared: NonNull<sys::CuscoPreparedMapping>,
+    ) -> Result<u32, Error> {
+        let mut mapping = 0;
+        // SAFETY: both handles are live; the ABI consumes prepared on every result.
+        status(unsafe {
+            sys::cusco_executor_commit_mapping(executor.as_ptr(), prepared.as_ptr(), &mut mapping)
+        })?;
+        Ok(mapping)
+    }
+
+    pub(super) fn activate_mapping(
+        executor: NonNull<sys::CuscoExecutor>,
+        mapping: u32,
+    ) -> Result<(), Error> {
+        // SAFETY: executor is live and uniquely borrowed by the caller.
+        status(unsafe { sys::cusco_executor_activate_mapping(executor.as_ptr(), mapping) })
+    }
+
+    pub(super) fn remove_mapping(
+        executor: NonNull<sys::CuscoExecutor>,
+        mapping: u32,
+    ) -> Result<(), Error> {
+        // SAFETY: executor is live and uniquely borrowed by the caller.
+        status(unsafe { sys::cusco_executor_remove_mapping(executor.as_ptr(), mapping) })
+    }
+
+    pub(super) fn mapping_metrics(executor: NonNull<sys::CuscoExecutor>) -> super::MappingMetrics {
+        // SAFETY: executor is live for all read-only metric calls.
+        unsafe {
+            super::MappingMetrics {
+                active: super::MappingId(sys::cusco_executor_active_mapping(executor.as_ptr())),
+                resident_mappings: sys::cusco_executor_mapping_count(executor.as_ptr()),
+                graph_epoch: sys::cusco_executor_mapping_epoch(executor.as_ptr()),
+                reference_switches: sys::cusco_executor_reference_switches(executor.as_ptr()),
+                activation_bytes_copied: sys::cusco_executor_mapped_bytes_copied(executor.as_ptr()),
+            }
+        }
+    }
+
+    pub(super) fn free_prepared_mapping(raw: NonNull<sys::CuscoPreparedMapping>) {
+        // SAFETY: raw is uniquely owned and released exactly once.
+        unsafe { sys::cusco_prepared_mapping_free(raw.as_ptr()) }
+    }
+
     pub(super) fn replace_state_for_proof(
         raw: NonNull<sys::CuscoExecutor>,
         tokens: &[i32],
@@ -385,5 +495,39 @@ mod tests {
             Executor::open("bad\0path", 1, 0),
             Err(Error::InvalidPath)
         ));
+    }
+    #[test]
+    fn mapped_forks_publish_transactionally_and_switch_by_reference() {
+        let mut executor = Executor::open("mock://deterministic", 128, 0).unwrap();
+        assert!(executor.capabilities().mapped_execution);
+        let prefix = executor.tokenize("shared prefix").unwrap();
+        executor.decode(&prefix).unwrap();
+        let epoch = executor.mapping_metrics().graph_epoch;
+
+        let aborted = executor.prepare_mapping_fork(MappingId(0)).unwrap();
+        assert_eq!(
+            executor.activate_mapping(MappingId(1)),
+            Err(Error::Backend(1))
+        );
+        drop(aborted);
+        assert_eq!(executor.mapping_metrics().resident_mappings, 1);
+
+        let prepared = executor.prepare_mapping_fork(MappingId(0)).unwrap();
+        let branch = executor.commit_mapping(prepared).unwrap();
+        assert_eq!(executor.mapping_metrics().resident_mappings, 2);
+        let continuation = [7, 8];
+        let staged = executor.decode(&continuation).unwrap();
+        executor.activate_mapping(branch).unwrap();
+        let mapped = executor.decode(&continuation).unwrap();
+        assert_eq!(mapped.token, staged.token);
+        assert!(logits_identical(&mapped.logits, &staged.logits));
+
+        let metrics = executor.mapping_metrics();
+        assert_eq!(metrics.graph_epoch, epoch);
+        assert_eq!(metrics.reference_switches, 1);
+        assert_eq!(metrics.activation_bytes_copied, 0);
+        executor.activate_mapping(MappingId(0)).unwrap();
+        executor.remove_mapping(branch).unwrap();
+        assert_eq!(executor.mapping_metrics().resident_mappings, 1);
     }
 }

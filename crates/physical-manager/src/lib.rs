@@ -15,6 +15,7 @@ id_type!(ActiveBindingId);
 id_type!(PreparedTransitionId);
 id_type!(TransferId);
 id_type!(GrowthReservationId);
+id_type!(DeviceBlockTableId);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Component {
@@ -77,6 +78,22 @@ pub struct PhysicalRepresentation {
     pub reuse_value: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DeviceBlock {
+    pub representation: PhysicalRepresentationId,
+    pub component: Component,
+    pub bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DeviceBlockTable {
+    pub id: DeviceBlockTableId,
+    pub binding: ActiveBindingId,
+    pub mapping: EvaluatedPrefixId,
+    pub executor_mapping: u32,
+    pub blocks: Vec<DeviceBlock>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Capacity {
     pub device_bytes: usize,
@@ -101,6 +118,8 @@ pub struct Metrics {
     pub committed: u64,
     pub aborted: u64,
     pub recomputed: u64,
+    pub mapped_publications: u64,
+    pub reference_switches: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -214,6 +233,7 @@ pub struct PhysicalManager {
     transitions: HashMap<PreparedTransitionId, PreparedTransition>,
     transfers: HashMap<TransferId, Transfer>,
     growth: HashMap<GrowthReservationId, GrowthReservation>,
+    block_tables: HashMap<LogicalContextId, DeviceBlockTable>,
     metrics: Metrics,
     events: Vec<TraceEvent>,
 }
@@ -229,6 +249,7 @@ impl PhysicalManager {
             transitions: HashMap::new(),
             transfers: HashMap::new(),
             growth: HashMap::new(),
+            block_tables: HashMap::new(),
             metrics: Metrics {
                 device_total: capacity.device_bytes,
                 host_total: capacity.host_bytes,
@@ -314,11 +335,58 @@ impl PhysicalManager {
             .get(&context)
             .map(|binding| (binding.id, binding.mapping))
     }
+    /// Publish the executor's already-committed sequence mapping for the current
+    /// physical binding. No table is visible until both commits have succeeded.
+    pub fn publish_device_block_table(
+        &mut self,
+        context: LogicalContextId,
+        binding: ActiveBindingId,
+        executor_mapping: u32,
+    ) -> Result<DeviceBlockTableId, Error> {
+        let active = self.bindings.get(&context).ok_or(Error::BindingNotFound)?;
+        if active.id != binding {
+            return Err(Error::BindingNotFound);
+        }
+        let mapping = active.mapping;
+        let blocks = active
+            .representations
+            .iter()
+            .map(|id| {
+                let representation = &self.representations[id];
+                if !representation.device {
+                    return Err(Error::InvalidComposite);
+                }
+                Ok(DeviceBlock {
+                    representation: *id,
+                    component: representation.component,
+                    bytes: representation.bytes,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let id = DeviceBlockTableId(self.id());
+        self.block_tables.insert(
+            context,
+            DeviceBlockTable {
+                id,
+                binding,
+                mapping,
+                executor_mapping,
+                blocks,
+            },
+        );
+        self.metrics.mapped_publications += 1;
+        Ok(id)
+    }
+
+    pub fn device_block_table(&self, context: LogicalContextId) -> Option<&DeviceBlockTable> {
+        self.block_tables.get(&context)
+    }
     pub fn unbind(&mut self, context: LogicalContextId) -> Result<(), Error> {
         let binding = self
             .bindings
             .remove(&context)
             .ok_or(Error::BindingNotFound)?;
+        self.block_tables.remove(&context);
         for representation in binding.representations {
             self.representations
                 .get_mut(&representation)
@@ -556,6 +624,12 @@ impl PhysicalManager {
         }
         let transition = self.transitions.remove(&id).unwrap();
         self.release_transition_refs(&transition);
+        self.block_tables.remove(&transition.context);
+        if transition.class == TransitionClass::ReferenceOnly
+            && self.bindings.contains_key(&transition.context)
+        {
+            self.metrics.reference_switches += 1;
+        }
         if let Some(old) = self.bindings.remove(&transition.context) {
             for representation in old.representations {
                 self.representations
@@ -1108,5 +1182,46 @@ mod tests {
             manager.release_logical_reference(rep).unwrap();
             assert!(manager.representation(rep).is_none());
         }
+    }
+
+    #[test]
+    fn device_block_table_is_published_only_for_current_committed_binding() {
+        let mut manager = PhysicalManager::new(Capacity {
+            device_bytes: 64,
+            host_bytes: 64,
+        });
+        let reps = register_composite(&mut manager, mapping(1), Tier::Device, 2);
+        let (transition, class, _) = manager
+            .prepare_transition(context(1), 7, mapping(1), 32, all(), &reps, false)
+            .unwrap();
+        assert!(manager.device_block_table(context(1)).is_none());
+        assert_eq!(class, TransitionClass::ReferenceOnly);
+        let binding = manager.commit_transition(transition, 7).unwrap();
+        assert!(manager.device_block_table(context(1)).is_none());
+        let table_id = manager
+            .publish_device_block_table(context(1), binding, 9)
+            .unwrap();
+        let table = manager.device_block_table(context(1)).unwrap();
+        assert_eq!(table.id, table_id);
+        assert_eq!(table.executor_mapping, 9);
+        assert_eq!(table.blocks.len(), 3);
+
+        let (next, class, _) = manager
+            .prepare_transition(context(1), 8, mapping(1), 32, all(), &reps, false)
+            .unwrap();
+        assert_eq!(class, TransitionClass::ReferenceOnly);
+        let next_binding = manager.commit_transition(next, 8).unwrap();
+        assert!(manager.device_block_table(context(1)).is_none());
+        assert!(matches!(
+            manager.publish_device_block_table(context(1), binding, 10),
+            Err(Error::BindingNotFound)
+        ));
+        manager
+            .publish_device_block_table(context(1), next_binding, 10)
+            .unwrap();
+        assert_eq!(manager.metrics().reference_switches, 1);
+        assert_eq!(manager.metrics().mapped_publications, 2);
+        manager.unbind(context(1)).unwrap();
+        assert!(manager.device_block_table(context(1)).is_none());
     }
 }
