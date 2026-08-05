@@ -1319,7 +1319,7 @@ Implement:
 - model and adapter epochs;
 - longest dependency-valid prefix lookup;
 - immutable mapping publication;
-- logical reference accounting.
+- logical reference accounting;
 - monotonic logical-context revisions for ABA-safe prepared publication;
 - hash-indexed lookup with allocation-free literal-token confirmation.
 
