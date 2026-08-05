@@ -1,0 +1,10 @@
+[package]
+name = "cusco-physical-manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cusco-context-store = { path = "../context-store" }
+serde.workspace = true
+thiserror.workspace = true

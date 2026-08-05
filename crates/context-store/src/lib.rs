@@ -443,6 +443,10 @@ impl ContextStore {
         }
         Ok(self.valid_mapping_for_branch(context, empty_branch_id()))
     }
+    /// Returns immutable mapping metadata without conferring residency ownership.
+    pub fn mapping(&self, id: EvaluatedPrefixId) -> Option<Arc<EvaluatedPrefix>> {
+        self.mappings.get(&id).map(|entry| entry.mapping.clone())
+    }
 
     /// Reports store-owned logical references; external `Arc` clones are
     /// metadata snapshots and intentionally are not included.
