@@ -1,12 +1,14 @@
 use axum::{
     Json, Router,
-    body::to_bytes,
+    body::{Body, to_bytes},
     extract::{FromRequest, Path as AxumPath, Request, State},
-    http::{HeaderMap, StatusCode, header::RETRY_AFTER},
+    http::{HeaderMap, HeaderValue, StatusCode, header::RETRY_AFTER},
+    middleware::{self, Next},
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{delete, get, post},
 };
 use futures_util::{StreamExt, stream};
+use http_body_util::BodyExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -203,6 +205,116 @@ impl Default for ServerConfig {
             stream_buffer: 8,
             shutdown_grace_ms: 30_000,
         }
+    }
+}
+
+const HTTP_DEBUG_BODY_LIMIT: usize = 64 << 10;
+
+#[derive(Clone)]
+pub struct HttpDebug {
+    sink: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl HttpDebug {
+    pub fn stderr() -> Self {
+        Self::new(|line| eprintln!("{line}"))
+    }
+
+    pub fn new(sink: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self {
+            sink: Arc::new(sink),
+        }
+    }
+
+    fn emit(&self, record: Value) {
+        (self.sink)(&record.to_string());
+    }
+}
+
+#[derive(Default)]
+struct HttpBodyCapture {
+    bytes: Vec<u8>,
+    total: usize,
+    truncated: bool,
+}
+
+impl HttpBodyCapture {
+    fn push(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(bytes.len());
+        if self.truncated {
+            return;
+        }
+        if self.bytes.len().saturating_add(bytes.len()) > HTTP_DEBUG_BODY_LIMIT {
+            self.bytes.clear();
+            self.truncated = true;
+        } else {
+            self.bytes.extend_from_slice(bytes);
+        }
+    }
+
+    fn redacted(&self, content_type: Option<&str>) -> Value {
+        if self.truncated {
+            return json!({
+                "bytes": self.total,
+                "omitted": "body exceeds 65536-byte HTTP debug limit"
+            });
+        }
+        if self.bytes.is_empty() {
+            return json!({"bytes": 0});
+        }
+        let is_sse = content_type.is_some_and(|value| value.starts_with("text/event-stream"));
+        if is_sse {
+            let events = String::from_utf8_lossy(&self.bytes)
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(str::trim)
+                .map(|data| {
+                    serde_json::from_str(data).map_or_else(
+                        |_| json!({"omitted": "non-JSON SSE data"}),
+                        |mut value| {
+                            redact_body_values(&mut value);
+                            value
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            return json!({"bytes": self.total, "events": events});
+        }
+        let Ok(mut value) = serde_json::from_slice(&self.bytes) else {
+            return json!({"bytes": self.total, "omitted": "non-JSON body"});
+        };
+        redact_body_values(&mut value);
+        json!({"bytes": self.total, "json": value})
+    }
+}
+
+fn redact_body_values(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                let key = key.to_ascii_lowercase().replace('-', "_");
+                if matches!(
+                    key.as_str(),
+                    "authorization"
+                        | "cookie"
+                        | "set_cookie"
+                        | "password"
+                        | "secret"
+                        | "api_key"
+                        | "bearer_token"
+                        | "access_token"
+                        | "refresh_token"
+                ) {
+                    *value = Value::String("[REDACTED]".into());
+                } else {
+                    redact_body_values(value);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_body_values),
+        Value::String(value) if value == "[DONE]" => {}
+        Value::String(value) => *value = "[REDACTED]".into(),
+        _ => {}
     }
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -1491,6 +1603,14 @@ struct ChatMessage {
 }
 
 pub fn router(server: Server) -> Router {
+    routes(server)
+}
+
+pub fn router_with_http_debug(server: Server, debug: HttpDebug) -> Router {
+    routes(server).layer(middleware::from_fn_with_state(debug, http_debug_middleware))
+}
+
+fn routes(server: Server) -> Router {
     Router::new()
         .route("/openapi.json", get(openapi))
         .route("/v1/completions", post(completion))
@@ -1521,6 +1641,86 @@ pub fn router(server: Server) -> Router {
         .route("/native/contexts/{id}/branches", post(branch_context))
         .route("/native/requests/{id}", delete(cancel_request))
         .with_state(server)
+}
+
+async fn http_debug_middleware(
+    State(debug): State<HttpDebug>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let request_id = Uuid::new_v4().to_string();
+    let method = request.method().to_string();
+    let path = request.uri().path().to_owned();
+    let request_content_type = request
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let request_content_length = request
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let request_body = Arc::new(Mutex::new(HttpBodyCapture::default()));
+    let body_capture = request_body.clone();
+    let (parts, body) = request.into_parts();
+    let body = Body::new(body.map_frame(move |frame| {
+        if let Some(bytes) = frame.data_ref() {
+            body_capture.lock().push(bytes);
+        }
+        frame
+    }));
+    let started = Instant::now();
+    let mut response = next.run(Request::from_parts(parts, body)).await;
+    debug.emit(json!({
+        "type": "http_debug",
+        "direction": "in",
+        "request_id": request_id,
+        "method": method,
+        "path": path,
+        "content_type": request_content_type,
+        "content_length": request_content_length,
+        "body": request_body.lock().redacted(request_content_type.as_deref())
+    }));
+
+    let status = response.status();
+    let response_content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    response.headers_mut().insert(
+        "x-request-id",
+        HeaderValue::from_str(&request_id).expect("UUID is a valid header value"),
+    );
+    debug.emit(json!({
+        "type": "http_debug",
+        "direction": "out",
+        "request_id": request_id,
+        "method": method,
+        "path": path,
+        "status": status.as_u16(),
+        "duration_ms": started.elapsed().as_millis()
+    }));
+
+    let (parts, body) = response.into_parts();
+    let mut chunk_index = 0_u64;
+    let body = Body::new(body.map_frame(move |frame| {
+        if let Some(bytes) = frame.data_ref() {
+            let mut capture = HttpBodyCapture::default();
+            capture.push(bytes);
+            debug.emit(json!({
+                "type": "http_debug",
+                "direction": "out_body",
+                "request_id": request_id,
+                "chunk_index": chunk_index,
+                "body": capture.redacted(response_content_type.as_deref())
+            }));
+            chunk_index += 1;
+        }
+        frame
+    }));
+    Response::from_parts(parts, body)
 }
 fn auth(server: &Server, headers: &HeaderMap, scope: Scope) -> Result<RequestContext, Error> {
     server.authorize(headers, scope)
@@ -1892,7 +2092,32 @@ pub async fn serve(
     anonymous: bool,
     unsafe_public: bool,
 ) -> Result<(), Error> {
-    serve_until(server, addr, anonymous, unsafe_public, shutdown_signal()).await
+    serve_until(
+        server,
+        addr,
+        anonymous,
+        unsafe_public,
+        None,
+        shutdown_signal(),
+    )
+    .await
+}
+
+pub async fn serve_with_http_debug(
+    server: Server,
+    addr: SocketAddr,
+    anonymous: bool,
+    unsafe_public: bool,
+) -> Result<(), Error> {
+    serve_until(
+        server,
+        addr,
+        anonymous,
+        unsafe_public,
+        Some(HttpDebug::stderr()),
+        shutdown_signal(),
+    )
+    .await
 }
 
 async fn serve_until(
@@ -1900,6 +2125,7 @@ async fn serve_until(
     addr: SocketAddr,
     anonymous: bool,
     unsafe_public: bool,
+    http_debug: Option<HttpDebug>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
     Server::validate_listener(addr, anonymous, unsafe_public)?;
@@ -1910,7 +2136,11 @@ async fn serve_until(
         .map_err(state_err)?;
     let (begin_shutdown, shutdown_requested) = tokio::sync::oneshot::channel();
     let serving = async move {
-        axum::serve(listener, router(server))
+        let app = match http_debug {
+            Some(debug) => router_with_http_debug(server, debug),
+            None => router(server),
+        };
+        axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 let _ = shutdown_requested.await;
             })
@@ -2769,8 +2999,14 @@ mod tests {
     #[tokio::test]
     async fn configured_server_stops_when_shutdown_is_requested() {
         let (server, dir) = setup(Arc::new(AnonymousAdmin));
-        serve_until(server, "127.0.0.1:0".parse().unwrap(), true, false, async {
-        })
+        serve_until(
+            server,
+            "127.0.0.1:0".parse().unwrap(),
+            true,
+            false,
+            None,
+            async {},
+        )
         .await
         .unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -3016,6 +3252,171 @@ mod tests {
         assert_eq!(restarted.context(&context.id).unwrap(), context);
         assert_eq!(restarted.admission_metrics(), AdmissionMetrics::default());
         assert!(!restarted.inner.lock().shutting_down);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_debug_traces_redacted_json_without_credentials_or_content() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let app = router_with_http_debug(
+            server,
+            HttpDebug::new(move |line| captured.lock().push(line.to_owned())),
+        );
+        let response = app
+            .oneshot(
+                Request::post("/v1/completions")
+                    .header("authorization", "Bearer header-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","prompt":"private prompt","max_tokens":2,"api_key":"body-secret"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let records = records
+            .lock()
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["direction"], "in");
+        assert_eq!(records[0]["request_id"], request_id);
+        assert_eq!(records[0]["method"], "POST");
+        assert_eq!(records[0]["path"], "/v1/completions");
+        assert_eq!(records[0]["body"]["json"]["model"], "[REDACTED]");
+        assert_eq!(records[0]["body"]["json"]["prompt"], "[REDACTED]");
+        assert_eq!(records[0]["body"]["json"]["api_key"], "[REDACTED]");
+        assert_eq!(records[0]["body"]["json"]["max_tokens"], 2);
+        assert_eq!(records[1]["direction"], "out");
+        assert_eq!(records[1]["status"], 200);
+        assert!(records[1]["duration_ms"].is_number());
+        assert_eq!(records[2]["direction"], "out_body");
+        assert_eq!(
+            records[2]["body"]["json"]["choices"][0]["text"],
+            "[REDACTED]"
+        );
+        let serialized = serde_json::to_string(&records).unwrap();
+        for secret in ["header-secret", "body-secret", "private prompt"] {
+            assert!(!serialized.contains(secret));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_debug_observes_stream_chunks_without_buffering_the_response() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let app = router_with_http_debug(
+            server,
+            HttpDebug::new(move |line| captured.lock().push(line.to_owned())),
+        );
+        let response = app
+            .oneshot(
+                Request::post("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","prompt":"stream secret","max_tokens":2,"stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(records.lock().len(), 2);
+        let wire_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&wire_body).contains("data:"));
+
+        let records = records.lock().clone();
+        let body_records = records
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|record| record["direction"] == "out_body")
+            .collect::<Vec<_>>();
+        assert!(body_records.len() >= 2);
+        for (index, record) in body_records.iter().enumerate() {
+            assert_eq!(record["chunk_index"], index as u64);
+        }
+        let serialized = records.join("\n");
+        assert!(!serialized.contains("stream secret"));
+        assert!(!serialized.contains("\"token\":\"world\""));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn http_debug_omits_oversized_and_non_json_bodies() {
+        let mut oversized = HttpBodyCapture::default();
+        oversized.push(&vec![b'x'; HTTP_DEBUG_BODY_LIMIT + 1]);
+        let trace = oversized.redacted(Some("application/json"));
+        assert_eq!(trace["bytes"], HTTP_DEBUG_BODY_LIMIT + 1);
+        assert!(trace["omitted"].as_str().unwrap().contains("exceeds"));
+
+        let mut binary = HttpBodyCapture::default();
+        binary.push(b"private binary data");
+        let trace = binary.redacted(Some("application/octet-stream"));
+        assert_eq!(trace["omitted"], "non-JSON body");
+        assert!(!trace.to_string().contains("private binary data"));
+    }
+
+    #[tokio::test]
+    async fn http_debug_runs_on_the_live_http_transport() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let (shutdown, shutdown_requested) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(serve_until(
+            server,
+            address,
+            true,
+            false,
+            Some(HttpDebug::new(move |line| {
+                captured.lock().push(line.to_owned())
+            })),
+            async move {
+                let _ = shutdown_requested.await;
+            },
+        ));
+        let response = tokio::task::spawn_blocking(move || {
+            let mut socket = (0..100)
+                .find_map(|_| match std::net::TcpStream::connect(address) {
+                    Ok(socket) => Some(socket),
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        None
+                    }
+                })
+                .expect("HTTP server became ready");
+            std::io::Write::write_all(
+                &mut socket,
+                b"GET /openapi.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            let mut response = String::new();
+            std::io::Read::read_to_string(&mut socket, &mut response).unwrap();
+            response
+        })
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.to_ascii_lowercase().contains("\r\nx-request-id: "));
+        shutdown.send(()).unwrap();
+        serving.await.unwrap().unwrap();
+        let records = records.lock().clone();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|line| line.contains("\"http_debug\"")));
         fs::remove_dir_all(dir).unwrap();
     }
 

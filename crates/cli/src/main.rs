@@ -106,6 +106,9 @@ enum Command {
         active_time_ms: u64,
         #[arg(long, default_value_t = 8)]
         stream_buffer: usize,
+        /// Emit privacy-safe per-request HTTP debug records to stderr.
+        #[arg(long)]
+        http_debug: bool,
         #[arg(long, default_value_t = 30_000)]
         shutdown_grace_ms: u64,
     },
@@ -175,6 +178,7 @@ fn run(command: Command) -> Result<()> {
             wall_time_ms,
             active_time_ms,
             stream_buffer,
+            http_debug,
             shutdown_grace_ms,
         } => {
             use cusco_server::{
@@ -223,12 +227,22 @@ fn run(command: Command) -> Result<()> {
                 size_bytes: registered.size,
                 epoch: 0,
             })?;
-            tokio::runtime::Runtime::new()?.block_on(cusco_server::serve(
-                server,
-                listen,
-                anonymous,
-                unsafe_public_unauthenticated,
-            ))?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            if http_debug {
+                runtime.block_on(cusco_server::serve_with_http_debug(
+                    server,
+                    listen,
+                    anonymous,
+                    unsafe_public_unauthenticated,
+                ))?;
+            } else {
+                runtime.block_on(cusco_server::serve(
+                    server,
+                    listen,
+                    anonymous,
+                    unsafe_public_unauthenticated,
+                ))?;
+            }
         }
     }
     Ok(())
@@ -440,6 +454,7 @@ mod tests {
             "2048",
             "--stream-buffer",
             "4",
+            "--http-debug",
             "--shutdown-grace-ms",
             "250",
         ])
@@ -449,6 +464,7 @@ mod tests {
             queue_count,
             queue_bytes,
             request_bytes,
+            http_debug,
             stream_buffer,
             shutdown_grace_ms,
             ..
@@ -467,6 +483,7 @@ mod tests {
             ),
             (2, 3, 4096, 2048, 4, 250)
         );
+        assert!(http_debug);
     }
 
     #[test]
@@ -565,6 +582,7 @@ mod tests {
                 active_time_ms: 240_000,
                 stream_buffer: 1,
                 shutdown_grace_ms: 100,
+                http_debug: false,
             })
             .is_err()
         );
@@ -596,6 +614,7 @@ mod tests {
             active_time_ms: 240_000,
             stream_buffer: 1,
             shutdown_grace_ms: 100,
+            http_debug: false,
         })
         .unwrap_err();
         assert!(unsupported.to_string().contains("unsupported model family"));

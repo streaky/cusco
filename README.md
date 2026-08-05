@@ -117,6 +117,14 @@ Pass `--bearer-token` to require authentication. Listening anonymously on a
 non-loopback address is rejected unless
 `--unsafe-public-unauthenticated` is explicitly supplied.
 
+For local HTTP diagnosis, add `--http-debug`. The opt-in mode writes one
+JSON-line request/response record to stderr and observes streaming response
+chunks without buffering them. It never logs request headers, replaces every
+JSON string value with `[REDACTED]`, preserves only JSON structure and
+non-string scalar values, and omits non-JSON or body data above 64 KiB. Each
+response includes the trace correlation ID in `x-request-id`. Keep the mode
+disabled during normal operation.
+
 The checked OpenAPI document is served at `/openapi.json`. OpenAI-compatible
 entry points are `/v1/completions`, `/v1/chat/completions`, and `/v1/models`.
 Native `/native/models`, `/native/contexts`, and `/native/requests` operations

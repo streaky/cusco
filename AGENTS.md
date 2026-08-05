@@ -25,7 +25,7 @@ The repository currently contains:
 - `executor`: upstream and patch metadata;
 - `tools`: fetch, verification, integration-report, and coverage helpers.
 
-The server dynamically admits and reuses multiple model epochs within configured device, host, and storage budgets. Each resident model currently owns one native execution slot, so requests for the same model serialize at that slot while distinct resident models can execute independently. Phase 8 workload scheduling and operational hardening is next. Broader compatibility and production hardening remain later work and must not be represented as implemented.
+The server dynamically admits and reuses multiple model epochs within configured device, host, and storage budgets. Each resident model currently owns one native execution slot, so requests for the same model serialize at that slot while distinct resident models can execute independently. An opt-in `--http-debug` mode emits correlation IDs and privacy-safe JSON-line transport diagnostics without buffering streams or logging headers and body string values. Phase 8 workload scheduling and operational hardening is next; this diagnostic slice alone does not implement that phase. Broader compatibility and production hardening remain later work and must not be represented as implemented.
 
 ## Build and dependency conventions
 

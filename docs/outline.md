@@ -1601,6 +1601,12 @@ Harden request ordering and make resource decisions explainable under sustained 
 - report model residency, executor-slot occupancy, context placement, queue state and age, capacity reservations, transition costs, eviction and unload reasons, and scheduler decisions;
 - validate multi-model and mixed-context pressure, repeated load/unload cycles, cancellation storms, deadline expiry, and sustained operation against capacity, fairness, leak, and latency gates.
 
+The server already includes one narrow operator-diagnostic slice toward this
+phase: opt-in HTTP debug records correlate request metadata, terminal status,
+duration, and streaming response chunks while omitting headers, redacting JSON
+string values, and bounding captured bodies. This transport trace is not
+scheduler decision attribution and does not satisfy the Phase 8 exit gate.
+
 ### Phase 9: compatibility, persistence, and production packaging
 
 Freeze and deliver the external product contract only after the live execution and scheduling architecture is measurable:
