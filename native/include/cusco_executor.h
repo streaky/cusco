@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define CUSCO_EXECUTOR_ABI_VERSION 1u
+#define CUSCO_EXECUTOR_ABI_VERSION 2u
 
 /* Opaque, uniquely owned handles. None is thread-safe. */
 typedef struct cusco_executor cusco_executor;
@@ -48,6 +48,11 @@ cusco_capabilities cusco_executor_capabilities(const cusco_executor *);
  * zero). Release it exactly once with cusco_executor_tokens_free. */
 cusco_status cusco_executor_tokenize(cusco_executor *, const char *, int32_t ** tokens, size_t * count);
 void cusco_executor_tokens_free(int32_t * tokens);
+/* Converts one token to an owned UTF-8 byte sequence. Release it exactly once
+ * with cusco_executor_piece_free. */
+cusco_status cusco_executor_token_to_piece(
+    cusco_executor *, int32_t token, char ** piece, size_t * size);
+void cusco_executor_piece_free(char * piece);
 
 /* Mutates executor state. Input tokens are borrowed for the duration of the call. */
 cusco_status cusco_executor_decode(cusco_executor *, const int32_t *, size_t, cusco_decode_result *);

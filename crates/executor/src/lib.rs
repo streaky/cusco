@@ -83,6 +83,10 @@ impl Executor {
         let text = CString::new(text).map_err(|_| Error::InvalidPath)?;
         ffi::tokenize(self.raw, &text)
     }
+    pub fn token_to_piece(&mut self, token: i32) -> Result<String, Error> {
+        let bytes = ffi::token_to_piece(self.raw, token)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
 
     pub fn decode(&mut self, tokens: &[i32]) -> Result<Decode, Error> {
         let out = ffi::decode(self.raw, tokens)?;
@@ -202,6 +206,27 @@ mod ffi {
         };
         // SAFETY: the ABI permits NULL and this allocation is released exactly once.
         unsafe { sys::cusco_executor_tokens_free(tokens) };
+        Ok(owned)
+    }
+
+    pub(super) fn token_to_piece(
+        raw: NonNull<sys::CuscoExecutor>,
+        token: i32,
+    ) -> Result<Vec<u8>, Error> {
+        let mut piece = std::ptr::null_mut();
+        let mut size = 0;
+        // SAFETY: raw is live and both outputs point to writable storage.
+        status(unsafe {
+            sys::cusco_executor_token_to_piece(raw.as_ptr(), token, &mut piece, &mut size)
+        })?;
+        let owned = if size == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: the ABI returns size initialized bytes on success.
+            unsafe { slice::from_raw_parts(piece.cast::<u8>(), size) }.to_vec()
+        };
+        // SAFETY: the ABI permits NULL and this allocation is released exactly once.
+        unsafe { sys::cusco_executor_piece_free(piece) };
         Ok(owned)
     }
 
@@ -328,6 +353,7 @@ mod tests {
         let capabilities = executor.capabilities();
         assert!(capabilities.global_kv && capabilities.swa && capabilities.recurrent);
         let prefix = executor.tokenize("prefix").unwrap();
+        assert_eq!(executor.token_to_piece(42).unwrap(), "42");
         executor.replace_state_for_proof(&prefix).unwrap();
         let checkpoint = executor.capture_checkpoint().unwrap();
         assert!(checkpoint.bytes > 0);

@@ -48,6 +48,13 @@ unsafe extern "C" {
         count: *mut usize,
     ) -> c_int;
     pub fn cusco_executor_tokens_free(tokens: *mut i32);
+    pub fn cusco_executor_token_to_piece(
+        executor: *mut CuscoExecutor,
+        token: i32,
+        piece: *mut *mut c_char,
+        size: *mut usize,
+    ) -> c_int;
+    pub fn cusco_executor_piece_free(piece: *mut c_char);
     pub fn cusco_executor_decode(
         executor: *mut CuscoExecutor,
         tokens: *const i32,

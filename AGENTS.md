@@ -10,21 +10,22 @@ Keep this `AGENTS.md` up to date whenever development workflows, architecture, s
 
 ## Current state
 
-Phases 1 through 3 are implemented. The real Gemma executor proof demonstrated exact token and bitwise-logit continuation after checkpoint capture, slot displacement, restoration, and a device-to-host-to-device round trip across four logical contexts. Cancellation and failed promotion preserve the prior binding. The Rust logical context store owns persistent token-sequence branches, model and adapter epochs, dependency-valid evaluated-prefix mappings, longest-valid-prefix lookup, reference accounting, and revision-guarded transactional publication. The physical manager owns capacity-accounted device, host, and storage copies, guarded reservations, transfers, active bindings, prepared transitions, deterministic eviction, and capacity observability.
+Phases 1 through 4 are implemented. The real Gemma executor proof demonstrated exact checkpoint continuation. The logical context store owns shared token branches and transactional mappings. The physical manager owns tier capacity, representations, transfers, bindings, prepared transitions, eviction, and observability. The minimal server adds durable opaque external context IDs, atomic state recovery, model lifecycle APIs, bounded transition-cost scheduling, shared streaming events, canonical usage, cancellation/deadlines, authentication policy, OpenAI completion/chat adapters, and checked OpenAPI.
 
-There is no production server yet. The repository currently contains:
+The repository currently contains:
 
 - `crates/context-store`: Rust logical contexts, structurally shared token sequences, and evaluated-prefix mappings;
 - `crates/physical-manager`: physical representations, tier capacity, ownership references, transfers, bindings, and transactional transitions;
 - `crates/executor-sys`: native FFI declarations and linking;
-- `crates/executor`: safe Rust executor and checkpoint wrappers;
+- `crates/executor`: safe Rust executor, token-piece, and checkpoint wrappers;
 - `crates/model-registry`: immutable Hugging Face resolution and verified local registration;
-- `crates/cli`: the proof and model-management driver;
+- `crates/server`: protocol-neutral inference/model services, durable catalog, scheduler, auth, HTTP adapters, and OpenAPI;
+- `crates/cli`: proof, model-management, and `serve` commands;
 - `native`: the C ABI header and llama.cpp shim;
 - `executor`: upstream and patch metadata;
-- `tools`: fetch, verification, and coverage helpers.
+- `tools`: fetch, verification, integration-report, and coverage helpers.
 
-Do not represent later phases as implemented. The next architectural work is the minimal server and scheduler.
+The Phase 4 server is minimal: it loads a registered llama.cpp model for inference and has not yet integrated live executor slots with the Phase 3 physical manager. Do not represent mapped execution, production hardening, or later phases as implemented. The next architectural work is mapped execution if staged measurements justify it, followed by compatibility and production hardening.
 
 ## Build and dependency conventions
 
