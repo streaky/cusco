@@ -82,6 +82,20 @@ enum Command {
         #[arg(long, default_value = "/results/phase1.json")]
         output: PathBuf,
     },
+    MappedProof {
+        model: PathBuf,
+        #[arg(long, default_value_t = 4096)]
+        context: u32,
+        #[arg(long, default_value_t = 99)]
+        gpu_layers: i32,
+        #[arg(
+            long,
+            default_value = "Mapped execution proves reference-only branch switching"
+        )]
+        prefix: String,
+        #[arg(long, default_value = "/results/phase5.json")]
+        output: PathBuf,
+    },
     Serve {
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: SocketAddr,
@@ -125,6 +139,13 @@ fn run(command: Command) -> Result<()> {
             &replacement,
             output,
         )?,
+        Command::MappedProof {
+            model,
+            context,
+            gpu_layers,
+            prefix,
+            output,
+        } => mapped_proof(model, context, gpu_layers, &prefix, output)?,
         Command::Serve {
             listen,
             state,
@@ -148,6 +169,83 @@ fn run(command: Command) -> Result<()> {
     }
     Ok(())
 }
+fn mapped_proof(
+    model: PathBuf,
+    n_ctx: u32,
+    gpu_layers: i32,
+    prefix: &str,
+    output: PathBuf,
+) -> Result<()> {
+    let started = Instant::now();
+    let model_path = model.to_str().context("model path is not UTF-8")?;
+    let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
+    ensure!(
+        executor.capabilities().mapped_execution,
+        "executor does not support mapped execution"
+    );
+    let tokens = executor.tokenize(prefix)?;
+    ensure!(
+        !tokens.is_empty(),
+        "mapped proof prefix tokenized to nothing"
+    );
+    executor.decode(&tokens)?;
+    let checkpoint = executor.capture_checkpoint()?;
+    let staged_started = Instant::now();
+    for _ in 0..4 {
+        let prepared = executor.prepare_restore(&checkpoint, checkpoint.checksum)?;
+        executor.commit_restore(prepared)?;
+    }
+    let staged_restore_ns = staged_started.elapsed().as_nanos();
+    let mut mappings = Vec::with_capacity(4);
+    for _ in 0..4 {
+        let prepared = executor.prepare_mapping_fork(cusco_executor::MappingId(0))?;
+        mappings.push(executor.commit_mapping(prepared)?);
+    }
+    let continuation = *tokens.last().unwrap();
+    let mut expected: Option<(i32, Vec<f32>)> = None;
+    let mut results = Vec::with_capacity(mappings.len());
+    let mut activation_ns = 0u128;
+    for mapping in mappings {
+        let activation_started = Instant::now();
+        executor.activate_mapping(mapping)?;
+        activation_ns += activation_started.elapsed().as_nanos();
+        let decoded = executor.decode(&[continuation])?;
+        if let Some((token, logits)) = &expected {
+            ensure!(
+                *token == decoded.token && logits_identical(logits, &decoded.logits),
+                "mapped branches diverged"
+            );
+        } else {
+            expected = Some((decoded.token, decoded.logits.clone()));
+        }
+        results.push(json!({"mapping": mapping.0, "next_token": decoded.token}));
+    }
+    let metrics = executor.mapping_metrics();
+    ensure!(
+        metrics.activation_bytes_copied == 0,
+        "mapping activation copied device bytes"
+    );
+    let artifact = json!({
+        "model": model,
+        "branches": results,
+        "metrics": metrics,
+        "comparison": {
+            "staged_restore_ns": staged_restore_ns,
+            "mapped_activation_ns": activation_ns,
+            "staged_bytes_read": checkpoint.bytes * 4,
+            "mapped_activation_bytes_copied": metrics.activation_bytes_copied,
+            "prompt_tokens_avoided": tokens.len() * 4
+        },
+        "elapsed_ms": started.elapsed().as_millis()
+    });
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&output, serde_json::to_vec_pretty(&artifact)?)?;
+    println!("{}", serde_json::to_string_pretty(&artifact)?);
+    Ok(())
+}
+
 fn proof(
     model: PathBuf,
     expected_sha256: Option<&str>,
@@ -308,6 +406,27 @@ mod tests {
         assert_eq!(artifact["contexts"][0]["prompt"], "prefix [0]");
         assert!(artifact["contexts"][0]["next_token"].is_number());
         assert_eq!(artifact["failed_promotion_preserved_binding"], true);
+        let mapped_output = root.join("mapped.json");
+        run(Command::MappedProof {
+            model: PathBuf::from("mock://deterministic"),
+            context: 128,
+            gpu_layers: 0,
+            prefix: "mapped prefix".into(),
+            output: mapped_output.clone(),
+        })
+        .unwrap();
+        let mapped: serde_json::Value =
+            serde_json::from_slice(&fs::read(mapped_output).unwrap()).unwrap();
+        assert_eq!(mapped["branches"].as_array().unwrap().len(), 4);
+        assert_eq!(mapped["metrics"]["activation_bytes_copied"], 0);
+        assert!(mapped["comparison"]["staged_bytes_read"].as_u64().unwrap() > 0);
+        assert_eq!(mapped["comparison"]["mapped_activation_bytes_copied"], 0);
+        assert!(
+            mapped["comparison"]["prompt_tokens_avoided"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
         let public: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         assert!(
             run(Command::Serve {

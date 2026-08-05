@@ -13,6 +13,10 @@ pub struct CuscoPreparedRestore {
     _private: [u8; 0],
 }
 #[repr(C)]
+pub struct CuscoPreparedMapping {
+    _private: [u8; 0],
+}
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Capabilities {
     pub abi_version: c_uint,
@@ -20,6 +24,8 @@ pub struct Capabilities {
     pub has_swa: c_uint,
     pub has_recurrent: c_uint,
     pub n_vocab: c_int,
+    pub has_mapped_execution: c_uint,
+    pub max_mappings: c_uint,
 }
 #[repr(C)]
 pub struct DecodeResult {
@@ -79,6 +85,23 @@ unsafe extern "C" {
         executor: *mut CuscoExecutor,
         prepared: *mut CuscoPreparedRestore,
     ) -> c_int;
+    pub fn cusco_executor_prepare_mapping_fork(
+        executor: *mut CuscoExecutor,
+        source_mapping: c_uint,
+        out: *mut *mut CuscoPreparedMapping,
+    ) -> c_int;
+    pub fn cusco_prepared_mapping_free(prepared: *mut CuscoPreparedMapping);
+    pub fn cusco_executor_commit_mapping(
+        executor: *mut CuscoExecutor,
+        prepared: *mut CuscoPreparedMapping,
+        mapping: *mut c_uint,
+    ) -> c_int;
+    pub fn cusco_executor_activate_mapping(executor: *mut CuscoExecutor, mapping: c_uint) -> c_int;
+    pub fn cusco_executor_remove_mapping(executor: *mut CuscoExecutor, mapping: c_uint) -> c_int;
+    pub fn cusco_executor_active_mapping(executor: *const CuscoExecutor) -> c_uint;
+    pub fn cusco_executor_mapping_count(executor: *const CuscoExecutor) -> usize;
+    pub fn cusco_executor_reference_switches(executor: *const CuscoExecutor) -> c_ulonglong;
+    pub fn cusco_executor_mapped_bytes_copied(executor: *const CuscoExecutor) -> c_ulonglong;
     pub fn cusco_executor_replace_state_for_proof(
         executor: *mut CuscoExecutor,
         tokens: *const i32,

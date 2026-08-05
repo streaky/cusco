@@ -6,12 +6,13 @@
 extern "C" {
 #endif
 
-#define CUSCO_EXECUTOR_ABI_VERSION 2u
+#define CUSCO_EXECUTOR_ABI_VERSION 3u
 
 /* Opaque, uniquely owned handles. None is thread-safe. */
 typedef struct cusco_executor cusco_executor;
 typedef struct cusco_checkpoint cusco_checkpoint;
 typedef struct cusco_prepared_restore cusco_prepared_restore;
+typedef struct cusco_prepared_mapping cusco_prepared_mapping;
 
 typedef struct {
     uint32_t abi_version;
@@ -19,6 +20,8 @@ typedef struct {
     uint32_t has_swa;
     uint32_t has_recurrent;
     int32_t n_vocab;
+    uint32_t has_mapped_execution;
+    uint32_t max_mappings;
 } cusco_capabilities;
 
 /* logits is borrowed from the executor and remains valid only until the next
@@ -72,6 +75,24 @@ void cusco_prepared_restore_free(cusco_prepared_restore *);
  * success installs the prepared state; ordinary failure leaves the prior binding
  * valid. CUSCO_ROLLBACK_FAILED reports that restoring the prior binding also failed. */
 cusco_status cusco_executor_commit_restore(cusco_executor *, cusco_prepared_restore * prepared);
+
+/* A mapped execution binding is a llama.cpp sequence that remains resident in
+ * the executor context. Preparing a fork allocates and copies sequence
+ * references, but it is invisible to activation until commit publishes it.
+ * Activation changes only the block-table reference used by subsequent decode
+ * calls; it does not serialize or restore checkpoint bytes. Graph/cache reuse
+ * is not reported because llama.cpp's public API exposes no rebuild signal. */
+cusco_status cusco_executor_prepare_mapping_fork(
+    cusco_executor *, uint32_t source_mapping, cusco_prepared_mapping ** out);
+void cusco_prepared_mapping_free(cusco_prepared_mapping *);
+cusco_status cusco_executor_commit_mapping(
+    cusco_executor *, cusco_prepared_mapping *, uint32_t * mapping);
+cusco_status cusco_executor_activate_mapping(cusco_executor *, uint32_t mapping);
+cusco_status cusco_executor_remove_mapping(cusco_executor *, uint32_t mapping);
+uint32_t cusco_executor_active_mapping(const cusco_executor *);
+size_t cusco_executor_mapping_count(const cusco_executor *);
+uint64_t cusco_executor_reference_switches(const cusco_executor *);
+uint64_t cusco_executor_mapped_bytes_copied(const cusco_executor *);
 
 /* Phase 1 proof hooks, not production executor operations. */
 cusco_status cusco_executor_replace_state_for_proof(cusco_executor *, const int32_t *, size_t);

@@ -1,25 +1,26 @@
 # Cusco progress and capability evidence
 
-_Last updated: 2026-08-05 on branch `phase-4-minimal-server`._
+_Last updated: 2026-08-05 on branch `phase-5-mapped-execution`._
 
 ## Executive summary
 
-Cusco has completed the first four implementation gates in `docs/outline.md`:
+Cusco has completed the first five implementation gates in `docs/outline.md`:
 
 1. **Phase 1 — executor proof:** a real hybrid/recurrent Gemma checkpoint was captured, displaced, copied through host memory, restored, and continued exactly across four logical contexts.
 2. **Phase 2 — Rust logical context store:** Rust represents logical contexts, structurally shared token branches, dependency-aware evaluated-prefix mappings, transactional publication, and logical reference accounting.
 3. **Phase 3 — tiered physical manager:** Rust accounts for device, pinned-host, and storage representations; guarded capacity; asynchronous transfer ownership; transactional binding transitions; deterministic eviction; and capacity observability.
 4. **Phase 4 — minimal server:** an authenticated HTTP service exposes OpenAI completion/chat adapters and native model/context lifecycle APIs over bounded admission, durable opaque contexts, canonical usage, cancellation/deadline handling, and the real llama.cpp executor.
+5. **Phase 5 — mapped execution:** transactional device-resident sequence mappings publish by reference, activate without copying checkpoint bytes or rebuilding the graph, and connect committed physical bindings to explicit executor block tables.
 
-The strongest executor-boundary result remains the exact Phase 1 checkpoint proof. A second repeatable GPU-backed report now exercises the Phase 4 server end to end: authenticated model registration, a complex 72-token streaming completion through the real Gemma model, OpenAPI route checks, canonical usage, and client/server timing.
+The strongest executor-boundary result remains the exact Phase 1 checkpoint proof. Repeatable GPU-backed reports now exercise the Phase 4 server end to end and compare Phase 5 staged checkpoint restoration with mapped activation on the pinned Gemma artifact.
 
-Cusco remains experimental. The Phase 4 server persists its catalog and logical contexts across process restarts, but its SSE events are currently buffered until generation completes, and live executor slots are not yet integrated with the Phase 3 physical manager. It does not establish production readiness, sustained-load performance, or a stable public API.
+Cusco remains experimental. The Phase 4 server persists its catalog and logical contexts across process restarts, but its SSE events are currently buffered until generation completes, and its request path is not yet wired to Phase 5 mappings. It does not establish production readiness, sustained-load performance, or a stable public API.
 
 ## Capability status
 
 | Capability | Status | Evidence |
 |---|---|---|
-| Versioned native C ABI around llama.cpp | Demonstrated | The current ABI is version 2; declarations and ownership contracts, including token-to-piece conversion, live in `native/include/cusco_executor.h`. |
+| Versioned native C ABI around llama.cpp | Demonstrated | The current ABI is version 3; declarations and ownership contracts include checkpointing, token-to-piece conversion, transactional sequence mappings, and mapping metrics. |
 | Composite checkpoint capture and restore | Demonstrated on the pinned Gemma artifact | `results/phase1.json` records four restored contexts with non-empty checkpoints. |
 | Exact token continuation | Demonstrated | `token_equal: true` for all four contexts in `results/phase1.json`. |
 | Bitwise-identical logit continuation | Demonstrated | `logits_equal: true` for all four contexts in `results/phase1.json`; the proof uses exact float-bit comparison rather than tolerance-based comparison. |
@@ -39,6 +40,7 @@ Cusco remains experimental. The Phase 4 server persists its catalog and logical 
 | Physical device/host/storage tier manager | Implemented and tested | `crates/physical-manager` accounts for residency and guarded capacity, models transfers separately from prepared transitions, commits bindings revision-transactionally, and emits capacity metrics and structured trace events. |
 | Durable cross-process context persistence | Implemented and tested | Phase 4 atomically persists the model catalog, logical contexts, branches, revisions, and opaque UUIDs; restart tests verify recovery and non-reuse. Physical representation storage remains separate ownership/accounting metadata. |
 | Inference server, scheduler, streaming API | Implemented and GPU-exercised | `cusco-server` provides bounded admission, transition-cost selection, OpenAI completion/chat adapters, native lifecycle routes, shared stream events, cancellation/deadline handling, canonical usage, and checked OpenAPI. `results/phase4-server.json` records a real-model authenticated streaming run. |
+| Mapped device-resident execution | Implemented and GPU-exercised | `results/phase5.json` records four exact mapped branch continuations, reference-only activation, graph epoch stability, staged-versus-mapped timing, bytes moved, and prompt work avoided. |
 
 ## Phase 1 real-model proof
 
@@ -165,6 +167,30 @@ The latest observed run used the pinned Gemma artifact on an NVIDIA GeForce GTX 
 
 The machine-readable result is `results/phase4-server.json`. This measurement is an end-to-end integration observation, not a decode-only benchmark: the server currently opens the model per request and emits buffered SSE events after generation.
 
+## Phase 5 mapped-execution evidence
+
+The native ABI and safe Rust wrapper expose prepare/commit mapping forks,
+activation, removal, and metrics. Publication is transactional: dropped
+preparations are invisible, failed commits leave the prior active mapping
+valid, and committed mappings remain independently addressable. The physical
+manager publishes a `DeviceBlockTable` only after the corresponding physical
+binding has committed and removes stale tables on transition or unbind.
+
+The reproducible GPU proof is:
+
+```sh
+docker compose run --rm mapped-proof
+```
+
+The latest observed GTX 1080 Ti run continued four mapped branches with token
+ID `26182` in every branch. Four reference switches copied **0 activation
+bytes**. Four staged restores read **668,040 bytes** and took **5,944,233 ns**,
+while four mapped activations took **2,400 ns** and avoided reevaluating **36
+prompt tokens**. These are focused single-run observations, not sustained-load
+benchmarks; mapping fork creation inside llama.cpp may still copy KV/recurrent
+sequence data, while subsequent activation is reference-only. The proof does
+not claim graph/cache reuse because llama.cpp exposes no public rebuild signal.
+
 ## Test and coverage evidence
 
 The repository's containerized gate is:
@@ -180,12 +206,12 @@ Per-file line coverage reported by that run:
 
 | Rust source file | Line coverage |
 |---|---:|
-| `crates/cli/src/main.rs` | 85.82% |
+| `crates/cli/src/main.rs` | 86.46% |
 | `crates/context-store/src/lib.rs` | 97.07% |
-| `crates/executor/src/lib.rs` | 95.75% |
+| `crates/executor/src/lib.rs` | 96.98% |
 | `crates/model-registry/src/lib.rs` | 92.86% |
 | `crates/physical-manager/src/lib.rs` | 98.82% |
-| `crates/server/src/lib.rs` | 95.03% |
+| `crates/server/src/lib.rs` | 94.50% |
 
 Every measured Rust source file exceeded the required **80%** threshold.
 
@@ -213,6 +239,8 @@ Every measured Rust source file exceeded the required **80%** threshold.
 | Runnable real-model report | `tools/inference-integration-test.sh`, `tools/report-inference-proof.py` |
 | Phase 4 machine-readable real-model server result | `results/phase4-server.json` |
 | Runnable Phase 4 server report | `tools/server-inference-report.sh`, `tools/report-server-inference.py` |
+| Phase 5 machine-readable mapped proof | `results/phase5.json` |
+| Mapped executor and block-table behavior | `native/shim/cusco_executor.cpp`, `crates/executor/src/lib.rs`, `crates/physical-manager/src/lib.rs` |
 | Minimal server, HTTP adapters, scheduler, persistence, and tests | `crates/server/src/lib.rs` |
 | Immutable model registry | `crates/model-registry/src/lib.rs` |
 | Containerized proof/test services | `compose.yaml` |
@@ -222,6 +250,16 @@ Every measured Rust source file exceeded the required **80%** threshold.
 
 ## Current boundary and next gate
 
-The evidence now supports the executor-boundary hypothesis, logical-state and transactional physical-tier models, durable minimal-server state, authenticated model/context APIs, and real-model HTTP generation. It does not establish production readiness, sustained-load behavior, true incremental token delivery, or a stable public API. The current server opens a model for each request, buffers generation before emitting SSE events, and does not yet bind Phase 3 physical-manager transitions to live executor slots.
+The evidence now supports the executor-boundary hypothesis, logical-state and
+transactional physical-tier models, durable minimal-server state,
+authenticated model/context APIs, real-model HTTP generation, and
+reference-only mapped activation. It does not establish production readiness,
+sustained-load behavior, true incremental token delivery, or a stable public
+API. The current server opens a model for each request, buffers generation
+before emitting SSE events, and does not yet use mapped execution in live
+request scheduling.
 
-The next architectural gate is mapped execution if staged measurements justify it; otherwise the immediate work is integrating the minimal scheduler with the physical manager and then compatibility and production hardening. Any such work must preserve the transactional cancellation, capacity, persistence, and checkpoint guarantees already demonstrated.
+The next architectural gate is integrating Phase 5 mappings and committed
+physical block tables with the minimal server scheduler, followed by
+compatibility and production hardening. That work must preserve transactional
+cancellation, capacity, persistence, and checkpoint guarantees.

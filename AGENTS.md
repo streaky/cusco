@@ -10,7 +10,7 @@ Keep this `AGENTS.md` up to date whenever development workflows, architecture, s
 
 ## Current state
 
-Phases 1 through 4 are implemented. The real Gemma executor proof demonstrated exact checkpoint continuation. The logical context store owns shared token branches and transactional mappings. The physical manager owns tier capacity, representations, transfers, bindings, prepared transitions, eviction, and observability. The minimal server adds durable opaque external context IDs, atomic state recovery, model lifecycle APIs, bounded transition-cost scheduling, shared streaming events, canonical usage, cancellation/deadlines, authentication policy, OpenAI completion/chat adapters, and checked OpenAPI.
+Phases 1 through 5 are implemented. The real Gemma executor proof demonstrated exact checkpoint continuation. The logical context store owns shared token branches and transactional mappings. The physical manager owns tier capacity, representations, transfers, bindings, prepared transitions, eviction, observability, and committed device block tables. The minimal server adds durable opaque external context IDs, atomic state recovery, model lifecycle APIs, bounded transition-cost scheduling, shared streaming events, canonical usage, cancellation/deadlines, authentication policy, OpenAI completion/chat adapters, and checked OpenAPI. Phase 5 adds transactional llama.cpp sequence mappings, reference-only activation, byte-copy metrics, and a real-GPU staged-versus-mapped proof. Graph/cache reuse remains unmeasured because llama.cpp exposes no public rebuild signal.
 
 The repository currently contains:
 
@@ -25,7 +25,7 @@ The repository currently contains:
 - `executor`: upstream and patch metadata;
 - `tools`: fetch, verification, integration-report, and coverage helpers.
 
-The Phase 4 server is minimal: it loads a registered llama.cpp model for inference and has not yet integrated live executor slots with the Phase 3 physical manager. Do not represent mapped execution, production hardening, or later phases as implemented. The next architectural work is mapped execution if staged measurements justify it, followed by compatibility and production hardening.
+The Phase 4 server remains minimal: it loads a registered llama.cpp model per inference request and has not yet integrated live executor slots with the physical manager or Phase 5 mapped mappings. Do not represent production hardening or later phases as implemented. The next architectural work is integrating mapped execution with server scheduling, followed by compatibility and production hardening.
 
 ## Build and dependency conventions
 
@@ -33,7 +33,7 @@ The Phase 4 server is minimal: it loads a registered llama.cpp model for inferen
 - Local builds must support CUDA architectures `sm_61` and `sm_70`. Use `CUSCO_CUDA_ARCHITECTURES="61;70"` for normal local builds.
 - Reserve the broad, full CUDA architecture build for production releases. Do not spend local development time compiling every supported CUDA target unless release validation specifically requires it.
 - `llama.cpp-version.txt` is the sole source of truth for the llama.cpp version. It contains a release tag only. Build and fetch tooling must read it; never duplicate the tag or record the corresponding commit hash.
-- Keep llama.cpp changes behind the versioned C ABI in `native/include/cusco_executor.h`. Rust should not depend directly on unstable llama.cpp internals.
+- Keep llama.cpp changes behind the versioned C ABI in `native/include/cusco_executor.h` (currently ABI version 3). Rust should not depend directly on unstable llama.cpp internals.
 - Model files and generated proof results are local artifacts and must not be committed.
 
 A normal local image build is:
@@ -50,6 +50,7 @@ Select the proof GPU with `CUSCO_GPU_DEVICE_ID`; do not assume a particular host
 - Every measured Rust source file must maintain at least 80% line coverage. `tools/coverage.sh` runs the tests and enforces the per-file threshold.
 - Run the GPU-less coverage path with `docker compose run --rm test`.
 - Executor-boundary changes require the real model proof, not only the deterministic model-free tests. The proof uses the external `models/gemma-4-e2b-it.gguf` asset and writes a machine-readable result under `results/`.
+- Mapped-executor changes require `docker compose run --rm mapped-proof`; it writes staged-versus-mapped evidence to `results/phase5.json`.
 - Verify failure behavior transactionally: cancellation, preparation failure, transfer failure, validation failure, and commit failure must leave the prior binding usable.
 - For behavioral work, exercise the changed path end to end. A successful compile alone is not sufficient.
 
