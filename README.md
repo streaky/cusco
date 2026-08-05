@@ -28,6 +28,25 @@ and a deliberately failed restore preserve the prior binding. The command
 exits nonzero on any failed assertion and prints a short Markdown report with
 the prompts, inferred token IDs, checkpoint sizes, and exactness results.
 
+## Run the real-model server report
+
+To exercise the authenticated Phase 4 HTTP surface with the same validation
+GGUF and print a prompt, generated response, streaming assertions, usage, and
+end-to-end timing data, run:
+
+```sh
+tools/server-inference-report.sh
+```
+
+The report is also written to `results/phase4-server.json`. The workflow uses
+GPU 1 and port 18082 by default; `CUSCO_GPU_DEVICE_ID`,
+`CUSCO_SERVER_REPORT_PORT`, `CUSCO_MODEL_DIR`, and `CUSCO_RESULT_DIR` override
+those defaults. Server timing includes model loading and generation, and the
+current SSE adapter emits its buffered token events after generation completes,
+so the reported first streamed token is an end-to-end observation rather than
+decode-only time-to-first-token.
+
+
 ## Run the minimal server
 
 The unauthenticated development provider is restricted to loopback:
