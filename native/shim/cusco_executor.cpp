@@ -365,6 +365,9 @@ cusco_status cusco_executor_replace_state_for_proof(
     } else {
         llama_memory_clear(llama_get_memory(executor->ctx), true);
     }
+    if (count == 0) {
+        return CUSCO_OK;
+    }
     cusco_decode_result ignored{};
     return cusco_executor_decode(executor, tokens, count, &ignored);
 } catch (const std::bad_alloc &) {

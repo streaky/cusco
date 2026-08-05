@@ -335,6 +335,8 @@ mod tests {
         let expected = executor.decode(&continuation).unwrap();
         let unrelated = executor.tokenize("other").unwrap();
         executor.replace_state_for_proof(&unrelated).unwrap();
+        executor.replace_state_for_proof(&[]).unwrap();
+        assert_eq!(executor.capture_checkpoint().unwrap().bytes, 0);
         assert_eq!(
             executor
                 .prepare_restore(&checkpoint, checkpoint.checksum ^ 1)
