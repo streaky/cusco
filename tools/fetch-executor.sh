@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
-tag=b10273
-revision=a6aa6f5450eaad18b3c86631b5c3fff330f5a46e
+tag=$(cat llama.cpp-version.txt)
 repository=https://github.com/ggml-org/llama.cpp.git
 destination=${1:-vendor/llama.cpp}
-if [ -e "$destination/.git" ]; then test "$(git -C "$destination" rev-parse HEAD)" = "$revision"; else git clone --filter=blob:none "$repository" "$destination";git -C "$destination" checkout --detach "$revision";fi
+if [ -e "$destination/.git" ]; then git -C "$destination" fetch --depth 1 origin "refs/tags/$tag:refs/tags/$tag"; else git clone --filter=blob:none --branch "$tag" --depth 1 "$repository" "$destination"; fi
+git -C "$destination" checkout --detach "$tag"
