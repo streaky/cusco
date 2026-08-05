@@ -472,6 +472,10 @@ cusco_status cusco_executor_prepare_mapping_fork(
     const uint32_t mapping = executor->next_mapping++;
     const int32_t sequence = executor->next_sequence++;
     const int32_t source_sequence = executor->block_table.at(source_mapping);
+    std::unique_ptr<cusco_prepared_mapping, decltype(&cusco_prepared_mapping_free)>
+        prepared(
+            new cusco_prepared_mapping{executor, mapping, sequence, false},
+            cusco_prepared_mapping_free);
     if (is_mock(executor)) {
         const auto & state = source_mapping == executor->active_mapping
             ? executor->mock_state
@@ -483,8 +487,8 @@ cusco_status cusco_executor_prepare_mapping_fork(
     }
     executor->block_table.emplace(mapping, sequence);
     executor->positions.emplace(mapping, executor->positions.at(source_mapping));
-    auto prepared = std::make_unique<cusco_prepared_mapping>(
-        cusco_prepared_mapping{executor, mapping, sequence, false});
+    // Keep the unpublished mapping under rollback-aware RAII ownership until
+    // every fallible allocation has completed.
     *out = prepared.release();
     return CUSCO_OK;
 } catch (const std::bad_alloc &) {
@@ -508,8 +512,8 @@ cusco_status cusco_executor_commit_mapping(
         discard_mapping(prepared.get());
         return CUSCO_INVALID;
     }
-    prepared->committed = true;
     executor->published_mappings.insert(prepared->mapping);
+    prepared->committed = true;
     *mapping = prepared->mapping;
     return CUSCO_OK;
 } catch (...) {
