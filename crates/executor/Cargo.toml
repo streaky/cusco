@@ -1,0 +1,10 @@
+[package]
+name = "cusco-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cusco-executor-sys = { path = "../executor-sys" }
+serde.workspace = true
+thiserror.workspace = true
