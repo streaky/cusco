@@ -112,7 +112,7 @@ impl ExecutionProfile {
     fn required_mask(&self) -> ComponentMask {
         self.required_components
             .iter()
-            .fold(ComponentMask::GLOBAL_KV, |mask, component| {
+            .fold(ComponentMask::EMPTY, |mask, component| {
                 mask.union(match component {
                     ProfileComponent::Kv => ComponentMask::GLOBAL_KV,
                     ProfileComponent::Swa => ComponentMask::SWA,
@@ -604,6 +604,22 @@ mod tests {
             serde_json::from_str(include_str!("../../../config/model-families.schema.json"))
                 .unwrap();
         assert_eq!(schema["properties"]["schema_version"]["const"], 1);
+    }
+
+    #[test]
+    fn profile_rejects_missing_global_kv() {
+        let mut missing_kv = ExecutionProfile::bundled_gemma().unwrap();
+        missing_kv
+            .required_components
+            .retain(|component| *component != ProfileComponent::Kv);
+        assert!(!missing_kv
+            .required_mask()
+            .contains(ComponentMask::GLOBAL_KV));
+        assert!(matches!(
+            missing_kv.validate(),
+            Err(Error::State(message))
+                if message == "Gemma profile omits a required execution component"
+        ));
     }
 
     #[test]

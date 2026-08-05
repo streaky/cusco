@@ -27,6 +27,7 @@ pub struct AdapterEpoch(pub u64);
 pub struct ComponentMask(u8);
 
 impl ComponentMask {
+    pub const EMPTY: Self = Self(0);
     pub const GLOBAL_KV: Self = Self(1);
     pub const SWA: Self = Self(2);
     pub const RECURRENT: Self = Self(4);
