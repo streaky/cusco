@@ -40,7 +40,6 @@ struct cusco_executor {
     std::unordered_map<uint32_t, size_t> positions;
     std::unordered_set<uint32_t> published_mappings;
     uint32_t active_mapping;
-    uint64_t graph_epoch = 1;
     uint32_t next_mapping;
     int32_t next_sequence;
     uint64_t mapping_epoch;
@@ -558,9 +557,6 @@ uint32_t cusco_executor_active_mapping(const cusco_executor * executor) {
 }
 size_t cusco_executor_mapping_count(const cusco_executor * executor) {
     return executor ? executor->published_mappings.size() : 0;
-}
-uint64_t cusco_executor_mapping_epoch(const cusco_executor * executor) {
-    return executor ? executor->graph_epoch : 0;
 }
 uint64_t cusco_executor_reference_switches(const cusco_executor * executor) {
     return executor ? executor->reference_switches : 0;

@@ -47,9 +47,10 @@ docker compose run --rm mapped-proof
 ```
 
 The command forks four device-resident sequence mappings, activates and
-continues each one with identical results, verifies graph reuse and zero bytes
-copied by activation, and writes staged-versus-mapped timing, bytes, and prompt
-work avoided to `results/phase5.json`.
+continues each one with identical results, verifies zero bytes copied by
+activation, and writes staged-versus-mapped timing, bytes, and prompt work
+avoided to `results/phase5.json`. The proof does not claim graph/cache reuse:
+llama.cpp's public API does not expose whether its backend rebuilt a graph.
 
 ## Run the real-model server report
 

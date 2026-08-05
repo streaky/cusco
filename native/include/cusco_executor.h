@@ -80,8 +80,8 @@ cusco_status cusco_executor_commit_restore(cusco_executor *, cusco_prepared_rest
  * the executor context. Preparing a fork allocates and copies sequence
  * references, but it is invisible to activation until commit publishes it.
  * Activation changes only the block-table reference used by subsequent decode
- * calls; it does not serialize or restore checkpoint bytes and keeps the same
- * llama context (and therefore the same graph/cache epoch) alive. */
+ * calls; it does not serialize or restore checkpoint bytes. Graph/cache reuse
+ * is not reported because llama.cpp's public API exposes no rebuild signal. */
 cusco_status cusco_executor_prepare_mapping_fork(
     cusco_executor *, uint32_t source_mapping, cusco_prepared_mapping ** out);
 void cusco_prepared_mapping_free(cusco_prepared_mapping *);
@@ -91,7 +91,6 @@ cusco_status cusco_executor_activate_mapping(cusco_executor *, uint32_t mapping)
 cusco_status cusco_executor_remove_mapping(cusco_executor *, uint32_t mapping);
 uint32_t cusco_executor_active_mapping(const cusco_executor *);
 size_t cusco_executor_mapping_count(const cusco_executor *);
-uint64_t cusco_executor_mapping_epoch(const cusco_executor *);
 uint64_t cusco_executor_reference_switches(const cusco_executor *);
 uint64_t cusco_executor_mapped_bytes_copied(const cusco_executor *);
 

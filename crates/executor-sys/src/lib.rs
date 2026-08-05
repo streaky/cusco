@@ -100,7 +100,6 @@ unsafe extern "C" {
     pub fn cusco_executor_remove_mapping(executor: *mut CuscoExecutor, mapping: c_uint) -> c_int;
     pub fn cusco_executor_active_mapping(executor: *const CuscoExecutor) -> c_uint;
     pub fn cusco_executor_mapping_count(executor: *const CuscoExecutor) -> usize;
-    pub fn cusco_executor_mapping_epoch(executor: *const CuscoExecutor) -> c_ulonglong;
     pub fn cusco_executor_reference_switches(executor: *const CuscoExecutor) -> c_ulonglong;
     pub fn cusco_executor_mapped_bytes_copied(executor: *const CuscoExecutor) -> c_ulonglong;
     pub fn cusco_executor_replace_state_for_proof(

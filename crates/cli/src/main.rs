@@ -196,7 +196,6 @@ fn mapped_proof(
         executor.commit_restore(prepared)?;
     }
     let staged_restore_ns = staged_started.elapsed().as_nanos();
-    let graph_epoch = executor.mapping_metrics().graph_epoch;
     let mut mappings = Vec::with_capacity(4);
     for _ in 0..4 {
         let prepared = executor.prepare_mapping_fork(cusco_executor::MappingId(0))?;
@@ -223,10 +222,6 @@ fn mapped_proof(
     }
     let metrics = executor.mapping_metrics();
     ensure!(
-        metrics.graph_epoch == graph_epoch,
-        "mapping change rebuilt the graph"
-    );
-    ensure!(
         metrics.activation_bytes_copied == 0,
         "mapping activation copied device bytes"
     );
@@ -234,7 +229,6 @@ fn mapped_proof(
         "model": model,
         "branches": results,
         "metrics": metrics,
-        "graph_reused": true,
         "comparison": {
             "staged_restore_ns": staged_restore_ns,
             "mapped_activation_ns": activation_ns,
@@ -424,7 +418,6 @@ mod tests {
         let mapped: serde_json::Value =
             serde_json::from_slice(&fs::read(mapped_output).unwrap()).unwrap();
         assert_eq!(mapped["branches"].as_array().unwrap().len(), 4);
-        assert_eq!(mapped["graph_reused"], true);
         assert_eq!(mapped["metrics"]["activation_bytes_copied"], 0);
         assert!(mapped["comparison"]["staged_bytes_read"].as_u64().unwrap() > 0);
         assert_eq!(mapped["comparison"]["mapped_activation_bytes_copied"], 0);

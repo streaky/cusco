@@ -183,13 +183,13 @@ docker compose run --rm mapped-proof
 ```
 
 The latest observed GTX 1080 Ti run continued four mapped branches with token
-ID `26182` in every branch. The graph epoch remained `1`; four reference
-switches copied **0 activation bytes**. Four staged restores read **668,040
-bytes** and took **6,432,118 ns**, while four mapped activations took **2,740
-ns** and avoided reevaluating **36 prompt tokens**. These are focused
-single-run observations, not sustained-load benchmarks; mapping fork creation
-inside llama.cpp may still copy KV/recurrent sequence data, while subsequent
-activation is reference-only.
+ID `26182` in every branch. Four reference switches copied **0 activation
+bytes**. Four staged restores read **668,040 bytes** and took **5,944,233 ns**,
+while four mapped activations took **2,400 ns** and avoided reevaluating **36
+prompt tokens**. These are focused single-run observations, not sustained-load
+benchmarks; mapping fork creation inside llama.cpp may still copy KV/recurrent
+sequence data, while subsequent activation is reference-only. The proof does
+not claim graph/cache reuse because llama.cpp exposes no public rebuild signal.
 
 ## Test and coverage evidence
 

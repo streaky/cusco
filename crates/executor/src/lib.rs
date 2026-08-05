@@ -51,7 +51,6 @@ pub struct MappingId(pub u32);
 pub struct MappingMetrics {
     pub active: MappingId,
     pub resident_mappings: usize,
-    pub graph_epoch: u64,
     pub reference_switches: u64,
     pub activation_bytes_copied: u64,
 }
@@ -399,7 +398,6 @@ mod ffi {
             super::MappingMetrics {
                 active: super::MappingId(sys::cusco_executor_active_mapping(executor.as_ptr())),
                 resident_mappings: sys::cusco_executor_mapping_count(executor.as_ptr()),
-                graph_epoch: sys::cusco_executor_mapping_epoch(executor.as_ptr()),
                 reference_switches: sys::cusco_executor_reference_switches(executor.as_ptr()),
                 activation_bytes_copied: sys::cusco_executor_mapped_bytes_copied(executor.as_ptr()),
             }
@@ -502,7 +500,6 @@ mod tests {
         assert!(executor.capabilities().mapped_execution);
         let prefix = executor.tokenize("shared prefix").unwrap();
         executor.decode(&prefix).unwrap();
-        let epoch = executor.mapping_metrics().graph_epoch;
 
         let aborted = executor.prepare_mapping_fork(MappingId(0)).unwrap();
         assert_eq!(
@@ -523,7 +520,6 @@ mod tests {
         assert!(logits_identical(&mapped.logits, &staged.logits));
 
         let metrics = executor.mapping_metrics();
-        assert_eq!(metrics.graph_epoch, epoch);
         assert_eq!(metrics.reference_switches, 1);
         assert_eq!(metrics.activation_bytes_copied, 0);
         executor.activate_mapping(MappingId(0)).unwrap();
