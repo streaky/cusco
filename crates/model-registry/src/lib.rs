@@ -65,7 +65,12 @@ fn parse_hf(uri: &str) -> Result<(String, String, String), Error> {
     let (org, remainder) = rest.split_once('/').ok_or(Error::InvalidUri)?;
     let (model_revision, file) = remainder.split_once('/').ok_or(Error::InvalidUri)?;
     let (model, revision) = model_revision.rsplit_once('@').ok_or(Error::InvalidUri)?;
-    if org.is_empty() || model.is_empty() || revision.len() != 40 || file.is_empty() {
+    let simple_file = Path::new(file)
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && Path::new(file).components().count() == 1;
+    if org.is_empty() || model.is_empty() || revision.len() != 40 || file.is_empty() || !simple_file
+    {
         return Err(Error::InvalidUri);
     }
     Ok((
@@ -123,6 +128,10 @@ mod tests {
         assert!(matches!(parse_hf("https://bad"), Err(Error::InvalidUri)));
         assert!(matches!(
             parse_hf("hf://models/a/b@short/f"),
+            Err(Error::InvalidUri)
+        ));
+        assert!(matches!(
+            parse_hf("hf://models/a/b@0123456789012345678901234567890123456789/../escape.gguf"),
             Err(Error::InvalidUri)
         ));
     }
