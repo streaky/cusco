@@ -156,6 +156,13 @@ struct MappingEntry {
     references: ReferenceCounts,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct MappingLookupKey {
+    model_epoch: ModelEpoch,
+    adapter_epoch: AdapterEpoch,
+    branch: BranchId,
+}
+
 #[derive(Debug)]
 pub struct PreparedPublication {
     context: LogicalContextId,
@@ -188,6 +195,7 @@ pub struct ContextStore {
     next_context: u64,
     contexts: HashMap<LogicalContextId, LogicalContext>,
     mappings: HashMap<EvaluatedPrefixId, MappingEntry>,
+    prefix_index: HashMap<MappingLookupKey, Vec<EvaluatedPrefixId>>,
 }
 
 impl ContextStore {
@@ -366,6 +374,11 @@ impl ContextStore {
                     .references
                     .dependents += 1;
             }
+            let lookup_key = MappingLookupKey {
+                model_epoch: prepared.mapping.model_epoch,
+                adapter_epoch: prepared.mapping.adapter_epoch,
+                branch: prepared.mapping.branch,
+            };
             self.mappings.insert(
                 prepared.mapping.id,
                 MappingEntry {
@@ -377,6 +390,7 @@ impl ContextStore {
                     },
                 },
             );
+            self.prefix_index.entry(lookup_key).or_default().push(id);
         }
 
         if current != Some(id) {
@@ -397,12 +411,14 @@ impl ContextStore {
             .contexts
             .get(&context_id)
             .ok_or(Error::ContextNotFound)?;
-        Ok(self
-            .mappings
-            .values()
-            .filter(|entry| self.mapping_valid_for_context(&entry.mapping, context, None))
-            .max_by_key(|entry| entry.mapping.represented_end)
-            .map(|entry| entry.mapping.clone()))
+        let mut node = context.tokens.tail.as_deref();
+        while let Some(sequence) = node {
+            if let Some(mapping) = self.valid_mapping_for_branch(context, sequence.hash) {
+                return Ok(Some(mapping));
+            }
+            node = sequence.parent.as_deref();
+        }
+        Ok(self.valid_mapping_for_branch(context, empty_branch_id()))
     }
 
     pub fn references(&self, id: EvaluatedPrefixId) -> Option<ReferenceCounts> {
@@ -446,6 +462,24 @@ impl ContextStore {
         }
     }
 
+    fn valid_mapping_for_branch(
+        &self,
+        context: &LogicalContext,
+        branch: BranchId,
+    ) -> Option<Arc<EvaluatedPrefix>> {
+        self.prefix_index
+            .get(&MappingLookupKey {
+                model_epoch: context.model_epoch,
+                adapter_epoch: context.adapter_epoch,
+                branch,
+            })?
+            .iter()
+            .filter_map(|id| self.mappings.get(id))
+            .filter(|entry| self.mapping_valid_for_context(&entry.mapping, context, None))
+            .max_by_key(|entry| entry.mapping.represented_end)
+            .map(|entry| entry.mapping.clone())
+    }
+
     fn adjust_context_refs(&mut self, id: EvaluatedPrefixId, increment: bool) {
         if let Some(entry) = self.mappings.get_mut(&id) {
             if increment {
@@ -468,10 +502,22 @@ impl ContextStore {
             if !removable {
                 break;
             }
-            candidate = self
-                .mappings
-                .remove(&id)
-                .and_then(|entry| entry.mapping.parent);
+            let removed = self.mappings.remove(&id).unwrap();
+            let key = MappingLookupKey {
+                model_epoch: removed.mapping.model_epoch,
+                adapter_epoch: removed.mapping.adapter_epoch,
+                branch: removed.mapping.branch,
+            };
+            let remove_key = if let Some(ids) = self.prefix_index.get_mut(&key) {
+                ids.retain(|candidate| *candidate != id);
+                ids.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                self.prefix_index.remove(&key);
+            }
+            candidate = removed.mapping.parent;
             if let Some(parent) = candidate {
                 if let Some(entry) = self.mappings.get_mut(&parent) {
                     entry.references.dependents = entry.references.dependents.saturating_sub(1);
