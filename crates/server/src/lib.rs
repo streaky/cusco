@@ -22,6 +22,9 @@ use std::{
 };
 use thiserror::Error;
 use uuid::Uuid;
+mod mapped;
+
+pub use mapped::{ExecutionProfile, MappedEngine, MappedMetrics};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -106,6 +109,8 @@ pub struct ContextRecord {
     pub id: ContextId,
     pub revision: u64,
     pub tokens: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_tokens: Vec<i32>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelRecord {
@@ -198,28 +203,36 @@ impl AuthProvider for BearerAuth {
     }
 }
 
+pub struct EngineRequest<'a> {
+    pub model: &'a ModelRecord,
+    pub prompt: &'a str,
+    pub max_tokens: usize,
+    pub prior_tokens: &'a [i32],
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EngineOutput {
+    pub pieces: Vec<String>,
+    pub successor_tokens: Vec<i32>,
+    pub input_tokens: usize,
+    pub cached_tokens: usize,
+    pub evaluated_tokens: usize,
+}
+
 pub trait InferenceEngine: Send + Sync {
-    fn generate(
-        &self,
-        model: &ModelRecord,
-        prompt: &str,
-        max_tokens: usize,
-    ) -> Result<Vec<String>, Error>;
+    fn generate(&self, request: EngineRequest<'_>) -> Result<EngineOutput, Error>;
 }
 #[derive(Default)]
 pub struct DeterministicEngine;
 impl InferenceEngine for DeterministicEngine {
-    fn generate(
-        &self,
-        _: &ModelRecord,
-        prompt: &str,
-        max_tokens: usize,
-    ) -> Result<Vec<String>, Error> {
-        Ok(prompt
+    fn generate(&self, request: EngineRequest<'_>) -> Result<EngineOutput, Error> {
+        let input_tokens = request.prompt.split_whitespace().count();
+        let pieces = request
+            .prompt
             .split_whitespace()
             .rev()
             .cycle()
-            .take(max_tokens)
+            .take(request.max_tokens)
             .enumerate()
             .map(|(index, piece)| {
                 if index == 0 {
@@ -228,7 +241,14 @@ impl InferenceEngine for DeterministicEngine {
                     format!(" {piece}")
                 }
             })
-            .collect())
+            .collect();
+        Ok(EngineOutput {
+            pieces,
+            successor_tokens: request.prior_tokens.to_vec(),
+            input_tokens,
+            cached_tokens: 0,
+            evaluated_tokens: input_tokens,
+        })
     }
 }
 
@@ -340,6 +360,7 @@ impl Server {
             id: id.clone(),
             revision: 0,
             tokens: vec![],
+            native_tokens: vec![],
         };
         guard.durable.contexts.insert(id, record.clone());
         drop(guard);
@@ -388,6 +409,7 @@ impl Server {
             id: ContextId::new(),
             revision: 0,
             tokens,
+            native_tokens: vec![],
         };
         self.inner
             .lock()
@@ -516,7 +538,15 @@ impl Server {
             Some(id) => Some(self.context(id)?),
             None => None,
         };
-        let generated = self.engine.generate(&model, &req.prompt, req.max_tokens)?;
+        let prior_tokens = context
+            .as_ref()
+            .map_or(&[][..], |record| record.native_tokens.as_slice());
+        let generated = self.engine.generate(EngineRequest {
+            model: &model,
+            prompt: &req.prompt,
+            max_tokens: req.max_tokens,
+            prior_tokens,
+        })?;
         if self.inner.lock().cancelled.remove(request_id).is_some() {
             return Err(Error::Cancelled);
         }
@@ -527,6 +557,13 @@ impl Server {
             return Err(Error::Deadline);
         }
         let input: Vec<_> = req.prompt.split_whitespace().map(str::to_owned).collect();
+        let EngineOutput {
+            pieces: generated_pieces,
+            successor_tokens,
+            input_tokens,
+            cached_tokens,
+            evaluated_tokens,
+        } = generated;
         let mut guard = self.inner.lock();
         let (context_id, revision) = if let Some(context) = context {
             let stored = guard
@@ -535,19 +572,21 @@ impl Server {
                 .get_mut(&context.id)
                 .ok_or(Error::ContextNotFound)?;
             stored.tokens.extend(input.iter().cloned());
-            stored.tokens.extend(generated.iter().cloned());
+            stored.tokens.extend(generated_pieces.iter().cloned());
+            stored.native_tokens = successor_tokens;
             stored.revision += 1;
             (stored.id.clone(), stored.revision)
         } else {
             let id = ContextId::new();
             let mut tokens = input.clone();
-            tokens.extend(generated.iter().cloned());
+            tokens.extend(generated_pieces.iter().cloned());
             guard.durable.contexts.insert(
                 id.clone(),
                 ContextRecord {
                     id: id.clone(),
                     revision: 1,
                     tokens,
+                    native_tokens: successor_tokens,
                 },
             );
             (id, 1)
@@ -555,10 +594,10 @@ impl Server {
         drop(guard);
         self.persist()?;
         let usage = Usage {
-            input_tokens: input.len(),
-            generated_tokens: generated.len(),
-            evaluated_tokens: input.len(),
-            cached_tokens: 0,
+            input_tokens,
+            generated_tokens: generated_pieces.len(),
+            evaluated_tokens,
+            cached_tokens,
             model: model.id,
             model_revision: model.revision,
             context_id: context_id.clone(),
@@ -569,15 +608,12 @@ impl Server {
             request_id: request_id.into(),
             context_id,
         }];
-        events.extend(
-            generated
-                .iter()
-                .enumerate()
-                .map(|(index, token)| StreamEvent::Token {
-                    token: token.clone(),
-                    index,
-                }),
-        );
+        events.extend(generated_pieces.iter().enumerate().map(|(index, token)| {
+            StreamEvent::Token {
+                token: token.clone(),
+                index,
+            }
+        }));
         events.push(StreamEvent::Usage {
             usage: usage.clone(),
         });
@@ -587,7 +623,7 @@ impl Server {
         Ok((
             InferResponse {
                 id: request_id.into(),
-                text: generated.concat(),
+                text: generated_pieces.concat(),
                 usage,
             },
             events,
@@ -634,6 +670,8 @@ struct CompletionRequest {
     max_tokens: Option<usize>,
     #[serde(default)]
     stream: bool,
+    #[serde(default)]
+    context_id: Option<ContextId>,
 }
 #[derive(Deserialize)]
 struct ChatRequest {
@@ -643,6 +681,8 @@ struct ChatRequest {
     max_tokens: Option<usize>,
     #[serde(default)]
     stream: bool,
+    #[serde(default)]
+    context_id: Option<ContextId>,
 }
 #[derive(Deserialize)]
 struct ChatMessage {
@@ -689,7 +729,7 @@ async fn completion(
     Json(r): Json<CompletionRequest>,
 ) -> Result<Response, Error> {
     auth(&s, &headers, Scope::Inference)?;
-    infer_response(&s, r.model, r.prompt, r.max_tokens, r.stream)
+    infer_response(&s, r.model, r.prompt, r.max_tokens, r.stream, r.context_id)
 }
 async fn chat(
     State(s): State<Server>,
@@ -707,6 +747,7 @@ async fn chat(
             .join("\n"),
         r.max_tokens,
         r.stream,
+        r.context_id,
     )
 }
 fn infer_response(
@@ -715,6 +756,7 @@ fn infer_response(
     prompt: String,
     max_tokens: Option<usize>,
     streaming: bool,
+    context_id: Option<ContextId>,
 ) -> Result<Response, Error> {
     let id = Uuid::new_v4().to_string();
     let (response, events) = s.infer(
@@ -723,7 +765,7 @@ fn infer_response(
             model,
             prompt,
             max_tokens: max_tokens.unwrap_or_else(default_tokens),
-            context_id: None,
+            context_id,
             deadline_ms: None,
             priority: 0,
         },
@@ -949,7 +991,7 @@ mod tests {
 
     struct FailingEngine;
     impl InferenceEngine for FailingEngine {
-        fn generate(&self, _: &ModelRecord, _: &str, _: usize) -> Result<Vec<String>, Error> {
+        fn generate(&self, _: EngineRequest<'_>) -> Result<EngineOutput, Error> {
             Err(Error::State("generation failed".into()))
         }
     }
@@ -1142,6 +1184,31 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["choices"][0]["text"], "world hello");
+        let context_id = body["usage"]["context_id"].as_str().unwrap();
+        let continuation = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("authorization", "Bearer secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "m",
+                    "prompt": "again",
+                    "max_tokens": 1,
+                    "context_id": context_id
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let continuation = app.clone().oneshot(continuation).await.unwrap();
+        assert_eq!(continuation.status(), StatusCode::OK);
+        let continuation: Value = serde_json::from_slice(
+            &to_bytes(continuation.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(continuation["usage"]["context_id"], context_id);
         let spec = openapi_document();
         assert_eq!(spec["openapi"], "3.1.0");
         assert!(spec["paths"]["/v1/chat/completions"].is_object());

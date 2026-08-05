@@ -5,46 +5,6 @@ use cusco_model_registry::{GEMMA_URI, ModelRecord, fetch_hf, register_local};
 use serde_json::json;
 use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 
-#[derive(Default)]
-struct LlamaEngine;
-impl cusco_server::InferenceEngine for LlamaEngine {
-    fn generate(
-        &self,
-        model: &cusco_server::ModelRecord,
-        prompt: &str,
-        max_tokens: usize,
-    ) -> Result<Vec<String>, cusco_server::Error> {
-        let path = model
-            .path
-            .to_str()
-            .ok_or_else(|| cusco_server::Error::State("model path is not UTF-8".into()))?;
-        let mut executor = Executor::open(path, 4096, 99)
-            .map_err(|error| cusco_server::Error::State(error.to_string()))?;
-        let prompt_tokens = executor
-            .tokenize(prompt)
-            .map_err(|error| cusco_server::Error::State(error.to_string()))?;
-        if prompt_tokens.is_empty() {
-            return Ok(vec![]);
-        }
-        let mut decoded = executor
-            .decode(&prompt_tokens)
-            .map_err(|error| cusco_server::Error::State(error.to_string()))?;
-        let mut pieces = Vec::with_capacity(max_tokens);
-        for index in 0..max_tokens {
-            pieces.push(
-                executor
-                    .token_to_piece(decoded.token)
-                    .map_err(|error| cusco_server::Error::State(error.to_string()))?,
-            );
-            if index + 1 < max_tokens {
-                decoded = executor
-                    .decode(&[decoded.token])
-                    .map_err(|error| cusco_server::Error::State(error.to_string()))?;
-            }
-        }
-        Ok(pieces)
-    }
-}
 #[derive(Parser)]
 struct Args {
     #[command(subcommand)]
@@ -97,6 +57,17 @@ enum Command {
         output: PathBuf,
     },
     Serve {
+        model: PathBuf,
+        #[arg(long, default_value = "gemma-4-e2b-it")]
+        model_id: String,
+        #[arg(long, default_value_t = 4096)]
+        context: u32,
+        #[arg(long, default_value_t = 99)]
+        gpu_layers: i32,
+        #[arg(long, default_value_t = 8_589_934_592)]
+        device_bytes: usize,
+        #[arg(long, default_value_t = 17_179_869_184)]
+        host_bytes: usize,
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: SocketAddr,
         #[arg(long, default_value = "/data/cusco-state.json")]
@@ -147,18 +118,42 @@ fn run(command: Command) -> Result<()> {
             output,
         } => mapped_proof(model, context, gpu_layers, &prefix, output)?,
         Command::Serve {
+            model,
+            model_id,
+            context,
+            gpu_layers,
+            device_bytes,
+            host_bytes,
             listen,
             state,
             bearer_token,
             unsafe_public_unauthenticated,
         } => {
-            use cusco_server::{AnonymousAdmin, AuthProvider, BearerAuth, Server};
+            use cusco_server::{
+                AnonymousAdmin, AuthProvider, BearerAuth, MappedEngine, ModelRecord, Server,
+            };
             let anonymous = bearer_token.is_none();
             let auth: Arc<dyn AuthProvider> = match bearer_token {
                 Some(token) => Arc::new(BearerAuth::new(token)),
                 None => Arc::new(AnonymousAdmin),
             };
-            let server = Server::open(state, auth, Arc::new(LlamaEngine))?;
+            let registered = register_local(&model, &model_id, None)?;
+            let engine = MappedEngine::open(
+                &model_id,
+                &registered.path,
+                context,
+                gpu_layers,
+                device_bytes,
+                host_bytes,
+            )?;
+            let server = Server::open(state, auth, engine)?;
+            server.register_model(ModelRecord {
+                id: model_id,
+                revision: registered.sha256.clone(),
+                path: registered.path,
+                sha256: registered.sha256,
+                aliases: vec![],
+            })?;
             tokio::runtime::Runtime::new()?.block_on(cusco_server::serve(
                 server,
                 listen,
@@ -430,6 +425,12 @@ mod tests {
         let public: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         assert!(
             run(Command::Serve {
+                model: PathBuf::from("mock://deterministic"),
+                model_id: "gemma-4-e2b-it".into(),
+                context: 128,
+                gpu_layers: 0,
+                device_bytes: 1 << 20,
+                host_bytes: 1 << 20,
                 listen: public,
                 state: root.join("server.json"),
                 bearer_token: None,
@@ -437,21 +438,21 @@ mod tests {
             })
             .is_err()
         );
-        let engine = LlamaEngine;
-        let generated = cusco_server::InferenceEngine::generate(
-            &engine,
-            &cusco_server::ModelRecord {
-                id: "mock".into(),
-                revision: "test".into(),
-                path: PathBuf::from("mock://deterministic"),
-                sha256: String::new(),
-                aliases: vec![],
-            },
-            "prompt",
-            2,
-        )
-        .unwrap();
-        assert_eq!(generated.len(), 2);
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let unsupported = run(Command::Serve {
+            model: root.join("local.gguf"),
+            model_id: "unsupported".into(),
+            context: 128,
+            gpu_layers: 0,
+            device_bytes: 1 << 20,
+            host_bytes: 1 << 20,
+            listen: loopback,
+            state: root.join("unsupported-server.json"),
+            bearer_token: None,
+            unsafe_public_unauthenticated: false,
+        })
+        .unwrap_err();
+        assert!(unsupported.to_string().contains("unsupported model family"));
         fs::remove_dir_all(root).unwrap();
     }
 }

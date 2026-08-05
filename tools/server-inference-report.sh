@@ -6,7 +6,7 @@ model_dir=${CUSCO_MODEL_DIR:-./models}
 port=${CUSCO_SERVER_REPORT_PORT:-18082}
 docker compose run --build --rm --no-deps --entrypoint chmod server-report a+rwx /results
 mkdir -p "$result_dir"
-rm -f "$result_dir/phase4-gpu.csv" "$result_dir/phase4-server.json" "$result_dir/phase4-state.json"
+rm -f "$result_dir/phase6a-gpu.csv" "$result_dir/phase6a-server.json" "$result_dir/phase6a-state.json"
 cleanup() {
     docker compose stop server-report >/dev/null 2>&1 || true
     docker compose rm -f server-report >/dev/null 2>&1 || true

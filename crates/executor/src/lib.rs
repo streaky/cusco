@@ -59,6 +59,9 @@ pub struct MappingMetrics {
 pub struct Executor {
     raw: NonNull<sys::CuscoExecutor>,
 }
+// The native slot has unique ownership and all mutation requires `&mut self`.
+// Moving that ownership between threads is safe; concurrent access is not.
+unsafe impl Send for Executor {}
 
 /// An immutable, independently owned snapshot of one executor state.
 pub struct Checkpoint {

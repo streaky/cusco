@@ -6,19 +6,19 @@ The project separates responsibilities deliberately: Rust will manage logical co
 
 ## Current state
 
-Cusco has completed its executor proof, Rust logical-context-store, tiered
-physical-manager, minimal server, and mapped-execution phases. The Phase 1
-proof established the project’s central technical premise on a
-hybrid/recurrent Gemma model: captured execution state can be replaced, moved
-through host memory, restored, and continued with identical tokens and
-bitwise-identical logits.
+Cusco has completed Phases 1 through 5 and the Phase 6A persistent mapped-core
+milestone. The executor proof established exact checkpoint continuation for a
+hybrid/recurrent Gemma model, and the Rust layers now provide durable logical
+contexts, capacity-accounted physical state, transactional mapped activation,
+an authenticated HTTP API, and immutable model registration.
 
-Phase 2 adds Rust-owned logical contexts and transactional evaluated-prefix
-publication. Phase 3 adds capacity-accounted physical representations and
-transactional tier transitions. Phase 4 adds the authenticated inference and
-model-management server. Phase 5 adds transactional device-resident sequence
-mappings, reference-only activation, physical block-table publication, and
-mapped-versus-staged measurements without exposing llama.cpp internals to Rust.
+Phase 6A connects those pieces on the live request path: one validated Gemma
+profile owns a process-persistent llama.cpp model and executor slot; opaque
+context continuations reuse complete mapped blocks without model reload or
+valid-prefix reevaluation; and admission accounts for context, prompt, output,
+device, and host capacity before decode. Phase 6B will add the incremental
+generation frontier, followed by bounded lifecycle and acceptance work in
+Phase 6C.
 
 ## Run the real-model inference integration test
 
@@ -54,21 +54,18 @@ llama.cpp's public API does not expose whether its backend rebuilt a graph.
 
 ## Run the real-model server report
 
-To exercise the authenticated Phase 4 HTTP surface with the same validation
-GGUF and print a prompt, generated response, streaming assertions, usage, and
-end-to-end timing data, run:
+To exercise authenticated HTTP inference and a successive opaque-context
+continuation through one persistent mapped executor, run:
 
 ```sh
 tools/server-inference-report.sh
 ```
 
-The report is also written to `results/phase4-server.json`. The workflow uses
-GPU 1 and port 18082 by default; `CUSCO_GPU_DEVICE_ID`,
-`CUSCO_SERVER_REPORT_PORT`, `CUSCO_MODEL_DIR`, and `CUSCO_RESULT_DIR` override
-those defaults. Server timing includes model loading and generation, and the
-current SSE adapter emits its buffered token events after generation completes,
-so the reported first streamed token is an end-to-end observation rather than
-decode-only time-to-first-token.
+The workflow verifies token streaming, durable context identity, and reuse of
+at least one complete mapped block on the second request. It writes the
+machine-readable evidence to `results/phase6a-server.json`. GPU 1 and port
+18082 are defaults; `CUSCO_GPU_DEVICE_ID`, `CUSCO_SERVER_REPORT_PORT`,
+`CUSCO_MODEL_DIR`, and `CUSCO_RESULT_DIR` override them.
 
 
 ## Run the minimal server
