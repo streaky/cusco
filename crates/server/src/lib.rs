@@ -525,11 +525,81 @@ struct Inner {
     shutting_down: bool,
     config: ServerConfig,
 }
+struct PrequeueState {
+    limit: usize,
+    retire_on_drop: usize,
+}
+
+struct PrequeueGate {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    state: Mutex<PrequeueState>,
+}
+
+impl PrequeueGate {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
+            state: Mutex::new(PrequeueState {
+                limit,
+                retire_on_drop: 0,
+            }),
+        })
+    }
+
+    async fn acquire(self: &Arc<Self>) -> Result<PrequeuePermit, Error> {
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::ShuttingDown)?;
+        Ok(PrequeuePermit {
+            gate: self.clone(),
+            permit: Some(permit),
+        })
+    }
+
+    fn set_limit(&self, limit: usize) {
+        let mut state = self.state.lock();
+        if limit < state.limit {
+            let reduction = state.limit - limit;
+            let retired = self.semaphore.forget_permits(reduction);
+            state.retire_on_drop += reduction - retired;
+        } else {
+            let increase = limit - state.limit;
+            let cancelled_retirements = increase.min(state.retire_on_drop);
+            state.retire_on_drop -= cancelled_retirements;
+            self.semaphore
+                .add_permits(increase - cancelled_retirements);
+        }
+        state.limit = limit;
+    }
+}
+
+struct PrequeuePermit {
+    gate: Arc<PrequeueGate>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for PrequeuePermit {
+    fn drop(&mut self) {
+        let permit = self.permit.take().expect("pre-queue permit exists");
+        let mut state = self.gate.state.lock();
+        if state.retire_on_drop == 0 {
+            drop(state);
+            drop(permit);
+        } else {
+            state.retire_on_drop -= 1;
+            permit.forget();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Server {
     state_path: PathBuf,
     inner: Arc<Mutex<Inner>>,
-    pre_queue: Arc<tokio::sync::Semaphore>,
+    pre_queue: Arc<PrequeueGate>,
     auth: Arc<dyn AuthProvider>,
     engine: Arc<dyn InferenceEngine>,
 }
@@ -580,9 +650,7 @@ impl Server {
                 shutting_down: false,
                 config,
             })),
-            pre_queue: Arc::new(tokio::sync::Semaphore::new(
-                config.pre_queue_concurrency,
-            )),
+            pre_queue: PrequeueGate::new(config.pre_queue_concurrency),
             auth,
             engine,
         };
@@ -799,15 +867,8 @@ impl Server {
         {
             return Err(Error::State("server limits must be nonzero".into()));
         }
-        let current = self.pre_queue.available_permits();
-        if config.pre_queue_concurrency > current {
-            self.pre_queue
-                .add_permits(config.pre_queue_concurrency - current);
-        } else {
-            self.pre_queue
-                .forget_permits(current - config.pre_queue_concurrency);
-        }
         let mut guard = self.inner.lock();
+        self.pre_queue.set_limit(config.pre_queue_concurrency);
         guard.admission_limit = config.active_requests;
         guard.config = config;
         Self::promote_queued(&mut guard);
@@ -1216,7 +1277,7 @@ struct PrequeueJson<T> {
     headers: HeaderMap,
     value: T,
     retained_bytes: usize,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: PrequeuePermit,
 }
 
 impl<T> FromRequest<Server> for PrequeueJson<T>
@@ -1235,12 +1296,7 @@ where
         if header_bytes > config.header_bytes {
             return Err(Error::HeadersTooLarge);
         }
-        let permit = state
-            .pre_queue
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::ShuttingDown)?;
+        let permit = state.pre_queue.acquire().await?;
         let (parts, body) = request.into_parts();
         let bytes = tokio::time::timeout(
             Duration::from_millis(config.body_timeout_ms),
@@ -2719,6 +2775,52 @@ mod tests {
             .unwrap();
         assert_eq!(timed_out.status(), StatusCode::REQUEST_TIMEOUT);
         assert_eq!(server.admission_metrics(), AdmissionMetrics::default());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prequeue_reconfiguration_preserves_configured_capacity_with_active_permits() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        server
+            .configure(ServerConfig {
+                pre_queue_concurrency: 3,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        let first = server.pre_queue.acquire().await.unwrap();
+        let second = server.pre_queue.acquire().await.unwrap();
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 1);
+
+        server
+            .configure(ServerConfig {
+                pre_queue_concurrency: 3,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 1);
+
+        server
+            .configure(ServerConfig {
+                pre_queue_concurrency: 1,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 0);
+        drop(first);
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 0);
+        drop(second);
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 1);
+
+        let third = server.pre_queue.acquire().await.unwrap();
+        server
+            .configure(ServerConfig {
+                pre_queue_concurrency: 3,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 2);
+        drop(third);
+        assert_eq!(server.pre_queue.semaphore.available_permits(), 3);
         fs::remove_dir_all(dir).unwrap();
     }
 
