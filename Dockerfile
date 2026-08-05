@@ -2,6 +2,7 @@
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
 ARG CUSCO_CUDA_ARCHITECTURES="61;70"
 RUN apt-get update && apt-get install -y --no-install-recommends ccache curl ca-certificates cmake ninja-build python3 clang llvm git build-essential pkg-config && rm -rf /var/lib/apt/lists/* && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85.0 && /root/.cargo/bin/cargo install cargo-llvm-cov --version 0.6.16 --locked
+RUN /root/.cargo/bin/rustup component add llvm-tools-preview
 ENV PATH=/root/.cargo/bin:$PATH
 WORKDIR /work
 COPY llama.cpp-version.txt /work/llama.cpp-version.txt

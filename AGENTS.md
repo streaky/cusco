@@ -30,6 +30,7 @@ The server now has one persistent mapped Gemma executor path, but it remains del
 ## Build and dependency conventions
 
 - Docker Compose is the primary development, test, and proof interface. Keep CPU-only and GPU execution supported by the same image; CPU-only checks should omit GPU passthrough rather than use a separate build.
+- Compose services mount project-scoped `cargo-registry`, `cargo-git`, and `cargo-target` named volumes so `docker compose run --rm ...` reuses downloaded crates and compiled artifacts. Preserve these mounts on new Rust-running services; do not remove the volumes during routine cleanup.
 - Local builds must support CUDA architectures `sm_61` and `sm_70`. Use `CUSCO_CUDA_ARCHITECTURES="61;70"` for normal local builds.
 - Reserve the broad, full CUDA architecture build for production releases. Do not spend local development time compiling every supported CUDA target unless release validation specifically requires it.
 - `llama.cpp-version.txt` is the sole source of truth for the llama.cpp version. It contains a release tag only. Build and fetch tooling must read it; never duplicate the tag or record the corresponding commit hash.
