@@ -2,7 +2,7 @@
 
 ## Document purpose and status
 
-This is the standalone project proposal for **Cusco**, a new persistent, tiered, branch-aware model-state server. It defines the problem, architecture, ownership rules, native execution boundary, project layout, implementation phases, and acceptance gates needed to begin implementation without relying on another proposal or repository for context.
+This document is the living architecture, implementation roadmap, and acceptance contract for **Cusco**, a persistent, tiered, branch-aware model-state server. It began as a pre-implementation proposal, but now records both demonstrated foundations and prospective work so that historical hypotheses are not confused with current project state.
 
 Cusco is written in Rust and uses a deliberately but conservatively extended llama.cpp as its model execution engine. It is not a Rust rewrite of llama.cpp, a wrapper around llama-server, or an incremental feature plan for an existing server. The intended split is:
 
@@ -10,7 +10,11 @@ Cusco is written in Rust and uses a deliberately but conservatively extended lla
 
 The first project decision is therefore an architectural boundary, not a cache policy: slots are disposable execution workers, while logical contexts and their evaluated state are durable objects owned outside the executor.
 
-The proposal is ready to drive a focused executor proof and project bootstrap. Later server and mapped-execution phases remain contingent on the correctness gates defined below.
+The document uses three status categories:
+
+- **Historical design hypothesis:** the decisive executor question and early recommendations explain why implementation began with checkpoint equivalence rather than a broad server.
+- **Implemented current state:** Phases 1 through 5 are complete. The real Gemma proof demonstrated exact checkpoint continuation; the logical and physical managers implement transactional shared state and tiering; the minimal server implements durable contexts, scheduling, lifecycle APIs, streaming events, authentication policy, compatibility adapters, and checked OpenAPI; and the mapped-execution proof demonstrated transactional sequence mappings and reference-only activation.
+- **Remaining prospective contract:** Phase 6 begins the next architectural cutover by integrating the persistent mapped executor with the live server. Phases 7 through 10 remain planned work and are requirements, not claims of implementation.
 
 ## Decisive technical hypothesis
 
@@ -1213,9 +1217,15 @@ The essential invariant is:
 
 A fast restoration with different logits or token IDs is a correctness failure, not a successful cache hit.
 
-## Initial product scope
+## Current implementation and Phase 6 scope
 
-The first usable server should remain deliberately narrow:
+Phases 1 through 5 provide the proven executor, logical context store, physical manager, minimal server, and mapped-execution foundation described by their exit criteria. The current minimal server still loads a model per inference request and does not yet connect live executor slots, physical-manager bindings, and mapped sequence state end to end.
+
+Phase 6 is the next usable-server cutover: one configured Gemma model, one persistent native executor slot, mapped context reuse across requests, exact bounded admission, incremental normalized streaming, and transactional cancellation and deadline behavior. It deliberately excludes dynamic model residency, multiple native executions, workload fairness, broad protocol expansion, and production hardening.
+
+## Target completion profile
+
+The completed roadmap target remains deliberately scoped:
 
 - one loaded local model per process, acquired primarily from Hugging Face Hub;
 - CLI model fetch, inspection, verification, removal, completion, and chat;
@@ -1235,7 +1245,7 @@ The first usable server should remain deliberately narrow:
 - model, inference, cache, and usage metrics and traces;
 - authentication and authorization interfaces backed initially by an anonymous administrator.
 
-Broader llama-server compatibility should follow only after the executor/cache contract is proven. Phase 9 adds the required Ollama adapter, the declared OpenAI profile, image input, storage persistence, and the other compatibility and packaging work listed below. Potential post-completion features include an Anthropic adapter, configured authentication providers and roles, multi-GPU placement, speculative decoding, model adapters, grammars, reranking, additional media types, multi-model routing, and broader hosted-protocol surfaces.
+Broader compatibility follows only after the executor/cache contract and live Phase 6 path are proven. Phase 9 adds the required Ollama adapter, the declared OpenAI profile, image input, storage persistence, and the other compatibility and packaging work listed below. Potential post-completion features include an Anthropic adapter, configured authentication providers and roles, multi-GPU placement, speculative decoding, model adapters, grammars, reranking, additional media types, multi-model routing, and broader hosted-protocol surfaces.
 
 ## Project source layout
 
@@ -1258,7 +1268,7 @@ The repository should make the ownership boundary visible rather than hiding it 
 │   ├── executor-sys/          generated/raw C ABI declarations only
 │   ├── executor/              safe Rust handles and lifecycle wrappers
 │   ├── server-core/           protocol-neutral application services
-│   ├── server-api/            HTTP routing, streaming, and native admin API
+│   ├── server-api/            HTTP routing and compatibility/extension adapters
 │   ├── api-openai/            first-class OpenAI-compatible /v1 adapter
 │   ├── api-ollama/            required Phase 9 Ollama native adapter
 │   ├── api-anthropic/         post-completion optional Anthropic adapter
@@ -1286,7 +1296,7 @@ The repository should make the ownership boundary visible rather than hiding it 
 └── tools/                     reproducible executor, model, and report utilities
 ```
 
-Crate boundaries are dependency rules, not merely organization. `context-store` must not depend on HTTP or native tensor layouts. `executor-sys` contains no policy. `executor` turns raw handles into safe Rust state transitions but does not decide eviction. Protocol adapters depend on `api-types` and `server-core`, never directly on the scheduler, model cache, or FFI. `server-api` hosts adapters but does not define their application semantics. The CLI uses the same core service traits in-process or through the native administrative client. Native conformance tests must be runnable without starting the HTTP server.
+Crate boundaries are dependency rules, not merely organization. `context-store` must not depend on HTTP or native tensor layouts. `executor-sys` contains no policy. `executor` turns raw handles into safe Rust state transitions but does not decide eviction. Protocol adapters depend on `api-types` and `server-core`, never directly on the scheduler, model cache, or FFI. `server-api` hosts adapters but does not define their application semantics. The CLI uses the same core service traits in-process or through the supported versioned HTTP APIs. Native conformance tests must be runnable without starting the HTTP server.
 
 ## Container-first build and test interface
 
@@ -1480,6 +1490,16 @@ After the staged design is correct and measurable:
 
 Replace the minimal server's per-request executor path with the architecture proven in Phases 2 through 5. This phase is deliberately limited to one loaded model, one active native execution, and bounded static admission so that execution correctness is established before dynamic lifecycle, execution concurrency, and compatibility breadth are added:
 
+Implementation is divided into three dependency-ordered, independently reviewable milestones under this single phase and final acceptance gate:
+
+| Milestone | Reviewable deliverable | Milestone gate |
+|---|---|---|
+| **6A: persistent mapped core** | one manually authored, schema-validated Gemma execution profile; one process-owned model and executor slot; physical-manager admission, mapped activation, complete-block publication, exact continuation bounds, and fixed operating-point reservations | successive opaque-context requests reuse mapped state without model reload or valid-prefix reevaluation; isolated controls match; preparation and late-capacity failures preserve the prior binding |
+| **6B: incremental generation frontier** | one-token decode quanta, request-owned native greedy sampler, bounded protocol-neutral event buffer, native token-piece rendering, incremental UTF-8 and stop matching, presentation normalization, canonical finish reasons, usage, and sampled-token successor selection | slow-consumer, split-UTF-8, whitespace, terminal/control-token, and token-aligned/cross-token/intra-token stop fixtures pass without unbounded buffering or token-history fabrication |
+| **6C: bounded lifecycle and integrated proof** | count-and-byte-bounded FIFO admission, pre-queue transport limits, cancellation and disconnect propagation, wall and active deadlines, graceful shutdown, restart behavior, and the recorded end-to-end acceptance artifact | overload rejects before expensive work; every terminal-state injection preserves transactional ownership; shutdown/restart semantics pass; the complete real-Gemma/GPU acceptance matrix and coverage gate pass |
+
+Each milestone must be mergeable with its own changed-path behavioral tests and must leave the server usable under the narrower contract it has reached. A milestone may introduce only the interfaces required by the next one; passing 6A or 6B does not satisfy the Phase 6 exit criterion. The detailed requirements below remain the combined normative contract.
+
 - connect server admission to the physical manager and mapped executor;
 - keep one loaded model instance and one executor slot alive across requests;
 - after authentication, request-size enforcement, parsing, structural validation, and model-name resolution, assign an immutable monotonic admission ticket and place the request into a count-and-retained-byte-bounded FIFO queue before template application, tokenization, context lookup, cache promotion, mapping preparation, or executor reservation. Phase 6 executes strictly by ticket order; later planners may reorder only under their documented fairness contract while retaining the ticket for age, bypass, and decision accounting. Reject saturation immediately as canonical `queue_overloaded`, mapped to HTTP `429 Too Many Requests` and a defensible `Retry-After` when available; count queue time against deadlines and remove cancelled or disconnected work promptly;
@@ -1526,7 +1546,7 @@ The active model and native operating point are required configuration, not gues
 
 Phase 6 is complete only when one recorded end-to-end acceptance run, using the pinned real Gemma asset and selected GPU, proves all of the following together:
 
-1. the family catalog compiles reproducibly without network access, the Gemma profile matches its immutable Hub/GGUF identities, and incompatible metadata or missing executor capabilities fail before model publication;
+1. one manually authored, schema-validated Gemma profile compiles reproducibly into the binary without network access, matches its immutable Hub/GGUF identities, and rejects incompatible metadata or missing executor capabilities before model publication. Phase 6 does not require a general catalog scaffolder, automatic family discovery, or profiles for additional families;
 2. one process loads exactly one model and creates exactly one executor slot, then successive opaque-context requests reuse committed mapped state without reloading the model or reevaluating the valid prefix;
 3. full logical blocks assembled across prior tails, new prompt tokens, and generated tokens publish transactionally, while incomplete tails are neither padded nor published and are reconstructed correctly on a later continuation;
 4. queue count and retained-byte saturation return `queue_overloaded` before template application, tokenization, context lookup, physical preparation, or native reservation, and ticket order remains FIFO;
@@ -1808,12 +1828,14 @@ The executor-proof, logical-store, mapped-execution, and Phase 6 design question
 
 ## Recommendation
 
-Proceed with a minimal Rust-controlled executor proof rather than immediately building a complete replacement server.
+Proceed with Phase 6 live execution integration through the three independently reviewable milestones defined above: persistent mapped execution, the incremental generation frontier, and bounded lifecycle integration with one final acceptance artifact.
 
-The proof should establish one capability decisively:
+The original recommendation to begin with a minimal Rust-controlled executor proof is now historical rationale. That proof succeeded, as did the logical-store, physical-manager, minimal-server, and mapped-execution gates in Phases 2 through 5. Their result is the implemented foundation, not a remaining prerequisite.
 
-> A logical Gemma context can be captured as a complete composite checkpoint, displaced from an execution slot, moved through the selected memory tiers, restored transactionally, and continued with the same logits and token IDs as uninterrupted evaluation.
+The next decisive gate is:
 
-If that succeeds, the Rust logical context store and tier manager have a solid foundation. If it fails, the failure will be localized to the executor and model-state boundary rather than entangled with HTTP compatibility, scheduling policy, and production server behavior.
+> A real, incrementally streaming Gemma server can keep one model and executor slot alive across requests, reuse mapped logical state without recomputing valid prefixes, and preserve exact output and prior bindings across bounded admission, backpressure, cancellation, deadline, capacity, shutdown, and restart paths.
 
-The long-term target is therefore not a Rust clone of llama.cpp. It is a Rust context operating system around a narrower llama.cpp execution engine: logical branches and resource policy outside, architecture-specific tensors and optimized inference inside.
+If that succeeds, Phase 7 can safely generalize resource ownership and residency. If it fails, the failure remains localized to the live coordinator, generation frontier, or native execution boundary before dynamic lifecycle and concurrency multiply the state space.
+
+The long-term target remains a Rust context operating system around a narrower llama.cpp execution engine: logical branches and resource policy outside, architecture-specific tensors and optimized inference inside.

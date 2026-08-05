@@ -25,7 +25,7 @@ The repository currently contains:
 - `executor`: upstream and patch metadata;
 - `tools`: fetch, verification, integration-report, and coverage helpers.
 
-The Phase 4 server remains minimal: it loads a registered llama.cpp model per inference request and has not yet integrated live executor slots with the physical manager or Phase 5 mapped mappings. Do not represent production hardening or later phases as implemented. The next architectural work is integrating mapped execution with server scheduling, followed by compatibility and production hardening.
+The Phase 4 server remains minimal: it loads a registered llama.cpp model per inference request and has not yet integrated live executor slots with the physical manager or Phase 5 mapped mappings. Do not represent production hardening or later phases as implemented. Phase 6 is the next architectural work and is divided into three reviewable milestones under one acceptance gate: 6A integrates one manually authored, schema-validated Gemma profile with a persistent mapped executor and exact admission; 6B adds the incremental normalized generation frontier; and 6C adds bounded queueing, cancellation, deadlines, shutdown, and the complete real-GPU acceptance artifact. Dynamic residency, concurrent native execution, compatibility breadth, and production hardening follow later.
 
 ## Build and dependency conventions
 
