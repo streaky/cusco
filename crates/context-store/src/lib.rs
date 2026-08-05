@@ -429,12 +429,7 @@ impl ContextStore {
                 .contains(mapping.required_components)
             || mapping.represented_end > context.tokens.len()
             || child_end.is_some_and(|end| mapping.represented_end > end)
-            || context
-                .tokens
-                .prefix(mapping.represented_end)
-                .unwrap()
-                .tokens()
-                != mapping.tokens
+            || context.tokens.prefix(mapping.represented_end).unwrap().id() != mapping.branch
         {
             return false;
         }
