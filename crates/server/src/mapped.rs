@@ -241,7 +241,7 @@ impl InferenceEngine for MappedEngine {
     ) -> Result<EngineOutput, Error> {
         if request.model.path.to_str() != Some(self.model_path()) {
             return Err(Error::State(
-                "Phase 6A admits only the process-owned model".into(),
+                "Phase 6B admits only the process-owned model".into(),
             ));
         }
         let prompt_started = Instant::now();
