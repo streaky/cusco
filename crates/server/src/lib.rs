@@ -597,6 +597,7 @@ impl Server {
 fn state_err(error: impl std::fmt::Display) -> Error {
     Error::State(error.to_string())
 }
+#[cfg(test)]
 fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
