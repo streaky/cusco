@@ -1,0 +1,114 @@
+{
+  "version": 2,
+  "name": "gemma-4-e2b-it-mixed-scheduler-v2",
+  "model_family": "gemma-4-e2b-it",
+  "policy": {
+    "version": 1,
+    "interactive_weight": 4,
+    "standard_weight": 2,
+    "batch_weight": 1,
+    "promotion_rounds": 8,
+    "deficit_refill": 1,
+    "prefill_tokens": 32,
+    "diagnostic_capacity": 2048
+  },
+  "baseline": {
+    "id": "isolated-standard",
+    "principal": "baseline",
+    "class": "standard",
+    "prompt": "Summarize why transactional state publication matters. ",
+    "prompt_repetitions": 4,
+    "max_tokens": 6,
+    "arrival_delay_ms": 0,
+    "expected": "complete"
+  },
+  "mixed": [
+    {
+      "id": "interactive-a-1",
+      "principal": "tenant-a",
+      "class": "interactive",
+      "prompt": "Give one concise scheduling invariant. ",
+      "prompt_repetitions": 1,
+      "max_tokens": 6,
+      "arrival_delay_ms": 0,
+      "expected": "complete"
+    },
+    {
+      "id": "interactive-b-1",
+      "principal": "tenant-b",
+      "class": "interactive",
+      "prompt": "Name one cancellation safety rule. ",
+      "prompt_repetitions": 1,
+      "max_tokens": 6,
+      "arrival_delay_ms": 2,
+      "expected": "complete"
+    },
+    {
+      "id": "standard-a-1",
+      "principal": "tenant-a",
+      "class": "standard",
+      "prompt": "Explain bounded fairness for an inference scheduler. ",
+      "prompt_repetitions": 4,
+      "max_tokens": 8,
+      "arrival_delay_ms": 0,
+      "expected": "complete"
+    },
+    {
+      "id": "standard-c-cancel",
+      "principal": "tenant-c",
+      "class": "standard",
+      "prompt": "Generate a response that will be cancelled after its first token. ",
+      "prompt_repetitions": 3,
+      "max_tokens": 8,
+      "arrival_delay_ms": 1,
+      "expected": "cancel"
+    },
+    {
+      "id": "standard-d-deadline",
+      "principal": "tenant-d",
+      "class": "standard",
+      "prompt": "Generate a response whose active deadline expires after its first token. ",
+      "prompt_repetitions": 3,
+      "max_tokens": 8,
+      "arrival_delay_ms": 1,
+      "expected": "deadline"
+    },
+    {
+      "id": "batch-a-1",
+      "principal": "tenant-a",
+      "class": "batch",
+      "prompt": "Describe transactional model-state ownership and safe publication. ",
+      "prompt_repetitions": 12,
+      "max_tokens": 8,
+      "arrival_delay_ms": 0,
+      "expected": "complete"
+    },
+    {
+      "id": "batch-b-1",
+      "principal": "tenant-b",
+      "class": "batch",
+      "prompt": "Describe checkpoint restoration, spill accounting, and capacity recovery. ",
+      "prompt_repetitions": 12,
+      "max_tokens": 8,
+      "arrival_delay_ms": 0,
+      "expected": "complete"
+    },
+    {
+      "id": "batch-e-1",
+      "principal": "tenant-e",
+      "class": "batch",
+      "prompt": "Explain why scheduler priority and model residency must remain separate decisions. ",
+      "prompt_repetitions": 10,
+      "max_tokens": 8,
+      "arrival_delay_ms": 3,
+      "expected": "complete"
+    }
+  ],
+  "thresholds": {
+    "max_queue_age_rounds": 128,
+    "max_first_event_baseline_multiplier": 20,
+    "max_first_event_additive_ms": 5000,
+    "max_quantum_baseline_multiplier": 20,
+    "max_quantum_additive_ms": 1000
+  }
+}

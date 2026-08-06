@@ -319,6 +319,7 @@ dependencies = [
  "cusco-executor",
  "cusco-model-registry",
  "cusco-server",
+ "serde",
  "serde_json",
  "tokio",
 ]

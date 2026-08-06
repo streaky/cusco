@@ -82,6 +82,30 @@ services:
       - cargo-target:/work/target
     deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
 
+  phase8-proof:
+    build: *test-build
+    command:
+      - sh
+      - -c
+      - >-
+        umask 000 && chmod a+rwx /results &&
+        nvidia-smi --query-gpu=uuid,name,compute_cap,driver_version
+        --format=csv,noheader > /results/phase8-gpu.csv &&
+        cargo run -p cusco -- scheduler-proof
+        /models/gemma-4-e2b-it.gguf
+        --workload /work/config/phase8-workload.json
+        --output /results/phase8-server.json
+    environment:
+      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
+      LD_LIBRARY_PATH: "/opt/llama-build/bin"
+    volumes:
+      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_RESULT_DIR:-./results}:/results"
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
+
 volumes:
   cargo-registry:
   cargo-git:
