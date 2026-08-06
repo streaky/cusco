@@ -130,8 +130,11 @@ credentials and generated content and must be enabled only in a controlled
 diagnostic environment. Traced responses include the correlation ID in
 `x-request-id`.
 
-The checked OpenAPI document is served at `/openapi.json`. OpenAI-compatible
-entry points are `/v1/completions`, `/v1/chat/completions`, and `/v1/models`.
+The checked OpenAPI document is served at `/openapi.json`. The current minimal
+completion and chat entry points are `/v1/completions`,
+`/v1/chat/completions`, and `/v1/models`; they do not yet claim the Phase 9
+OpenAI compatibility contract, including chat-template and tool semantics or
+OpenAI-native streaming chunks.
 Native `/native/models`, `/native/contexts`, and `/native/requests` operations
 cover model lifecycle, durable contexts and branches, imports, and
 cancellation. Server inference uses registered local model paths and does not

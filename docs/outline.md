@@ -1230,7 +1230,7 @@ The completed roadmap target remains deliberately scoped:
 
 - one loaded local model per process, acquired primarily from Hugging Face Hub;
 - CLI model fetch, inspection, verification, removal, completion, and chat;
-- text completion and basic chat through the minimal server's documented OpenAI-compatible `/v1` profile, migrated in Phase 9 to the complete `/openai/v1/*` compatibility boundary defined above;
+- text completion and basic chat through the minimal server's `/v1` completion and chat adapters, which are intentionally narrower than the complete OpenAI compatibility profile delivered under `/openai/v1/*` in Phase 9;
 - a native Ollama protocol adapter under `/ollama/api/*` delivered in Phase 9 over the same protocol-neutral services;
 - an explicit versioned `/cusco/v1/*` extension API for logical contexts, branches, cache and compaction policy, activity hints, extended usage, and explicit cancellation; model installation is fully covered by Ollama lifecycle routes and read-only `user.yaml` discovery;
 - generated, checked OpenAPI descriptions for the `/openai/v1/*`, `/ollama/api/*`, and `/cusco/v1/*` surfaces;
@@ -1461,7 +1461,7 @@ Implement:
 Implement:
 
 - protocol-neutral inference and model-management services;
-- the useful OpenAI-compatible `/v1` completion and chat surface plus its OpenAPI document;
+- the useful minimal `/v1` completion and chat adapters plus their OpenAPI document;
 - native model fetch, local registration, list, inspect, update-check, verify, alias, and removal APIs;
 - opaque durable logical-context identifiers that cannot be reused across restart, restore, import, or multiple server processes;
 - durable logical-context and revision recovery with atomic restoration of the next externally visible identifier state;
@@ -1599,7 +1599,9 @@ Harden request ordering and make resource decisions explainable under sustained 
 - prevent one large model, long context, or bulk request from starving smaller, older, or explicitly higher-priority work while preserving bounded interactive latency;
 - apply cancellation and deadlines consistently to queued, loading, transferring, and executing work, reclaiming resources only after ownership and native-fence obligations end;
 - report model residency, executor-slot occupancy, context placement, queue state and age, capacity reservations, transition costs, eviction and unload reasons, and scheduler decisions;
-- validate multi-model and mixed-context pressure, repeated load/unload cycles, cancellation storms, deadline expiry, and sustained operation against capacity, fairness, leak, and latency gates.
+- validate multi-model and mixed-context pressure, repeated load/unload cycles, cancellation storms, deadline expiry, and sustained operation against capacity, fairness, leak, and latency gates;
+- propagate one transport correlation identifier into canonical requests and scheduler/executor work while naming any distinct inference operation identifier explicitly; report response-header, first-event, and terminal durations separately instead of presenting header latency as whole-request duration;
+- make routine diagnostics operationally non-interfering and machine-usable: encode JSON and SSE bodies structurally where possible, move record emission off the response-polling path through a bounded asynchronous sink, and expose overflow or loss rather than silently dropping records. If exact unredacted capture deliberately backpressures that sink, make the latency tradeoff operator-visible and enforce restricted sink access and retention alongside unmistakable credential and content warnings.
 
 The server already includes one narrow operator-diagnostic slice toward this
 phase: HTTP debug records correlate request metadata, terminal status,
@@ -1616,6 +1618,8 @@ Freeze and deliver the external product contract only after the live execution a
 - deliver the required Ollama native protocol adapter under `/ollama/api/*` over the same canonical services as the OpenAI adapter, including convergent pull with integrated update resolution, verification, and repair;
 - reconcile read-only `user.yaml` local-model declarations at startup, then remove every native model register, list, show, fetch, update-check, verify, alias, and delete route;
 - deliver the complete OpenAI-compatible behavior under `/openai/v1/*` declared in the adapter architecture section, with conformance fixtures for configurable subdirectory base URLs, request defaults, streaming, errors, output semantics, usage, tools, structured output, embeddings when supported, and stateless Responses;
+- treat every compatibility request as a strict semantic contract: preserve message roles, reject unknown or unsupported fields and capabilities before admission, and never silently discard tools, tool choice, stream options, structured-output controls, content parts, or other accepted input;
+- define and test protocol defaults explicitly, including omitted output-token limits; apply the selected model's chat template and normalized tool schema exactly once before tokenization; and emit protocol-native streaming chunks, terminal usage behavior such as `include_usage`, finish reasons, and errors rather than exposing Cusco's internal event schema;
 - migrate durable context, branch, import, cache and compaction policy, activity, extended-usage, and request-cancellation operations to `/cusco/v1/*`;
 - remove the minimal server's unprefixed `/v1/*` and `/native/*` routes rather than retaining aliases;
 - support text-and-image input within the declared model, projector, content-part, size, and transport boundaries;
@@ -1663,12 +1667,12 @@ Each phase must end in a usable artifact and a decision, not merely merged infra
 | 1. Executor proof | CLI driver, reproducibly patched native ABI, Hub-resolved model, complete Gemma checkpoint operation | displaced and tier-moved continuations match uninterrupted logits and tokens; failed preparations preserve the old binding |
 | 2. Logical context store | persistent branch and evaluated-prefix library | structural sharing, lineage invalidation, and longest valid-prefix lookup pass deterministic and property-based checks |
 | 3. Tiered physical manager | reservation, residency, transfer, and eviction subsystem | active-growth guarantees survive full warm capacity; cancellation and delayed fences produce no leaks or premature reuse |
-| 4. Minimal server | runnable OpenAI-compatible streaming server, native model-management API, context APIs, CLI, and scheduler | four concurrent branch revisits match isolated controls; committed hits avoid measured prompt work; protocol, accounting, anonymous-auth, and immutable model-install contracts pass |
+| 4. Minimal server | runnable completion and chat adapters, native model-management API, context APIs, CLI, and scheduler | four concurrent branch revisits match isolated controls; committed hits avoid measured prompt work; minimal protocol, accounting, anonymous-auth, and immutable model-install contracts pass |
 | 5. Mapped execution | block-table-capable executor path | semantic gates remain green and measured resident-switch cost improves enough to justify backend complexity |
 | 6. Live execution integration | mapped server execution, one persistent Gemma instance and executor slot, early bounded FIFO admission, and normalized incremental generation | successive requests reuse live mapped state; queue saturation rejects before expensive planning; impossible generation bounds fail before decode; terminal tokens, control pieces, whitespace, finish reasons, and usage are correct; cancellation and capacity failures preserve prior bindings |
 | 7. Residency and lifecycle scheduling | capacity-aware model residency, context tiering, transactional load/reload/unload, and immutable model-epoch ownership | measured device and host admission remains within capacity; load, movement, revision, removal, eviction, reload, and unload races preserve active references and prior usable bindings without leaks |
-| 8. Workload and operational hardening | distinct request-ordering policy, starvation protection, lifecycle-aware cancellation and deadlines, scheduler observability, and sustained-load validation | mixed workloads satisfy bounded fairness, capacity, cancellation, deadline, latency, and reclamation gates while every residency and scheduling decision is attributable |
-| 9. Compatibility, persistence, and packaging | supported OpenAI, Ollama, and Cusco profiles, local and managed model lifecycle, bounded image input, durable recovery, and production/test container contracts | declared protocol and model-lifecycle conformance fixtures pass; restarts, crashes, migrations, backup/restore, and corrupt state preserve transactional guarantees; production deployment exercises the live scheduled path |
+| 8. Workload and operational hardening | distinct request-ordering policy, starvation protection, lifecycle-aware cancellation and deadlines, scheduler observability, and sustained-load validation | mixed workloads satisfy bounded fairness, capacity, cancellation, deadline, latency, and reclamation gates; every residency and scheduling decision is attributable; correlated transport and inference timings remain unambiguous without diagnostic backpressure silently changing execution |
+| 9. Compatibility, persistence, and packaging | supported OpenAI, Ollama, and Cusco profiles, local and managed model lifecycle, bounded image input, durable recovery, and production/test container contracts | declared protocol and model-lifecycle conformance fixtures pass, including strict unsupported-input errors, request defaults, templates, tools, and native streaming framing; restarts, crashes, migrations, backup/restore, and corrupt state preserve transactional guarantees; production deployment exercises the live scheduled path |
 | 10. Semantic compaction | strategy registry, built-in strategy, worker protocol, speculative scheduler, and explicit client declaration API | original contexts survive every failure and race; accepted declarations start eligible work without predictive guessing; abandoned successors demote normally; committed successors execute correctly; interactive latency and guarded capacity are not regressed; strategy sandboxes and authorization pass their gates |
 
 Phase 1 has an explicit go/no-go boundary. If complete recurrent capture and restoration cannot be expressed without exposing unstable model internals, the project pauses for an executor-boundary redesign before server work begins. Phase 5 is optional unless staged measurements show that physical assembly is a material bottleneck.

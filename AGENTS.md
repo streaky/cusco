@@ -27,6 +27,8 @@ The repository currently contains:
 
 The server dynamically admits and reuses multiple model epochs within configured device, host, and storage budgets. Each resident model currently owns one native execution slot, so requests for the same model serialize at that slot while distinct resident models can execute independently. HTTP transport diagnostics default off and support privacy-safe and fully unredacted levels through `--http-debug` or `CUSCO_HTTP_DEBUG`; full mode exposes headers, query values, credentials, and body content. Phase 8 workload scheduling and operational hardening is next; this diagnostic slice alone does not implement that phase. Broader compatibility and production hardening remain later work and must not be represented as implemented.
 
+The current unprefixed `/v1` completion and chat routes are minimal adapters, not the complete Phase 9 OpenAI compatibility profile. They do not yet preserve the full chat, tool, and stream-option semantics or emit OpenAI-native streaming chunks; unsupported compatibility input must not be represented as supported.
+
 ## Build and dependency conventions
 
 - Docker Compose is the primary development, test, proof, and production interface. `compose.test.yaml` owns development and verification services; every test or proof command must select it explicitly with `docker compose -f compose.test.yaml`. `compose.yaml` is reserved for the production-oriented `cusco` service, which runs the release binary with persistent bind mounts under the ignored `data/` tree. Keep CPU-only and GPU execution supported by the same image; CPU-only checks should omit GPU passthrough rather than use a separate build.
