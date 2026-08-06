@@ -277,8 +277,13 @@ impl Default for SchedulerPolicyConfig {
 
 impl SchedulerPolicyConfig {
     fn validate(self) -> Result<Self, Error> {
-        if self.version == 0
-            || self.interactive_weight == 0
+        if self.version != 1 {
+            return Err(Error::State(format!(
+                "unsupported scheduler policy version {}",
+                self.version
+            )));
+        }
+        if self.interactive_weight == 0
             || self.standard_weight == 0
             || self.batch_weight == 0
             || self.deficit_refill == 0
