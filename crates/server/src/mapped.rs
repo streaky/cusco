@@ -1,16 +1,17 @@
 use crate::{
-    EngineOutput, EngineRequest, Error, FrontierControl, InferenceEngine, PrefillMetrics, TokenSink,
+    EngineOutput, EngineRequest, Error, ExecutionSession, InferenceEngine, PrefillMetrics,
+    QuantumKind, QuantumObservation, SessionStep,
 };
 use cusco_context_store::{
     AdapterEpoch, ComponentMask, ContextStore, EvaluatedPrefixId, LogicalContextId, ModelEpoch,
     PersistentTokenSequence,
 };
-use cusco_executor::{Decode, Executor, MappingId, MappingState, OperatingPoint};
+use cusco_executor::{Decode, Executor, GreedySampler, MappingId, MappingState, OperatingPoint};
 use cusco_physical_manager::{
     Capacity, Component, PhysicalManager, PhysicalRepresentationId, Tier,
 };
 use parking_lot::Mutex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
@@ -139,7 +140,7 @@ impl ExecutionProfile {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct MappedMetrics {
     pub requests: u64,
     pub cache_hits: u64,
@@ -181,7 +182,7 @@ pub struct MappedEngine {
     context_capacity: usize,
     spill_dir: Option<PathBuf>,
     spill_capacity: usize,
-    state: Mutex<MappedState>,
+    state: Arc<Mutex<MappedState>>,
 }
 
 impl MappedEngine {
@@ -275,7 +276,7 @@ impl MappedEngine {
             model_path,
             spill_dir,
             spill_capacity,
-            state: Mutex::new(MappedState {
+            state: Arc::new(Mutex::new(MappedState {
                 executor,
                 logical: ContextStore::default(),
                 physical: PhysicalManager::new(Capacity {
@@ -286,7 +287,7 @@ impl MappedEngine {
                 model_epoch,
                 metrics: MappedMetrics::default(),
                 spill_bytes: 0,
-            }),
+            })),
         }))
     }
 
@@ -368,49 +369,69 @@ impl MappedEngine {
     }
 }
 
-impl InferenceEngine for MappedEngine {
-    fn generate(
-        &self,
-        request: EngineRequest<'_>,
-        sink: &mut TokenSink<'_>,
-    ) -> Result<EngineOutput, Error> {
-        request.control.check()?;
-        if request.model.path.to_str() != Some(self.model_path()) {
-            return Err(Error::State(
-                "Phase 6B admits only the process-owned model".into(),
-            ));
-        }
-        let prompt_started = Instant::now();
+struct MappedSession {
+    profile: ExecutionProfile,
+    state: Arc<Mutex<MappedState>>,
+    request: EngineRequest,
+    prompt_started: Instant,
+    stage: MappedStage,
+    tokens: Vec<i32>,
+    logical_context: Option<LogicalContextId>,
+    active_mapping: Option<MappingId>,
+    parent: Option<EvaluatedPrefixId>,
+    next: Option<Decode>,
+    sampler: Option<GreedySampler>,
+    input_tokens: usize,
+    cached: usize,
+    evaluated_tokens: usize,
+    evaluated: usize,
+    generated: usize,
+    prefill: PrefillMetrics,
+    finished: Option<EngineOutput>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MappedStage {
+    Preparation,
+    Prefill,
+    Decode,
+    Publication,
+    Finished,
+}
+
+impl MappedSession {
+    fn prepare(&mut self) -> Result<SessionStep, Error> {
+        self.request.control.check()?;
+        let tokenization_started = Instant::now();
         let mut state = self.state.lock();
         state.executor.reset_cancellation();
         let cancellation = state.executor.cancellation_handle();
-        let _abort = request.control.register_abort(Arc::new(move || {
+        let _abort = self.request.control.register_abort(Arc::new(move || {
             cancellation.cancel();
         }));
-        request.control.check()?;
-        let tokenization_started = Instant::now();
         let prompt = state
             .executor
-            .tokenize(request.prompt)
+            .tokenize(&self.request.prompt)
             .map_err(state_error)?;
-        request.control.check()?;
-        let tokenization_ns = elapsed_ns(tokenization_started);
-        let input_tokens = prompt.len();
-        let total = request
+        self.request.control.check()?;
+        self.prefill.tokenization_ns = elapsed_ns(tokenization_started);
+        self.input_tokens = prompt.len();
+        let total = self
+            .request
             .prior_tokens
             .len()
             .checked_add(prompt.len())
-            .and_then(|value| value.checked_add(request.max_tokens))
+            .and_then(|value| value.checked_add(self.request.max_tokens))
             .ok_or_else(|| Error::State("request token count overflow".into()))?;
-        if total > self.context_capacity {
+        if total > self.profile.context_limit {
             return Err(Error::State(
                 "request exceeds model context capacity".into(),
             ));
         }
 
-        let mut tokens = request.prior_tokens.to_vec();
-        tokens.extend_from_slice(&prompt);
-        let sequence = PersistentTokenSequence::default().append(&tokens);
+        self.tokens = self.request.prior_tokens.clone();
+        self.tokens.extend_from_slice(&prompt);
+        let sequence = PersistentTokenSequence::default().append(&self.tokens);
         let model_epoch = state.model_epoch;
         let logical_context = state.logical.create(sequence, model_epoch, ADAPTER_EPOCH);
         let prefix_lookup_started = Instant::now();
@@ -418,131 +439,300 @@ impl InferenceEngine for MappedEngine {
             .logical
             .longest_valid_prefix(logical_context)
             .map_err(state_error)?;
-        let prefix_lookup_ns = elapsed_ns(prefix_lookup_started);
-        let cached = prefix.as_ref().map_or(0, |mapping| mapping.represented_end);
-        let evaluated_tokens = tokens.len().saturating_sub(cached);
-        let mapping_activation_started = Instant::now();
-        activate_prefix(&mut state, logical_context, prefix.as_deref())?;
-        request.control.check()?;
-
-        let mut active_mapping = state.executor.mapping_metrics().active;
-        if cached == 0 {
-            active_mapping = fork_and_activate(&mut state.executor, active_mapping)?;
-        }
-        let mapping_activation_ns = elapsed_ns(mapping_activation_started);
-        let uncached_prefill_started = Instant::now();
-        let mut evaluated = cached;
-        let mut parent = prefix.as_ref().map(|mapping| mapping.id);
-        let mut next = prefix
+        self.prefill.prefix_lookup_ns = elapsed_ns(prefix_lookup_started);
+        self.cached = prefix.as_ref().map_or(0, |mapping| mapping.represented_end);
+        self.evaluated_tokens = self.tokens.len().saturating_sub(self.cached);
+        self.evaluated = self.cached;
+        self.parent = prefix.as_ref().map(|mapping| mapping.id);
+        self.next = prefix
             .as_ref()
             .and_then(|mapping| state.resident.get(&mapping.id))
             .map(|resident| resident.continuation.clone());
-        while evaluated < tokens.len() {
-            request.control.check()?;
-            let end = tokens
-                .len()
-                .min(((evaluated / self.profile.block_size) + 1) * self.profile.block_size);
-            next = Some(
-                state
-                    .executor
-                    .decode(&tokens[evaluated..end])
-                    .map_err(state_error)?,
-            );
-            request.control.check()?;
-            state.metrics.decoded_tokens += (end - evaluated) as u64;
-            evaluated = end;
-            if evaluated % self.profile.block_size == 0 {
-                parent = Some(publish_block(
-                    &mut state,
-                    &self.profile,
-                    logical_context,
-                    evaluated,
-                    parent,
-                    active_mapping,
-                    next.as_ref().expect("decode result exists"),
-                )?);
-                active_mapping = fork_and_activate(&mut state.executor, active_mapping)?;
+
+        let activation_started = Instant::now();
+        let transfer_before = state.physical.metrics().transfer_bytes;
+        activate_prefix(&mut state, logical_context, prefix.as_deref())?;
+        let source = state.executor.mapping_metrics().active;
+        self.active_mapping = Some(fork_and_activate(&mut state.executor, source)?);
+        self.prefill.mapping_activation_ns = elapsed_ns(activation_started);
+        let transfer_after = state.physical.metrics().transfer_bytes;
+        self.logical_context = Some(logical_context);
+        self.prefill.total_tokens = self.tokens.len();
+        self.prefill.cached_tokens = self.cached;
+        self.prefill.uncached_tokens = self.evaluated_tokens;
+        self.stage = MappedStage::Prefill;
+        Ok(SessionStep::Progress(QuantumObservation {
+            kind: QuantumKind::Preparation,
+            charged_tokens: 1,
+            context_placement: "device".into(),
+            executor_slot_occupied: true,
+            transition_cost_bytes: transfer_after.saturating_sub(transfer_before),
+            capacity_reserved_bytes: 0,
+        }))
+    }
+
+    fn prefill(&mut self) -> Result<SessionStep, Error> {
+        if self.evaluated >= self.tokens.len() {
+            if self.request.max_tokens > 0 && self.next.is_none() {
+                return Err(Error::State(
+                    "an exact cached prefix cannot supply uncached logits".into(),
+                ));
             }
+            let mut state = self.state.lock();
+            self.sampler = Some(state.executor.greedy_sampler().map_err(state_error)?);
+            self.stage = MappedStage::Decode;
+            return Ok(SessionStep::Progress(QuantumObservation::model_free(
+                QuantumKind::Prefill,
+                1,
+            )));
         }
-        let uncached_prefill_ns = elapsed_ns(uncached_prefill_started);
-        if request.max_tokens > 0 && next.is_none() {
-            return Err(Error::State(
-                "an exact cached prefix cannot supply uncached logits".into(),
-            ));
-        }
-        let mut prefill = PrefillMetrics {
-            total_tokens: tokens.len(),
-            cached_tokens: cached,
-            uncached_tokens: evaluated_tokens,
-            tokenization_ns,
-            prefix_lookup_ns,
-            mapping_activation_ns,
-            uncached_prefill_ns,
-            total_ns: elapsed_ns(prompt_started),
-            ..PrefillMetrics::default()
-        };
-        let mut sampler = state.executor.greedy_sampler().map_err(state_error)?;
-        let mut piece = Vec::with_capacity(32);
-        for index in 0..request.max_tokens {
-            request.control.check()?;
-            let sampled = sampler.sample(&mut state.executor).map_err(state_error)?;
-            let terminal_or_control = self.profile.terminal_tokens.contains(&sampled);
-            if terminal_or_control {
-                piece.clear();
-            } else {
-                state
-                    .executor
-                    .render_token(sampled, &mut piece)
-                    .map_err(state_error)?;
-            }
-            request.control.check()?;
-            tokens.push(sampled);
+
+        let started = Instant::now();
+        let mut state = self.state.lock();
+        self.request.control.check()?;
+        state.executor.reset_cancellation();
+        let cancellation = state.executor.cancellation_handle();
+        let _abort = self.request.control.register_abort(Arc::new(move || {
+            cancellation.cancel();
+        }));
+        self.request.control.check()?;
+        self.activate_owned(&mut state)?;
+        let next_block = ((self.evaluated / self.profile.block_size) + 1)
+            .saturating_mul(self.profile.block_size);
+        let end = self.tokens.len().min(next_block).min(
+            self.evaluated
+                .saturating_add(self.request.prefill_chunk_tokens),
+        );
+        let charged = end.saturating_sub(self.evaluated);
+        self.next = Some(
             state
-                .logical
-                .append(logical_context, &[sampled])
+                .executor
+                .decode(&self.tokens[self.evaluated..end])
+                .map_err(state_error)?,
+        );
+        self.request.control.check()?;
+        state.metrics.decoded_tokens += charged as u64;
+        self.evaluated = end;
+        if self.evaluated % self.profile.block_size == 0 {
+            self.parent = Some(publish_block(
+                &mut state,
+                &self.profile,
+                self.logical_context.expect("prepared context exists"),
+                self.evaluated,
+                self.parent,
+                self.active_mapping.expect("prepared mapping exists"),
+                self.next.as_ref().expect("decode result exists"),
+            )?);
+            let source = self.active_mapping.expect("published mapping exists");
+            self.active_mapping = Some(fork_and_activate(&mut state.executor, source)?);
+        }
+        self.prefill.uncached_prefill_ns = self
+            .prefill
+            .uncached_prefill_ns
+            .saturating_add(elapsed_ns(started));
+        Ok(SessionStep::Progress(QuantumObservation {
+            kind: QuantumKind::Prefill,
+            charged_tokens: charged.max(1),
+            context_placement: "device".into(),
+            executor_slot_occupied: true,
+            transition_cost_bytes: 0,
+            capacity_reserved_bytes: 0,
+        }))
+    }
+
+    fn decode(&mut self) -> Result<SessionStep, Error> {
+        if self.generated >= self.request.max_tokens {
+            self.stage = MappedStage::Publication;
+            return self.publish().map(SessionStep::Finished);
+        }
+        let mut state = self.state.lock();
+        self.request.control.check()?;
+        state.executor.reset_cancellation();
+        let cancellation = state.executor.cancellation_handle();
+        let _abort = self.request.control.register_abort(Arc::new(move || {
+            cancellation.cancel();
+        }));
+        self.request.control.check()?;
+        self.activate_owned(&mut state)?;
+        let sampled = self
+            .sampler
+            .as_mut()
+            .expect("decode owns sampler")
+            .sample(&mut state.executor)
+            .map_err(state_error)?;
+        let terminal_or_control = self.profile.terminal_tokens.contains(&sampled);
+        let mut piece = Vec::with_capacity(32);
+        if !terminal_or_control {
+            state
+                .executor
+                .render_token(sampled, &mut piece)
                 .map_err(state_error)?;
-            let control = sink(sampled, &piece, terminal_or_control)?;
-            if control == FrontierControl::Stop
-                || terminal_or_control
-                || index + 1 == request.max_tokens
-            {
-                break;
-            }
-            next = Some(state.executor.decode(&[sampled]).map_err(state_error)?);
-            request.control.check()?;
+        }
+        self.request.control.check()?;
+        self.tokens.push(sampled);
+        state
+            .logical
+            .append(
+                self.logical_context.expect("prepared context exists"),
+                &[sampled],
+            )
+            .map_err(state_error)?;
+        self.generated += 1;
+        if terminal_or_control || self.generated == self.request.max_tokens {
+            self.stage = MappedStage::Publication;
+        } else {
+            self.next = Some(state.executor.decode(&[sampled]).map_err(state_error)?);
+            self.request.control.check()?;
             state.metrics.decoded_tokens += 1;
-            evaluated += 1;
-            if evaluated % self.profile.block_size == 0 {
-                parent = Some(publish_block(
+            self.evaluated += 1;
+            if self.evaluated % self.profile.block_size == 0 {
+                self.parent = Some(publish_block(
                     &mut state,
                     &self.profile,
-                    logical_context,
-                    evaluated,
-                    parent,
-                    active_mapping,
-                    next.as_ref().expect("decode result exists"),
+                    self.logical_context.expect("prepared context exists"),
+                    self.evaluated,
+                    self.parent,
+                    self.active_mapping.expect("prepared mapping exists"),
+                    self.next.as_ref().expect("decode result exists"),
                 )?);
-                active_mapping = fork_and_activate(&mut state.executor, active_mapping)?;
+                let source = self.active_mapping.expect("published mapping exists");
+                self.active_mapping = Some(fork_and_activate(&mut state.executor, source)?);
             }
         }
-        request.control.check()?;
+        Ok(SessionStep::Token {
+            id: sampled,
+            piece,
+            terminal_or_control,
+            observation: QuantumObservation {
+                kind: QuantumKind::Decode,
+                charged_tokens: 1,
+                context_placement: "device".into(),
+                executor_slot_occupied: true,
+                transition_cost_bytes: 0,
+                capacity_reserved_bytes: 0,
+            },
+        })
+    }
+
+    fn activate_owned(&self, state: &mut MappedState) -> Result<(), Error> {
+        state
+            .executor
+            .activate_mapping(self.active_mapping.expect("prepared mapping exists"))
+            .map_err(state_error)
+    }
+
+    fn publish(&mut self) -> Result<EngineOutput, Error> {
+        if let Some(output) = &self.finished {
+            return Ok(output.clone());
+        }
+        self.request.control.check()?;
+        self.sampler = None;
+        let mut state = self.state.lock();
+        if let Some(active) = self.active_mapping.take() {
+            let fallback = self
+                .parent
+                .and_then(|id| state.resident.get(&id))
+                .and_then(|resident| resident.native)
+                .unwrap_or(MappingId(0));
+            if active != fallback {
+                state
+                    .executor
+                    .activate_mapping(fallback)
+                    .map_err(state_error)?;
+                state.executor.remove_mapping(active).map_err(state_error)?;
+            }
+        }
         let native_metrics = state.executor.mapping_metrics();
         state.metrics.requests += 1;
-        state.metrics.cached_tokens += cached as u64;
-        state.metrics.cache_hits += u64::from(cached != 0);
+        state.metrics.cached_tokens += self.cached as u64;
+        state.metrics.cache_hits += u64::from(self.cached != 0);
         state.metrics.reference_switches = native_metrics.reference_switches;
         state.metrics.activation_bytes_copied = native_metrics.activation_bytes_copied;
         let physical_metrics = state.physical.metrics();
-        prefill.transfer_bytes = physical_metrics.transfer_bytes;
-        prefill.device_bytes = physical_metrics.device_total;
-        prefill.host_bytes = physical_metrics.host_used;
-        Ok(EngineOutput {
-            successor_tokens: tokens,
-            input_tokens,
-            cached_tokens: cached,
-            evaluated_tokens,
-            prefill,
-        })
+        self.prefill.transfer_bytes = physical_metrics.transfer_bytes;
+        self.prefill.device_bytes = physical_metrics.device_total;
+        self.prefill.host_bytes = physical_metrics.host_used;
+        self.prefill.total_ns = elapsed_ns(self.prompt_started);
+        let output = EngineOutput {
+            successor_tokens: self.tokens.clone(),
+            input_tokens: self.input_tokens,
+            cached_tokens: self.cached,
+            evaluated_tokens: self.evaluated_tokens,
+            prefill: self.prefill,
+        };
+        self.finished = Some(output.clone());
+        self.stage = MappedStage::Finished;
+        Ok(output)
+    }
+}
+
+impl ExecutionSession for MappedSession {
+    fn step(&mut self) -> Result<SessionStep, Error> {
+        match self.stage {
+            MappedStage::Preparation => self.prepare(),
+            MappedStage::Prefill => self.prefill(),
+            MappedStage::Decode => self.decode(),
+            MappedStage::Publication => self.publish().map(SessionStep::Finished),
+            MappedStage::Finished => Ok(SessionStep::Finished(
+                self.finished.clone().expect("finished output exists"),
+            )),
+        }
+    }
+
+    fn finish(&mut self) -> Result<EngineOutput, Error> {
+        self.publish()
+    }
+}
+
+impl Drop for MappedSession {
+    fn drop(&mut self) {
+        self.sampler = None;
+        if let Some(active) = self.active_mapping.take() {
+            let mut state = self.state.lock();
+            let fallback = self
+                .parent
+                .and_then(|id| state.resident.get(&id))
+                .and_then(|resident| resident.native)
+                .unwrap_or(MappingId(0));
+            if active != fallback {
+                let _ = state.executor.activate_mapping(fallback);
+                let _ = state.executor.remove_mapping(active);
+            }
+        }
+    }
+}
+
+impl InferenceEngine for MappedEngine {
+    fn start_session(&self, request: EngineRequest) -> Result<Box<dyn ExecutionSession>, Error> {
+        request.control.check()?;
+        if request.model.path.to_str() != Some(self.model_path()) {
+            return Err(Error::State(
+                "Phase 8 admits only a resident process-owned model".into(),
+            ));
+        }
+        let context_limit = self.context_capacity.min(self.profile.context_limit);
+        let mut profile = self.profile.clone();
+        profile.context_limit = context_limit;
+        Ok(Box::new(MappedSession {
+            profile,
+            state: self.state.clone(),
+            request,
+            prompt_started: Instant::now(),
+            stage: MappedStage::Preparation,
+            tokens: Vec::new(),
+            logical_context: None,
+            active_mapping: None,
+            parent: None,
+            next: None,
+            sampler: None,
+            input_tokens: 0,
+            cached: 0,
+            evaluated_tokens: 0,
+            evaluated: 0,
+            generated: 0,
+            prefill: PrefillMetrics::default(),
+            finished: None,
+        }))
     }
 
     fn demote_inactive(&self) -> Result<usize, Error> {
@@ -844,8 +1034,8 @@ fn state_error(error: impl std::fmt::Display) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ModelRecord;
-    use std::path::PathBuf;
+    use crate::{FrontierControl, ModelRecord, RequestControl, SchedulingMetadata};
+    use std::{path::PathBuf, sync::Arc};
 
     fn model() -> ModelRecord {
         ModelRecord {
@@ -860,6 +1050,23 @@ mod tests {
         }
     }
 
+    fn test_request(
+        model: &ModelRecord,
+        prompt: impl Into<String>,
+        max_tokens: usize,
+        prior_tokens: &[i32],
+    ) -> EngineRequest {
+        EngineRequest {
+            model: model.clone(),
+            prompt: prompt.into(),
+            max_tokens,
+            prior_tokens: prior_tokens.to_vec(),
+            control: Arc::new(RequestControl::new()),
+            scheduling: SchedulingMetadata::default(),
+            prefill_chunk_tokens: 32,
+        }
+    }
+
     #[derive(Debug)]
     struct CollectedOutput {
         pieces: Vec<Vec<u8>>,
@@ -869,10 +1076,10 @@ mod tests {
     }
 
     trait GenerateCollected {
-        fn generate_collected(&self, request: EngineRequest<'_>) -> Result<CollectedOutput, Error>;
+        fn generate_collected(&self, request: EngineRequest) -> Result<CollectedOutput, Error>;
     }
     impl GenerateCollected for MappedEngine {
-        fn generate_collected(&self, request: EngineRequest<'_>) -> Result<CollectedOutput, Error> {
+        fn generate_collected(&self, request: EngineRequest) -> Result<CollectedOutput, Error> {
             let mut pieces = Vec::new();
             let output = self.generate(request, &mut |_, piece, _| {
                 pieces.push(piece.to_vec());
@@ -930,22 +1137,10 @@ mod tests {
         .unwrap();
         let model = model();
         let first = engine
-            .generate_collected(EngineRequest {
-                model: &model,
-                prompt: &"a".repeat(40),
-                max_tokens: 2,
-                prior_tokens: &[],
-                control: &crate::RequestControl::new(),
-            })
+            .generate_collected(test_request(&model, &"a".repeat(40), 2, &[]))
             .unwrap();
         let second = engine
-            .generate_collected(EngineRequest {
-                model: &model,
-                prompt: "z",
-                max_tokens: 1,
-                prior_tokens: &first.successor_tokens,
-                control: &crate::RequestControl::new(),
-            })
+            .generate_collected(test_request(&model, "z", 1, &first.successor_tokens))
             .unwrap();
         assert!(!second.pieces.is_empty());
         let metrics = engine.metrics();
@@ -1001,13 +1196,10 @@ mod tests {
         .unwrap();
         let model = model();
         let first = engine
-            .generate_collected(EngineRequest {
-                model: &model,
-                prompt: &"a".repeat(40),
-                max_tokens: 2,
-                prior_tokens: &[],
-                control: &crate::RequestControl::new(),
-            })
+            .generate_collected(test_request(&model, &"a".repeat(40), 2, &[]))
+            .unwrap();
+        engine
+            .generate_collected(test_request(&model, &"b".repeat(40), 1, &[]))
             .unwrap();
         let control = MappedEngine::open(
             "gemma-4-e2b-it",
@@ -1019,34 +1211,21 @@ mod tests {
         )
         .unwrap();
         let control_first = control
-            .generate_collected(EngineRequest {
-                model: &model,
-                prompt: &"a".repeat(40),
-                max_tokens: 2,
-                prior_tokens: &[],
-                control: &crate::RequestControl::new(),
-            })
+            .generate_collected(test_request(&model, &"a".repeat(40), 2, &[]))
             .unwrap();
         let baseline = control
-            .generate_collected(EngineRequest {
-                model: &model,
-                prompt: "z",
-                max_tokens: 2,
-                prior_tokens: &control_first.successor_tokens,
-                control: &crate::RequestControl::new(),
-            })
+            .generate_collected(test_request(
+                &model,
+                "z",
+                2,
+                &control_first.successor_tokens,
+            ))
             .unwrap();
         assert_eq!(engine.spill_inactive_mappings().unwrap(), 1);
         assert_eq!(fs::read_dir(&spill_dir).unwrap().count(), 1);
 
         let resumed = engine
-            .generate_collected(EngineRequest {
-                model: &model,
-                prompt: "z",
-                max_tokens: 2,
-                prior_tokens: &first.successor_tokens,
-                control: &crate::RequestControl::new(),
-            })
+            .generate_collected(test_request(&model, "z", 2, &first.successor_tokens))
             .unwrap();
         assert_eq!(resumed.cached_tokens, 32);
         assert_eq!(resumed.pieces, baseline.pieces);
@@ -1068,13 +1247,7 @@ mod tests {
         .unwrap();
         let model = model();
         let error = engine
-            .generate_collected(EngineRequest {
-                model: &model,
-                prompt: &"x".repeat(65),
-                max_tokens: 1,
-                prior_tokens: &[],
-                control: &crate::RequestControl::new(),
-            })
+            .generate_collected(test_request(&model, &"x".repeat(65), 1, &[]))
             .unwrap_err();
         assert!(error.to_string().contains("context capacity"));
         assert_eq!(engine.metrics(), MappedMetrics::default());
@@ -1093,30 +1266,17 @@ mod tests {
         .unwrap();
         let model = model();
         let first = engine
-            .generate_collected(EngineRequest {
-                model: &model,
-                prompt: &"a".repeat(40),
-                max_tokens: 1,
-                prior_tokens: &[],
-                control: &crate::RequestControl::new(),
-            })
+            .generate_collected(test_request(&model, &"a".repeat(40), 1, &[]))
             .unwrap();
-        let failed = engine.generate_collected(EngineRequest {
-            model: &model,
-            prompt: &"b".repeat(25),
-            max_tokens: 1,
-            prior_tokens: &first.successor_tokens,
-            control: &crate::RequestControl::new(),
-        });
+        let failed = engine.generate_collected(test_request(
+            &model,
+            &"b".repeat(25),
+            1,
+            &first.successor_tokens,
+        ));
         assert!(failed.unwrap_err().to_string().contains("cannot publish"));
         let resumed = engine
-            .generate_collected(EngineRequest {
-                model: &model,
-                prompt: "c",
-                max_tokens: 1,
-                prior_tokens: &first.successor_tokens,
-                control: &crate::RequestControl::new(),
-            })
+            .generate_collected(test_request(&model, "c", 1, &first.successor_tokens))
             .unwrap();
         assert_eq!(resumed.pieces.len(), 1);
         assert_eq!(engine.metrics().requests, 2);
@@ -1136,22 +1296,10 @@ mod tests {
         .unwrap();
         let model = model();
         let primed = engine
-            .generate_collected(EngineRequest {
-                model: &model,
-                prompt: &"p".repeat(32),
-                max_tokens: 0,
-                prior_tokens: &[],
-                control: &crate::RequestControl::new(),
-            })
+            .generate_collected(test_request(&model, &"p".repeat(32), 0, &[]))
             .unwrap();
         let resumed = engine
-            .generate_collected(EngineRequest {
-                model: &model,
-                prompt: "",
-                max_tokens: 1,
-                prior_tokens: &primed.successor_tokens,
-                control: &crate::RequestControl::new(),
-            })
+            .generate_collected(test_request(&model, "", 1, &primed.successor_tokens))
             .unwrap();
         assert_eq!(resumed.pieces.len(), 1);
         assert_eq!(resumed.cached_tokens, 32);
@@ -1189,7 +1337,7 @@ mod tests {
                     max_tokens: 1,
                     context_id: None,
                     deadline_ms: None,
-                    priority: 0,
+                    scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
                 },
@@ -1207,7 +1355,7 @@ mod tests {
                     max_tokens: 1,
                     context_id: Some(durable.id),
                     deadline_ms: None,
-                    priority: 0,
+                    scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
                 },

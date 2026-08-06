@@ -6,19 +6,21 @@ The project separates responsibilities deliberately: Rust will manage logical co
 
 ## Current state
 
-Cusco has completed Phases 1 through 7. The executor proof established exact
+Cusco has completed Phases 1 through 8. The executor proof established exact
 checkpoint continuation for a hybrid/recurrent Gemma model, and the Rust layers
 now provide durable logical contexts, capacity-accounted physical state,
 transactional mapped activation, an authenticated HTTP API, immutable model
-epochs, bounded live inference, and dynamic model residency.
+epochs, bounded live inference, dynamic model residency, and resumable
+priority-aware workload scheduling.
 
-Phase 7 replaces the one-model process with a capacity-admitted residency
-scheduler. Executor-reported operating points account model weights, context
-capacity, and device/host placement; model loads, epoch reloads, retirement,
-and unload use transactional publication and active-reference draining.
-Pressure selects idle LRU victims, inactive mapped contexts can spill through
-the native sequence-state ABI and restore exactly, and `/native/status`
-reports configured budgets, resident epochs, and lifecycle/tier metrics.
+Phase 8 schedules bounded prefill and one-token decode quanta with
+priority-aware deficit round robin, per-principal fairness, FIFO ordering, and
+monotonic age promotion. Request-owned execution sessions preserve unpublished
+successor state across quanta, while bounded asynchronous scheduler diagnostics
+attribute decisions without backpressuring inference. The checked-in versioned
+mixed workload gates fairness, starvation, cancellation, deadlines, capacity
+recovery, diagnostic loss, and relative first-event and per-quantum latency on
+the declared real model and GPU.
 
 ## Run the real-model inference integration test
 
@@ -86,6 +88,21 @@ inference. Machine-readable GPU, epoch, resident-set, capacity, lifecycle, and
 latency evidence is written to `results/phase7-server.json`.
 
 
+## Run the Phase 8 scheduler report
+
+With the validation GGUF and NVIDIA runtime available, run:
+
+```sh
+CUSCO_GPU_DEVICE_ID=0 tools/phase8-report.sh
+```
+
+The workflow runs the GPU-less 80%-per-file coverage gate and the versioned
+real-GPU workload in `config/phase8-workload.json`. It records the isolated
+baseline, mixed interactive/standard/batch results, cancellation and deadline
+injections, post-workload capacity recovery, scheduler policy and counters,
+fully drained attributed decision records, latency/starvation thresholds, build
+and workload provenance, and selected GPU in `results/phase8-server.json`.
+
 ## Run the production Compose service
 
 Place the initial model at `data/models/gemma-4-e2b-it.gguf`, then provide an
@@ -142,10 +159,10 @@ implicitly fetch models.
 
 ## Future goals
 
-Development now proceeds from dynamic residency toward:
+Development now proceeds from measured workload scheduling toward:
 
-- workload scheduling and operational hardening;
-- broader protocol and model compatibility, recovery, and deployment behavior;
+- compatibility, persistence, daemon configuration, and production packaging;
+- broader model compatibility and later execution-policy optimization;
 - optional semantic context compaction once the underlying state system is proven reliable.
 
 Each stage is intended to remain gated by correctness and measurable capacity results. The full design and phased acceptance criteria are documented in `docs/outline.md`.

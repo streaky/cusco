@@ -13,8 +13,8 @@ The first project decision is therefore an architectural boundary, not a cache p
 The document uses three status categories:
 
 - **Historical design hypothesis:** the decisive executor question and early recommendations explain why implementation began with checkpoint equivalence rather than a broad server.
-- **Implemented current state:** Phases 1 through 5 are complete. The real Gemma proof demonstrated exact checkpoint continuation; the logical and physical managers implement transactional shared state and tiering; the minimal server implements durable contexts, scheduling, lifecycle APIs, streaming events, authentication policy, compatibility adapters, and checked OpenAPI; and the mapped-execution proof demonstrated transactional sequence mappings and reference-only activation.
-- **Remaining prospective contract:** Phase 6 begins the next architectural cutover by integrating the persistent mapped executor with the live server. Phases 7 through 10 remain planned work and are requirements, not claims of implementation.
+- **Implemented current state:** Phases 1 through 8 are complete. The real Gemma proof demonstrated exact checkpoint continuation; the logical and physical managers implement transactional shared state and tiering; the live server implements persistent mapped execution, bounded lifecycle, dynamic multi-model residency, resumable priority-aware workload scheduling, non-blocking attributed diagnostics, authentication, compatibility adapters, and checked OpenAPI; and the real-GPU acceptance artifacts cover mapped activation, live lifecycle, residency, and mixed-workload fairness.
+- **Remaining prospective contract:** Phases 9 and 10 remain planned work and are requirements, not claims of implementation.
 
 ## Decisive technical hypothesis
 
@@ -1685,13 +1685,26 @@ recovery, diagnostic loss, and all thresholds. Tuning those policy parameters
 after observing a working system requires a new versioned fixture and evidence;
 it does not require changing the resumable execution contract.
 
-The server already includes one narrow operator-diagnostic slice toward this
-phase: HTTP debug records correlate request metadata, terminal status,
-duration, and streaming response chunks. Diagnostics default off and may be
-selected by CLI or environment as privacy-safe records with omitted headers,
-redacted JSON strings, and bounded bodies, or as fully unredacted URI, header,
-and body records for controlled diagnosis. This transport trace is not
-scheduler decision attribution and does not satisfy the Phase 8 exit gate.
+The implemented Phase 8 contract uses a protocol-neutral `ExecutionSession`
+boundary and a replaceable priority-aware deficit-round-robin scheduler with
+per-principal/class flows, FIFO equivalence ordering, monotonic age promotion,
+bounded prefill quanta, and one-token decode quanta. Trusted scheduling
+metadata carries distinct transport, inference-operation, and execution-session
+identifiers. Native slot occupancy is scoped to each activation, prefill, or
+decode quantum, and native abort registration remains live through that
+quantum's completion fence. Every scheduler decision records policy attribution
+and resource observations through a bounded asynchronous sink with exact loss
+counters; HTTP debug tracing remains a separate opt-in transport diagnostic.
+
+`config/phase8-workload.json` freezes the versioned real-GPU workload, policy,
+and acceptance thresholds. `tools/phase8-report.sh` runs the per-file coverage
+gate and records model, build, workload, GPU, isolated-baseline, mixed-load,
+cancellation, deadline, capacity-recovery, starvation, latency, and diagnostic
+evidence in `results/phase8-server.json`; proof snapshots wait for every accepted
+diagnostic record to reach the sink. Deterministic model-free fixtures cover
+weighted class shares, per-flow FIFO, age promotion, cancellation, suspended
+session slot release, diagnostic overflow, scheduler shutdown, and the proof
+path.
 
 ### Phase 9: compatibility, persistence, and production packaging
 

@@ -32,6 +32,7 @@ use thiserror::Error;
 use uuid::Uuid;
 mod generation;
 mod mapped;
+mod scheduler;
 
 pub use generation::{
     FinishReason, FrontierControl, GenerationFrontier, MAX_STOP_BYTES, MAX_STOP_SEQUENCES,
@@ -39,6 +40,7 @@ pub use generation::{
 };
 pub use mapped::{ExecutionProfile, MappedEngine, MappedMetrics};
 pub use residency::{ResidencyConfig, ResidencyMetrics, ResidentEngine, ResidentModelStatus};
+pub use scheduler::{SchedulerMetrics, SchedulerStatus, WorkloadScheduler};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -110,6 +112,44 @@ pub enum StreamEvent {
         message: String,
     },
 }
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulingClass {
+    Interactive,
+    #[default]
+    Standard,
+    Batch,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrioritySource {
+    #[default]
+    AdapterDefault,
+    ControlledWorkload,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SchedulingMetadata {
+    pub class: SchedulingClass,
+    pub source: PrioritySource,
+    pub principal: String,
+    pub correlation_id: String,
+    pub inference_id: String,
+}
+
+impl Default for SchedulingMetadata {
+    fn default() -> Self {
+        Self {
+            class: SchedulingClass::Standard,
+            source: PrioritySource::AdapterDefault,
+            principal: "anonymous-admin".into(),
+            correlation_id: String::new(),
+            inference_id: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InferRequest {
     pub model: String,
@@ -124,8 +164,8 @@ pub struct InferRequest {
     pub stop: Vec<String>,
     #[serde(default)]
     pub raw_continuation: bool,
-    #[serde(default)]
-    pub priority: i32,
+    #[serde(skip, default)]
+    pub scheduling: SchedulingMetadata,
 }
 fn default_tokens() -> usize {
     16
@@ -205,6 +245,52 @@ impl Default for ServerConfig {
             stream_buffer: 8,
             shutdown_grace_ms: 30_000,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SchedulerPolicyConfig {
+    pub version: u32,
+    pub interactive_weight: u32,
+    pub standard_weight: u32,
+    pub batch_weight: u32,
+    pub deficit_refill: u32,
+    pub prefill_tokens: usize,
+    pub promotion_rounds: u64,
+    pub diagnostic_capacity: usize,
+}
+
+impl Default for SchedulerPolicyConfig {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            interactive_weight: 4,
+            standard_weight: 2,
+            batch_weight: 1,
+            deficit_refill: 1,
+            prefill_tokens: 32,
+            promotion_rounds: 64,
+            diagnostic_capacity: 1024,
+        }
+    }
+}
+
+impl SchedulerPolicyConfig {
+    fn validate(self) -> Result<Self, Error> {
+        if self.version == 0
+            || self.interactive_weight == 0
+            || self.standard_weight == 0
+            || self.batch_weight == 0
+            || self.deficit_refill == 0
+            || self.prefill_tokens == 0
+            || self.promotion_rounds == 0
+            || self.diagnostic_capacity == 0
+        {
+            return Err(Error::State(
+                "scheduler policy parameters must be nonzero".into(),
+            ));
+        }
+        Ok(self)
     }
 }
 const HTTP_DEBUG_BODY_LIMIT: usize = 64 << 10;
@@ -473,7 +559,7 @@ pub struct RequestControl {
     abort: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 impl RequestControl {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             state: AtomicU8::new(CONTROL_RUNNING),
             abort: Mutex::new(None),
@@ -488,7 +574,7 @@ impl RequestControl {
         }
     }
 
-    fn cancel(&self) {
+    pub fn cancel(&self) {
         if self
             .state
             .compare_exchange(
@@ -503,7 +589,7 @@ impl RequestControl {
         }
     }
 
-    fn expire(&self) {
+    pub fn expire(&self) {
         if self
             .state
             .compare_exchange(
@@ -597,12 +683,15 @@ impl AuthProvider for BearerAuth {
     }
 }
 
-pub struct EngineRequest<'a> {
-    pub model: &'a ModelRecord,
-    pub prompt: &'a str,
+#[derive(Clone)]
+pub struct EngineRequest {
+    pub model: ModelRecord,
+    pub prompt: String,
     pub max_tokens: usize,
-    pub prior_tokens: &'a [i32],
-    pub control: &'a RequestControl,
+    pub prior_tokens: Vec<i32>,
+    pub control: Arc<RequestControl>,
+    pub scheduling: SchedulingMetadata,
+    pub prefill_chunk_tokens: usize,
 }
 
 pub type TokenSink<'a> = dyn FnMut(i32, &[u8], bool) -> Result<FrontierControl, Error> + 'a;
@@ -616,12 +705,80 @@ pub struct EngineOutput {
     pub prefill: PrefillMetrics,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantumKind {
+    Preparation,
+    Prefill,
+    Decode,
+    Publication,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct QuantumObservation {
+    pub kind: QuantumKind,
+    pub charged_tokens: usize,
+    pub context_placement: String,
+    pub executor_slot_occupied: bool,
+    pub transition_cost_bytes: u64,
+    pub capacity_reserved_bytes: u64,
+}
+
+impl QuantumObservation {
+    fn model_free(kind: QuantumKind, charged_tokens: usize) -> Self {
+        Self {
+            kind,
+            charged_tokens,
+            context_placement: "model_free".into(),
+            executor_slot_occupied: false,
+            transition_cost_bytes: 0,
+            capacity_reserved_bytes: 0,
+        }
+    }
+}
+
+pub enum SessionStep {
+    Progress(QuantumObservation),
+    Token {
+        id: i32,
+        piece: Vec<u8>,
+        terminal_or_control: bool,
+        observation: QuantumObservation,
+    },
+    Finished(EngineOutput),
+}
+
+pub trait ExecutionSession: Send {
+    fn step(&mut self) -> Result<SessionStep, Error>;
+    fn finish(&mut self) -> Result<EngineOutput, Error>;
+}
+
 pub trait InferenceEngine: Send + Sync {
+    fn start_session(&self, request: EngineRequest) -> Result<Box<dyn ExecutionSession>, Error>;
+
     fn generate(
         &self,
-        request: EngineRequest<'_>,
+        request: EngineRequest,
         sink: &mut TokenSink<'_>,
-    ) -> Result<EngineOutput, Error>;
+    ) -> Result<EngineOutput, Error> {
+        let mut session = self.start_session(request)?;
+        loop {
+            match session.step()? {
+                SessionStep::Progress(_) => {}
+                SessionStep::Token {
+                    id,
+                    piece,
+                    terminal_or_control,
+                    ..
+                } => {
+                    if sink(id, &piece, terminal_or_control)? == FrontierControl::Stop {
+                        return session.finish();
+                    }
+                }
+                SessionStep::Finished(output) => return Ok(output),
+            }
+        }
+    }
 
     fn prepare_model(&self, _model: &ModelRecord) -> Result<(), Error> {
         Ok(())
@@ -639,36 +796,51 @@ pub trait InferenceEngine: Send + Sync {
         None
     }
 }
+
 #[derive(Default)]
 pub struct DeterministicEngine;
-impl InferenceEngine for DeterministicEngine {
-    fn generate(
-        &self,
-        request: EngineRequest<'_>,
-        sink: &mut TokenSink<'_>,
-    ) -> Result<EngineOutput, Error> {
-        request.control.check()?;
-        let input_tokens = request.prompt.split_whitespace().count();
-        for (index, piece) in request
-            .prompt
-            .split_whitespace()
-            .rev()
-            .cycle()
-            .take(request.max_tokens)
-            .enumerate()
-        {
-            request.control.check()?;
-            let piece = if index == 0 {
-                piece.to_owned()
-            } else {
-                format!(" {piece}")
-            };
-            if sink(-(index as i32) - 1, piece.as_bytes(), false)? == FrontierControl::Stop {
-                break;
-            }
+
+struct DeterministicSession {
+    request: EngineRequest,
+    pieces: Vec<String>,
+    index: usize,
+    prepared: bool,
+}
+
+impl ExecutionSession for DeterministicSession {
+    fn step(&mut self) -> Result<SessionStep, Error> {
+        self.request.control.check()?;
+        if !self.prepared {
+            self.prepared = true;
+            return Ok(SessionStep::Progress(QuantumObservation::model_free(
+                QuantumKind::Preparation,
+                self.pieces.len(),
+            )));
         }
+        if self.index >= self.request.max_tokens || self.pieces.is_empty() {
+            return self.finish().map(SessionStep::Finished);
+        }
+        let piece = &self.pieces[self.index % self.pieces.len()];
+        let piece = if self.index == 0 {
+            piece.clone()
+        } else {
+            format!(" {piece}")
+        };
+        let id = -(self.index as i32) - 1;
+        self.index += 1;
+        Ok(SessionStep::Token {
+            id,
+            piece: piece.into_bytes(),
+            terminal_or_control: false,
+            observation: QuantumObservation::model_free(QuantumKind::Decode, 1),
+        })
+    }
+
+    fn finish(&mut self) -> Result<EngineOutput, Error> {
+        self.request.control.check()?;
+        let input_tokens = self.pieces.len();
         Ok(EngineOutput {
-            successor_tokens: request.prior_tokens.to_vec(),
+            successor_tokens: self.request.prior_tokens.clone(),
             input_tokens,
             cached_tokens: 0,
             evaluated_tokens: input_tokens,
@@ -678,6 +850,24 @@ impl InferenceEngine for DeterministicEngine {
                 ..PrefillMetrics::default()
             },
         })
+    }
+}
+
+impl InferenceEngine for DeterministicEngine {
+    fn start_session(&self, request: EngineRequest) -> Result<Box<dyn ExecutionSession>, Error> {
+        request.control.check()?;
+        let pieces = request
+            .prompt
+            .split_whitespace()
+            .rev()
+            .map(str::to_owned)
+            .collect();
+        Ok(Box::new(DeterministicSession {
+            request,
+            pieces,
+            index: 0,
+            prepared: false,
+        }))
     }
 }
 
@@ -1429,11 +1619,13 @@ impl Server {
         let mut delta_index = 0;
         let generated = self.engine.generate(
             EngineRequest {
-                model: &model,
-                prompt: &req.prompt,
+                model: model.clone(),
+                prompt: req.prompt.clone(),
                 max_tokens: req.max_tokens,
-                prior_tokens,
-                control: &control,
+                prior_tokens: prior_tokens.to_vec(),
+                control: control.clone(),
+                scheduling: req.scheduling.clone(),
+                prefill_chunk_tokens: 32,
             },
             &mut |_id, piece, terminal_or_control| {
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -1822,7 +2014,7 @@ async fn completion(
         _permit: permit,
     }: PrequeueJson<CompletionRequest>,
 ) -> Result<Response, Error> {
-    auth(&s, &headers, Scope::Inference)?;
+    let request_context = auth(&s, &headers, Scope::Inference)?;
     s.model(&r.model)?;
     drop(permit);
     infer_response(
@@ -1836,6 +2028,7 @@ async fn completion(
         r.raw_continuation,
         r.deadline_ms,
         retained_bytes,
+        request_context.principal,
     )
     .await
 }
@@ -1848,7 +2041,7 @@ async fn chat(
         _permit: permit,
     }: PrequeueJson<ChatRequest>,
 ) -> Result<Response, Error> {
-    auth(&s, &headers, Scope::Inference)?;
+    let request_context = auth(&s, &headers, Scope::Inference)?;
     s.model(&r.model)?;
     drop(permit);
     infer_response(
@@ -1866,6 +2059,7 @@ async fn chat(
         false,
         r.deadline_ms,
         retained_bytes,
+        request_context.principal,
     )
     .await
 }
@@ -1922,9 +2116,11 @@ async fn infer_response(
     raw_continuation: bool,
     deadline_ms: Option<u64>,
     retained_bytes: usize,
+    principal: String,
 ) -> Result<Response, Error> {
     server.model(&model)?;
     let id = Uuid::new_v4().to_string();
+    let correlation_id = id.clone();
     let config = server.config();
     let wall_limit = Duration::from_millis(
         deadline_ms
@@ -1956,7 +2152,13 @@ async fn infer_response(
         ),
         stop,
         raw_continuation,
-        priority: 0,
+        scheduling: SchedulingMetadata {
+            class: SchedulingClass::Standard,
+            source: PrioritySource::AdapterDefault,
+            principal,
+            correlation_id: correlation_id.clone(),
+            inference_id: Uuid::new_v4().to_string(),
+        },
     };
     if streaming {
         let (started, receiver) = server.infer_stream_reserved(id, request, admission).await?;
@@ -1977,7 +2179,12 @@ async fn infer_response(
         let rows = first
             .chain(rest)
             .map(|event| Ok::<_, Infallible>(Event::default().json_data(event).unwrap()));
-        Ok(Sse::new(rows).into_response())
+        let mut response = Sse::new(rows).into_response();
+        response.headers_mut().insert(
+            "x-request-id",
+            HeaderValue::from_str(&correlation_id).expect("UUID is a valid header value"),
+        );
+        Ok(response)
     } else {
         let mut disconnect = DisconnectGuard::new(control);
         let result = tokio::task::spawn_blocking(move || {
@@ -1988,7 +2195,12 @@ async fn infer_response(
         .map_err(state_err)?;
         disconnect.disarm();
         let (response, _) = result?;
-        Ok(Json(json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text}],"usage":response.usage})).into_response())
+        let mut response = Json(json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text}],"usage":response.usage})).into_response();
+        response.headers_mut().insert(
+            "x-request-id",
+            HeaderValue::from_str(&correlation_id).expect("UUID is a valid header value"),
+        );
+        Ok(response)
     }
 }
 async fn list_models(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
@@ -2303,11 +2515,7 @@ mod tests {
 
     struct FailingEngine;
     impl InferenceEngine for FailingEngine {
-        fn generate(
-            &self,
-            _: EngineRequest<'_>,
-            _: &mut TokenSink<'_>,
-        ) -> Result<EngineOutput, Error> {
+        fn start_session(&self, _: EngineRequest) -> Result<Box<dyn ExecutionSession>, Error> {
             Err(Error::State("generation failed".into()))
         }
     }
@@ -2315,30 +2523,64 @@ mod tests {
     struct SlowEngine {
         started: Arc<tokio::sync::Notify>,
     }
-    impl InferenceEngine for SlowEngine {
-        fn generate(
-            &self,
-            request: EngineRequest<'_>,
-            sink: &mut TokenSink<'_>,
-        ) -> Result<EngineOutput, Error> {
-            for index in 0..request.max_tokens {
-                sink(index as i32, b"x", false)?;
-                if index == 0 {
-                    self.started.notify_one();
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Ok(EngineOutput {
-                successor_tokens: (0..request.max_tokens as i32).collect(),
-                input_tokens: request.prompt.split_whitespace().count(),
+
+    struct SlowSession {
+        request: EngineRequest,
+        started: Arc<tokio::sync::Notify>,
+        index: usize,
+    }
+
+    impl SlowSession {
+        fn output(&self) -> EngineOutput {
+            let input_tokens = self.request.prompt.split_whitespace().count();
+            EngineOutput {
+                successor_tokens: (0..self.request.max_tokens as i32).collect(),
+                input_tokens,
                 cached_tokens: 0,
-                evaluated_tokens: request.prompt.split_whitespace().count(),
+                evaluated_tokens: input_tokens,
                 prefill: PrefillMetrics {
-                    total_tokens: request.prompt.split_whitespace().count(),
-                    uncached_tokens: request.prompt.split_whitespace().count(),
+                    total_tokens: input_tokens,
+                    uncached_tokens: input_tokens,
                     ..PrefillMetrics::default()
                 },
+            }
+        }
+    }
+
+    impl ExecutionSession for SlowSession {
+        fn step(&mut self) -> Result<SessionStep, Error> {
+            self.request.control.check()?;
+            if self.index >= self.request.max_tokens {
+                return Ok(SessionStep::Finished(self.output()));
+            }
+            let id = self.index as i32;
+            self.index += 1;
+            if id == 0 {
+                self.started.notify_one();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(SessionStep::Token {
+                id,
+                piece: b"x".to_vec(),
+                terminal_or_control: false,
+                observation: QuantumObservation::model_free(QuantumKind::Decode, 1),
             })
+        }
+
+        fn finish(&mut self) -> Result<EngineOutput, Error> {
+            Ok(self.output())
+        }
+    }
+    impl InferenceEngine for SlowEngine {
+        fn start_session(
+            &self,
+            request: EngineRequest,
+        ) -> Result<Box<dyn ExecutionSession>, Error> {
+            Ok(Box::new(SlowSession {
+                request,
+                started: self.started.clone(),
+                index: 0,
+            }))
         }
     }
     #[test]
@@ -2369,7 +2611,7 @@ mod tests {
             max_tokens: 2,
             context_id: None,
             deadline_ms: Some(1000),
-            priority: 2,
+            scheduling: SchedulingMetadata::default(),
             stop: vec![],
             raw_continuation: false,
         };
@@ -2388,7 +2630,7 @@ mod tests {
                     max_tokens: 1,
                     context_id: Some(before.id.clone()),
                     deadline_ms: None,
-                    priority: 0,
+                    scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
                 },
@@ -2405,7 +2647,7 @@ mod tests {
                     max_tokens: 1,
                     context_id: Some(before.id),
                     deadline_ms: Some(0),
-                    priority: 0,
+                    scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
                 }
@@ -2422,7 +2664,7 @@ mod tests {
                     max_tokens: 1,
                     context_id: None,
                     deadline_ms: None,
-                    priority: 0,
+                    scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
                 },
@@ -2446,7 +2688,7 @@ mod tests {
                     max_tokens: 1,
                     context_id: None,
                     deadline_ms: None,
-                    priority: 0,
+                    scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
                 }
@@ -2950,7 +3192,7 @@ mod tests {
                     deadline_ms: None,
                     stop: vec![],
                     raw_continuation: false,
-                    priority: 0,
+                    scheduling: SchedulingMetadata::default(),
                 },
                 admission,
             )
@@ -2997,7 +3239,7 @@ mod tests {
                     deadline_ms: None,
                     stop: vec![],
                     raw_continuation: false,
-                    priority: 0,
+                    scheduling: SchedulingMetadata::default(),
                 },
                 admission,
             )
@@ -3056,7 +3298,7 @@ mod tests {
                         deadline_ms: None,
                         stop: vec![],
                         raw_continuation: false,
-                        priority: 0,
+                        scheduling: SchedulingMetadata::default(),
                     },
                 )
             })
@@ -3076,7 +3318,7 @@ mod tests {
                     deadline_ms: Some(5),
                     stop: vec![],
                     raw_continuation: false,
-                    priority: 0,
+                    scheduling: SchedulingMetadata::default(),
                 },
             ),
             Err(Error::Deadline)

@@ -2,8 +2,16 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use cusco_executor::{Executor, logits_identical};
 use cusco_model_registry::{GEMMA_URI, ModelRecord, fetch_hf, register_local};
-use serde_json::json;
-use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Barrier, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
 #[derive(Parser)]
 struct Args {
@@ -64,6 +72,22 @@ enum Command {
         #[arg(long, default_value = "/results/phase5.json")]
         output: PathBuf,
     },
+    /// Run the versioned real-model Phase 8 scheduler acceptance workload.
+    SchedulerProof {
+        model: PathBuf,
+        #[arg(long, default_value = "/work/config/phase8-workload.json")]
+        workload: PathBuf,
+        #[arg(long, default_value = "/results/phase8-server.json")]
+        output: PathBuf,
+        #[arg(long, default_value_t = 4096)]
+        context: u32,
+        #[arg(long, default_value_t = 99)]
+        gpu_layers: i32,
+        #[arg(long, default_value_t = 8_589_934_592)]
+        device_bytes: usize,
+        #[arg(long, default_value_t = 17_179_869_184)]
+        host_bytes: usize,
+    },
     Serve {
         model: PathBuf,
         #[arg(long, default_value = "gemma-4-e2b-it")]
@@ -114,6 +138,20 @@ enum Command {
         active_time_ms: u64,
         #[arg(long, default_value_t = 8)]
         stream_buffer: usize,
+        #[arg(long, default_value_t = 32)]
+        scheduler_prefill_tokens: usize,
+        #[arg(long, default_value_t = 8)]
+        scheduler_interactive_weight: u32,
+        #[arg(long, default_value_t = 4)]
+        scheduler_standard_weight: u32,
+        #[arg(long, default_value_t = 1)]
+        scheduler_batch_weight: u32,
+        #[arg(long, default_value_t = 64)]
+        scheduler_promotion_rounds: u64,
+        #[arg(long, default_value_t = 1)]
+        scheduler_deficit_refill: u32,
+        #[arg(long, default_value_t = 1024)]
+        scheduler_diagnostic_capacity: usize,
         /// HTTP transport diagnostics: off, privacy-safe, or fully unredacted.
         #[arg(
             long,
@@ -165,6 +203,23 @@ fn run(command: Command) -> Result<()> {
             prefix,
             output,
         } => mapped_proof(model, context, gpu_layers, &prefix, output)?,
+        Command::SchedulerProof {
+            model,
+            workload,
+            output,
+            context,
+            gpu_layers,
+            device_bytes,
+            host_bytes,
+        } => scheduler_proof(
+            model,
+            workload,
+            output,
+            context,
+            gpu_layers,
+            device_bytes,
+            host_bytes,
+        )?,
         Command::Serve {
             model,
             model_id,
@@ -191,12 +246,19 @@ fn run(command: Command) -> Result<()> {
             wall_time_ms,
             active_time_ms,
             stream_buffer,
+            scheduler_prefill_tokens,
+            scheduler_interactive_weight,
+            scheduler_standard_weight,
+            scheduler_batch_weight,
+            scheduler_promotion_rounds,
+            scheduler_deficit_refill,
+            scheduler_diagnostic_capacity,
             http_debug,
             shutdown_grace_ms,
         } => {
             use cusco_server::{
                 AnonymousAdmin, AuthProvider, BearerAuth, ModelRecord, ResidencyConfig,
-                ResidentEngine, Server, ServerConfig,
+                ResidentEngine, SchedulerPolicyConfig, Server, ServerConfig, WorkloadScheduler,
             };
             let anonymous = bearer_token.is_none();
             let auth: Arc<dyn AuthProvider> = match bearer_token {
@@ -215,6 +277,19 @@ fn run(command: Command) -> Result<()> {
                     require_competent,
                 },
                 spill_directory,
+            )?;
+            let engine = WorkloadScheduler::new(
+                engine,
+                SchedulerPolicyConfig {
+                    version: 1,
+                    prefill_tokens: scheduler_prefill_tokens,
+                    interactive_weight: scheduler_interactive_weight,
+                    standard_weight: scheduler_standard_weight,
+                    batch_weight: scheduler_batch_weight,
+                    promotion_rounds: scheduler_promotion_rounds,
+                    deficit_refill: scheduler_deficit_refill,
+                    diagnostic_capacity: scheduler_diagnostic_capacity,
+                },
             )?;
             let server = Server::open(state, auth, engine)?;
             server.configure(ServerConfig {
@@ -269,6 +344,395 @@ fn run(command: Command) -> Result<()> {
     }
     Ok(())
 }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SchedulerProofWorkload {
+    version: u32,
+    name: String,
+    model_family: String,
+    policy: cusco_server::SchedulerPolicyConfig,
+    baseline: SchedulerProofCase,
+    mixed: Vec<SchedulerProofCase>,
+    thresholds: SchedulerProofThresholds,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SchedulerProofCase {
+    id: String,
+    principal: String,
+    class: cusco_server::SchedulingClass,
+    prompt: String,
+    prompt_repetitions: usize,
+    max_tokens: usize,
+    arrival_delay_ms: u64,
+    expected: SchedulerProofOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SchedulerProofOutcome {
+    Complete,
+    Cancel,
+    Deadline,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SchedulerProofThresholds {
+    max_queue_age_rounds: u64,
+    max_first_event_baseline_multiplier: u128,
+    max_first_event_additive_ms: u128,
+    max_quantum_baseline_multiplier: u128,
+    max_quantum_additive_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct SchedulerProofResult {
+    id: String,
+    principal: String,
+    class: cusco_server::SchedulingClass,
+    expected: SchedulerProofOutcome,
+    observed: String,
+    first_event_ms: Option<u128>,
+    total_ms: u128,
+    token_wait_ms: Vec<u128>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scheduler_proof(
+    model_path: PathBuf,
+    workload_path: PathBuf,
+    output: PathBuf,
+    n_ctx: u32,
+    gpu_layers: i32,
+    device_bytes: usize,
+    host_bytes: usize,
+) -> Result<()> {
+    use cusco_server::{MappedEngine, WorkloadScheduler};
+
+    let proof_started = Instant::now();
+    let workload_bytes = fs::read(&workload_path)
+        .with_context(|| format!("read workload {}", workload_path.display()))?;
+    let workload: SchedulerProofWorkload =
+        serde_json::from_slice(&workload_bytes).context("parse scheduler workload")?;
+    ensure!(
+        matches!(workload.version, 1 | 2),
+        "unsupported scheduler workload version"
+    );
+    ensure!(!workload.mixed.is_empty(), "mixed workload is empty");
+    ensure!(
+        workload
+            .mixed
+            .iter()
+            .any(|case| case.expected == SchedulerProofOutcome::Cancel),
+        "mixed workload has no cancellation injection"
+    );
+    ensure!(
+        workload
+            .mixed
+            .iter()
+            .any(|case| case.expected == SchedulerProofOutcome::Deadline),
+        "mixed workload has no deadline injection"
+    );
+
+    let model_size = if model_path.to_string_lossy().starts_with("mock://") {
+        1
+    } else {
+        fs::metadata(&model_path)
+            .with_context(|| format!("stat model {}", model_path.display()))?
+            .len()
+    };
+    let engine = MappedEngine::open(
+        &workload.model_family,
+        &model_path,
+        n_ctx,
+        gpu_layers,
+        device_bytes,
+        host_bytes,
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let model = cusco_server::ModelRecord {
+        id: "phase8-proof-model".into(),
+        revision: "proof".into(),
+        path: model_path.clone(),
+        sha256: "verified-by-proof-wrapper".into(),
+        aliases: Vec::new(),
+        family: workload.model_family.clone(),
+        size_bytes: model_size,
+        epoch: 1,
+    };
+    let diagnostics = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let diagnostic_rows = diagnostics.clone();
+    let scheduler = WorkloadScheduler::new_with_diagnostics(
+        engine.clone(),
+        workload.policy,
+        Some(move |line: &str| {
+            if let Ok(value) = serde_json::from_str(line) {
+                diagnostic_rows.lock().expect("diagnostic lock").push(value);
+            }
+        }),
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    let baseline = run_scheduler_proof_case(
+        scheduler.clone(),
+        model.clone(),
+        workload.baseline.clone(),
+        None,
+    );
+    ensure!(
+        baseline.observed == "complete",
+        "isolated baseline did not complete"
+    );
+    let baseline_first = baseline
+        .first_event_ms
+        .context("isolated baseline emitted no token")?;
+    let baseline_quantum = percentile(&baseline.token_wait_ms, 95).max(1);
+
+    let barrier = Arc::new(Barrier::new(workload.mixed.len() + 1));
+    let mut workers = Vec::with_capacity(workload.mixed.len());
+    for case in workload.mixed.clone() {
+        let scheduler = scheduler.clone();
+        let model = model.clone();
+        let barrier = barrier.clone();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            if case.arrival_delay_ms > 0 {
+                thread::sleep(Duration::from_millis(case.arrival_delay_ms));
+            }
+            run_scheduler_proof_case(scheduler, model, case, None)
+        }));
+    }
+    barrier.wait();
+    let mixed = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("scheduler proof worker panicked"))
+        .collect::<Vec<_>>();
+
+    ensure!(
+        wait_for_scheduler_idle(&scheduler, Duration::from_secs(5)),
+        "scheduler did not become idle after the mixed workload"
+    );
+    let before_recovery_status = scheduler.status();
+    let before_recovery_metrics = engine.metrics();
+    let recovery_case = SchedulerProofCase {
+        id: "capacity-recovery".into(),
+        principal: "recovery".into(),
+        class: cusco_server::SchedulingClass::Interactive,
+        prompt: "Capacity recovered.".into(),
+        prompt_repetitions: 1,
+        max_tokens: 2,
+        arrival_delay_ms: 0,
+        expected: SchedulerProofOutcome::Complete,
+    };
+    let recovery = run_scheduler_proof_case(scheduler.clone(), model, recovery_case, None);
+    ensure!(
+        wait_for_scheduler_idle(&scheduler, Duration::from_secs(5)),
+        "scheduler did not become idle after the recovery request"
+    );
+    ensure!(
+        scheduler.flush_diagnostics(Duration::from_secs(5)),
+        "scheduler diagnostic sink did not drain"
+    );
+    let status = scheduler.status();
+    let after_recovery_metrics = engine.metrics();
+    let diagnostic_rows = diagnostics.lock().expect("diagnostic lock").clone();
+    let decisions = diagnostic_rows
+        .iter()
+        .filter(|row| row["type"] == "scheduler_decision")
+        .cloned()
+        .collect::<Vec<_>>();
+    let max_queue_age_rounds = decisions
+        .iter()
+        .filter_map(|row| row["queue_age_rounds"].as_u64())
+        .max()
+        .unwrap_or(0);
+    let mixed_first = mixed
+        .iter()
+        .filter_map(|result| result.first_event_ms)
+        .collect::<Vec<_>>();
+    let mixed_quantums = mixed
+        .iter()
+        .flat_map(|result| result.token_wait_ms.iter().copied())
+        .collect::<Vec<_>>();
+    let p95_first_event_ms = percentile(&mixed_first, 95);
+    let p95_token_wait_ms = percentile(&mixed_quantums, 95);
+    let first_event_limit_ms = baseline_first
+        .saturating_mul(workload.thresholds.max_first_event_baseline_multiplier)
+        .saturating_add(workload.thresholds.max_first_event_additive_ms);
+    let quantum_limit_ms = baseline_quantum
+        .saturating_mul(workload.thresholds.max_quantum_baseline_multiplier)
+        .saturating_add(workload.thresholds.max_quantum_additive_ms);
+    let outcomes_match = mixed.iter().all(|result| {
+        result.observed
+            == match result.expected {
+                SchedulerProofOutcome::Complete => "complete",
+                SchedulerProofOutcome::Cancel => "cancelled",
+                SchedulerProofOutcome::Deadline => "deadline",
+            }
+    });
+    let capacity_recovered = recovery.observed == "complete"
+        && before_recovery_status.metrics.runnable == 0
+        && before_recovery_status.metrics.waiting_for_consumer == 0
+        && status.metrics.runnable == 0
+        && status.metrics.waiting_for_consumer == 0
+        && after_recovery_metrics.requests == before_recovery_metrics.requests.saturating_add(1);
+    let gates = json!({
+        "outcomes_match": outcomes_match,
+        "capacity_recovered": capacity_recovered,
+        "diagnostics_lossless": status.metrics.diagnostic_records_lost == 0
+            && status.metrics.diagnostic_records == status.metrics.diagnostic_records_delivered,
+        "starvation_round_bound": max_queue_age_rounds <= workload.thresholds.max_queue_age_rounds,
+        "first_event_latency_bound": p95_first_event_ms <= first_event_limit_ms,
+        "quantum_latency_bound": p95_token_wait_ms <= quantum_limit_ms,
+    });
+    let passed = gates
+        .as_object()
+        .expect("gates object")
+        .values()
+        .all(|value| value == &Value::Bool(true));
+    let artifact = json!({
+        "phase": "8",
+        "passed": passed,
+        "workload": workload,
+        "provenance": {
+            "model_path": model_path,
+            "model_bytes": model_size,
+            "context": n_ctx,
+            "gpu_layers": gpu_layers,
+            "device_bytes": device_bytes,
+            "host_bytes": host_bytes,
+        },
+        "baseline": baseline,
+        "mixed": mixed,
+        "capacity_recovery": recovery,
+        "capacity_recovery_evidence": {
+            "before": {
+                "scheduler": before_recovery_status,
+                "mapped_metrics": before_recovery_metrics,
+            },
+            "after": {
+                "scheduler": status.clone(),
+                "mapped_metrics": after_recovery_metrics,
+            },
+        },
+        "measurements": {
+            "max_queue_age_rounds": max_queue_age_rounds,
+            "p95_first_event_ms": p95_first_event_ms,
+            "p95_token_wait_ms": p95_token_wait_ms,
+            "first_event_limit_ms": first_event_limit_ms,
+            "quantum_limit_ms": quantum_limit_ms,
+            "elapsed_ms": proof_started.elapsed().as_millis(),
+        },
+        "scheduler": status,
+        "mapped_metrics": engine.metrics(),
+        "diagnostics": diagnostic_rows,
+        "gates": gates,
+    });
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&output, serde_json::to_vec_pretty(&artifact)?)?;
+    ensure!(passed, "Phase 8 scheduler proof gates failed");
+    println!("{}", output.display());
+    Ok(())
+}
+
+fn run_scheduler_proof_case(
+    scheduler: Arc<cusco_server::WorkloadScheduler>,
+    model: cusco_server::ModelRecord,
+    case: SchedulerProofCase,
+    start_barrier: Option<Arc<Barrier>>,
+) -> SchedulerProofResult {
+    use cusco_server::{
+        EngineRequest, Error as ServerError, FrontierControl, InferenceEngine, RequestControl,
+        SchedulingMetadata,
+    };
+
+    if let Some(barrier) = start_barrier {
+        barrier.wait();
+    }
+    let control = Arc::new(RequestControl::new());
+    let sink_control = control.clone();
+    let expected = case.expected;
+    let started = Instant::now();
+    let mut last_token = started;
+    let mut first_event_ms = None;
+    let mut token_wait_ms = Vec::new();
+    let prompt = case.prompt.repeat(case.prompt_repetitions);
+    let result = scheduler.generate(
+        EngineRequest {
+            model,
+            prompt,
+            max_tokens: case.max_tokens,
+            prior_tokens: Vec::new(),
+            control,
+            scheduling: SchedulingMetadata {
+                class: case.class,
+                source: cusco_server::PrioritySource::ControlledWorkload,
+                principal: case.principal.clone(),
+                correlation_id: format!("phase8-transport-{}", case.id),
+                inference_id: format!("phase8-inference-{}", case.id),
+            },
+            prefill_chunk_tokens: scheduler.status().policy.prefill_tokens,
+        },
+        &mut |_, _, _| {
+            let now = Instant::now();
+            first_event_ms.get_or_insert_with(|| now.duration_since(started).as_millis());
+            token_wait_ms.push(now.duration_since(last_token).as_millis());
+            last_token = now;
+            match expected {
+                SchedulerProofOutcome::Complete => {}
+                SchedulerProofOutcome::Cancel => sink_control.cancel(),
+                SchedulerProofOutcome::Deadline => sink_control.expire(),
+            }
+            Ok(FrontierControl::Continue)
+        },
+    );
+    let observed = match result {
+        Ok(_) => "complete",
+        Err(ServerError::Cancelled) => "cancelled",
+        Err(ServerError::Deadline) => "deadline",
+        Err(_) => "failed",
+    }
+    .to_owned();
+    SchedulerProofResult {
+        id: case.id,
+        principal: case.principal,
+        class: case.class,
+        expected,
+        observed,
+
+        first_event_ms,
+        total_ms: started.elapsed().as_millis(),
+        token_wait_ms,
+    }
+}
+fn wait_for_scheduler_idle(scheduler: &cusco_server::WorkloadScheduler, timeout: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        let metrics = scheduler.status().metrics;
+        if metrics.runnable == 0 && metrics.waiting_for_consumer == 0 {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn percentile(values: &[u128], percentile: usize) -> u128 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let index = (sorted.len() - 1).saturating_mul(percentile) / 100;
+    sorted[index]
+}
+
 fn mapped_proof(
     model: PathBuf,
     n_ctx: u32,
@@ -510,6 +974,37 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_proof_cli_parses_versioned_workload_inputs() {
+        let args = Args::try_parse_from([
+            "cusco",
+            "scheduler-proof",
+            "model.gguf",
+            "--workload",
+            "workload.json",
+            "--output",
+            "artifact.json",
+            "--context",
+            "2048",
+        ])
+        .unwrap();
+        let Command::SchedulerProof {
+            model,
+            workload,
+            output,
+            context,
+            ..
+        } = args.command
+        else {
+            panic!("scheduler-proof command expected")
+        };
+        assert_eq!(model, PathBuf::from("model.gguf"));
+        assert_eq!(workload, PathBuf::from("workload.json"));
+        assert_eq!(output, PathBuf::from("artifact.json"));
+        assert_eq!(context, 2048);
+        assert_eq!(percentile(&[40, 10, 30, 20], 95), 30);
+    }
+
+    #[test]
     fn http_debug_defaults_off_and_declares_environment_source() {
         use clap::CommandFactory;
 
@@ -601,6 +1096,97 @@ mod tests {
                 .unwrap()
                 > 0
         );
+        let workload = root.join("scheduler-workload.json");
+        fs::write(
+            &workload,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "name": "model-free",
+                "model_family": "gemma-4-e2b-it",
+                "policy": {
+                    "version": 1,
+                    "interactive_weight": 4,
+                    "standard_weight": 2,
+                    "batch_weight": 1,
+                    "promotion_rounds": 8,
+                    "deficit_refill": 1,
+                    "prefill_tokens": 8,
+                    "diagnostic_capacity": 1024
+                },
+                "baseline": {
+                    "id": "baseline",
+                    "principal": "baseline",
+                    "class": "standard",
+                    "prompt": "baseline",
+                    "prompt_repetitions": 1,
+                    "max_tokens": 2,
+                    "arrival_delay_ms": 0,
+                    "expected": "complete"
+                },
+                "mixed": [
+                    {
+                        "id": "interactive",
+                        "principal": "one",
+                        "class": "interactive",
+                        "prompt": "interactive",
+                        "prompt_repetitions": 1,
+                        "max_tokens": 2,
+                        "arrival_delay_ms": 0,
+                        "expected": "complete"
+                    },
+                    {
+                        "id": "cancel",
+                        "principal": "two",
+                        "class": "standard",
+                        "prompt": "cancel",
+                        "prompt_repetitions": 1,
+                        "max_tokens": 2,
+                        "arrival_delay_ms": 0,
+                        "expected": "cancel"
+                    },
+                    {
+                        "id": "deadline",
+                        "principal": "three",
+                        "class": "batch",
+                        "prompt": "deadline",
+                        "prompt_repetitions": 1,
+                        "max_tokens": 2,
+                        "arrival_delay_ms": 0,
+                        "expected": "deadline"
+                    }
+                ],
+                "thresholds": {
+                    "max_queue_age_rounds": 100,
+                    "max_first_event_baseline_multiplier": 100,
+                    "max_first_event_additive_ms": 1000,
+                    "max_quantum_baseline_multiplier": 100,
+                    "max_quantum_additive_ms": 1000
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let scheduler_output = root.join("scheduler.json");
+        run(Command::SchedulerProof {
+            model: PathBuf::from("mock://deterministic"),
+            workload,
+            output: scheduler_output.clone(),
+            context: 128,
+            gpu_layers: 0,
+            device_bytes: 1 << 20,
+            host_bytes: 1 << 20,
+        })
+        .unwrap();
+        let scheduler_artifact: Value =
+            serde_json::from_slice(&fs::read(scheduler_output).unwrap()).unwrap();
+        assert_eq!(scheduler_artifact["passed"], true);
+        assert_eq!(scheduler_artifact["mixed"].as_array().unwrap().len(), 3);
+        assert!(
+            scheduler_artifact["measurements"]["max_queue_age_rounds"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
         let public: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         assert!(
             run(Command::Serve {
@@ -631,6 +1217,13 @@ mod tests {
                 stream_buffer: 1,
                 shutdown_grace_ms: 100,
                 http_debug: HttpDebugLevelArg::Off,
+                scheduler_prefill_tokens: 32,
+                scheduler_interactive_weight: 8,
+                scheduler_standard_weight: 4,
+                scheduler_batch_weight: 1,
+                scheduler_promotion_rounds: 64,
+                scheduler_deficit_refill: 1,
+                scheduler_diagnostic_capacity: 1024,
             })
             .is_err()
         );
@@ -663,6 +1256,13 @@ mod tests {
             stream_buffer: 1,
             shutdown_grace_ms: 100,
             http_debug: HttpDebugLevelArg::Off,
+            scheduler_prefill_tokens: 32,
+            scheduler_interactive_weight: 8,
+            scheduler_standard_weight: 4,
+            scheduler_batch_weight: 1,
+            scheduler_promotion_rounds: 64,
+            scheduler_deficit_refill: 1,
+            scheduler_diagnostic_capacity: 1024,
         })
         .unwrap_err();
         assert!(unsupported.to_string().contains("unsupported model family"));

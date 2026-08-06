@@ -137,6 +137,11 @@ pub struct GreedySampler {
     raw: NonNull<sys::CuscoSampler>,
 }
 
+// SAFETY: a sampler is request-owned and all access still requires an exclusive
+// borrow of the executor that created it. Moving a suspended request between
+// scheduler threads does not permit concurrent native sampler access.
+unsafe impl Send for GreedySampler {}
+
 impl Executor {
     pub fn open(path: &str, n_ctx: u32, gpu_layers: i32) -> Result<Self, Error> {
         let path = CString::new(path).map_err(|_| Error::InvalidPath)?;

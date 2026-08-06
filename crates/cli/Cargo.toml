@@ -10,5 +10,6 @@ clap.workspace = true
 cusco-executor = { path = "../executor" }
 cusco-model-registry = { path = "../model-registry" }
 cusco-server = { path = "../server" }
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

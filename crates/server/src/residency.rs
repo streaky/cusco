@@ -1,5 +1,5 @@
 use crate::{
-    EngineOutput, EngineRequest, Error, InferenceEngine, MappedEngine, ModelRecord, TokenSink,
+    EngineRequest, Error, ExecutionSession, InferenceEngine, MappedEngine, ModelRecord, SessionStep,
 };
 use cusco_context_store::ModelEpoch;
 use cusco_executor::OperatingPoint;
@@ -54,6 +54,7 @@ pub struct ResidencyMetrics {
     pub host_bytes: u64,
     pub storage_bytes: u64,
     pub active_slots: usize,
+    pub sessions: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -62,6 +63,7 @@ pub struct ResidentModelStatus {
     pub revision: String,
     pub epoch: u64,
     pub active_slots: usize,
+    pub sessions: usize,
     pub retiring: bool,
     pub context_resident: bool,
     pub last_used: u64,
@@ -112,6 +114,7 @@ struct ResidentModel {
     engine: Arc<dyn InferenceEngine>,
     point: OperatingPoint,
     active: AtomicUsize,
+    sessions: AtomicUsize,
     retiring: AtomicBool,
     context_resident: AtomicBool,
     last_used: AtomicU64,
@@ -124,6 +127,7 @@ impl ResidentModel {
             revision: self.record.revision.clone(),
             epoch: self.record.epoch,
             active_slots: self.active.load(Ordering::Acquire),
+            sessions: self.sessions.load(Ordering::Acquire),
             retiring: self.retiring.load(Ordering::Acquire),
             context_resident: self.context_resident.load(Ordering::Acquire),
             last_used: self.last_used.load(Ordering::Acquire),
@@ -141,7 +145,7 @@ struct ResidencyState {
 
 pub struct ResidentEngine {
     config: ResidencyConfig,
-    state: Mutex<ResidencyState>,
+    state: Arc<Mutex<ResidencyState>>,
     loader: Arc<dyn ModelLoader>,
 }
 
@@ -158,7 +162,7 @@ impl ResidentEngine {
         fs::create_dir_all(&spill_dir).map_err(super::state_err)?;
         Ok(Arc::new(Self {
             config: config.validate()?,
-            state: Mutex::new(ResidencyState::default()),
+            state: Arc::new(Mutex::new(ResidencyState::default())),
             loader: Arc::new(NativeLoader { spill_dir }),
         }))
     }
@@ -167,7 +171,7 @@ impl ResidentEngine {
     fn with_loader(config: ResidencyConfig, loader: Arc<dyn ModelLoader>) -> Arc<Self> {
         Arc::new(Self {
             config: config.validate().unwrap(),
-            state: Mutex::new(ResidencyState::default()),
+            state: Arc::new(Mutex::new(ResidencyState::default())),
             loader,
         })
     }
@@ -204,7 +208,11 @@ impl ResidentEngine {
             competent: !self.config.require_competent || self.config.gpu_layers > 0,
         })
     }
-    fn fits(&self, point: OperatingPoint, retained: impl Iterator<Item = OperatingPoint>) -> bool {
+    fn fits_with(
+        config: ResidencyConfig,
+        point: OperatingPoint,
+        retained: impl Iterator<Item = OperatingPoint>,
+    ) -> bool {
         let (device, host, storage) = retained.fold(
             (point.device_bytes, point.host_bytes, point.model_bytes),
             |(device, host, storage), item| {
@@ -215,9 +223,13 @@ impl ResidentEngine {
                 )
             },
         );
-        device <= self.config.device_bytes
-            && host <= self.config.host_bytes
-            && storage <= self.config.storage_bytes
+        device <= config.device_bytes
+            && host <= config.host_bytes
+            && storage <= config.storage_bytes
+    }
+
+    fn fits(&self, point: OperatingPoint, retained: impl Iterator<Item = OperatingPoint>) -> bool {
+        Self::fits_with(self.config, point, retained)
     }
 
     fn effective_point(entry: &ResidentModel) -> OperatingPoint {
@@ -259,7 +271,9 @@ impl ResidentEngine {
                 .entries
                 .values()
                 .filter(|entry| {
-                    entry.active.load(Ordering::Acquire) == 0 && entry.record.id != model.id
+                    entry.active.load(Ordering::Acquire) == 0
+                        && entry.sessions.load(Ordering::Acquire) == 0
+                        && entry.record.id != model.id
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -359,6 +373,7 @@ impl ResidentEngine {
             engine,
             point,
             active: AtomicUsize::new(0),
+            sessions: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
             context_resident: AtomicBool::new(true),
             last_used: AtomicU64::new(last_used),
@@ -390,6 +405,11 @@ impl ResidentEngine {
             .values()
             .map(|entry| entry.active.load(Ordering::Acquire))
             .sum();
+        state.metrics.sessions = state
+            .entries
+            .values()
+            .map(|entry| entry.sessions.load(Ordering::Acquire))
+            .sum();
     }
 
     fn retire_other_epochs(&self, model: &ModelRecord) {
@@ -402,15 +422,22 @@ impl ResidentEngine {
             .collect::<Vec<_>>();
         for (key, entry) in keys {
             entry.retiring.store(true, Ordering::Release);
-            if entry.active.load(Ordering::Acquire) == 0 && state.entries.remove(&key).is_some() {
+            if entry.active.load(Ordering::Acquire) == 0
+                && entry.sessions.load(Ordering::Acquire) == 0
+                && state.entries.remove(&key).is_some()
+            {
                 state.metrics.unloads += 1;
                 state.metrics.reloads += 1;
             }
         }
         Self::refresh_metrics(&mut state);
     }
-    fn acquire(&self, target: &Arc<ResidentModel>) -> Result<bool, Error> {
-        let mut state = self.state.lock();
+    fn acquire_entry(
+        config: ResidencyConfig,
+        shared: &Arc<Mutex<ResidencyState>>,
+        target: &Arc<ResidentModel>,
+    ) -> Result<bool, Error> {
+        let mut state = shared.lock();
         let key = (target.record.id.clone(), target.record.epoch);
         let Some(current) = state.entries.get(&key) else {
             return Ok(false);
@@ -425,6 +452,7 @@ impl ResidentEngine {
                 .filter(|entry| {
                     !Arc::ptr_eq(entry, target)
                         && entry.active.load(Ordering::Acquire) == 0
+                        && entry.sessions.load(Ordering::Acquire) == 0
                         && entry.context_resident.load(Ordering::Acquire)
                 })
                 .cloned()
@@ -436,7 +464,7 @@ impl ResidentEngine {
                     .values()
                     .filter(|entry| !Arc::ptr_eq(entry, target))
                     .map(|entry| Self::effective_point(entry));
-                if self.fits(target.point, retained) {
+                if Self::fits_with(config, target.point, retained) {
                     target.context_resident.store(true, Ordering::Release);
                     state.metrics.context_reloads += 1;
                     break;
@@ -463,16 +491,27 @@ impl ResidentEngine {
         Ok(true)
     }
 
-    fn release(&self, entry: &Arc<ResidentModel>) {
+    fn acquire(&self, target: &Arc<ResidentModel>) -> Result<bool, Error> {
+        Self::acquire_entry(self.config, &self.state, target)
+    }
+
+    fn release_entry(shared: &Arc<Mutex<ResidencyState>>, entry: &Arc<ResidentModel>) {
         entry.active.fetch_sub(1, Ordering::AcqRel);
-        let mut state = self.state.lock();
-        if entry.retiring.load(Ordering::Acquire) && entry.active.load(Ordering::Acquire) == 0 {
+        let mut state = shared.lock();
+        if entry.retiring.load(Ordering::Acquire)
+            && entry.active.load(Ordering::Acquire) == 0
+            && entry.sessions.load(Ordering::Acquire) == 0
+        {
             let key = (entry.record.id.clone(), entry.record.epoch);
             if state.entries.remove(&key).is_some() {
                 state.metrics.unloads += 1;
             }
         }
         Self::refresh_metrics(&mut state);
+    }
+
+    fn release(&self, entry: &Arc<ResidentModel>) {
+        Self::release_entry(&self.state, entry);
     }
 
     pub fn metrics(&self) -> ResidencyMetrics {
@@ -494,6 +533,72 @@ impl ResidentEngine {
     }
 }
 
+struct ResidentSession {
+    config: ResidencyConfig,
+    entry: Arc<ResidentModel>,
+    state: Arc<Mutex<ResidencyState>>,
+    inner: Box<dyn ExecutionSession>,
+}
+
+struct ResidentQuantumLease {
+    entry: Arc<ResidentModel>,
+    state: Arc<Mutex<ResidencyState>>,
+}
+
+impl Drop for ResidentQuantumLease {
+    fn drop(&mut self) {
+        ResidentEngine::release_entry(&self.state, &self.entry);
+    }
+}
+
+impl ResidentSession {
+    fn acquire(&self) -> Result<ResidentQuantumLease, Error> {
+        if !ResidentEngine::acquire_entry(self.config, &self.state, &self.entry)? {
+            return Err(Error::State(
+                "resident model disappeared while its session was suspended".into(),
+            ));
+        }
+        Ok(ResidentQuantumLease {
+            entry: self.entry.clone(),
+            state: self.state.clone(),
+        })
+    }
+}
+
+impl ExecutionSession for ResidentSession {
+    fn step(&mut self) -> Result<SessionStep, Error> {
+        let lease = self.acquire()?;
+        let result = self.inner.step();
+        drop(lease);
+        result
+    }
+
+    fn finish(&mut self) -> Result<crate::EngineOutput, Error> {
+        let lease = self.acquire()?;
+        let result = self.inner.finish();
+        drop(lease);
+        result
+    }
+}
+
+impl Drop for ResidentSession {
+    fn drop(&mut self) {
+        let previous = self.entry.sessions.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "resident session count underflow");
+        let mut state = self.state.lock();
+        if self.entry.retiring.load(Ordering::Acquire)
+            && self.entry.active.load(Ordering::Acquire) == 0
+            && self.entry.sessions.load(Ordering::Acquire) == 0
+        {
+            let key = (self.entry.record.id.clone(), self.entry.record.epoch);
+            if state.entries.remove(&key).is_some() {
+                state.metrics.unloads += 1;
+            }
+        }
+        ResidentEngine::refresh_metrics(&mut state);
+    }
+}
+
 impl InferenceEngine for ResidentEngine {
     fn prepare_model(&self, model: &ModelRecord) -> Result<(), Error> {
         self.load(model, None)?;
@@ -509,7 +614,9 @@ impl InferenceEngine for ResidentEngine {
         let key = (id.to_owned(), epoch);
         if let Some(entry) = state.entries.get(&key).cloned() {
             entry.retiring.store(true, Ordering::Release);
-            if entry.active.load(Ordering::Acquire) == 0 {
+            if entry.active.load(Ordering::Acquire) == 0
+                && entry.sessions.load(Ordering::Acquire) == 0
+            {
                 state.entries.remove(&key);
                 state.metrics.unloads += 1;
             }
@@ -525,27 +632,37 @@ impl InferenceEngine for ResidentEngine {
         }))
     }
 
-    fn generate(
-        &self,
-        request: EngineRequest<'_>,
-        sink: &mut TokenSink<'_>,
-    ) -> Result<EngineOutput, Error> {
+    fn start_session(&self, request: EngineRequest) -> Result<Box<dyn ExecutionSession>, Error> {
         let entry = loop {
-            let entry = self.load(request.model, Some(request.control))?;
+            let entry = self.load(&request.model, Some(&request.control))?;
             if self.acquire(&entry)? {
                 break entry;
             }
         };
-        let result = entry.engine.generate(request, sink);
-        self.release(&entry);
-        result
+        let started = entry.engine.start_session(request);
+        match started {
+            Ok(inner) => {
+                entry.sessions.fetch_add(1, Ordering::AcqRel);
+                self.release(&entry);
+                Ok(Box::new(ResidentSession {
+                    config: self.config,
+                    entry,
+                    state: self.state.clone(),
+                    inner,
+                }))
+            }
+            Err(error) => {
+                self.release(&entry);
+                Err(error)
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DeterministicEngine, FrontierControl, RequestControl};
+    use crate::{DeterministicEngine, FrontierControl, RequestControl, SchedulingMetadata};
     use std::{path::PathBuf, sync::Barrier, thread};
 
     struct FixtureLoader {
@@ -559,31 +676,71 @@ mod tests {
         release: Arc<Barrier>,
     }
 
+    struct BlockingSession {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        inner: Box<dyn ExecutionSession>,
+        blocked: bool,
+    }
+
+    impl ExecutionSession for BlockingSession {
+        fn step(&mut self) -> Result<SessionStep, Error> {
+            if !self.blocked {
+                self.entered.wait();
+                self.release.wait();
+                self.blocked = true;
+            }
+            self.inner.step()
+        }
+
+        fn finish(&mut self) -> Result<crate::EngineOutput, Error> {
+            self.inner.finish()
+        }
+    }
+
     impl InferenceEngine for BlockingEngine {
-        fn generate(
+        fn start_session(
             &self,
-            request: EngineRequest<'_>,
-            sink: &mut TokenSink<'_>,
-        ) -> Result<EngineOutput, Error> {
-            self.entered.wait();
-            self.release.wait();
-            DeterministicEngine.generate(request, sink)
+            request: EngineRequest,
+        ) -> Result<Box<dyn ExecutionSession>, Error> {
+            Ok(Box::new(BlockingSession {
+                entered: self.entered.clone(),
+                release: self.release.clone(),
+                inner: DeterministicEngine.start_session(request)?,
+                blocked: false,
+            }))
         }
     }
 
     struct DemotableEngine;
 
     impl InferenceEngine for DemotableEngine {
-        fn generate(
+        fn start_session(
             &self,
-            request: EngineRequest<'_>,
-            sink: &mut TokenSink<'_>,
-        ) -> Result<EngineOutput, Error> {
-            DeterministicEngine.generate(request, sink)
+            request: EngineRequest,
+        ) -> Result<Box<dyn ExecutionSession>, Error> {
+            DeterministicEngine.start_session(request)
         }
 
         fn demote_inactive(&self) -> Result<usize, Error> {
             Ok(1)
+        }
+    }
+
+    fn test_request(
+        model: &ModelRecord,
+        prompt: impl Into<String>,
+        max_tokens: usize,
+        control: Arc<RequestControl>,
+    ) -> EngineRequest {
+        EngineRequest {
+            model: model.clone(),
+            prompt: prompt.into(),
+            max_tokens,
+            prior_tokens: vec![],
+            control,
+            scheduling: SchedulingMetadata::default(),
+            prefill_chunk_tokens: 32,
         }
     }
 
@@ -664,6 +821,32 @@ mod tests {
     }
 
     #[test]
+    fn suspended_session_releases_its_native_slot_without_becoming_evictable() {
+        let loader = Arc::new(FixtureLoader {
+            point: point(10),
+            failures: Mutex::new(vec![]),
+            blocker: None,
+        });
+        let engine = ResidentEngine::with_loader(config(21), loader);
+        let model = model("suspended", "r", 1, 10);
+        let mut session = engine
+            .start_session(test_request(
+                &model,
+                "yield",
+                2,
+                Arc::new(RequestControl::new()),
+            ))
+            .unwrap();
+
+        assert_eq!(engine.status()[0].active_slots, 0);
+        assert_eq!(engine.status()[0].sessions, 1);
+        let _ = session.step().unwrap();
+        assert_eq!(engine.status()[0].active_slots, 0);
+        assert_eq!(engine.metrics().active_slots, 0);
+        drop(session);
+        assert_eq!(engine.status()[0].sessions, 0);
+    }
+    #[test]
     fn failed_reload_preserves_the_published_epoch() {
         let loader = Arc::new(FixtureLoader {
             point: point(10),
@@ -706,19 +889,10 @@ mod tests {
         engine.prepare_model(&first).unwrap();
         engine.prepare_model(&second).unwrap();
 
-        let control = RequestControl::new();
+        let control = Arc::new(RequestControl::new());
         let mut sink = |_: i32, _: &[u8], _: bool| Ok(FrontierControl::Continue);
         engine
-            .generate(
-                EngineRequest {
-                    model: &first,
-                    prompt: "touch",
-                    max_tokens: 1,
-                    prior_tokens: &[],
-                    control: &control,
-                },
-                &mut sink,
-            )
+            .generate(test_request(&first, "touch", 1, control), &mut sink)
             .unwrap();
         engine.prepare_model(&third).unwrap();
 
@@ -763,19 +937,10 @@ mod tests {
 
         let worker_engine = engine.clone();
         let worker = thread::spawn(move || {
-            let control = RequestControl::new();
+            let control = Arc::new(RequestControl::new());
             let mut sink = |_: i32, _: &[u8], _: bool| Ok(FrontierControl::Continue);
             worker_engine
-                .generate(
-                    EngineRequest {
-                        model: &old,
-                        prompt: "old epoch",
-                        max_tokens: 1,
-                        prior_tokens: &[],
-                        control: &control,
-                    },
-                    &mut sink,
-                )
+                .generate(test_request(&old, "old epoch", 1, control), &mut sink)
                 .unwrap();
         });
         entered.wait();
@@ -852,12 +1017,8 @@ mod tests {
         limits.gpu_layers = 0;
         let engine = ResidentEngine::with_loader(limits, Arc::new(DemotableLoader { point }));
 
-        engine
-            .prepare_model(&model("first", "r", 1, 10))
-            .unwrap();
-        engine
-            .prepare_model(&model("second", "r", 2, 10))
-            .unwrap();
+        engine.prepare_model(&model("first", "r", 1, 10)).unwrap();
+        engine.prepare_model(&model("second", "r", 2, 10)).unwrap();
 
         assert_eq!(engine.status().len(), 2);
         assert_eq!(engine.metrics().context_spills, 1);
@@ -873,18 +1034,12 @@ mod tests {
             blocker: None,
         });
         let engine = ResidentEngine::with_loader(config(100), loader);
-        let control = RequestControl::new();
+        let control = Arc::new(RequestControl::new());
         control.cancel();
         let mut sink = |_: i32, _: &[u8], _: bool| Ok(FrontierControl::Continue);
         let error = engine
             .generate(
-                EngineRequest {
-                    model: &model("cancelled", "r", 1, 10),
-                    prompt: "cancel",
-                    max_tokens: 1,
-                    prior_tokens: &[],
-                    control: &control,
-                },
+                test_request(&model("cancelled", "r", 1, 10), "cancel", 1, control),
                 &mut sink,
             )
             .unwrap_err();
