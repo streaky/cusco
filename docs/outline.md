@@ -1607,7 +1607,83 @@ Harden request ordering and make resource decisions explainable under sustained 
 - report model residency, executor-slot occupancy, context placement, queue state and age, capacity reservations, transition costs, eviction and unload reasons, and scheduler decisions;
 - validate multi-model and mixed-context pressure, repeated load/unload cycles, cancellation storms, deadline expiry, and sustained operation against capacity, fairness, leak, and latency gates;
 - propagate one transport correlation identifier into canonical requests and scheduler/executor work while naming any distinct inference operation identifier explicitly; report response-header, first-event, and terminal durations separately instead of presenting header latency as whole-request duration;
-- make routine diagnostics operationally non-interfering and machine-usable: encode JSON and SSE bodies structurally where possible, move record emission off the response-polling path through a bounded asynchronous sink, and expose overflow or loss rather than silently dropping records. If exact unredacted capture deliberately backpressures that sink, make the latency tradeoff operator-visible and enforce restricted sink access and retention alongside unmistakable credential and content warnings.
+- make routine diagnostics operationally non-interfering and machine-usable: encode JSON and SSE bodies structurally where possible, move record emission off the response-polling path through a bounded asynchronous sink, expose overflow or loss rather than silently dropping records, and never let either privacy-safe or fully unredacted capture backpressure inference; fully unredacted capture must enforce restricted sink access and retention alongside unmistakable credential and content warnings.
+
+The initial Phase 8 scheduler is deliberately a replaceable fairness baseline,
+not the final locality- or cost-aware planner. Rust should expose request
+ordering as a policy over protocol-neutral runnable operations, with residency,
+context placement, and transition estimates supplied as observations rather
+than embedded as policy state. The baseline policy is priority-aware deficit
+round robin with monotonic age promotion. It charges bounded work quanta,
+preserves FIFO order among otherwise equivalent requests, and eventually
+promotes every continuously runnable request. Class weights, deficit refill,
+prefill width, and promotion intervals are versioned scheduler-policy
+parameters recorded by status and proof artifacts, so measurements may tune
+them without changing the execution-session or application APIs. Later
+locality-aware planning may replace this policy behind the same boundary, but
+may not weaken its explicit priority, age, deadline, tenant-isolation, or
+starvation invariants.
+
+The baseline has three protocol-neutral request classes: `interactive`,
+`standard`, and `batch`; `standard` is the default. Phase 8 does not expose
+client-selected elevation through any external adapter. Adapters assign
+`standard`, while controlled model-free and acceptance workloads may assign
+other classes internally. The canonical request nevertheless records a typed
+class and its trusted source so a post-v1 authorization policy could permit
+client selection without changing scheduler or executor interfaces. No
+transport field should be accepted and silently trusted before that policy
+exists. Fairness accounting is defined per authenticated principal, with
+request FIFO order inside an otherwise equivalent principal/class queue;
+anonymous operation naturally has one principal.
+
+Scheduling requires resumable execution rather than a synchronous whole-request
+`generate` call. A request-owned execution session retains sampler,
+incremental UTF-8/stop frontier, usage, deadline, and unpublished successor
+state. Tokenization is cancellation-aware preparation but is not interleaved.
+Uncached prefill runs in bounded token chunks, and each decode quantum samples
+and renders exactly one token. Activation and transfer are scheduler-owned
+operations immediately preceding the native quantum that needs them. A session
+holds a native slot only while activation, prefill, or decode work and its
+native completion fence are outstanding; it may be suspended and later
+reacquire a compatible slot at the resulting safe boundary. Cancellation
+during native work requests the native abort, waits for the ownership fence,
+and discards unpublished successor state. Logical context publication remains
+one terminal transactional operation and never occurs at an intermediate
+quantum.
+
+Scheduler diagnostics use distinct identifiers for distinct lifetimes: a
+transport correlation ID names one adapter request, an inference-operation ID
+names the protocol-neutral inference, and an execution-session ID names its
+resumable scheduled state. Durable context IDs and immutable model epochs
+remain separate. Every decision record includes these applicable IDs, the
+principal and class, queue age and age promotion, quantum kind and charged
+work, model and context placement, executor-slot occupancy, transition cost
+and capacity reservations, cancellation/deadline state, and a machine-readable
+selection or rejection reason.
+
+Diagnostic emission never backpressures inference in the Phase 8 baseline,
+including in fully unredacted mode. Records move through a bounded asynchronous
+sink whose configured capacity is published in status and proof output. On
+overflow it drops a complete record, increments exact per-kind and total loss
+counters, and emits a later loss summary when capacity returns; it never
+silently truncates a record. The default stderr sink retains no in-process
+history. Fully unredacted mode changes disclosure only, requires the existing
+explicit warnings and controlled access, and leaves durable retention to an
+operator-selected restricted sink rather than an implicit server buffer.
+
+The Phase 8 acceptance workload and thresholds are versioned proof inputs, not
+constants inferred after a mixed-load result is known. The first vertical slice
+must check in deterministic model-free fairness and cancellation fixtures plus
+the real-GPU workload definition, measure isolated first-event and per-quantum
+baselines on the declared model, executor, configuration, and GPU, and freeze
+relative latency thresholds before running the sustained mixed workload.
+Starvation is gated primarily by a maximum number of scheduler rounds while
+wall-clock queue and first-event latency are reported separately. The mixed
+artifact records class/principal/request mix, prompt and generation sizes,
+arrival pattern, duration, cancellation and deadline injection, capacity
+recovery, diagnostic loss, and all thresholds. Tuning those policy parameters
+after observing a working system requires a new versioned fixture and evidence;
+it does not require changing the resumable execution contract.
 
 The server already includes one narrow operator-diagnostic slice toward this
 phase: HTTP debug records correlate request metadata, terminal status,
