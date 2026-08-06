@@ -223,7 +223,11 @@ impl ResidentEngine {
     fn effective_point(entry: &ResidentModel) -> OperatingPoint {
         let mut point = entry.point;
         if !entry.context_resident.load(Ordering::Acquire) {
-            point.device_bytes = point.device_bytes.saturating_sub(point.context_bytes);
+            if point.device_bytes == 0 {
+                point.host_bytes = point.host_bytes.saturating_sub(point.context_bytes);
+            } else {
+                point.device_bytes = point.device_bytes.saturating_sub(point.context_bytes);
+            }
             point.model_bytes = point.model_bytes.saturating_add(point.context_bytes);
         }
         point
@@ -567,6 +571,36 @@ mod tests {
         }
     }
 
+    struct DemotableEngine;
+
+    impl InferenceEngine for DemotableEngine {
+        fn generate(
+            &self,
+            request: EngineRequest<'_>,
+            sink: &mut TokenSink<'_>,
+        ) -> Result<EngineOutput, Error> {
+            DeterministicEngine.generate(request, sink)
+        }
+
+        fn demote_inactive(&self) -> Result<usize, Error> {
+            Ok(1)
+        }
+    }
+
+    struct DemotableLoader {
+        point: OperatingPoint,
+    }
+
+    impl ModelLoader for DemotableLoader {
+        fn load(
+            &self,
+            _model: &ModelRecord,
+            _config: ResidencyConfig,
+        ) -> Result<(Arc<dyn InferenceEngine>, OperatingPoint), Error> {
+            Ok((Arc::new(DemotableEngine), self.point))
+        }
+    }
+
     impl ModelLoader for FixtureLoader {
         fn load(
             &self,
@@ -800,6 +834,35 @@ mod tests {
         let engine = ResidentEngine::with_loader(competent, loader);
         assert!(engine.prepare_model(&model("weak", "r", 2, 10)).is_err());
         assert!(engine.status().is_empty());
+    }
+
+    #[test]
+    fn cpu_context_spill_releases_host_capacity() {
+        let point = OperatingPoint {
+            model_bytes: 10,
+            context_bytes: 5,
+            device_bytes: 0,
+            host_bytes: 15,
+            gpu_layers: 0,
+            model_layers: 1,
+            competent: true,
+        };
+        let mut limits = config(25);
+        limits.storage_bytes = 25;
+        limits.gpu_layers = 0;
+        let engine = ResidentEngine::with_loader(limits, Arc::new(DemotableLoader { point }));
+
+        engine
+            .prepare_model(&model("first", "r", 1, 10))
+            .unwrap();
+        engine
+            .prepare_model(&model("second", "r", 2, 10))
+            .unwrap();
+
+        assert_eq!(engine.status().len(), 2);
+        assert_eq!(engine.metrics().context_spills, 1);
+        assert_eq!(engine.metrics().host_bytes, 25);
+        assert_eq!(engine.metrics().storage_bytes, 25);
     }
 
     #[test]
