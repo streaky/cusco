@@ -93,7 +93,7 @@ authentication token and start the release-binary service:
 
 ```sh
 mkdir -p data/models data/state data/spill
-CUSCO_BEARER_TOKEN='replace-with-a-secret' docker compose up --build -d cusco
+CUSCO_BEARER_TOKEN='replace-with-a-secret' docker compose up --build -d server
 ```
 
 The production definition listens on `127.0.0.1:8080` by default, persists the

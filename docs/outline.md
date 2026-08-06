@@ -1311,7 +1311,7 @@ Docker images and Docker Compose are the primary supported interfaces for buildi
 
 The repository provides one multi-stage `Dockerfile` with two complementary Compose files:
 
-- `compose.yaml` is the production-oriented runtime definition. Its `cusco` service has an explicit restart policy and health check, runs the release binary from the production image target, and bind-mounts the ignored `./data/models`, `./data/state`, and `./data/spill` paths read-write at stable container paths. It does not hide persistent state in anonymous or named Docker volumes.
+- `compose.yaml` is the production-oriented runtime definition. Its `server` service has an explicit restart policy and health check, runs the release binary from the production image target, and bind-mounts the ignored `./data/models`, `./data/state`, and `./data/spill` paths read-write at stable container paths. It does not hide persistent state in anonymous or named Docker volumes.
 - `compose.test.yaml` is the development and verification definition. It contains GPU-less coverage, executor and mapped proofs, the Phase 6C acceptance server, and the Phase 7 residency server. Test result and external model mounts remain explicit and may be read-only where mutation is unnecessary.
 
 The same build stages should be used locally and in CI. Compiler, Rust, CUDA, CMake, and Python/tooling versions must be pinned by image digest or another immutable lock, and the resulting provenance must record the base-image identity, executor source identity, patch manifest, build arguments, GPU architecture targets, and runtime image identity. BuildKit caches and mounted dependency caches may accelerate builds, but a clean build must not depend on untracked host state. Model weights, Hugging Face caches, benchmark outputs, compiler caches, and the ignored production `./data` tree must not be copied into image layers.
@@ -1327,7 +1327,7 @@ docker compose -f compose.test.yaml build
 docker compose -f compose.test.yaml run --rm test
 docker compose -f compose.test.yaml run --rm mapped-proof
 docker compose -f compose.test.yaml run --rm executor-proof
-docker compose up -d cusco
+docker compose up -d server
 ```
 
 Project scripts may wrap these commands for ergonomics, but must not create a second host-native build path with different dependency resolution, build flags, tests, or runtime behavior.
