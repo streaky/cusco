@@ -249,6 +249,9 @@ impl MappedEngine {
                 "configured context exceeds the Gemma profile limit".into(),
             ));
         }
+        if let Some(path) = &spill_dir {
+            reset_spill_directory(path)?;
+        }
         let model_path = model_path
             .as_ref()
             .to_str()
@@ -265,9 +268,7 @@ impl MappedEngine {
                 "executor does not satisfy the Gemma execution profile".into(),
             ));
         }
-        if let Some(path) = &spill_dir {
-            fs::create_dir_all(path).map_err(state_error)?;
-        }
+
         Ok(Arc::new(Self {
             profile,
             context_capacity: n_ctx as usize,
@@ -820,6 +821,22 @@ fn elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
+fn reset_spill_directory(path: &Path) -> Result<(), Error> {
+    fs::create_dir_all(path).map_err(state_error)?;
+    for entry in fs::read_dir(path).map_err(state_error)? {
+        let entry = entry.map_err(state_error)?;
+        if !entry.file_type().map_err(state_error)?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".seq") || name.ends_with(".seq.tmp") {
+            fs::remove_file(entry.path()).map_err(state_error)?;
+        }
+    }
+    Ok(())
+}
+
 fn state_error(error: impl std::fmt::Display) -> Error {
     Error::State(error.to_string())
 }
@@ -937,6 +954,34 @@ mod tests {
         assert!(metrics.cached_tokens >= 32);
         assert_eq!(metrics.activation_bytes_copied, 0);
         assert!(metrics.reference_switches >= 2);
+    }
+
+    #[test]
+    fn restart_removes_orphaned_runtime_spills() {
+        let spill_dir =
+            std::env::temp_dir().join(format!("cusco-spill-restart-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&spill_dir).unwrap();
+        fs::write(spill_dir.join("stale.seq"), b"checkpoint").unwrap();
+        fs::write(spill_dir.join("stale.seq.tmp"), b"temporary").unwrap();
+        fs::write(spill_dir.join("operator-note"), b"keep").unwrap();
+
+        let _engine = MappedEngine::open_at_epoch_with_spill(
+            "gemma-4-e2b-it",
+            "mock://deterministic",
+            4096,
+            0,
+            1 << 30,
+            1 << 30,
+            ModelEpoch(1),
+            Some(spill_dir.clone()),
+            1 << 20,
+        )
+        .unwrap();
+
+        assert!(!spill_dir.join("stale.seq").exists());
+        assert!(!spill_dir.join("stale.seq.tmp").exists());
+        assert!(spill_dir.join("operator-note").exists());
+        fs::remove_dir_all(spill_dir).unwrap();
     }
 
     #[test]
