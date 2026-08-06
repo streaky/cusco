@@ -705,6 +705,9 @@ impl Drop for MappedSession {
 impl InferenceEngine for MappedEngine {
     fn start_session(&self, request: EngineRequest) -> Result<Box<dyn ExecutionSession>, Error> {
         request.control.check()?;
+        if request.prefill_chunk_tokens == 0 {
+            return Err(Error::State("prefill chunk size must be nonzero".into()));
+        }
         if request.model.path.to_str() != Some(self.model_path()) {
             return Err(Error::State(
                 "Phase 8 admits only a resident process-owned model".into(),
