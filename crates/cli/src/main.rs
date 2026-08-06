@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use cusco_executor::{Executor, logits_identical};
 use cusco_model_registry::{GEMMA_URI, ModelRecord, fetch_hf, register_local};
 use serde_json::json;
@@ -10,6 +10,14 @@ struct Args {
     #[command(subcommand)]
     command: Command,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum HttpDebugLevelArg {
+    #[default]
+    Off,
+    Safe,
+    Full,
+}
+
 #[derive(Subcommand)]
 enum Command {
     Fetch {
@@ -106,9 +114,14 @@ enum Command {
         active_time_ms: u64,
         #[arg(long, default_value_t = 8)]
         stream_buffer: usize,
-        /// Emit privacy-safe per-request HTTP debug records to stderr.
-        #[arg(long)]
-        http_debug: bool,
+        /// HTTP transport diagnostics: off, privacy-safe, or fully unredacted.
+        #[arg(
+            long,
+            env = "CUSCO_HTTP_DEBUG",
+            value_enum,
+            default_value_t = HttpDebugLevelArg::Off
+        )]
+        http_debug: HttpDebugLevelArg,
         #[arg(long, default_value_t = 30_000)]
         shutdown_grace_ms: u64,
     },
@@ -228,20 +241,29 @@ fn run(command: Command) -> Result<()> {
                 epoch: 0,
             })?;
             let runtime = tokio::runtime::Runtime::new()?;
-            if http_debug {
-                runtime.block_on(cusco_server::serve_with_http_debug(
-                    server,
-                    listen,
-                    anonymous,
-                    unsafe_public_unauthenticated,
-                ))?;
-            } else {
-                runtime.block_on(cusco_server::serve(
-                    server,
-                    listen,
-                    anonymous,
-                    unsafe_public_unauthenticated,
-                ))?;
+            match http_debug {
+                HttpDebugLevelArg::Off => {
+                    runtime.block_on(cusco_server::serve(
+                        server,
+                        listen,
+                        anonymous,
+                        unsafe_public_unauthenticated,
+                    ))?;
+                }
+                HttpDebugLevelArg::Safe | HttpDebugLevelArg::Full => {
+                    let level = match http_debug {
+                        HttpDebugLevelArg::Safe => cusco_server::HttpDebugLevel::Safe,
+                        HttpDebugLevelArg::Full => cusco_server::HttpDebugLevel::Full,
+                        HttpDebugLevelArg::Off => unreachable!(),
+                    };
+                    runtime.block_on(cusco_server::serve_with_http_debug(
+                        server,
+                        listen,
+                        anonymous,
+                        unsafe_public_unauthenticated,
+                        level,
+                    ))?;
+                }
             }
         }
     }
@@ -455,6 +477,7 @@ mod tests {
             "--stream-buffer",
             "4",
             "--http-debug",
+            "full",
             "--shutdown-grace-ms",
             "250",
         ])
@@ -483,7 +506,32 @@ mod tests {
             ),
             (2, 3, 4096, 2048, 4, 250)
         );
-        assert!(http_debug);
+        assert_eq!(http_debug, HttpDebugLevelArg::Full);
+    }
+
+    #[test]
+    fn http_debug_defaults_off_and_declares_environment_source() {
+        use clap::CommandFactory;
+
+        let args = Args::try_parse_from(["cusco", "serve", "model.gguf"]).unwrap();
+        let Command::Serve { http_debug, .. } = args.command else {
+            panic!("serve command expected")
+        };
+        assert_eq!(http_debug, HttpDebugLevelArg::Off);
+
+        let command = Args::command();
+        let serve = command
+            .get_subcommands()
+            .find(|command| command.get_name() == "serve")
+            .unwrap();
+        let argument = serve
+            .get_arguments()
+            .find(|argument| argument.get_id() == "http_debug")
+            .unwrap();
+        assert_eq!(
+            argument.get_env(),
+            Some(std::ffi::OsStr::new("CUSCO_HTTP_DEBUG"))
+        );
     }
 
     #[test]
@@ -582,7 +630,7 @@ mod tests {
                 active_time_ms: 240_000,
                 stream_buffer: 1,
                 shutdown_grace_ms: 100,
-                http_debug: false,
+                http_debug: HttpDebugLevelArg::Off,
             })
             .is_err()
         );
@@ -614,7 +662,7 @@ mod tests {
             active_time_ms: 240_000,
             stream_buffer: 1,
             shutdown_grace_ms: 100,
-            http_debug: false,
+            http_debug: HttpDebugLevelArg::Off,
         })
         .unwrap_err();
         assert!(unsupported.to_string().contains("unsupported model family"));

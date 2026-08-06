@@ -207,21 +207,30 @@ impl Default for ServerConfig {
         }
     }
 }
-
 const HTTP_DEBUG_BODY_LIMIT: usize = 64 << 10;
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpDebugLevel {
+    #[default]
+    Off,
+    Safe,
+    Full,
+}
 
 #[derive(Clone)]
 pub struct HttpDebug {
+    level: HttpDebugLevel,
     sink: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 impl HttpDebug {
-    pub fn stderr() -> Self {
-        Self::new(|line| eprintln!("{line}"))
+    pub fn stderr(level: HttpDebugLevel) -> Self {
+        Self::new(level, |line| eprintln!("{line}"))
     }
 
-    pub fn new(sink: impl Fn(&str) + Send + Sync + 'static) -> Self {
+    pub fn new(level: HttpDebugLevel, sink: impl Fn(&str) + Send + Sync + 'static) -> Self {
         Self {
+            level,
             sink: Arc::new(sink),
         }
     }
@@ -231,24 +240,53 @@ impl HttpDebug {
     }
 }
 
-#[derive(Default)]
 struct HttpBodyCapture {
     bytes: Vec<u8>,
     total: usize,
+    limit: Option<usize>,
     truncated: bool,
 }
 
+impl Default for HttpBodyCapture {
+    fn default() -> Self {
+        Self {
+            bytes: Vec::new(),
+            total: 0,
+            limit: Some(HTTP_DEBUG_BODY_LIMIT),
+            truncated: false,
+        }
+    }
+}
+
 impl HttpBodyCapture {
+    fn full() -> Self {
+        Self {
+            limit: None,
+            ..Self::default()
+        }
+    }
+
     fn push(&mut self, bytes: &[u8]) {
         self.total = self.total.saturating_add(bytes.len());
         if self.truncated {
             return;
         }
-        if self.bytes.len().saturating_add(bytes.len()) > HTTP_DEBUG_BODY_LIMIT {
+        if self
+            .limit
+            .is_some_and(|limit| self.bytes.len().saturating_add(bytes.len()) > limit)
+        {
             self.bytes.clear();
             self.truncated = true;
         } else {
             self.bytes.extend_from_slice(bytes);
+        }
+    }
+
+    fn rendered(&self, level: HttpDebugLevel, content_type: Option<&str>) -> Value {
+        match level {
+            HttpDebugLevel::Off => json!({"bytes": 0}),
+            HttpDebugLevel::Safe => self.redacted(content_type),
+            HttpDebugLevel::Full => self.unredacted(),
         }
     }
 
@@ -286,6 +324,28 @@ impl HttpBodyCapture {
         redact_body_values(&mut value);
         json!({"bytes": self.total, "json": value})
     }
+
+    fn unredacted(&self) -> Value {
+        match std::str::from_utf8(&self.bytes) {
+            Ok(text) => json!({"bytes": self.total, "utf8": text}),
+            Err(_) => json!({"bytes": self.total, "hex": hex::encode(&self.bytes)}),
+        }
+    }
+}
+
+fn unredacted_headers(headers: &HeaderMap) -> Value {
+    Value::Array(
+        headers
+            .iter()
+            .map(|(name, value)| {
+                let value = std::str::from_utf8(value.as_bytes()).map_or_else(
+                    |_| json!({"hex": hex::encode(value.as_bytes())}),
+                    |value| json!({"utf8": value}),
+                );
+                json!({"name": name.as_str(), "value": value})
+            })
+            .collect(),
+    )
 }
 
 fn redact_body_values(value: &mut Value) {
@@ -1607,7 +1667,11 @@ pub fn router(server: Server) -> Router {
 }
 
 pub fn router_with_http_debug(server: Server, debug: HttpDebug) -> Router {
-    routes(server).layer(middleware::from_fn_with_state(debug, http_debug_middleware))
+    if debug.level == HttpDebugLevel::Off {
+        routes(server)
+    } else {
+        routes(server).layer(middleware::from_fn_with_state(debug, http_debug_middleware))
+    }
 }
 
 fn routes(server: Server) -> Router {
@@ -1661,7 +1725,16 @@ async fn http_debug_middleware(
         .get("content-length")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let request_body = Arc::new(Mutex::new(HttpBodyCapture::default()));
+    let full_request = (debug.level == HttpDebugLevel::Full).then(|| {
+        (
+            request.uri().to_string(),
+            unredacted_headers(request.headers()),
+        )
+    });
+    let request_body = Arc::new(Mutex::new(match debug.level {
+        HttpDebugLevel::Full => HttpBodyCapture::full(),
+        HttpDebugLevel::Off | HttpDebugLevel::Safe => HttpBodyCapture::default(),
+    }));
     let body_capture = request_body.clone();
     let (parts, body) = request.into_parts();
     let body = Body::new(body.map_frame(move |frame| {
@@ -1672,16 +1745,22 @@ async fn http_debug_middleware(
     }));
     let started = Instant::now();
     let mut response = next.run(Request::from_parts(parts, body)).await;
-    debug.emit(json!({
+    let mut request_record = json!({
         "type": "http_debug",
+        "level": debug.level,
         "direction": "in",
         "request_id": request_id,
         "method": method,
         "path": path,
         "content_type": request_content_type,
         "content_length": request_content_length,
-        "body": request_body.lock().redacted(request_content_type.as_deref())
-    }));
+        "body": request_body.lock().rendered(debug.level, request_content_type.as_deref())
+    });
+    if let Some((uri, headers)) = full_request {
+        request_record["uri"] = Value::String(uri);
+        request_record["headers"] = headers;
+    }
+    debug.emit(request_record);
 
     let status = response.status();
     let response_content_type = response
@@ -1693,28 +1772,37 @@ async fn http_debug_middleware(
         "x-request-id",
         HeaderValue::from_str(&request_id).expect("UUID is a valid header value"),
     );
-    debug.emit(json!({
+    let mut response_record = json!({
         "type": "http_debug",
+        "level": debug.level,
         "direction": "out",
         "request_id": request_id,
         "method": method,
         "path": path,
         "status": status.as_u16(),
         "duration_ms": started.elapsed().as_millis()
-    }));
+    });
+    if debug.level == HttpDebugLevel::Full {
+        response_record["headers"] = unredacted_headers(response.headers());
+    }
+    debug.emit(response_record);
 
     let (parts, body) = response.into_parts();
     let mut chunk_index = 0_u64;
     let body = Body::new(body.map_frame(move |frame| {
         if let Some(bytes) = frame.data_ref() {
-            let mut capture = HttpBodyCapture::default();
+            let mut capture = match debug.level {
+                HttpDebugLevel::Full => HttpBodyCapture::full(),
+                HttpDebugLevel::Off | HttpDebugLevel::Safe => HttpBodyCapture::default(),
+            };
             capture.push(bytes);
             debug.emit(json!({
                 "type": "http_debug",
+                "level": debug.level,
                 "direction": "out_body",
                 "request_id": request_id,
                 "chunk_index": chunk_index,
-                "body": capture.redacted(response_content_type.as_deref())
+                "body": capture.rendered(debug.level, response_content_type.as_deref())
             }));
             chunk_index += 1;
         }
@@ -2108,13 +2196,14 @@ pub async fn serve_with_http_debug(
     addr: SocketAddr,
     anonymous: bool,
     unsafe_public: bool,
+    level: HttpDebugLevel,
 ) -> Result<(), Error> {
     serve_until(
         server,
         addr,
         anonymous,
         unsafe_public,
-        Some(HttpDebug::stderr()),
+        Some(HttpDebug::stderr(level)),
         shutdown_signal(),
     )
     .await
@@ -3262,7 +3351,9 @@ mod tests {
         let captured = records.clone();
         let app = router_with_http_debug(
             server,
-            HttpDebug::new(move |line| captured.lock().push(line.to_owned())),
+            HttpDebug::new(HttpDebugLevel::Safe, move |line| {
+                captured.lock().push(line.to_owned())
+            }),
         );
         let response = app
             .oneshot(
@@ -3313,13 +3404,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_http_debug_records_unredacted_headers_uri_and_bodies() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let app = router_with_http_debug(
+            server,
+            HttpDebug::new(HttpDebugLevel::Full, move |line| {
+                captured.lock().push(line.to_owned())
+            }),
+        );
+        let response = app
+            .oneshot(
+                Request::post("/v1/completions?trace_token=query-secret")
+                    .header("authorization", "Bearer header-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","prompt":"private prompt","max_tokens":2}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let records = records
+            .lock()
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["level"], "full");
+        assert_eq!(
+            records[0]["uri"],
+            "/v1/completions?trace_token=query-secret"
+        );
+        assert!(
+            records[0]["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|header| {
+                    header["name"] == "authorization"
+                        && header["value"]["utf8"] == "Bearer header-secret"
+                })
+        );
+        assert!(
+            records[0]["body"]["utf8"]
+                .as_str()
+                .unwrap()
+                .contains("private prompt")
+        );
+        assert!(records[1]["headers"].is_array());
+        let response_body: Value =
+            serde_json::from_str(records[2]["body"]["utf8"].as_str().unwrap()).unwrap();
+        assert_eq!(response_body["choices"][0]["text"], "prompt private");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn off_http_debug_level_installs_no_transport_observer() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let app = router_with_http_debug(
+            server,
+            HttpDebug::new(HttpDebugLevel::Off, move |line| {
+                captured.lock().push(line.to_owned())
+            }),
+        );
+        let response = app
+            .oneshot(Request::get("/openapi.json").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("x-request-id"));
+        assert!(records.lock().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn http_debug_observes_stream_chunks_without_buffering_the_response() {
         let (server, dir) = setup(Arc::new(AnonymousAdmin));
         let records = Arc::new(Mutex::new(Vec::new()));
         let captured = records.clone();
         let app = router_with_http_debug(
             server,
-            HttpDebug::new(move |line| captured.lock().push(line.to_owned())),
+            HttpDebug::new(HttpDebugLevel::Safe, move |line| {
+                captured.lock().push(line.to_owned())
+            }),
         );
         let response = app
             .oneshot(
@@ -3366,6 +3539,15 @@ mod tests {
         let trace = binary.redacted(Some("application/octet-stream"));
         assert_eq!(trace["omitted"], "non-JSON body");
         assert!(!trace.to_string().contains("private binary data"));
+
+        let mut full = HttpBodyCapture::full();
+        full.push(&vec![b'x'; HTTP_DEBUG_BODY_LIMIT + 1]);
+        let trace = full.unredacted();
+        assert_eq!(trace["bytes"], HTTP_DEBUG_BODY_LIMIT + 1);
+        assert_eq!(
+            trace["utf8"].as_str().unwrap().len(),
+            HTTP_DEBUG_BODY_LIMIT + 1
+        );
     }
 
     #[tokio::test]
@@ -3382,7 +3564,7 @@ mod tests {
             address,
             true,
             false,
-            Some(HttpDebug::new(move |line| {
+            Some(HttpDebug::new(HttpDebugLevel::Safe, move |line| {
                 captured.lock().push(line.to_owned())
             })),
             async move {

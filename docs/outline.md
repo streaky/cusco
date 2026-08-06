@@ -1602,9 +1602,11 @@ Harden request ordering and make resource decisions explainable under sustained 
 - validate multi-model and mixed-context pressure, repeated load/unload cycles, cancellation storms, deadline expiry, and sustained operation against capacity, fairness, leak, and latency gates.
 
 The server already includes one narrow operator-diagnostic slice toward this
-phase: opt-in HTTP debug records correlate request metadata, terminal status,
-duration, and streaming response chunks while omitting headers, redacting JSON
-string values, and bounding captured bodies. This transport trace is not
+phase: HTTP debug records correlate request metadata, terminal status,
+duration, and streaming response chunks. Diagnostics default off and may be
+selected by CLI or environment as privacy-safe records with omitted headers,
+redacted JSON strings, and bounded bodies, or as fully unredacted URI, header,
+and body records for controlled diagnosis. This transport trace is not
 scheduler decision attribution and does not satisfy the Phase 8 exit gate.
 
 ### Phase 9: compatibility, persistence, and production packaging

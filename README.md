@@ -117,13 +117,18 @@ Pass `--bearer-token` to require authentication. Listening anonymously on a
 non-loopback address is rejected unless
 `--unsafe-public-unauthenticated` is explicitly supplied.
 
-For local HTTP diagnosis, add `--http-debug`. The opt-in mode writes one
-JSON-line request/response record to stderr and observes streaming response
-chunks without buffering them. It never logs request headers, replaces every
-JSON string value with `[REDACTED]`, preserves only JSON structure and
-non-string scalar values, and omits non-JSON or body data above 64 KiB. Each
-response includes the trace correlation ID in `x-request-id`. Keep the mode
-disabled during normal operation.
+HTTP transport diagnostics have three levels selected with
+`--http-debug <off|safe|full>` or `CUSCO_HTTP_DEBUG`. An explicit CLI value
+overrides the environment; the default is `off`. `safe` writes correlated
+JSON-line request, response, and streaming-chunk records to stderr without
+buffering the response. It omits request headers, redacts every JSON string
+value, preserves only JSON structure and non-string scalars, and omits
+non-JSON or body data above 64 KiB. `full` records the complete URI (including
+the query), request and response headers, and unredacted request/response body
+frames; non-UTF-8 values are represented as hexadecimal. Full mode exposes
+credentials and generated content and must be enabled only in a controlled
+diagnostic environment. Traced responses include the correlation ID in
+`x-request-id`.
 
 The checked OpenAPI document is served at `/openapi.json`. OpenAI-compatible
 entry points are `/v1/completions`, `/v1/chat/completions`, and `/v1/models`.

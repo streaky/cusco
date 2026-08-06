@@ -10,7 +10,7 @@ version = "0.1.0"
 [workspace.dependencies]
 axum = "0.8.4"
 anyhow = "1.0.100"
-clap = { version = "4.5.54", features = ["derive"] }
+clap = { version = "4.5.54", features = ["derive", "env"] }
 hex = "0.4.3"
 jsonschema = { version = "0.18.3", default-features = false, features = ["draft202012"] }
 serde = { version = "1.0.228", features = ["derive"] }
