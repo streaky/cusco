@@ -679,8 +679,11 @@ fn run_scheduler_proof_case(
         },
         &mut |_, _, _| {
             let now = Instant::now();
-            first_event_ms.get_or_insert_with(|| now.duration_since(started).as_millis());
-            token_wait_ms.push(now.duration_since(last_token).as_millis());
+            if first_event_ms.is_some() {
+                token_wait_ms.push(now.duration_since(last_token).as_millis());
+            } else {
+                first_event_ms = Some(now.duration_since(started).as_millis());
+            }
             last_token = now;
             match expected {
                 SchedulerProofOutcome::Complete => {}
