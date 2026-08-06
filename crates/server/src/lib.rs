@@ -1,12 +1,14 @@
 use axum::{
     Json, Router,
-    body::to_bytes,
+    body::{Body, to_bytes},
     extract::{FromRequest, Path as AxumPath, Request, State},
-    http::{HeaderMap, StatusCode, header::RETRY_AFTER},
+    http::{HeaderMap, HeaderValue, StatusCode, header::RETRY_AFTER},
+    middleware::{self, Next},
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{delete, get, post},
 };
 use futures_util::{StreamExt, stream};
+use http_body_util::BodyExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -25,6 +27,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+mod residency;
 use thiserror::Error;
 use uuid::Uuid;
 mod generation;
@@ -35,6 +38,7 @@ pub use generation::{
     StopAlignment,
 };
 pub use mapped::{ExecutionProfile, MappedEngine, MappedMetrics};
+pub use residency::{ResidencyConfig, ResidencyMetrics, ResidentEngine, ResidentModelStatus};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -146,13 +150,30 @@ pub struct ModelRecord {
     pub revision: String,
     pub path: PathBuf,
     pub sha256: String,
+    #[serde(default)]
     pub aliases: Vec<String>,
+    #[serde(default = "default_model_family")]
+    pub family: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub epoch: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DurableState {
     installation: Uuid,
     contexts: HashMap<ContextId, ContextRecord>,
     models: HashMap<String, ModelRecord>,
+    #[serde(default = "initial_model_epoch")]
+    next_model_epoch: u64,
+}
+
+fn initial_model_epoch() -> u64 {
+    1
+}
+
+fn default_model_family() -> String {
+    "gemma-4-e2b-it".into()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -184,6 +205,176 @@ impl Default for ServerConfig {
             stream_buffer: 8,
             shutdown_grace_ms: 30_000,
         }
+    }
+}
+const HTTP_DEBUG_BODY_LIMIT: usize = 64 << 10;
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpDebugLevel {
+    #[default]
+    Off,
+    Safe,
+    Full,
+}
+
+#[derive(Clone)]
+pub struct HttpDebug {
+    level: HttpDebugLevel,
+    sink: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl HttpDebug {
+    pub fn stderr(level: HttpDebugLevel) -> Self {
+        Self::new(level, |line| eprintln!("{line}"))
+    }
+
+    pub fn new(level: HttpDebugLevel, sink: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self {
+            level,
+            sink: Arc::new(sink),
+        }
+    }
+
+    fn emit(&self, record: Value) {
+        (self.sink)(&record.to_string());
+    }
+}
+
+struct HttpBodyCapture {
+    bytes: Vec<u8>,
+    total: usize,
+    limit: Option<usize>,
+    truncated: bool,
+}
+
+impl Default for HttpBodyCapture {
+    fn default() -> Self {
+        Self {
+            bytes: Vec::new(),
+            total: 0,
+            limit: Some(HTTP_DEBUG_BODY_LIMIT),
+            truncated: false,
+        }
+    }
+}
+
+impl HttpBodyCapture {
+    fn full() -> Self {
+        Self {
+            limit: None,
+            ..Self::default()
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(bytes.len());
+        if self.truncated {
+            return;
+        }
+        if self
+            .limit
+            .is_some_and(|limit| self.bytes.len().saturating_add(bytes.len()) > limit)
+        {
+            self.bytes.clear();
+            self.truncated = true;
+        } else {
+            self.bytes.extend_from_slice(bytes);
+        }
+    }
+
+    fn rendered(&self, level: HttpDebugLevel, content_type: Option<&str>) -> Value {
+        match level {
+            HttpDebugLevel::Off => json!({"bytes": 0}),
+            HttpDebugLevel::Safe => self.redacted(content_type),
+            HttpDebugLevel::Full => self.unredacted(),
+        }
+    }
+
+    fn redacted(&self, content_type: Option<&str>) -> Value {
+        if self.truncated {
+            return json!({
+                "bytes": self.total,
+                "omitted": "body exceeds 65536-byte HTTP debug limit"
+            });
+        }
+        if self.bytes.is_empty() {
+            return json!({"bytes": 0});
+        }
+        let is_sse = content_type.is_some_and(|value| value.starts_with("text/event-stream"));
+        if is_sse {
+            let events = String::from_utf8_lossy(&self.bytes)
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(str::trim)
+                .map(|data| {
+                    serde_json::from_str(data).map_or_else(
+                        |_| json!({"omitted": "non-JSON SSE data"}),
+                        |mut value| {
+                            redact_body_values(&mut value);
+                            value
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            return json!({"bytes": self.total, "events": events});
+        }
+        let Ok(mut value) = serde_json::from_slice(&self.bytes) else {
+            return json!({"bytes": self.total, "omitted": "non-JSON body"});
+        };
+        redact_body_values(&mut value);
+        json!({"bytes": self.total, "json": value})
+    }
+
+    fn unredacted(&self) -> Value {
+        match std::str::from_utf8(&self.bytes) {
+            Ok(text) => json!({"bytes": self.total, "utf8": text}),
+            Err(_) => json!({"bytes": self.total, "hex": hex::encode(&self.bytes)}),
+        }
+    }
+}
+
+fn unredacted_headers(headers: &HeaderMap) -> Value {
+    Value::Array(
+        headers
+            .iter()
+            .map(|(name, value)| {
+                let value = std::str::from_utf8(value.as_bytes()).map_or_else(
+                    |_| json!({"hex": hex::encode(value.as_bytes())}),
+                    |value| json!({"utf8": value}),
+                );
+                json!({"name": name.as_str(), "value": value})
+            })
+            .collect(),
+    )
+}
+
+fn redact_body_values(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                let key = key.to_ascii_lowercase().replace('-', "_");
+                if matches!(
+                    key.as_str(),
+                    "authorization"
+                        | "cookie"
+                        | "set_cookie"
+                        | "password"
+                        | "secret"
+                        | "api_key"
+                        | "bearer_token"
+                        | "access_token"
+                        | "refresh_token"
+                ) {
+                    *value = Value::String("[REDACTED]".into());
+                } else {
+                    redact_body_values(value);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_body_values),
+        Value::String(value) if value == "[DONE]" => {}
+        Value::String(value) => *value = "[REDACTED]".into(),
+        _ => {}
     }
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -258,9 +449,11 @@ impl IntoResponse for Error {
             Self::UnsafeListener(_) | Self::State(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let retry = matches!(self, Self::Busy).then_some("1");
-        let mut response =
-            (status, Json(json!({"error":{"code":self.code(),"message":self.to_string()}})))
-                .into_response();
+        let mut response = (
+            status,
+            Json(json!({"error":{"code":self.code(),"message":self.to_string()}})),
+        )
+            .into_response();
         if let Some(value) = retry {
             response
                 .headers_mut()
@@ -338,10 +531,7 @@ impl RequestControl {
         self.state.load(Ordering::Acquire) == CONTROL_COMPLETE
     }
 
-    fn register_abort(
-        &self,
-        abort: Arc<dyn Fn() + Send + Sync>,
-    ) -> AbortRegistration<'_> {
+    fn register_abort(&self, abort: Arc<dyn Fn() + Send + Sync>) -> AbortRegistration<'_> {
         *self.abort.lock() = Some(abort.clone());
         if self.check().is_err() {
             abort();
@@ -432,6 +622,22 @@ pub trait InferenceEngine: Send + Sync {
         request: EngineRequest<'_>,
         sink: &mut TokenSink<'_>,
     ) -> Result<EngineOutput, Error>;
+
+    fn prepare_model(&self, _model: &ModelRecord) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn commit_model(&self, _model: &ModelRecord, _replaced_epoch: Option<u64>) {}
+
+    fn retire_model(&self, _id: &str, _epoch: u64) {}
+
+    fn demote_inactive(&self) -> Result<usize, Error> {
+        Ok(0)
+    }
+
+    fn residency_status(&self) -> Option<Value> {
+        None
+    }
 }
 #[derive(Default)]
 pub struct DeterministicEngine;
@@ -569,8 +775,7 @@ impl PrequeueGate {
             let increase = limit - state.limit;
             let cancelled_retirements = increase.min(state.retire_on_drop);
             state.retire_on_drop -= cancelled_retirements;
-            self.semaphore
-                .add_permits(increase - cancelled_retirements);
+            self.semaphore.add_permits(increase - cancelled_retirements);
         }
         state.limit = limit;
     }
@@ -600,6 +805,7 @@ pub struct Server {
     state_path: PathBuf,
     inner: Arc<Mutex<Inner>>,
     pre_queue: Arc<PrequeueGate>,
+    model_lifecycle: Arc<Mutex<()>>,
     auth: Arc<dyn AuthProvider>,
     engine: Arc<dyn InferenceEngine>,
 }
@@ -626,15 +832,24 @@ impl Server {
         engine: Arc<dyn InferenceEngine>,
     ) -> Result<Self, Error> {
         let path = path.as_ref().to_owned();
-        let durable = if path.exists() {
+        let mut durable: DurableState = if path.exists() {
             serde_json::from_slice(&fs::read(&path).map_err(state_err)?).map_err(state_err)?
         } else {
             DurableState {
                 installation: Uuid::new_v4(),
                 contexts: HashMap::new(),
                 models: HashMap::new(),
+                next_model_epoch: initial_model_epoch(),
             }
         };
+        durable.next_model_epoch = durable
+            .models
+            .values()
+            .map(|model| model.epoch)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(durable.next_model_epoch);
         let config = ServerConfig::default();
         let server = Self {
             state_path: path,
@@ -651,6 +866,7 @@ impl Server {
                 config,
             })),
             pre_queue: PrequeueGate::new(config.pre_queue_concurrency),
+            model_lifecycle: Arc::new(Mutex::new(())),
             auth,
             engine,
         };
@@ -759,14 +975,69 @@ impl Server {
         self.persist()
     }
     pub fn register_model(&self, mut model: ModelRecord) -> Result<ModelRecord, Error> {
+        let _lifecycle = self.model_lifecycle.lock();
         model.aliases.sort();
         model.aliases.dedup();
-        self.inner
+        if model.family.is_empty() {
+            model.family = default_model_family();
+        }
+        if model.size_bytes == 0 {
+            model.size_bytes = fs::metadata(&model.path).map_err(state_err)?.len();
+        }
+        let existing = self
+            .inner
             .lock()
             .durable
             .models
-            .insert(model.id.clone(), model.clone());
-        self.persist()?;
+            .get(&model.id)
+            .cloned()
+            .filter(|existing| {
+                existing.revision == model.revision
+                    && existing.path == model.path
+                    && existing.sha256 == model.sha256
+                    && existing.family == model.family
+                    && existing.size_bytes == model.size_bytes
+            });
+        if let Some(existing) = existing {
+            self.engine.prepare_model(&existing)?;
+            return Ok(existing);
+        }
+        let (epoch, previous, previous_models) = {
+            let mut guard = self.inner.lock();
+            let epoch = guard.durable.next_model_epoch;
+            guard.durable.next_model_epoch = epoch
+                .checked_add(1)
+                .ok_or_else(|| Error::State("model epoch space exhausted".into()))?;
+            (
+                epoch,
+                guard.durable.models.get(&model.id).cloned(),
+                guard.durable.models.clone(),
+            )
+        };
+        model.epoch = epoch;
+        if let Err(error) = self.engine.prepare_model(&model) {
+            self.inner.lock().durable.next_model_epoch = epoch;
+            return Err(error);
+        }
+        {
+            let mut guard = self.inner.lock();
+            for existing in guard.durable.models.values_mut() {
+                existing
+                    .aliases
+                    .retain(|alias| !model.aliases.contains(alias));
+            }
+            guard.durable.models.insert(model.id.clone(), model.clone());
+        }
+        if let Err(error) = self.persist() {
+            let mut guard = self.inner.lock();
+            guard.durable.models = previous_models;
+            guard.durable.next_model_epoch = epoch;
+            drop(guard);
+            self.engine.retire_model(&model.id, model.epoch);
+            return Err(error);
+        }
+        self.engine
+            .commit_model(&model, previous.as_ref().map(|record| record.epoch));
         Ok(model)
     }
     pub fn models(&self) -> Vec<ModelRecord> {
@@ -789,28 +1060,45 @@ impl Server {
             .ok_or_else(|| Error::ModelNotFound(id.into()))
     }
     pub fn alias_model(&self, id: &str, alias: String) -> Result<ModelRecord, Error> {
+        let _lifecycle = self.model_lifecycle.lock();
         let mut guard = self.inner.lock();
-        let model = guard
-            .durable
-            .models
-            .get_mut(id)
-            .ok_or_else(|| Error::ModelNotFound(id.into()))?;
-        if !model.aliases.contains(&alias) {
-            model.aliases.push(alias);
+        if !guard.durable.models.contains_key(id) {
+            return Err(Error::ModelNotFound(id.into()));
         }
+        let previous = guard.durable.models.clone();
+        for model in guard.durable.models.values_mut() {
+            model.aliases.retain(|existing| existing != &alias);
+        }
+        let model = guard.durable.models.get_mut(id).unwrap();
+        model.aliases.push(alias);
+        model.aliases.sort();
         let out = model.clone();
         drop(guard);
-        self.persist()?;
+        if let Err(error) = self.persist() {
+            self.inner.lock().durable.models = previous;
+            return Err(error);
+        }
         Ok(out)
     }
     pub fn remove_model(&self, id: &str) -> Result<(), Error> {
-        self.inner
+        let _lifecycle = self.model_lifecycle.lock();
+        let model = self
+            .inner
             .lock()
             .durable
             .models
             .remove(id)
             .ok_or_else(|| Error::ModelNotFound(id.into()))?;
-        self.persist()
+        if let Err(error) = self.persist() {
+            self.inner
+                .lock()
+                .durable
+                .models
+                .insert(model.id.clone(), model);
+            return Err(error);
+        }
+        self.engine.retire_model(&model.id, model.epoch);
+        Ok(())
     }
     pub fn verify_model(&self, id: &str) -> Result<bool, Error> {
         let model = self.model(id)?;
@@ -889,7 +1177,6 @@ impl Server {
         &self,
         request_id: &str,
         req: InferRequest,
-
     ) -> Result<(InferResponse, Vec<StreamEvent>), Error> {
         let control = Arc::new(RequestControl::new());
         let admission = self.try_admit(request_id, control)?;
@@ -950,13 +1237,12 @@ impl Server {
         tokio::task::spawn_blocking(move || {
             let _admission = admission;
             let emit_control = control.clone();
-            let result =
-                server.infer_admitted(&request_id, req, successor_id, frontier, |event| {
-                    sender.blocking_send(event).map_err(|_| {
-                        emit_control.cancel();
-                        Error::Cancelled
-                    })
-                });
+            let result = server.infer_admitted(&request_id, req, successor_id, frontier, |event| {
+                sender.blocking_send(event).map_err(|_| {
+                    emit_control.cancel();
+                    Error::Cancelled
+                })
+            });
             let event = match result {
                 Ok((_, terminal)) => terminal,
                 Err(error) => StreamEvent::Error {
@@ -1262,12 +1548,13 @@ struct RegisterRequest {
     revision: String,
     path: PathBuf,
     sha256: String,
+    #[serde(default = "default_model_family")]
+    family: String,
     #[serde(default)]
     aliases: Vec<String>,
 }
 #[derive(Clone, Deserialize)]
 struct FetchRequest {
-
     uri: String,
     cache: PathBuf,
     #[serde(default)]
@@ -1288,11 +1575,14 @@ where
 
     async fn from_request(request: Request, state: &Server) -> Result<Self, Self::Rejection> {
         let config = state.config();
-        let header_bytes = request.headers().iter().fold(0usize, |total, (name, value)| {
-            total
-                .saturating_add(name.as_str().len())
-                .saturating_add(value.as_bytes().len())
-        });
+        let header_bytes = request
+            .headers()
+            .iter()
+            .fold(0usize, |total, (name, value)| {
+                total
+                    .saturating_add(name.as_str().len())
+                    .saturating_add(value.as_bytes().len())
+            });
         if header_bytes > config.header_bytes {
             return Err(Error::HeadersTooLarge);
         }
@@ -1306,8 +1596,8 @@ where
         .map_err(|_| Error::BodyTimeout)?
         .map_err(|_| Error::PayloadTooLarge)?;
         let retained_bytes = bytes.len();
-        let value = serde_json::from_slice(&bytes)
-            .map_err(|error| Error::BadRequest(error.to_string()))?;
+        let value =
+            serde_json::from_slice(&bytes).map_err(|error| Error::BadRequest(error.to_string()))?;
         Ok(Self {
             headers: parts.headers,
             value,
@@ -1373,6 +1663,18 @@ struct ChatMessage {
 }
 
 pub fn router(server: Server) -> Router {
+    routes(server)
+}
+
+pub fn router_with_http_debug(server: Server, debug: HttpDebug) -> Router {
+    if debug.level == HttpDebugLevel::Off {
+        routes(server)
+    } else {
+        routes(server).layer(middleware::from_fn_with_state(debug, http_debug_middleware))
+    }
+}
+
+fn routes(server: Server) -> Router {
     Router::new()
         .route("/openapi.json", get(openapi))
         .route("/v1/completions", post(completion))
@@ -1403,6 +1705,110 @@ pub fn router(server: Server) -> Router {
         .route("/native/contexts/{id}/branches", post(branch_context))
         .route("/native/requests/{id}", delete(cancel_request))
         .with_state(server)
+}
+
+async fn http_debug_middleware(
+    State(debug): State<HttpDebug>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let request_id = Uuid::new_v4().to_string();
+    let method = request.method().to_string();
+    let path = request.uri().path().to_owned();
+    let request_content_type = request
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let request_content_length = request
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let full_request = (debug.level == HttpDebugLevel::Full).then(|| {
+        (
+            request.uri().to_string(),
+            unredacted_headers(request.headers()),
+        )
+    });
+    let request_body = Arc::new(Mutex::new(match debug.level {
+        HttpDebugLevel::Full => HttpBodyCapture::full(),
+        HttpDebugLevel::Off | HttpDebugLevel::Safe => HttpBodyCapture::default(),
+    }));
+    let body_capture = request_body.clone();
+    let (parts, body) = request.into_parts();
+    let body = Body::new(body.map_frame(move |frame| {
+        if let Some(bytes) = frame.data_ref() {
+            body_capture.lock().push(bytes);
+        }
+        frame
+    }));
+    let started = Instant::now();
+    let mut response = next.run(Request::from_parts(parts, body)).await;
+    let mut request_record = json!({
+        "type": "http_debug",
+        "level": debug.level,
+        "direction": "in",
+        "request_id": request_id,
+        "method": method,
+        "path": path,
+        "content_type": request_content_type,
+        "content_length": request_content_length,
+        "body": request_body.lock().rendered(debug.level, request_content_type.as_deref())
+    });
+    if let Some((uri, headers)) = full_request {
+        request_record["uri"] = Value::String(uri);
+        request_record["headers"] = headers;
+    }
+    debug.emit(request_record);
+
+    let status = response.status();
+    let response_content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    response.headers_mut().insert(
+        "x-request-id",
+        HeaderValue::from_str(&request_id).expect("UUID is a valid header value"),
+    );
+    let mut response_record = json!({
+        "type": "http_debug",
+        "level": debug.level,
+        "direction": "out",
+        "request_id": request_id,
+        "method": method,
+        "path": path,
+        "status": status.as_u16(),
+        "duration_ms": started.elapsed().as_millis()
+    });
+    if debug.level == HttpDebugLevel::Full {
+        response_record["headers"] = unredacted_headers(response.headers());
+    }
+    debug.emit(response_record);
+
+    let (parts, body) = response.into_parts();
+    let mut chunk_index = 0_u64;
+    let body = Body::new(body.map_frame(move |frame| {
+        if let Some(bytes) = frame.data_ref() {
+            let mut capture = match debug.level {
+                HttpDebugLevel::Full => HttpBodyCapture::full(),
+                HttpDebugLevel::Off | HttpDebugLevel::Safe => HttpBodyCapture::default(),
+            };
+            capture.push(bytes);
+            debug.emit(json!({
+                "type": "http_debug",
+                "level": debug.level,
+                "direction": "out_body",
+                "request_id": request_id,
+                "chunk_index": chunk_index,
+                "body": capture.rendered(debug.level, response_content_type.as_deref())
+            }));
+            chunk_index += 1;
+        }
+        frame
+    }));
+    Response::from_parts(parts, body)
 }
 fn auth(server: &Server, headers: &HeaderMap, scope: Scope) -> Result<RequestContext, Error> {
     server.authorize(headers, scope)
@@ -1553,9 +1959,7 @@ async fn infer_response(
         priority: 0,
     };
     if streaming {
-        let (started, receiver) = server
-            .infer_stream_reserved(id, request, admission)
-            .await?;
+        let (started, receiver) = server.infer_stream_reserved(id, request, admission).await?;
         let first = stream::once(async move { started });
         let disconnect = DisconnectGuard::new(control);
         let rest = stream::unfold(
@@ -1610,6 +2014,9 @@ async fn register_model(
         path: r.path,
         sha256: r.sha256,
         aliases: r.aliases,
+        family: r.family,
+        size_bytes: 0,
+        epoch: 0,
     })?))
 }
 async fn fetch_model(
@@ -1633,6 +2040,9 @@ async fn fetch_model(
         path: fetched.path,
         sha256: fetched.sha256,
         aliases: vec![],
+        family: "gemma-phase6".into(),
+        size_bytes: fetched.size,
+        epoch: 0,
     })?))
 }
 async fn inspect_model(
@@ -1651,6 +2061,7 @@ async fn native_status(
     Ok(Json(json!({
         "config": server.config(),
         "admission": server.admission_metrics(),
+        "residency": server.engine.residency_status(),
     })))
 }
 async fn verify_model(
@@ -1769,7 +2180,33 @@ pub async fn serve(
     anonymous: bool,
     unsafe_public: bool,
 ) -> Result<(), Error> {
-    serve_until(server, addr, anonymous, unsafe_public, shutdown_signal()).await
+    serve_until(
+        server,
+        addr,
+        anonymous,
+        unsafe_public,
+        None,
+        shutdown_signal(),
+    )
+    .await
+}
+
+pub async fn serve_with_http_debug(
+    server: Server,
+    addr: SocketAddr,
+    anonymous: bool,
+    unsafe_public: bool,
+    level: HttpDebugLevel,
+) -> Result<(), Error> {
+    serve_until(
+        server,
+        addr,
+        anonymous,
+        unsafe_public,
+        Some(HttpDebug::stderr(level)),
+        shutdown_signal(),
+    )
+    .await
 }
 
 async fn serve_until(
@@ -1777,6 +2214,7 @@ async fn serve_until(
     addr: SocketAddr,
     anonymous: bool,
     unsafe_public: bool,
+    http_debug: Option<HttpDebug>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
     Server::validate_listener(addr, anonymous, unsafe_public)?;
@@ -1787,7 +2225,11 @@ async fn serve_until(
         .map_err(state_err)?;
     let (begin_shutdown, shutdown_requested) = tokio::sync::oneshot::channel();
     let serving = async move {
-        axum::serve(listener, router(server))
+        let app = match http_debug {
+            Some(debug) => router_with_http_debug(server, debug),
+            None => router(server),
+        };
+        axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 let _ = shutdown_requested.await;
             })
@@ -1851,6 +2293,9 @@ mod tests {
             path: model,
             sha256: hex_digest(b"model"),
             aliases: vec!["latest".into()],
+            family: "gemma-4-e2b-it".into(),
+            size_bytes: 5,
+            epoch: 0,
         })
         .unwrap();
         (s, d)
@@ -2004,7 +2449,7 @@ mod tests {
                     priority: 0,
                     stop: vec![],
                     raw_continuation: false,
-                },
+                }
             ),
             Err(Error::State(_))
         ));
@@ -2017,8 +2462,35 @@ mod tests {
         assert!(s.verify_model("m").unwrap());
         assert!(!s.check_update("m", "r1").unwrap());
         assert!(s.check_update("m", "r2").unwrap());
+        let original = s.model("m").unwrap();
+        assert_eq!(
+            s.register_model(original.clone()).unwrap().epoch,
+            original.epoch
+        );
+
+        let second_path = d.join("second.gguf");
+        fs::write(&second_path, b"second").unwrap();
+        s.register_model(ModelRecord {
+            id: "second".into(),
+            revision: "r2".into(),
+            path: second_path,
+            sha256: hex_digest(b"second"),
+            aliases: vec!["latest".into()],
+            family: "gemma-4-e2b-it".into(),
+            size_bytes: 6,
+            epoch: 0,
+        })
+        .unwrap();
         s.alias_model("m", "stable".into()).unwrap();
         assert_eq!(s.model("stable").unwrap().id, "m");
+        assert_eq!(s.model("latest").unwrap().id, "second");
+        assert!(
+            s.model("m")
+                .unwrap()
+                .aliases
+                .iter()
+                .all(|alias| alias != "latest")
+        );
         s.remove_model("m").unwrap();
         assert!(matches!(s.model("m"), Err(Error::ModelNotFound(_))));
         let public = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 8080);
@@ -2172,14 +2644,15 @@ mod tests {
                 StatusCode::OK,
             ),
         ] {
-            assert_eq!(
-                app.clone()
-                    .oneshot(request(method, uri, body))
-                    .await
-                    .unwrap()
-                    .status(),
-                expected
-            );
+            let response = app
+                .clone()
+                .oneshot(request(method, uri, body))
+                .await
+                .unwrap();
+            if response.status() != expected {
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                panic!("{method} {uri}: {}", String::from_utf8_lossy(&bytes));
+            }
         }
         assert_eq!(
             app.clone()
@@ -2615,8 +3088,14 @@ mod tests {
     #[tokio::test]
     async fn configured_server_stops_when_shutdown_is_requested() {
         let (server, dir) = setup(Arc::new(AnonymousAdmin));
-        serve_until(server, "127.0.0.1:0".parse().unwrap(), true, false, async {
-        })
+        serve_until(
+            server,
+            "127.0.0.1:0".parse().unwrap(),
+            true,
+            false,
+            None,
+            async {},
+        )
         .await
         .unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -2866,22 +3345,271 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_debug_traces_redacted_json_without_credentials_or_content() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let app = router_with_http_debug(
+            server,
+            HttpDebug::new(HttpDebugLevel::Safe, move |line| {
+                captured.lock().push(line.to_owned())
+            }),
+        );
+        let response = app
+            .oneshot(
+                Request::post("/v1/completions")
+                    .header("authorization", "Bearer header-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","prompt":"private prompt","max_tokens":2,"api_key":"body-secret"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let records = records
+            .lock()
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["direction"], "in");
+        assert_eq!(records[0]["request_id"], request_id);
+        assert_eq!(records[0]["method"], "POST");
+        assert_eq!(records[0]["path"], "/v1/completions");
+        assert_eq!(records[0]["body"]["json"]["model"], "[REDACTED]");
+        assert_eq!(records[0]["body"]["json"]["prompt"], "[REDACTED]");
+        assert_eq!(records[0]["body"]["json"]["api_key"], "[REDACTED]");
+        assert_eq!(records[0]["body"]["json"]["max_tokens"], 2);
+        assert_eq!(records[1]["direction"], "out");
+        assert_eq!(records[1]["status"], 200);
+        assert!(records[1]["duration_ms"].is_number());
+        assert_eq!(records[2]["direction"], "out_body");
+        assert_eq!(
+            records[2]["body"]["json"]["choices"][0]["text"],
+            "[REDACTED]"
+        );
+        let serialized = serde_json::to_string(&records).unwrap();
+        for secret in ["header-secret", "body-secret", "private prompt"] {
+            assert!(!serialized.contains(secret));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_http_debug_records_unredacted_headers_uri_and_bodies() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let app = router_with_http_debug(
+            server,
+            HttpDebug::new(HttpDebugLevel::Full, move |line| {
+                captured.lock().push(line.to_owned())
+            }),
+        );
+        let response = app
+            .oneshot(
+                Request::post("/v1/completions?trace_token=query-secret")
+                    .header("authorization", "Bearer header-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","prompt":"private prompt","max_tokens":2}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let records = records
+            .lock()
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["level"], "full");
+        assert_eq!(
+            records[0]["uri"],
+            "/v1/completions?trace_token=query-secret"
+        );
+        assert!(
+            records[0]["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|header| {
+                    header["name"] == "authorization"
+                        && header["value"]["utf8"] == "Bearer header-secret"
+                })
+        );
+        assert!(
+            records[0]["body"]["utf8"]
+                .as_str()
+                .unwrap()
+                .contains("private prompt")
+        );
+        assert!(records[1]["headers"].is_array());
+        let response_body: Value =
+            serde_json::from_str(records[2]["body"]["utf8"].as_str().unwrap()).unwrap();
+        assert_eq!(response_body["choices"][0]["text"], "prompt private");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn off_http_debug_level_installs_no_transport_observer() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let app = router_with_http_debug(
+            server,
+            HttpDebug::new(HttpDebugLevel::Off, move |line| {
+                captured.lock().push(line.to_owned())
+            }),
+        );
+        let response = app
+            .oneshot(Request::get("/openapi.json").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("x-request-id"));
+        assert!(records.lock().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_debug_observes_stream_chunks_without_buffering_the_response() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let app = router_with_http_debug(
+            server,
+            HttpDebug::new(HttpDebugLevel::Safe, move |line| {
+                captured.lock().push(line.to_owned())
+            }),
+        );
+        let response = app
+            .oneshot(
+                Request::post("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","prompt":"stream secret","max_tokens":2,"stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(records.lock().len(), 2);
+        let wire_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&wire_body).contains("data:"));
+
+        let records = records.lock().clone();
+        let body_records = records
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|record| record["direction"] == "out_body")
+            .collect::<Vec<_>>();
+        assert!(body_records.len() >= 2);
+        for (index, record) in body_records.iter().enumerate() {
+            assert_eq!(record["chunk_index"], index as u64);
+        }
+        let serialized = records.join("\n");
+        assert!(!serialized.contains("stream secret"));
+        assert!(!serialized.contains("\"token\":\"world\""));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn http_debug_omits_oversized_and_non_json_bodies() {
+        let mut oversized = HttpBodyCapture::default();
+        oversized.push(&vec![b'x'; HTTP_DEBUG_BODY_LIMIT + 1]);
+        let trace = oversized.redacted(Some("application/json"));
+        assert_eq!(trace["bytes"], HTTP_DEBUG_BODY_LIMIT + 1);
+        assert!(trace["omitted"].as_str().unwrap().contains("exceeds"));
+
+        let mut binary = HttpBodyCapture::default();
+        binary.push(b"private binary data");
+        let trace = binary.redacted(Some("application/octet-stream"));
+        assert_eq!(trace["omitted"], "non-JSON body");
+        assert!(!trace.to_string().contains("private binary data"));
+
+        let mut full = HttpBodyCapture::full();
+        full.push(&vec![b'x'; HTTP_DEBUG_BODY_LIMIT + 1]);
+        let trace = full.unredacted();
+        assert_eq!(trace["bytes"], HTTP_DEBUG_BODY_LIMIT + 1);
+        assert_eq!(
+            trace["utf8"].as_str().unwrap().len(),
+            HTTP_DEBUG_BODY_LIMIT + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn http_debug_runs_on_the_live_http_transport() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let (shutdown, shutdown_requested) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(serve_until(
+            server,
+            address,
+            true,
+            false,
+            Some(HttpDebug::new(HttpDebugLevel::Safe, move |line| {
+                captured.lock().push(line.to_owned())
+            })),
+            async move {
+                let _ = shutdown_requested.await;
+            },
+        ));
+        let response = tokio::task::spawn_blocking(move || {
+            let mut socket = (0..100)
+                .find_map(|_| match std::net::TcpStream::connect(address) {
+                    Ok(socket) => Some(socket),
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        None
+                    }
+                })
+                .expect("HTTP server became ready");
+            std::io::Write::write_all(
+                &mut socket,
+                b"GET /openapi.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            let mut response = String::new();
+            std::io::Read::read_to_string(&mut socket, &mut response).unwrap();
+            response
+        })
+        .await
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.to_ascii_lowercase().contains("\r\nx-request-id: "));
+        shutdown.send(()).unwrap();
+        serving.await.unwrap().unwrap();
+        let records = records.lock().clone();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|line| line.contains("\"http_debug\"")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn wall_and_active_deadline_watchdogs_abort_owned_work() {
         let wall = Arc::new(RequestControl::new());
         let active = Arc::new(RequestControl::new());
-        start_deadline_watchdogs(
-            &wall,
-            Duration::from_millis(5),
-            Duration::from_secs(1),
-        );
-        start_deadline_watchdogs(
-            &active,
-            Duration::from_secs(1),
-            Duration::from_millis(5),
-        );
+        start_deadline_watchdogs(&wall, Duration::from_millis(5), Duration::from_secs(1));
+        start_deadline_watchdogs(&active, Duration::from_secs(1), Duration::from_millis(5));
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(matches!(wall.check(), Err(Error::Deadline)));
         assert!(matches!(active.check(), Err(Error::Deadline)));
     }
-
 }

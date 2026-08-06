@@ -5,15 +5,20 @@ use cusco_context_store::{
     AdapterEpoch, ComponentMask, ContextStore, EvaluatedPrefixId, LogicalContextId, ModelEpoch,
     PersistentTokenSequence,
 };
-use cusco_executor::{Decode, Executor, MappingId};
+use cusco_executor::{Decode, Executor, MappingId, MappingState, OperatingPoint};
 use cusco_physical_manager::{
     Capacity, Component, PhysicalManager, PhysicalRepresentationId, Tier,
 };
 use parking_lot::Mutex;
 use serde::Deserialize;
-use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
-const MODEL_EPOCH: ModelEpoch = ModelEpoch(1);
 const ADAPTER_EPOCH: AdapterEpoch = AdapterEpoch(0);
 const EXECUTION_SLOT: LogicalContextId = LogicalContextId(u64::MAX);
 
@@ -147,23 +152,35 @@ pub struct MappedMetrics {
 
 #[derive(Clone)]
 struct ResidentMapping {
-    native: MappingId,
+    native: Option<MappingId>,
+    spill: Option<SpilledMapping>,
     representations: Vec<PhysicalRepresentationId>,
     continuation: Decode,
+}
+
+#[derive(Clone)]
+struct SpilledMapping {
+    path: PathBuf,
+    bytes: usize,
+    position: usize,
 }
 
 struct MappedState {
     executor: Executor,
     logical: ContextStore,
     physical: PhysicalManager,
+    model_epoch: ModelEpoch,
     resident: HashMap<EvaluatedPrefixId, ResidentMapping>,
     metrics: MappedMetrics,
+    spill_bytes: usize,
 }
 
 pub struct MappedEngine {
     profile: ExecutionProfile,
     model_path: String,
     context_capacity: usize,
+    spill_dir: Option<PathBuf>,
+    spill_capacity: usize,
     state: Mutex<MappedState>,
 }
 
@@ -176,6 +193,51 @@ impl MappedEngine {
         device_bytes: usize,
         host_bytes: usize,
     ) -> Result<Arc<Self>, Error> {
+        Self::open_at_epoch(
+            model_family_id,
+            model_path,
+            n_ctx,
+            gpu_layers,
+            device_bytes,
+            host_bytes,
+            ModelEpoch(1),
+        )
+    }
+
+    pub fn open_at_epoch(
+        model_family_id: &str,
+        model_path: impl AsRef<Path>,
+        n_ctx: u32,
+        gpu_layers: i32,
+        device_bytes: usize,
+        host_bytes: usize,
+        model_epoch: ModelEpoch,
+    ) -> Result<Arc<Self>, Error> {
+        Self::open_at_epoch_with_spill(
+            model_family_id,
+            model_path,
+            n_ctx,
+            gpu_layers,
+            device_bytes,
+            host_bytes,
+            model_epoch,
+            None,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_at_epoch_with_spill(
+        model_family_id: &str,
+        model_path: impl AsRef<Path>,
+        n_ctx: u32,
+        gpu_layers: i32,
+        device_bytes: usize,
+        host_bytes: usize,
+        model_epoch: ModelEpoch,
+        spill_dir: Option<PathBuf>,
+        spill_capacity: usize,
+    ) -> Result<Arc<Self>, Error> {
         let profile = ExecutionProfile::bundled_gemma()?;
         if model_family_id != profile.id {
             return Err(Error::State(format!(
@@ -186,6 +248,9 @@ impl MappedEngine {
             return Err(Error::State(
                 "configured context exceeds the Gemma profile limit".into(),
             ));
+        }
+        if let Some(path) = &spill_dir {
+            reset_spill_directory(path)?;
         }
         let model_path = model_path
             .as_ref()
@@ -203,10 +268,13 @@ impl MappedEngine {
                 "executor does not satisfy the Gemma execution profile".into(),
             ));
         }
+
         Ok(Arc::new(Self {
             profile,
             context_capacity: n_ctx as usize,
             model_path,
+            spill_dir,
+            spill_capacity,
             state: Mutex::new(MappedState {
                 executor,
                 logical: ContextStore::default(),
@@ -215,7 +283,9 @@ impl MappedEngine {
                     host_bytes,
                 }),
                 resident: HashMap::new(),
+                model_epoch,
                 metrics: MappedMetrics::default(),
+                spill_bytes: 0,
             }),
         }))
     }
@@ -224,12 +294,77 @@ impl MappedEngine {
         self.state.lock().metrics
     }
 
+    pub fn spill_inactive_mappings(&self) -> Result<usize, Error> {
+        let Some(spill_dir) = &self.spill_dir else {
+            return Ok(0);
+        };
+        let mut state = self.state.lock();
+        let active = state.executor.mapping_metrics().active;
+        let candidates = state
+            .resident
+            .iter()
+            .filter_map(|(id, resident)| {
+                resident
+                    .native
+                    .filter(|native| *native != active)
+                    .map(|native| (*id, native))
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let _ = state.physical.release_binding(EXECUTION_SLOT);
+        let mut spilled = 0;
+        for (id, native) in candidates {
+            let mapping = state.executor.export_mapping(native).map_err(state_error)?;
+            if state.spill_bytes.saturating_add(mapping.bytes.len()) > self.spill_capacity {
+                continue;
+            }
+            let name =
+                id.0.iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+            let path = spill_dir.join(format!("{name}.seq"));
+            let temporary = path.with_extension("seq.tmp");
+            fs::write(&temporary, &mapping.bytes).map_err(state_error)?;
+            fs::rename(&temporary, &path).map_err(state_error)?;
+            state.executor.remove_mapping(native).map_err(state_error)?;
+            let representations = state
+                .resident
+                .get(&id)
+                .expect("spill candidate remains resident")
+                .representations
+                .clone();
+            for representation in representations {
+                state
+                    .physical
+                    .demote_to_storage(representation)
+                    .map_err(state_error)?;
+            }
+            let bytes = mapping.bytes.len();
+            let resident = state.resident.get_mut(&id).unwrap();
+            resident.native = None;
+            resident.spill = Some(SpilledMapping {
+                path,
+                bytes,
+                position: mapping.position,
+            });
+            state.spill_bytes += bytes;
+            spilled += 1;
+        }
+        Ok(spilled)
+    }
+
     pub fn profile(&self) -> &ExecutionProfile {
         &self.profile
     }
 
     pub fn model_path(&self) -> &str {
         &self.model_path
+    }
+
+    pub fn operating_point(&self) -> OperatingPoint {
+        self.state.lock().executor.operating_point()
     }
 }
 
@@ -276,7 +411,8 @@ impl InferenceEngine for MappedEngine {
         let mut tokens = request.prior_tokens.to_vec();
         tokens.extend_from_slice(&prompt);
         let sequence = PersistentTokenSequence::default().append(&tokens);
-        let logical_context = state.logical.create(sequence, MODEL_EPOCH, ADAPTER_EPOCH);
+        let model_epoch = state.model_epoch;
+        let logical_context = state.logical.create(sequence, model_epoch, ADAPTER_EPOCH);
         let prefix_lookup_started = Instant::now();
         let prefix = state
             .logical
@@ -408,6 +544,10 @@ impl InferenceEngine for MappedEngine {
             prefill,
         })
     }
+
+    fn demote_inactive(&self) -> Result<usize, Error> {
+        self.spill_inactive_mappings()
+    }
 }
 
 fn activate_prefix(
@@ -427,6 +567,26 @@ fn activate_prefix(
         .get(&prefix.id)
         .cloned()
         .ok_or_else(|| Error::State("logical mapping has no resident native mapping".into()))?;
+    let restored = resident.native.is_none();
+    let native = if let Some(native) = resident.native {
+        native
+    } else {
+        let spilled = resident
+            .spill
+            .as_ref()
+            .ok_or_else(|| Error::State("mapping has neither native nor spilled state".into()))?;
+        let bytes = fs::read(&spilled.path).map_err(state_error)?;
+        if bytes.len() != spilled.bytes {
+            return Err(Error::State("spilled mapping size changed".into()));
+        }
+        state
+            .executor
+            .import_mapping(&MappingState {
+                bytes,
+                position: spilled.position,
+            })
+            .map_err(state_error)?
+    };
     let revision = state
         .logical
         .context(context)
@@ -444,27 +604,53 @@ fn activate_prefix(
             &resident.representations,
             false,
         )
-        .map_err(state_error)?;
+        .map_err(|error| {
+            if restored {
+                let _ = state.executor.remove_mapping(native);
+            }
+            state_error(error)
+        })?;
     for transfer in transfers {
         if let Err(error) = state.physical.complete_transfer(transfer, true) {
             let _ = state.physical.abort_transition(prepared);
+            if restored {
+                let _ = state.executor.remove_mapping(native);
+            }
             return Err(state_error(error));
         }
     }
-    if let Err(error) = state.executor.activate_mapping(resident.native) {
+    if let Err(error) = state.executor.activate_mapping(native) {
         let _ = state.physical.abort_transition(prepared);
+        if restored {
+            let _ = state.executor.remove_mapping(native);
+        }
         return Err(state_error(error));
     }
     match state.physical.commit_transition(prepared, revision) {
         Ok(binding) => {
             state
                 .physical
-                .publish_device_block_table(EXECUTION_SLOT, binding, resident.native.0)
+                .publish_device_block_table(EXECUTION_SLOT, binding, native.0)
                 .map_err(state_error)?;
+            if restored {
+                let spilled = state
+                    .resident
+                    .get_mut(&prefix.id)
+                    .expect("restored mapping remains resident")
+                    .spill
+                    .take()
+                    .expect("restored mapping has spill metadata");
+                let _ = fs::remove_file(spilled.path);
+                state.spill_bytes = state.spill_bytes.saturating_sub(spilled.bytes);
+                state.resident.get_mut(&prefix.id).unwrap().native = Some(native);
+            }
             Ok(())
         }
         Err(error) => {
             let _ = state.executor.activate_mapping(previous);
+            if restored {
+                let _ = state.executor.remove_mapping(native);
+            }
             Err(state_error(error))
         }
     }
@@ -504,7 +690,8 @@ fn publish_block(
     }
     let rollback = parent
         .and_then(|id| state.resident.get(&id))
-        .map_or(MappingId(0), |resident| resident.native);
+        .and_then(|resident| resident.native)
+        .unwrap_or(MappingId(0));
     let prepared_publication = state
         .logical
         .prepare_publication(
@@ -594,7 +781,10 @@ fn publish_block(
             return Err(state_error(error));
         }
     };
-    let published_native = existing.as_ref().map_or(native, |resident| resident.native);
+    let published_native = existing
+        .as_ref()
+        .and_then(|resident| resident.native)
+        .unwrap_or(native);
     if let Err(error) =
         state
             .physical
@@ -607,7 +797,8 @@ fn publish_block(
         state.resident.insert(
             mapping.id,
             ResidentMapping {
-                native,
+                native: Some(native),
+                spill: None,
                 representations,
                 continuation: continuation.clone(),
             },
@@ -630,6 +821,22 @@ fn elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
+fn reset_spill_directory(path: &Path) -> Result<(), Error> {
+    fs::create_dir_all(path).map_err(state_error)?;
+    for entry in fs::read_dir(path).map_err(state_error)? {
+        let entry = entry.map_err(state_error)?;
+        if !entry.file_type().map_err(state_error)?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".seq") || name.ends_with(".seq.tmp") {
+            fs::remove_file(entry.path()).map_err(state_error)?;
+        }
+    }
+    Ok(())
+}
+
 fn state_error(error: impl std::fmt::Display) -> Error {
     Error::State(error.to_string())
 }
@@ -647,6 +854,9 @@ mod tests {
             path: PathBuf::from("mock://deterministic"),
             sha256: "mock".into(),
             aliases: vec![],
+            family: "gemma-4-e2b-it".into(),
+            size_bytes: 1,
+            epoch: 1,
         }
     }
 
@@ -744,6 +954,105 @@ mod tests {
         assert!(metrics.cached_tokens >= 32);
         assert_eq!(metrics.activation_bytes_copied, 0);
         assert!(metrics.reference_switches >= 2);
+    }
+
+    #[test]
+    fn restart_removes_orphaned_runtime_spills() {
+        let spill_dir =
+            std::env::temp_dir().join(format!("cusco-spill-restart-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&spill_dir).unwrap();
+        fs::write(spill_dir.join("stale.seq"), b"checkpoint").unwrap();
+        fs::write(spill_dir.join("stale.seq.tmp"), b"temporary").unwrap();
+        fs::write(spill_dir.join("operator-note"), b"keep").unwrap();
+
+        let _engine = MappedEngine::open_at_epoch_with_spill(
+            "gemma-4-e2b-it",
+            "mock://deterministic",
+            4096,
+            0,
+            1 << 30,
+            1 << 30,
+            ModelEpoch(1),
+            Some(spill_dir.clone()),
+            1 << 20,
+        )
+        .unwrap();
+
+        assert!(!spill_dir.join("stale.seq").exists());
+        assert!(!spill_dir.join("stale.seq.tmp").exists());
+        assert!(spill_dir.join("operator-note").exists());
+        fs::remove_dir_all(spill_dir).unwrap();
+    }
+
+    #[test]
+    fn spilled_mapping_restores_exact_continuation() {
+        let spill_dir = std::env::temp_dir().join(format!("cusco-spill-{}", uuid::Uuid::new_v4()));
+        let engine = MappedEngine::open_at_epoch_with_spill(
+            "gemma-4-e2b-it",
+            "mock://deterministic",
+            4096,
+            0,
+            1 << 30,
+            1 << 30,
+            ModelEpoch(1),
+            Some(spill_dir.clone()),
+            1 << 20,
+        )
+        .unwrap();
+        let model = model();
+        let first = engine
+            .generate_collected(EngineRequest {
+                model: &model,
+                prompt: &"a".repeat(40),
+                max_tokens: 2,
+                prior_tokens: &[],
+                control: &crate::RequestControl::new(),
+            })
+            .unwrap();
+        let control = MappedEngine::open(
+            "gemma-4-e2b-it",
+            "mock://deterministic",
+            4096,
+            0,
+            1 << 30,
+            1 << 30,
+        )
+        .unwrap();
+        let control_first = control
+            .generate_collected(EngineRequest {
+                model: &model,
+                prompt: &"a".repeat(40),
+                max_tokens: 2,
+                prior_tokens: &[],
+                control: &crate::RequestControl::new(),
+            })
+            .unwrap();
+        let baseline = control
+            .generate_collected(EngineRequest {
+                model: &model,
+                prompt: "z",
+                max_tokens: 2,
+                prior_tokens: &control_first.successor_tokens,
+                control: &crate::RequestControl::new(),
+            })
+            .unwrap();
+        assert_eq!(engine.spill_inactive_mappings().unwrap(), 1);
+        assert_eq!(fs::read_dir(&spill_dir).unwrap().count(), 1);
+
+        let resumed = engine
+            .generate_collected(EngineRequest {
+                model: &model,
+                prompt: "z",
+                max_tokens: 2,
+                prior_tokens: &first.successor_tokens,
+                control: &crate::RequestControl::new(),
+            })
+            .unwrap();
+        assert_eq!(resumed.cached_tokens, 32);
+        assert_eq!(resumed.pieces, baseline.pieces);
+        assert_eq!(resumed.successor_tokens, baseline.successor_tokens);
+        assert_eq!(fs::read_dir(&spill_dir).unwrap().count(), 0);
+        fs::remove_dir_all(spill_dir).unwrap();
     }
 
     #[test]
@@ -919,9 +1228,7 @@ mod tests {
             assert!(usage.prefill.total_ns >= usage.prefill.mapping_activation_ns);
             assert!(usage.prefill.total_ns >= usage.prefill.uncached_prefill_ns);
         }
-        assert!(
-            serde_json::to_value(&second.usage).unwrap()["prefill"]["total_ns"].is_u64()
-        );
+        assert!(serde_json::to_value(&second.usage).unwrap()["prefill"]["total_ns"].is_u64());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

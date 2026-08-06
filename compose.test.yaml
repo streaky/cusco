@@ -1,0 +1,88 @@
+services:
+  test:
+    build: &test-build
+      context: .
+      target: development
+    command: ["tools/coverage.sh"]
+    volumes:
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
+  executor-proof:
+    build: *test-build
+    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid --format=csv,noheader && cargo run -p cusco -- proof /models/gemma-4-e2b-it.gguf --sha256 90293b8cdaf9c973012bf4df8a1e92bde7d74ad66a4fe56cf905ccd563d660c5"]
+    environment:
+      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
+      LD_LIBRARY_PATH: "/opt/llama-build/bin"
+    volumes:
+      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_RESULT_DIR:-./results}:/results"
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
+  mapped-proof:
+    build: *test-build
+    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader > /results/phase5-gpu.csv && cargo run -p cusco -- mapped-proof /models/gemma-4-e2b-it.gguf"]
+    environment:
+      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
+      LD_LIBRARY_PATH: "/opt/llama-build/bin"
+    volumes:
+      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_RESULT_DIR:-./results}:/results"
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
+  phase6c-report:
+    build: *test-build
+    command:
+      - sh
+      - -c
+      - >-
+        chmod a+rwx /results &&
+        nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader
+        > /results/phase6c-gpu.csv &&
+        cargo run -p cusco -- serve /models/gemma-4-e2b-it.gguf --listen 0.0.0.0:8080
+        --state /results/phase6c-state.json
+        --bearer-token phase6c-report-token
+    environment:
+      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
+      LD_LIBRARY_PATH: "/opt/llama-build/bin"
+    ports: ["127.0.0.1:${CUSCO_PHASE6C_REPORT_PORT:-18082}:8080"]
+    volumes:
+      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_RESULT_DIR:-./results}:/results"
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
+  phase7-report:
+    build: *test-build
+    command:
+      - sh
+      - -c
+      - >-
+        umask 000 && chmod a+rwx /results &&
+        nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader
+        > /results/phase7-gpu.csv &&
+        cargo run -p cusco -- serve /models/gemma-4-e2b-it.gguf --listen 0.0.0.0:8080
+        --state /results/phase7-state.json
+        --spill-directory /results/phase7-spill
+        --bearer-token phase7-report-token
+    environment:
+      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
+      LD_LIBRARY_PATH: "/opt/llama-build/bin"
+    ports: ["127.0.0.1:${CUSCO_PHASE7_REPORT_PORT:-18083}:8080"]
+    volumes:
+      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_RESULT_DIR:-./results}:/results"
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:

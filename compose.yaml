@@ -1,62 +1,62 @@
 services:
-  test:
-    build: .
-    command: ["tools/coverage.sh"]
-    volumes:
-      - cargo-registry:/root/.cargo/registry
-      - cargo-git:/root/.cargo/git
-      - cargo-target:/work/target
-  executor-proof:
-    build: .
-    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid --format=csv,noheader && cargo run -p cusco -- proof /models/gemma-4-e2b-it.gguf --sha256 90293b8cdaf9c973012bf4df8a1e92bde7d74ad66a4fe56cf905ccd563d660c5"]
-    environment:
-      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
-      LD_LIBRARY_PATH: "/opt/llama-build/bin"
-    volumes:
-      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
-      - "${CUSCO_RESULT_DIR:-./results}:/results"
-      - cargo-registry:/root/.cargo/registry
-      - cargo-git:/root/.cargo/git
-      - cargo-target:/work/target
-    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
-  mapped-proof:
-    build: .
-    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader > /results/phase5-gpu.csv && cargo run -p cusco -- mapped-proof /models/gemma-4-e2b-it.gguf"]
-    environment:
-      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
-      LD_LIBRARY_PATH: "/opt/llama-build/bin"
-    volumes:
-      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
-      - "${CUSCO_RESULT_DIR:-./results}:/results"
-      - cargo-registry:/root/.cargo/registry
-      - cargo-git:/root/.cargo/git
-      - cargo-target:/work/target
-    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
-  phase6c-report:
-    build: .
+  server:
+    build:
+      context: .
+      target: production
+      args:
+        CUSCO_CUDA_ARCHITECTURES: "${CUSCO_CUDA_ARCHITECTURES:-61;70}"
     command:
-      - sh
-      - -c
-      - >-
-        chmod a+rwx /results &&
-        nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader
-        > /results/phase6c-gpu.csv &&
-        cargo run -p cusco -- serve /models/gemma-4-e2b-it.gguf --listen 0.0.0.0:8080
-        --state /results/phase6c-state.json
-        --bearer-token phase6c-report-token
+      - /work/target/release/cusco
+      - serve
+      - "/data/models/${CUSCO_MODEL_FILE:-gemma-4-e2b-it.gguf}"
+      - --model-id
+      - "${CUSCO_MODEL_ID:-gemma-4-e2b-it}"
+      - --model-family
+      - "${CUSCO_MODEL_FAMILY:-gemma-4-e2b-it}"
+      - --listen
+      - 0.0.0.0:8080
+      - --state
+      - /data/state/cusco-state.json
+      - --spill-directory
+      - /data/spill
+      - --device-bytes
+      - "${CUSCO_DEVICE_BYTES:-8589934592}"
+      - --host-bytes
+      - "${CUSCO_HOST_BYTES:-17179869184}"
+      - --storage-bytes
+      - "${CUSCO_STORAGE_BYTES:-68719476736}"
+      - --context-reserve-bytes
+      - "${CUSCO_CONTEXT_RESERVE_BYTES:-1073741824}"
+      - --context
+      - "${CUSCO_CONTEXT_SIZE:-4096}"
+      - --gpu-layers
+      - "${CUSCO_GPU_LAYERS:-99}"
+      - --require-competent
+      - --bearer-token
+      - "${CUSCO_BEARER_TOKEN:?set CUSCO_BEARER_TOKEN}"
     environment:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
-      LD_LIBRARY_PATH: "/opt/llama-build/bin"
-    ports: ["127.0.0.1:${CUSCO_PHASE6C_REPORT_PORT:-18082}:8080"]
+      LD_LIBRARY_PATH: /opt/llama-build/bin
+#      CUSCO_HTTP_DEBUG: full
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/openapi.json"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 35s
+    ports:
+      - "${CUSCO_LISTEN_ADDRESS:-127.0.0.1}:${CUSCO_PORT:-11443}:8080"
     volumes:
-      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
-      - "${CUSCO_RESULT_DIR:-./results}:/results"
-      - cargo-registry:/root/.cargo/registry
-      - cargo-git:/root/.cargo/git
-      - cargo-target:/work/target
-    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
-
-volumes:
-  cargo-registry:
-  cargo-git:
-  cargo-target:
+      - ./data/models:/data/models
+      - ./data/state:/data/state
+      - ./data/spill:/data/spill
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${CUSCO_GPU_DEVICE_ID:-0}"]
+              capabilities: [gpu]

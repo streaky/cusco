@@ -377,6 +377,7 @@ dependencies = [
  "cusco-physical-manager",
  "futures-util",
  "hex",
+ "http-body-util",
  "jsonschema",
  "parking_lot",
  "serde",

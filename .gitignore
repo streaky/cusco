@@ -13,3 +13,6 @@ target
 models/
 results/
 docs/dump/
+data/
+
+.env

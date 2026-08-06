@@ -6,9 +6,9 @@
 extern "C" {
 #endif
 
-#define CUSCO_EXECUTOR_ABI_VERSION 4u
+#define CUSCO_EXECUTOR_ABI_VERSION 6u
 
-/* Opaque, uniquely owned handles. None is thread-safe. */
+/* Opaque, uniquely owned handles. Only the cancellation signal is thread-safe. */
 typedef struct cusco_executor cusco_executor;
 typedef struct cusco_checkpoint cusco_checkpoint;
 typedef struct cusco_prepared_restore cusco_prepared_restore;
@@ -24,6 +24,18 @@ typedef struct {
     uint32_t has_mapped_execution;
     uint32_t max_mappings;
 } cusco_capabilities;
+
+/* Executor-reported operating point selected at open. Byte counts are the
+ * conservative capacity envelope used by the Rust residency scheduler. */
+typedef struct {
+    uint64_t model_bytes;
+    uint64_t context_bytes;
+    uint64_t device_bytes;
+    uint64_t host_bytes;
+    int32_t gpu_layers;
+    int32_t model_layers;
+    uint32_t competent;
+} cusco_operating_point;
 
 /* logits is borrowed from the executor and remains valid only until the next
  * mutating executor call or cusco_executor_close. The caller must not free it. */
@@ -48,6 +60,7 @@ typedef enum {
 cusco_status cusco_executor_open(const char *, uint32_t, int32_t, cusco_executor ** out);
 void cusco_executor_close(cusco_executor *);
 cusco_capabilities cusco_executor_capabilities(const cusco_executor *);
+cusco_operating_point cusco_executor_operating_point(const cusco_executor *);
 
 /* On success, tokens receives a uniquely owned allocation (or NULL when count is
  * zero). Release it exactly once with cusco_executor_tokens_free. */
@@ -94,6 +107,16 @@ cusco_status cusco_executor_commit_mapping(
     cusco_executor *, cusco_prepared_mapping *, uint32_t * mapping);
 cusco_status cusco_executor_activate_mapping(cusco_executor *, uint32_t mapping);
 cusco_status cusco_executor_remove_mapping(cusco_executor *, uint32_t mapping);
+/* Serialize one published sequence mapping for bounded host/storage spill.
+ * Export is non-mutating. Import publishes a new mapping only after the
+ * complete payload has been restored; remove the old mapping separately. */
+size_t cusco_executor_mapping_state_size(cusco_executor *, uint32_t mapping);
+cusco_status cusco_executor_export_mapping(
+    cusco_executor *, uint32_t mapping, uint8_t * buffer, size_t capacity,
+    size_t * written, size_t * position);
+cusco_status cusco_executor_import_mapping(
+    cusco_executor *, const uint8_t * buffer, size_t size, size_t position,
+    uint32_t * mapping);
 uint32_t cusco_executor_active_mapping(const cusco_executor *);
 size_t cusco_executor_mapping_count(const cusco_executor *);
 uint64_t cusco_executor_reference_switches(const cusco_executor *);
@@ -104,9 +127,6 @@ uint64_t cusco_executor_mapped_bytes_copied(const cusco_executor *);
 void cusco_executor_cancel(cusco_executor *);
 /* Clear a stale abort signal while the caller exclusively owns the executor. */
 void cusco_executor_reset_cancel(cusco_executor *);
-
-
-
 /* Phase 1 proof hooks, not production executor operations. */
 cusco_status cusco_executor_replace_state_for_proof(cusco_executor *, const int32_t *, size_t);
 void cusco_executor_cancel_next_decode_for_proof(cusco_executor *);

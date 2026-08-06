@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use cusco_executor::{Executor, logits_identical};
 use cusco_model_registry::{GEMMA_URI, ModelRecord, fetch_hf, register_local};
 use serde_json::json;
@@ -10,6 +10,14 @@ struct Args {
     #[command(subcommand)]
     command: Command,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum HttpDebugLevelArg {
+    #[default]
+    Off,
+    Safe,
+    Full,
+}
+
 #[derive(Subcommand)]
 enum Command {
     Fetch {
@@ -60,6 +68,8 @@ enum Command {
         model: PathBuf,
         #[arg(long, default_value = "gemma-4-e2b-it")]
         model_id: String,
+        #[arg(long, default_value = "gemma-4-e2b-it")]
+        model_family: String,
         #[arg(long, default_value_t = 4096)]
         context: u32,
         #[arg(long, default_value_t = 99)]
@@ -68,6 +78,14 @@ enum Command {
         device_bytes: usize,
         #[arg(long, default_value_t = 17_179_869_184)]
         host_bytes: usize,
+        #[arg(long, default_value_t = 68_719_476_736)]
+        storage_bytes: u64,
+        #[arg(long, default_value_t = 1_073_741_824)]
+        context_reserve_bytes: u64,
+        #[arg(long, default_value = "/data/cusco-spill")]
+        spill_directory: PathBuf,
+        #[arg(long)]
+        require_competent: bool,
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: SocketAddr,
         #[arg(long, default_value = "/data/cusco-state.json")]
@@ -76,7 +94,7 @@ enum Command {
         bearer_token: Option<String>,
         #[arg(long)]
         unsafe_public_unauthenticated: bool,
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 4)]
         active_requests: usize,
         #[arg(long, default_value_t = 32)]
         queue_count: usize,
@@ -96,6 +114,14 @@ enum Command {
         active_time_ms: u64,
         #[arg(long, default_value_t = 8)]
         stream_buffer: usize,
+        /// HTTP transport diagnostics: off, privacy-safe, or fully unredacted.
+        #[arg(
+            long,
+            env = "CUSCO_HTTP_DEBUG",
+            value_enum,
+            default_value_t = HttpDebugLevelArg::Off
+        )]
+        http_debug: HttpDebugLevelArg,
         #[arg(long, default_value_t = 30_000)]
         shutdown_grace_ms: u64,
     },
@@ -142,10 +168,15 @@ fn run(command: Command) -> Result<()> {
         Command::Serve {
             model,
             model_id,
+            model_family,
             context,
             gpu_layers,
             device_bytes,
             host_bytes,
+            storage_bytes,
+            context_reserve_bytes,
+            spill_directory,
+            require_competent,
             listen,
             state,
             bearer_token,
@@ -160,11 +191,12 @@ fn run(command: Command) -> Result<()> {
             wall_time_ms,
             active_time_ms,
             stream_buffer,
+            http_debug,
             shutdown_grace_ms,
         } => {
             use cusco_server::{
-                AnonymousAdmin, AuthProvider, BearerAuth, MappedEngine, ModelRecord, Server,
-                ServerConfig,
+                AnonymousAdmin, AuthProvider, BearerAuth, ModelRecord, ResidencyConfig,
+                ResidentEngine, Server, ServerConfig,
             };
             let anonymous = bearer_token.is_none();
             let auth: Arc<dyn AuthProvider> = match bearer_token {
@@ -172,13 +204,17 @@ fn run(command: Command) -> Result<()> {
                 None => Arc::new(AnonymousAdmin),
             };
             let registered = register_local(&model, &model_id, None)?;
-            let engine = MappedEngine::open(
-                &model_id,
-                &registered.path,
-                context,
-                gpu_layers,
-                device_bytes,
-                host_bytes,
+            let engine = ResidentEngine::open_with_spill(
+                ResidencyConfig {
+                    device_bytes: device_bytes as u64,
+                    host_bytes: host_bytes as u64,
+                    storage_bytes,
+                    context_reserve_bytes,
+                    n_ctx: context,
+                    gpu_layers,
+                    require_competent,
+                },
+                spill_directory,
             )?;
             let server = Server::open(state, auth, engine)?;
             server.configure(ServerConfig {
@@ -195,18 +231,40 @@ fn run(command: Command) -> Result<()> {
                 shutdown_grace_ms,
             })?;
             server.register_model(ModelRecord {
-                id: model_id,
+                id: model_id.clone(),
                 revision: registered.sha256.clone(),
                 path: registered.path,
                 sha256: registered.sha256,
                 aliases: vec![],
+                family: model_family,
+                size_bytes: registered.size,
+                epoch: 0,
             })?;
-            tokio::runtime::Runtime::new()?.block_on(cusco_server::serve(
-                server,
-                listen,
-                anonymous,
-                unsafe_public_unauthenticated,
-            ))?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            match http_debug {
+                HttpDebugLevelArg::Off => {
+                    runtime.block_on(cusco_server::serve(
+                        server,
+                        listen,
+                        anonymous,
+                        unsafe_public_unauthenticated,
+                    ))?;
+                }
+                HttpDebugLevelArg::Safe | HttpDebugLevelArg::Full => {
+                    let level = match http_debug {
+                        HttpDebugLevelArg::Safe => cusco_server::HttpDebugLevel::Safe,
+                        HttpDebugLevelArg::Full => cusco_server::HttpDebugLevel::Full,
+                        HttpDebugLevelArg::Off => unreachable!(),
+                    };
+                    runtime.block_on(cusco_server::serve_with_http_debug(
+                        server,
+                        listen,
+                        anonymous,
+                        unsafe_public_unauthenticated,
+                        level,
+                    ))?;
+                }
+            }
         }
     }
     Ok(())
@@ -418,6 +476,8 @@ mod tests {
             "2048",
             "--stream-buffer",
             "4",
+            "--http-debug",
+            "full",
             "--shutdown-grace-ms",
             "250",
         ])
@@ -427,6 +487,7 @@ mod tests {
             queue_count,
             queue_bytes,
             request_bytes,
+            http_debug,
             stream_buffer,
             shutdown_grace_ms,
             ..
@@ -444,6 +505,32 @@ mod tests {
                 shutdown_grace_ms,
             ),
             (2, 3, 4096, 2048, 4, 250)
+        );
+        assert_eq!(http_debug, HttpDebugLevelArg::Full);
+    }
+
+    #[test]
+    fn http_debug_defaults_off_and_declares_environment_source() {
+        use clap::CommandFactory;
+
+        let args = Args::try_parse_from(["cusco", "serve", "model.gguf"]).unwrap();
+        let Command::Serve { http_debug, .. } = args.command else {
+            panic!("serve command expected")
+        };
+        assert_eq!(http_debug, HttpDebugLevelArg::Off);
+
+        let command = Args::command();
+        let serve = command
+            .get_subcommands()
+            .find(|command| command.get_name() == "serve")
+            .unwrap();
+        let argument = serve
+            .get_arguments()
+            .find(|argument| argument.get_id() == "http_debug")
+            .unwrap();
+        assert_eq!(
+            argument.get_env(),
+            Some(std::ffi::OsStr::new("CUSCO_HTTP_DEBUG"))
         );
     }
 
@@ -519,10 +606,15 @@ mod tests {
             run(Command::Serve {
                 model: PathBuf::from("mock://deterministic"),
                 model_id: "gemma-4-e2b-it".into(),
+                model_family: "gemma-4-e2b-it".into(),
                 context: 128,
                 gpu_layers: 0,
                 device_bytes: 1 << 20,
                 host_bytes: 1 << 20,
+                storage_bytes: 1 << 20,
+                context_reserve_bytes: 1,
+                spill_directory: root.join("spill"),
+                require_competent: false,
                 listen: public,
                 state: root.join("server.json"),
                 bearer_token: None,
@@ -538,6 +630,7 @@ mod tests {
                 active_time_ms: 240_000,
                 stream_buffer: 1,
                 shutdown_grace_ms: 100,
+                http_debug: HttpDebugLevelArg::Off,
             })
             .is_err()
         );
@@ -545,10 +638,15 @@ mod tests {
         let unsupported = run(Command::Serve {
             model: root.join("local.gguf"),
             model_id: "unsupported".into(),
+            model_family: "unsupported".into(),
             context: 128,
             gpu_layers: 0,
             device_bytes: 1 << 20,
             host_bytes: 1 << 20,
+            storage_bytes: 1 << 20,
+            context_reserve_bytes: 1,
+            spill_directory: root.join("unsupported-spill"),
+            require_competent: false,
             listen: loopback,
             state: root.join("unsupported-server.json"),
             bearer_token: None,
@@ -564,6 +662,7 @@ mod tests {
             active_time_ms: 240_000,
             stream_buffer: 1,
             shutdown_grace_ms: 100,
+            http_debug: HttpDebugLevelArg::Off,
         })
         .unwrap_err();
         assert!(unsupported.to_string().contains("unsupported model family"));

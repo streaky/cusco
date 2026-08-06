@@ -323,7 +323,9 @@ For a Hub-backed model, resolution must pin the repository to its immutable comm
 
 The local-model declaration should require only a public name and path. Cusco must derive everything safely available from the GGUF and executor probe—including architecture, tokenizer and vocabulary identity, embedded chat template, training context, RoPE metadata, quantization, tensor layout, and supported capabilities—and persist the resulting immutable identity in SQLite. Optional declarations may pin `sha256`, cap `max_context_length`, override a chat template, identify a vision projector, or reference a configured draft model. A context cap may reduce an inferred limit but must not expand a model or executor limit. Execution placement such as GPU layers, tier budgets, and concurrency belongs to runtime policy, not model identity.
 
-Cusco may extend model support from above through a versioned Rust-owned execution profile selected from verified Hub repository metadata when available, GGUF metadata, and executor capabilities. Profile selection may use declarative family signatures such as architecture/model type, tokenizer identity, special-token layout, chat-template structure, and executor capability descriptors. This deliberately allows later built-in family support to be expressed as data and validation rules rather than model-name conditionals: an unknown Hub model may match a known family profile only after its required predicates and conformance fixtures pass, while an unmatched model may use a generic profile only when the native executor exposes every required fact. A profile may supply declarative interpretation that the executor can already express: chat templates, role and turn markers, terminal and control-token sets, tokenizer configuration, model-family aliases, capability declarations, output normalization, projector association, and validated metadata corrections. The immutable profile identity includes the resolved Hub metadata artifact identities, selected profile version, validated declarations, GGUF identity, and executor compatibility epoch, so changing any correctness-relevant input invalidates evaluated state and resident compatibility.
+Model-derived configuration follows an explicit source order. Cusco first reads model-local facts from the GGUF and the loaded executor's family-neutral probe. For an immutably resolved Hugging Face model, verified repository metadata may fill facts the model artifact cannot express, but it must remain tied to the resolved commit and must agree with every overlapping GGUF or executor fact. The family catalog supplies recognition predicates, safe interpretation rules, invariants, and only genuinely family-wide defaults; it must not promote one fixture's model name, context limit, special-token IDs, tokenizer switches, placement, or memory measurements into family truth. Unresolved required facts and source conflicts fail model publication with provenance-rich diagnostics rather than selecting a familiar profile by name.
+
+Cusco may extend model support from above through a versioned Rust-owned execution profile selected first from the GGUF and executor probe, with verified Hub repository metadata filling only facts the model artifact cannot express. Profile selection may use declarative family signatures such as architecture/model type, tokenizer identity, special-token layout, chat-template structure, and executor capability descriptors. This deliberately allows later built-in family support to be expressed as data and validation rules rather than model-name conditionals: an unknown Hub model may match a known family profile only after its required predicates and conformance fixtures pass, while an unmatched model may use a generic profile only when the native executor exposes every required fact. A profile may supply declarative interpretation that the executor can already express: chat templates, role and turn markers, terminal and control-token sets, tokenizer configuration, model-family aliases, capability declarations, output normalization, projector association, and validated metadata corrections. The immutable profile identity includes the resolved Hub metadata artifact identities, selected profile version, validated declarations, GGUF identity, and executor compatibility epoch, so changing any correctness-relevant input invalidates evaluated state and resident compatibility.
 
 Built-in family support should have one repository-owned, schema-versioned declarative source such as `model-profiles/families.yaml`. This catalog is the review and contribution interface for family support that needs no new execution mechanics. Each entry has a stable profile ID and version; bounded, non-executable match predicates over Hub, GGUF, tokenizer, and executor facts; deterministic ambiguity/precedence rules; permitted metadata interpretations and source precedence; template and role-marker declarations; terminal/control-token invariants; output-normalization policy; capacity constraints that can only narrow probed limits; and references to conformance fixtures. The schema forbids arbitrary expressions, code hooks, remote includes, and silent unknown fields. A pull request that adds a family must make its claimed match surface and behavioral evidence reviewable in this catalog rather than scattering model-name checks through Rust.
 
@@ -1166,6 +1168,10 @@ The production container layout must keep mutable data outside image layers and 
 
 All paths are under the ignored `./data` tree. Managed model payloads, read-only operator files, runtime configuration, and transactional metadata remain distinct: database backup and migration do not copy weights, Ollama cannot mutate user-owned files, and a later PostgreSQL backend can replace SQLite without changing either model store. `config.yaml` and `user.yaml` are declarative startup inputs, not mutable database state. The server must validate their versioned schemas before opening listeners, reject unknown or inconsistent fields, and require restart for changes until an explicitly transactional reload contract exists. Environment variables must not form a second field-by-field configuration surface; the initial bootstrap may select the config path through an explicit CLI option, while secrets are supplied by configured file or provider references rather than embedded in ordinary runtime policy.
 
+The production `cusco serve` interface should accept the configuration path plus only process-bootstrap controls that cannot live in that file. The implemented and exercised Phase 6/7 positional model and field-by-field model, placement, capacity, queue, timeout, and shutdown flags are the active transitional wiring and must remain supported until that clean cutover; they are not the lasting daemon interface. Installed and declared models enter and leave residency through the model service and scheduler, so the final startup configuration must not select one model or duplicate metadata derivable from its artifacts. Operator policy remains in the versioned `config.yaml`.
+
+Human-facing capacity values in `config.yaml`, `user.yaml`, CLI output, and documented Compose inputs must be unit-bearing quantities with fractional forms, such as `8 GiB`, `1.5 GiB`, or `750 MB`, rather than unlabelled byte integers. Schemas define accepted SI and IEC units, reject non-finite, negative, ambiguous, overflowing, or sub-byte results, and convert once to checked integral bytes at the configuration boundary. Internal accounting, native ABI fields, metrics, and exact machine-readable execution facts remain integer bytes.
+
 ## Observability
 
 The server should expose native metrics for:
@@ -1218,19 +1224,19 @@ The essential invariant is:
 
 A fast restoration with different logits or token IDs is a correctness failure, not a successful cache hit.
 
-## Current implementation and Phase 6 scope
+## Current implementation and transitional server configuration
 
-Phases 1 through 5 provide the proven executor, logical context store, physical manager, minimal server, and mapped-execution foundation described by their exit criteria. The current minimal server still loads a model per inference request and does not yet connect live executor slots, physical-manager bindings, and mapped sequence state end to end.
+Phases 1 through 7 provide the proven executor, logical context store, physical manager, bounded live server, mapped execution, and dynamic residency and lifecycle scheduler described by their exit criteria. The Phase 7 server starts from one positional bootstrap GGUF and wires the field-by-field placement, device/host/storage capacity, context-reserve, queue, timeout, and shutdown controls into `ResidentEngine` and `ServerConfig`. It publishes the bootstrap model as an immutable model record, while the model service may add further immutable model epochs that the residency scheduler loads on demand into independently owned native slots.
 
-Phase 6 is the next usable-server cutover: one configured Gemma model, one persistent native executor slot, mapped context reuse across requests, exact bounded admission, incremental normalized streaming, and transactional cancellation and deadline behavior. It deliberately excludes dynamic model residency, multiple native executions, workload fairness, broad protocol expansion, and production hardening.
+That startup surface is deliberately transitional, but it is real operating wiring rather than a future placeholder. It remains the supported Phase 7 path until the Phase 9 configuration cutover atomically replaces it with validated `config.yaml`, metadata-derived profiles, declarative local models, and the canonical model-lifecycle adapters. Workload fairness, broad protocol compatibility, durable production persistence, and packaging hardening remain later phases.
 
 ## Target completion profile
 
 The completed roadmap target remains deliberately scoped:
 
-- one loaded local model per process, acquired primarily from Hugging Face Hub;
+- a dynamically managed set of installed local models, acquired primarily from Hugging Face Hub or declared from operator-owned GGUF files;
 - CLI model fetch, inspection, verification, removal, completion, and chat;
-- text completion and basic chat through the minimal server's documented OpenAI-compatible `/v1` profile, migrated in Phase 9 to the complete `/openai/v1/*` compatibility boundary defined above;
+- text completion and basic chat through the minimal server's `/v1` completion and chat adapters, which are intentionally narrower than the complete OpenAI compatibility profile delivered under `/openai/v1/*` in Phase 9;
 - a native Ollama protocol adapter under `/ollama/api/*` delivered in Phase 9 over the same protocol-neutral services;
 - an explicit versioned `/cusco/v1/*` extension API for logical contexts, branches, cache and compaction policy, activity hints, extended usage, and explicit cancellation; model installation is fully covered by Ollama lifecycle routes and read-only `user.yaml` discovery;
 - generated, checked OpenAPI descriptions for the `/openai/v1/*`, `/ollama/api/*`, and `/cusco/v1/*` surfaces;
@@ -1305,8 +1311,8 @@ Docker images and Docker Compose are the primary supported interfaces for buildi
 
 The repository provides one multi-stage `Dockerfile` with two complementary Compose files:
 
-- `compose.yaml` is the production-oriented runtime definition. Its default server service has an explicit restart policy and health check, runs from the runtime image rather than a compiler image, bind-mounts `./data/models` and `./data/db` read-write, and bind-mounts `./data/config.yaml`, `./data/user.yaml`, and `./data/user-models` read-only at stable container paths. It must not hide persistent state in anonymous or named Docker volumes.
-- `compose.test.yaml` is the development and verification definition. It contains CPU compilation and model-free tests, CUDA compilation and GPU tests, executor and mapped proofs, conformance and integration tests, benchmarks, reproducibility checks, and an explicitly development-only local server. Test result and external model mounts remain explicit and may be read-only where mutation is unnecessary.
+- `compose.yaml` is the production-oriented runtime definition. Its `server` service has an explicit restart policy and health check, runs the release binary from the production image target, and bind-mounts the ignored `./data/models`, `./data/state`, and `./data/spill` paths read-write at stable container paths. It does not hide persistent state in anonymous or named Docker volumes.
+- `compose.test.yaml` is the development and verification definition. It contains GPU-less coverage, executor and mapped proofs, the Phase 6C acceptance server, and the Phase 7 residency server. Test result and external model mounts remain explicit and may be read-only where mutation is unnecessary.
 
 The same build stages should be used locally and in CI. Compiler, Rust, CUDA, CMake, and Python/tooling versions must be pinned by image digest or another immutable lock, and the resulting provenance must record the base-image identity, executor source identity, patch manifest, build arguments, GPU architecture targets, and runtime image identity. BuildKit caches and mounted dependency caches may accelerate builds, but a clean build must not depend on untracked host state. Model weights, Hugging Face caches, benchmark outputs, compiler caches, and the ignored production `./data` tree must not be copied into image layers.
 
@@ -1318,10 +1324,10 @@ Canonical commands should remain short and explicit about which Compose contract
 
 ```text
 docker compose -f compose.test.yaml build
-docker compose -f compose.test.yaml run --rm test-cpu
-docker compose -f compose.test.yaml run --rm test-gpu
+docker compose -f compose.test.yaml run --rm test
+docker compose -f compose.test.yaml run --rm mapped-proof
 docker compose -f compose.test.yaml run --rm executor-proof
-docker compose up -d cusco
+docker compose up -d server
 ```
 
 Project scripts may wrap these commands for ergonomics, but must not create a second host-native build path with different dependency resolution, build flags, tests, or runtime behavior.
@@ -1461,7 +1467,7 @@ Implement:
 Implement:
 
 - protocol-neutral inference and model-management services;
-- the useful OpenAI-compatible `/v1` completion and chat surface plus its OpenAPI document;
+- the useful minimal `/v1` completion and chat adapters plus their OpenAPI document;
 - native model fetch, local registration, list, inspect, update-check, verify, alias, and removal APIs;
 - opaque durable logical-context identifiers that cannot be reused across restart, restore, import, or multiple server processes;
 - durable logical-context and revision recovery with atomic restoration of the next externally visible identifier state;
@@ -1566,7 +1572,7 @@ The acceptance artifact records the config values, resolved model/profile epoch 
 
 ### Phase 7: residency and lifecycle scheduling
 
-Generalize the live Phase 6 path from one statically admitted model into transactional dynamic resource ownership:
+Implemented by generalizing the live Phase 6 path from one statically admitted model into transactional dynamic resource ownership:
 
 - make the model-residency scheduler account for real device and host memory occupied by model weights, executor pools, mapped contexts, prepared transitions, and non-evictable work;
 - choose among executor-reported native operating points under operator policy, keep the selected competent model floor distinct from elastic layer or expert residency, and prevent elastic native allocations from silently consuming capacity protected for context cache;
@@ -1578,6 +1584,19 @@ Generalize the live Phase 6 path from one statically admitted model into transac
 - handle model removal, alias replacement, transactional reload, and revision changes while requests, contexts, or mappings still reference an old immutable model epoch;
 - prove through lifecycle races and fault injection that failed load, movement, eviction, reload, or unload leaves the prior usable state intact.
 
+The implemented contract uses executor-reported operating points selected by
+the operator's fixed competent floor, explicit device/host/storage and context
+reserve budgets, one independently locked native slot per resident model
+epoch, pressure-driven idle LRU eviction, monotonically assigned durable model
+epochs, and bounded local spill of inactive native sequence mappings. Load and
+reload prepare the replacement before durable publication; retirement drains
+active references before reclamation. `/native/status` exposes the configured
+budgets, resident epochs, effective operating points, and lifecycle/tier
+counters. `tools/phase7-report.sh` records the real-GPU multi-model
+load/reuse/reload/remove/restart artifact in `results/phase7-server.json`;
+model-free race, rollback, pressure, and exact spill/restore tests remain part
+of the per-file coverage gate.
+
 ### Phase 8: workload scheduling and operational hardening
 
 Harden request ordering and make resource decisions explainable under sustained mixed workloads:
@@ -1586,7 +1605,17 @@ Harden request ordering and make resource decisions explainable under sustained 
 - prevent one large model, long context, or bulk request from starving smaller, older, or explicitly higher-priority work while preserving bounded interactive latency;
 - apply cancellation and deadlines consistently to queued, loading, transferring, and executing work, reclaiming resources only after ownership and native-fence obligations end;
 - report model residency, executor-slot occupancy, context placement, queue state and age, capacity reservations, transition costs, eviction and unload reasons, and scheduler decisions;
-- validate multi-model and mixed-context pressure, repeated load/unload cycles, cancellation storms, deadline expiry, and sustained operation against capacity, fairness, leak, and latency gates.
+- validate multi-model and mixed-context pressure, repeated load/unload cycles, cancellation storms, deadline expiry, and sustained operation against capacity, fairness, leak, and latency gates;
+- propagate one transport correlation identifier into canonical requests and scheduler/executor work while naming any distinct inference operation identifier explicitly; report response-header, first-event, and terminal durations separately instead of presenting header latency as whole-request duration;
+- make routine diagnostics operationally non-interfering and machine-usable: encode JSON and SSE bodies structurally where possible, move record emission off the response-polling path through a bounded asynchronous sink, and expose overflow or loss rather than silently dropping records. If exact unredacted capture deliberately backpressures that sink, make the latency tradeoff operator-visible and enforce restricted sink access and retention alongside unmistakable credential and content warnings.
+
+The server already includes one narrow operator-diagnostic slice toward this
+phase: HTTP debug records correlate request metadata, terminal status,
+duration, and streaming response chunks. Diagnostics default off and may be
+selected by CLI or environment as privacy-safe records with omitted headers,
+redacted JSON strings, and bounded bodies, or as fully unredacted URI, header,
+and body records for controlled diagnosis. This transport trace is not
+scheduler decision attribution and does not satisfy the Phase 8 exit gate.
 
 ### Phase 9: compatibility, persistence, and production packaging
 
@@ -1594,7 +1623,11 @@ Freeze and deliver the external product contract only after the live execution a
 
 - deliver the required Ollama native protocol adapter under `/ollama/api/*` over the same canonical services as the OpenAI adapter, including convergent pull with integrated update resolution, verification, and repair;
 - reconcile read-only `user.yaml` local-model declarations at startup, then remove every native model register, list, show, fetch, update-check, verify, alias, and delete route;
+- replace the Phase 6/7 single-asset profile path and caller-supplied family selector with metadata-driven profile resolution: derive model facts from GGUF and the executor probe first, use verified immutable Hugging Face metadata only for missing compatible facts, and require family entries to describe families rather than fixture-specific model constants;
+- complete the daemon-configuration cutover to versioned `config.yaml`: reduce `cusco serve` to a config path and indispensable bootstrap controls, remove field-by-field environment and startup flags for models and runtime policy, and express operator-facing capacities as validated fractional unit-bearing quantities while retaining integer-byte accounting internally;
 - deliver the complete OpenAI-compatible behavior under `/openai/v1/*` declared in the adapter architecture section, with conformance fixtures for configurable subdirectory base URLs, request defaults, streaming, errors, output semantics, usage, tools, structured output, embeddings when supported, and stateless Responses;
+- treat every compatibility request as a strict semantic contract: preserve message roles, reject unknown or unsupported fields and capabilities before admission, and never silently discard tools, tool choice, stream options, structured-output controls, content parts, or other accepted input;
+- define and test protocol defaults explicitly, including omitted output-token limits; apply the selected model's chat template and normalized tool schema exactly once before tokenization; and emit protocol-native streaming chunks, terminal usage behavior such as `include_usage`, finish reasons, and errors rather than exposing Cusco's internal event schema;
 - migrate durable context, branch, import, cache and compaction policy, activity, extended-usage, and request-cancellation operations to `/cusco/v1/*`;
 - remove the minimal server's unprefixed `/v1/*` and `/native/*` routes rather than retaining aliases;
 - support text-and-image input within the declared model, projector, content-part, size, and transport boundaries;
@@ -1642,12 +1675,12 @@ Each phase must end in a usable artifact and a decision, not merely merged infra
 | 1. Executor proof | CLI driver, reproducibly patched native ABI, Hub-resolved model, complete Gemma checkpoint operation | displaced and tier-moved continuations match uninterrupted logits and tokens; failed preparations preserve the old binding |
 | 2. Logical context store | persistent branch and evaluated-prefix library | structural sharing, lineage invalidation, and longest valid-prefix lookup pass deterministic and property-based checks |
 | 3. Tiered physical manager | reservation, residency, transfer, and eviction subsystem | active-growth guarantees survive full warm capacity; cancellation and delayed fences produce no leaks or premature reuse |
-| 4. Minimal server | runnable OpenAI-compatible streaming server, native model-management API, context APIs, CLI, and scheduler | four concurrent branch revisits match isolated controls; committed hits avoid measured prompt work; protocol, accounting, anonymous-auth, and immutable model-install contracts pass |
+| 4. Minimal server | runnable completion and chat adapters, native model-management API, context APIs, CLI, and scheduler | four concurrent branch revisits match isolated controls; committed hits avoid measured prompt work; minimal protocol, accounting, anonymous-auth, and immutable model-install contracts pass |
 | 5. Mapped execution | block-table-capable executor path | semantic gates remain green and measured resident-switch cost improves enough to justify backend complexity |
 | 6. Live execution integration | mapped server execution, one persistent Gemma instance and executor slot, early bounded FIFO admission, and normalized incremental generation | successive requests reuse live mapped state; queue saturation rejects before expensive planning; impossible generation bounds fail before decode; terminal tokens, control pieces, whitespace, finish reasons, and usage are correct; cancellation and capacity failures preserve prior bindings |
 | 7. Residency and lifecycle scheduling | capacity-aware model residency, context tiering, transactional load/reload/unload, and immutable model-epoch ownership | measured device and host admission remains within capacity; load, movement, revision, removal, eviction, reload, and unload races preserve active references and prior usable bindings without leaks |
-| 8. Workload and operational hardening | distinct request-ordering policy, starvation protection, lifecycle-aware cancellation and deadlines, scheduler observability, and sustained-load validation | mixed workloads satisfy bounded fairness, capacity, cancellation, deadline, latency, and reclamation gates while every residency and scheduling decision is attributable |
-| 9. Compatibility, persistence, and packaging | supported OpenAI, Ollama, and Cusco profiles, local and managed model lifecycle, bounded image input, durable recovery, and production/test container contracts | declared protocol and model-lifecycle conformance fixtures pass; restarts, crashes, migrations, backup/restore, and corrupt state preserve transactional guarantees; production deployment exercises the live scheduled path |
+| 8. Workload and operational hardening | distinct request-ordering policy, starvation protection, lifecycle-aware cancellation and deadlines, scheduler observability, and sustained-load validation | mixed workloads satisfy bounded fairness, capacity, cancellation, deadline, latency, and reclamation gates; every residency and scheduling decision is attributable; correlated transport and inference timings remain unambiguous without diagnostic backpressure silently changing execution |
+| 9. Compatibility, persistence, and packaging | supported OpenAI, Ollama, and Cusco profiles, local and managed model lifecycle, bounded image input, durable recovery, and production/test container contracts | declared protocol and model-lifecycle conformance fixtures pass, including strict unsupported-input errors, request defaults, templates, tools, and native streaming framing; restarts, crashes, migrations, backup/restore, and corrupt state preserve transactional guarantees; production deployment exercises the live scheduled path |
 | 10. Semantic compaction | strategy registry, built-in strategy, worker protocol, speculative scheduler, and explicit client declaration API | original contexts survive every failure and race; accepted declarations start eligible work without predictive guessing; abandoned successors demote normally; committed successors execute correctly; interactive latency and guarded capacity are not regressed; strategy sandboxes and authorization pass their gates |
 
 Phase 1 has an explicit go/no-go boundary. If complete recurrent capture and restoration cannot be expressed without exposing unstable model internals, the project pauses for an executor-boundary redesign before server work begins. Phase 5 is optional unless staged measurements show that physical assembly is a material bottleneck.

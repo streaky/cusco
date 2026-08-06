@@ -6,18 +6,19 @@ The project separates responsibilities deliberately: Rust will manage logical co
 
 ## Current state
 
-Cusco has completed Phases 1 through 6. The executor proof established exact
+Cusco has completed Phases 1 through 7. The executor proof established exact
 checkpoint continuation for a hybrid/recurrent Gemma model, and the Rust layers
 now provide durable logical contexts, capacity-accounted physical state,
 transactional mapped activation, an authenticated HTTP API, immutable model
-registration, and bounded live inference.
+epochs, bounded live inference, and dynamic model residency.
 
-Phase 6 keeps one validated Gemma model and executor slot process-persistent,
-reuses complete mapped blocks across opaque-context continuations, and performs
-request-owned incremental sampling through a bounded UTF-8 and stop-aware event
-frontier. Count-and-byte-bounded FIFO admission, pre-queue transport limits,
-native cancellation, separate wall and active deadlines, graceful shutdown,
-and durable-context-only restart recovery complete the fixed one-slot contract.
+Phase 7 replaces the one-model process with a capacity-admitted residency
+scheduler. Executor-reported operating points account model weights, context
+capacity, and device/host placement; model loads, epoch reloads, retirement,
+and unload use transactional publication and active-reference draining.
+Pressure selects idle LRU victims, inactive mapped contexts can spill through
+the native sequence-state ABI and restore exactly, and `/native/status`
+reports configured budgets, resident epochs, and lifecycle/tier metrics.
 
 ## Run the real-model inference integration test
 
@@ -42,7 +43,7 @@ the prompts, inferred token IDs, checkpoint sizes, and exactness results.
 With the validation GGUF and NVIDIA runtime available, run:
 
 ```sh
-docker compose run --rm mapped-proof
+docker compose -f compose.test.yaml run --rm mapped-proof
 ```
 
 The command forks four device-resident sequence mappings, activates and
@@ -70,6 +71,37 @@ configuration, provenance, selected GPU UUID, exactness results, prompt phase
 timings, cache work, transfers, and device/host accounting, is written to
 `results/phase6c-server.json`.
 
+## Run the Phase 7 residency report
+
+With the validation GGUF and NVIDIA runtime available, run:
+
+```sh
+CUSCO_GPU_DEVICE_ID=0 tools/phase7-report.sh
+```
+
+The workflow runs the GPU-less per-file coverage gate, then exercises the live
+resident server with two immutable model identities, a transactional epoch
+reload, model removal, accounting checks, graceful restart, and post-restart
+inference. Machine-readable GPU, epoch, resident-set, capacity, lifecycle, and
+latency evidence is written to `results/phase7-server.json`.
+
+
+## Run the production Compose service
+
+Place the initial model at `data/models/gemma-4-e2b-it.gguf`, then provide an
+authentication token and start the release-binary service:
+
+```sh
+mkdir -p data/models data/state data/spill
+CUSCO_BEARER_TOKEN='replace-with-a-secret' docker compose up --build -d server
+```
+
+The production definition listens on `127.0.0.1:8080` by default, persists the
+catalog and contexts under `data/state`, and keeps bounded context spills under
+`data/spill`. `CUSCO_LISTEN_ADDRESS`, `CUSCO_PORT`, `CUSCO_GPU_DEVICE_ID`,
+`CUSCO_MODEL_FILE`, and the documented capacity environment variables can
+override the defaults. The entire `data/` tree is intentionally ignored by
+Git and excluded from image build contexts.
 
 ## Run the minimal server
 
@@ -85,8 +117,24 @@ Pass `--bearer-token` to require authentication. Listening anonymously on a
 non-loopback address is rejected unless
 `--unsafe-public-unauthenticated` is explicitly supplied.
 
-The checked OpenAPI document is served at `/openapi.json`. OpenAI-compatible
-entry points are `/v1/completions`, `/v1/chat/completions`, and `/v1/models`.
+HTTP transport diagnostics have three levels selected with
+`--http-debug <off|safe|full>` or `CUSCO_HTTP_DEBUG`. An explicit CLI value
+overrides the environment; the default is `off`. `safe` writes correlated
+JSON-line request, response, and streaming-chunk records to stderr without
+buffering the response. It omits request headers, redacts every JSON string
+value, preserves only JSON structure and non-string scalars, and omits
+non-JSON or body data above 64 KiB. `full` records the complete URI (including
+the query), request and response headers, and unredacted request/response body
+frames; non-UTF-8 values are represented as hexadecimal. Full mode exposes
+credentials and generated content and must be enabled only in a controlled
+diagnostic environment. Traced responses include the correlation ID in
+`x-request-id`.
+
+The checked OpenAPI document is served at `/openapi.json`. The current minimal
+completion and chat entry points are `/v1/completions`,
+`/v1/chat/completions`, and `/v1/models`; they do not yet claim the Phase 9
+OpenAI compatibility contract, including chat-template and tool semantics or
+OpenAI-native streaming chunks.
 Native `/native/models`, `/native/contexts`, and `/native/requests` operations
 cover model lifecycle, durable contexts and branches, imports, and
 cancellation. Server inference uses registered local model paths and does not
@@ -94,12 +142,10 @@ implicitly fetch models.
 
 ## Future goals
 
-Development is planned to proceed from the proven mapped-execution boundary
-toward:
+Development now proceeds from dynamic residency toward:
 
-- integration of mapped execution with live server scheduling;
-- production hardening of the inference and model-management server;
-- broader compatibility, operational hardening, and recovery behavior;
+- workload scheduling and operational hardening;
+- broader protocol and model compatibility, recovery, and deployment behavior;
 - optional semantic context compaction once the underlying state system is proven reliable.
 
 Each stage is intended to remain gated by correctness and measurable capacity results. The full design and phased acceptance criteria are documented in `docs/outline.md`.
