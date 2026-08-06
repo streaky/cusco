@@ -57,6 +57,7 @@ artifact["checks"] = {
         .get("metrics", {})
         .get("diagnostic_records_lost") == 0,
 }
+artifact["passed"] = all(artifact["checks"].values())
 ARTIFACT.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
 failed = [name for name, passed in artifact["checks"].items() if not passed]
 if failed:
