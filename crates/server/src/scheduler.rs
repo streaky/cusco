@@ -301,6 +301,14 @@ impl FairPolicy {
             (tokens.max(1) as i64).saturating_mul(scale);
     }
 
+    fn clear_if_idle(&mut self, flow: &FlowKey, jobs: &HashMap<u64, Job>) {
+        if !self.runnable.iter().any(|entry| &entry.flow == flow)
+            && !jobs.values().any(|job| &job.flow == flow)
+        {
+            self.deficits.remove(flow);
+        }
+    }
+
     fn remove(&mut self, id: u64) -> bool {
         let previous = self.runnable.len();
         self.runnable.retain(|entry| entry.id != id);
@@ -699,7 +707,6 @@ fn handle_command(
                 },
             );
             policy.enqueue(id, flow, admitted_round, admitted_at);
-            counters.admitted.fetch_add(1, Ordering::Relaxed);
         }
         Command::Continue(id) => {
             if let Some(job) = jobs.get(&id) {
@@ -710,23 +717,27 @@ fn handle_command(
         Command::Stop(id) => {
             counters.waiting.fetch_sub(1, Ordering::AcqRel);
             if let Some(mut job) = jobs.remove(&id) {
+                let flow = job.flow.clone();
                 let result = job
                     .session
                     .as_mut()
                     .ok_or_else(|| Error::State("scheduler session was not started".into()))
                     .and_then(|session| session.finish());
                 send_terminal(job, result, counters);
+                policy.clear_if_idle(&flow, jobs);
             }
         }
         Command::Cancel(id) => {
             let was_runnable = policy.remove(id);
             if let Some(job) = jobs.remove(&id) {
+                let flow = job.flow.clone();
                 if job.session.is_some() && !was_runnable {
                     counters.waiting.fetch_sub(1, Ordering::AcqRel);
                 }
                 job.control.cancel();
                 let _ = job.response.send(ClientMessage::Failed(Error::Cancelled));
                 counters.cancelled.fetch_add(1, Ordering::Relaxed);
+                policy.clear_if_idle(&flow, jobs);
             }
         }
         Command::Shutdown => unreachable!("shutdown is handled by the scheduler loop"),
@@ -830,10 +841,11 @@ fn execute_quantum(
             },
         },
     );
-
     if let Some(result) = terminal {
         let job = jobs.remove(&selection.id).expect("terminal job exists");
+        let flow = job.flow.clone();
         send_terminal(job, result, counters);
+        policy.clear_if_idle(&flow, jobs);
     } else if !wait_for_consumer {
         let job = jobs.get(&selection.id).expect("runnable job exists");
         policy.enqueue(
