@@ -50,7 +50,7 @@ services:
     ports:
       - "${CUSCO_LISTEN_ADDRESS:-127.0.0.1}:${CUSCO_PORT:-11443}:8080"
     volumes:
-      - ./models:/data/models
+      - ./data/models:/data/models
       - ./data/state:/data/state
       - ./data/spill:/data/spill
     deploy:
