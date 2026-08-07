@@ -17,6 +17,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("download failed: {0}")]
     Http(#[from] ureq::Error),
+    #[error("invalid GGUF metadata: {0}")]
+    InvalidMetadata(String),
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelRecord {
@@ -24,6 +26,61 @@ pub struct ModelRecord {
     pub path: PathBuf,
     pub sha256: String,
     pub size: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ModelMetadata {
+    pub architecture: String,
+    pub name: Option<String>,
+}
+
+fn read_u32(reader: &mut impl Read) -> Result<u32, Error> {
+    let mut bytes = [0; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+fn read_u64(reader: &mut impl Read) -> Result<u64, Error> {
+    let mut bytes = [0; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+fn read_string(reader: &mut impl Read) -> Result<String, Error> {
+    let length = usize::try_from(read_u64(reader)?).map_err(|_| Error::InvalidMetadata("string length exceeds address space".into()))?;
+    if length > 16 << 20 { return Err(Error::InvalidMetadata("metadata string exceeds 16 MiB".into())); }
+    let mut bytes = vec![0; length];
+    reader.read_exact(&mut bytes)?;
+    String::from_utf8(bytes).map_err(|_| Error::InvalidMetadata("metadata string is not UTF-8".into()))
+}
+fn skip_value(reader: &mut impl Read, kind: u32) -> Result<(), Error> {
+    let bytes = match kind { 0 | 1 | 7 => 1, 2 | 3 => 2, 4 | 5 | 6 => 4, 10 | 11 | 12 => 8, 8 => { let _ = read_string(reader)?; return Ok(()); }, 9 => { let element = read_u32(reader)?; let count = read_u64(reader)?; if count > 1_000_000 { return Err(Error::InvalidMetadata("metadata array is unreasonably large".into())); } for _ in 0..count { skip_value(reader, element)?; } return Ok(()); }, _ => return Err(Error::InvalidMetadata(format!("unknown metadata type {kind}"))) };
+    let mut buffer = [0; 8];
+    reader.read_exact(&mut buffer[..bytes])?;
+    Ok(())
+}
+
+pub fn probe_gguf(path: impl AsRef<Path>) -> Result<ModelMetadata, Error> {
+    let mut reader = File::open(path)?;
+    let mut magic = [0; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != b"GGUF" { return Err(Error::InvalidMetadata("missing GGUF magic".into())); }
+    let version = read_u32(&mut reader)?;
+    if !(2..=3).contains(&version) { return Err(Error::InvalidMetadata(format!("unsupported GGUF version {version}"))); }
+    let _tensor_count = read_u64(&mut reader)?;
+    let metadata_count = read_u64(&mut reader)?;
+    if metadata_count > 1_000_000 { return Err(Error::InvalidMetadata("metadata entry count is unreasonably large".into())); }
+    let mut architecture = None;
+    let mut name = None;
+    for _ in 0..metadata_count {
+        let key = read_string(&mut reader)?;
+        let kind = read_u32(&mut reader)?;
+        if (key == "general.architecture" || key == "general.name") && kind == 8 {
+            let value = read_string(&mut reader)?;
+            if key == "general.architecture" { architecture = Some(value); } else { name = Some(value); }
+        } else {
+            skip_value(&mut reader, kind)?;
+        }
+    }
+    Ok(ModelMetadata { architecture: architecture.ok_or_else(|| Error::InvalidMetadata("general.architecture is absent".into()))?, name })
 }
 fn digest(path: &Path) -> Result<(String, u64), Error> {
     let mut f = File::open(path)?;
@@ -134,5 +191,22 @@ mod tests {
             parse_hf("hf://models/a/b@0123456789012345678901234567890123456789/../escape.gguf"),
             Err(Error::InvalidUri)
         ));
+    }
+    #[test]
+    fn probes_architecture_from_gguf_metadata() {
+        let path = std::env::temp_dir().join(format!("cusco-probe-{}.gguf", std::process::id()));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&20_u64.to_le_bytes());
+        bytes.extend_from_slice(b"general.architecture");
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        bytes.extend_from_slice(&6_u64.to_le_bytes());
+        bytes.extend_from_slice(b"gemma3");
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(probe_gguf(&path).unwrap().architecture, "gemma3");
+        fs::remove_file(path).unwrap();
     }
 }

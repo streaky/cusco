@@ -1,6 +1,6 @@
 schema_version: 1
 families:
-  - id: gemma-4-e2b-it
+  - id: gemma3
     architecture: gemma3
     model_type: gemma3_text
     block_size: 32

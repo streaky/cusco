@@ -193,13 +193,14 @@ fn run(command: Command) -> Result<()> {
                     &declaration.name,
                     declaration.sha256.as_deref(),
                 )?;
+                let metadata = cusco_model_registry::probe_gguf(&registered.path)?;
                 let model = server.register_model(ModelRecord {
                     id: declaration.name,
                     revision: registered.sha256.clone(),
                     path: registered.path,
                     sha256: registered.sha256,
                     aliases: declaration.aliases,
-                    family: declaration.family,
+                    family: metadata.architecture,
                     size_bytes: registered.size,
                     epoch: 0,
                 })?;
@@ -935,7 +936,7 @@ mod tests {
             serde_json::to_vec(&json!({
                 "version": 1,
                 "name": "model-free",
-                "model_family": "gemma-4-e2b-it",
+                "model_family": "gemma3",
                 "policy": {
                     "version": 1,
                     "interactive_weight": 4,

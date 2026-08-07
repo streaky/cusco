@@ -893,7 +893,7 @@ mod tests {
                 path: PathBuf::from("m.gguf"),
                 sha256: String::new(),
                 aliases: vec![],
-                family: "gemma-4-e2b-it".into(),
+                family: "gemma3".into(),
                 size_bytes: 1,
                 epoch: 1,
             },

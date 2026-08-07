@@ -814,7 +814,7 @@ mod tests {
             path: PathBuf::from("mock://deterministic"),
             sha256: revision.into(),
             aliases: vec![],
-            family: "gemma-4-e2b-it".into(),
+            family: "gemma3".into(),
             size_bytes: bytes,
             epoch,
         }

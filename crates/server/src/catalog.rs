@@ -28,15 +28,12 @@ pub struct UserModelConfig {
     pub path: PathBuf,
     #[serde(default)]
     pub sha256: Option<String>,
-    #[serde(default = "default_family")]
-    pub family: String,
     #[serde(default)]
     pub aliases: Vec<String>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UserModels { #[serde(default)] pub models: Vec<UserModelConfig> }
-fn default_family() -> String { "gemma".into() }
 
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
