@@ -2290,10 +2290,25 @@ async fn chat(
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum ResponsesInput {
+    Text(String),
+    Items(Vec<ResponsesInputItem>),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesInputItem {
+    #[serde(default = "default_user_role")]
+    role: String,
+    content: ChatContent,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResponsesRequest {
     model: String,
-    input: String,
+    input: ResponsesInput,
     #[serde(default)]
     max_output_tokens: Option<usize>,
     #[serde(default)]
@@ -2330,12 +2345,26 @@ async fn responses(
         r.reasoning_effort.as_ref(),
     )?;
     let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
-    s.model(&r.model)?;
+    let model = s.model(&r.model)?;
+    let input = match r.input {
+        ResponsesInput::Text(text) => text,
+        ResponsesInput::Items(items) => lower_messages(
+            &model.family,
+            items
+                .into_iter()
+                .map(|item| ChatMessage {
+                    role: item.role,
+                    content: item.content,
+                })
+                .collect(),
+            s.vision_config(),
+        )?,
+    };
     drop(permit);
     infer_response(
         s,
         r.model,
-        r.input,
+        input,
         r.max_output_tokens,
         sampling,
         true,
