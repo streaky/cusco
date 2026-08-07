@@ -263,9 +263,9 @@ struct CanonicalGenerationRequest {
 }
 
 struct CompactionRequest {
-    strategy: StrategyId,           // required if `compaction` is present
-    trigger: CompactionTrigger,     // explicit (request-only, no background guessing)
-    strategy_config: JsonValue,     // strategy-specific policy overrides
+    strategy_preferences: Vec<StrategyId>, // ordered list, empty => no compaction
+    trigger: CompactionTrigger,            // explicit (request-only, no background guessing)
+    strategy_config: JsonValue,            // strategy-specific policy overrides
 }
 
 enum CompactionTrigger {
@@ -276,27 +276,15 @@ enum CompactionTrigger {
 }
 ```
 
-All external APIs that can influence generation must accept an explicit `compaction` request parameter with the same type requirement. If present, `compaction.strategy` must name a concrete built-in strategy identifier from the v1 strategy registry snapshot (currently `window_tail`). Unknown values are rejected as validation errors at admission.
+All external APIs that can influence generation must accept an explicit `compaction` request parameter with the same type requirement. If present, `compaction.strategy_preferences` is an ordered preference list evaluated at admission/selection time. Unknown values are rejected as validation errors. If the list is empty or no preference is supported in this build, compaction is treated as explicit no-compaction (`nocompact`) for that request.
 
-The accepted strategy identifier set is dynamic across release versions, but for the current v1 baseline it is build-time closed-world: only identifiers compiled and registered in this release are valid on admission. Later releases may widen this set by changing the compiled strategy registry contract (for example to add custom/native policy kinds), and clients must adapt by negotiating the new version.
+The accepted strategy identifier set is dynamic across release versions, but for the current v1 baseline it is build-time closed-world: only identifiers compiled and registered in this release are valid on admission. Later releases may widen this set by changing the compiled strategy registry contract (for example to add custom/native policy kinds); clients should discover supported values from catalog APIs instead of relying on undocumented assumptions.
 
 Protocol adapters may map their own extension fields onto this canonical object (for example, an OpenAI extension field `cusco_compaction` and an Ollama options field `cusco_compaction`). Inference adapters must validate and reject unknown enum values instead of treating the request as a boolean toggle.
+
+`ContextLifecycleService::list_strategies` should include current strategy catalog version and supported ids so clients can negotiate capabilities before sending preference lists.
+
 A separate context-lifecycle service should still accept advisory client-presence signals and expose strategy discovery without making any external protocol adapter responsible for compaction policy:
-
-```rust
-trait ContextLifecycleService {
-    async fn list_strategies(
-        &self,
-        caller: RequestContext,
-    ) -> Result<Vec<ContextStrategyDescriptor>, ServiceError>;
-
-    async fn signal_activity(
-        &self,
-        signal: ContextActivitySignal,
-        caller: RequestContext,
-    ) -> Result<(), ServiceError>;
-}
-```
 
 Capabilities that neither compatibility protocol models—including durable logical contexts, branch selection and import, cache and compaction policy, activity hints, extended usage, and explicit request cancellation—belong to the versioned `/cusco/v1/*` API. They must remain visible in the generated OpenAPI document and must not be smuggled into unrelated OpenAI or Ollama fields. The final Phase 9 surface contains no `/native/*` routes.
 
@@ -1715,9 +1703,6 @@ diagnostic loss, and all thresholds. Tuning those policy parameters after
 observing a working system requires a new versioned fixture and evidence; it
 does not require changing the resumable execution contract.
 
-- OpenAI compatibility covers completions, chat completions, the Responses API, streaming, text and bounded image input, tools/tool calls, response formats, temperature, `top_p`, output-token limits, and reasoning effort. The canonical internal reasoning-effort enum is `none`, `low`, `medium`, `high`, or `max`, and the OpenAI `reasoning_effort` request parameter maps onto it. Cusco adds an explicit extension field `cusco_compaction` for request-scoped compaction opt-in; the value is a strategy enum (currently only `window_tail`) and omission means no compaction speculation. Cusco maps the canonical value onto the selected strategy gate and rejects unknown values. Ollama's `think` behavior is the reasonable compatibility model: a selected model may support on/off, may support levels, or may ignore levels according to its template and capabilities. Cusco maps the canonical value onto the closest supported model behavior, applies capability checks, and does not claim universal token budgets or quality guarantees.
-- Ollama compatibility covers the equivalent generation and chat operations, streaming, vision, model lifecycle, and the other Ollama controls supported by the same canonical services. In its request options object, an explicit strategy enum field `cusco_compaction` enables request-scoped predictive compaction and must be one of the registered strategy IDs (currently `window_tail`); absence is treated as disabled. Cusco-specific context, scheduling, cancellation, usage, and lifecycle capabilities remain available through `/cusco/v1/*`, rather than creating a second execution path.
-
 The implemented Phase 8 contract uses a protocol-neutral `ExecutionSession`
 boundary and a replaceable priority-aware deficit-round-robin scheduler with
 per-principal/class flows, FIFO equivalence ordering, monotonic age promotion,
@@ -1726,8 +1711,7 @@ metadata carries distinct transport, inference-operation, and execution-session
 identifiers. Native slot occupancy is scoped to each activation, prefill, or
 decode quantum, and native abort registration remains live through that
 quantum's completion fence. Every scheduler decision records policy attribution
-and resource observations through a bounded asynchronous sink with exact loss
-counters; HTTP debug tracing remains a separate opt-in transport diagnostic.
+
 
 `config/phase8-workload.json` freezes the versioned real-GPU workload, policy,
 and acceptance thresholds. `tools/phase8-report.sh` runs the per-file coverage
@@ -1745,8 +1729,8 @@ Freeze and deliver the external product contract only after the live execution a
 
 The initial Phase 9 release deliberately favors a useful, bounded compatibility contract over exhaustive protocol coverage or restart-preserved execution state. These are provisional v1 decisions and may be refined before implementation, but they define the current planning baseline:
 
-- OpenAI compatibility covers completions, chat completions, the Responses API, streaming, text and bounded image input, tools/tool calls, response formats, temperature, `top_p`, output-token limits, and reasoning effort. The canonical internal reasoning-effort enum is `none`, `low`, `medium`, `high`, or `max`, and the OpenAI `reasoning_effort` request parameter maps onto it. Ollama's `think` behavior is the reasonable compatibility model: a selected model may support only on/off, may support levels, or may ignore levels according to its template and capabilities. Cusco maps the canonical value onto the closest supported model behavior, applies capability checks and any configured safety ceiling, and must not claim universal token budgets or quality guarantees. A seed is desirable and should be supported where practical, but v1 does not promise cross-version or cross-hardware bitwise reproducibility for ordinary sampled generation.
-- Ollama compatibility covers the equivalent generation and chat operations, streaming, vision, model lifecycle, and the other Ollama controls supported by the same canonical services. Cusco-specific context, scheduling, cancellation, usage, and lifecycle capabilities remain available through `/cusco/v1/*`, rather than creating a second execution path.
+- OpenAI compatibility covers completions, chat completions, the Responses API, streaming, text and bounded image input, tools/tool calls, response formats, temperature, `top_p`, output-token limits, reasoning effort, and explicit compaction control. The canonical internal reasoning-effort enum is `none`, `low`, `medium`, `high`, or `max`; the OpenAI `reasoning_effort` request parameter maps onto it. Cusco adds an explicit extension field `cusco_compaction` for request-scoped compaction opt-in: an ordered preference list of strategy ids where the first supported strategy is selected. An explicit empty list means no-compaction, and if no configured strategy in the list is supported the request is treated as explicit no-compaction. Unknown strategy ids are rejected as validation errors. In this release, only `window_tail` is currently available from the registered set. Ollama's `think` behavior is the compatibility model: a selected model may support only on/off, may support levels, or may ignore levels according to its template and capabilities. Cusco maps the canonical value onto the closest supported model behavior, applies capability checks and any configured safety ceiling, and must not claim universal token budgets or quality guarantees.
+- Ollama compatibility covers the equivalent generation and chat operations, streaming, vision, model lifecycle, and the other Ollama controls supported by the same canonical services. In request options, `cusco_compaction` is the same ordered preference list mechanism; empty/unsupported lists are explicit no-compaction and unknown ids are validation errors. It must be one of the registered strategy IDs (currently `window_tail`) in this release. Cusco-specific context, scheduling, cancellation, usage, and lifecycle capabilities remain available through `/cusco/v1/*`, rather than creating a second execution path.
 - Embeddings and direct tokenizer access are deferred. Unsupported protocol fields and capabilities must be rejected explicitly rather than silently discarded.
 - Vision input is inline base64/data-URI content only in v1. Remote URLs and local filesystem references are rejected. Accept static JPEG, PNG, WebP, and GIF inputs where the selected model/projector supports them; reject animated images, SVG-as-image input, BMP, TIFF, and other unsupported formats rather than silently choosing a frame or transforming the content. SVG remains ordinary text content unless a future capability explicitly renders it. Validate the declared MIME type against decoded content. Rust decodes base64 in the adapter/admission boundary before enforcing decoded-byte and image-dimension limits, while separately enforcing encoded transport limits; this prevents base64 expansion from masking actual memory usage. Reasonable default limits for image count, encoded and decoded bytes, pixel dimensions, total pixels, and supported MIME types are validated before model admission; administrators may tune those limits in `config.yaml` within implementation-defined hard safety bounds. Admission limits must account for the selected native projector's patch/grid multipliers and model-specific image-token expansion, not only raw pixel dimensions, so apparently safe images cannot overflow downstream tensor or context budgets. Encoded size is a transport and memory-safety guard, not a billing unit: compressed and uncompressed images with the same dimensions may have very different byte sizes, while model-facing image usage is accounted in the model's applicable input-token or equivalent processing units where measurable. Invalid or over-limit images produce explicit request errors rather than being dropped or transparently resized. Tool use does not grant implicit filesystem, URL, shell, or network access. Cusco v1 supports client-declared function tools that produce calls for external execution and client-supplied results; remote code agents are a supported use case because an agent runner can connect to Cusco, execute code-agent actions in its own environment, and return results without granting Cusco host access. Cusco-native tool execution is not part of v1. The model-facing orchestration, streaming, cancellation, deadlines, repeated tool-call/result turns, bounded argument/result sizes, explicit truncation markers, and usage metering are defined for external function tools, while unsupported native capabilities are rejected explicitly. Tool definitions are validated against the supported intersection of the declared OpenAI- and Ollama-compatible function-tool contracts: unsupported schema features, duplicate names, malformed definitions, and stale or mismatched continuation results are rejected explicitly rather than silently coerced.
 - Model registration and capability probing determine whether a model/projector supports vision. Requests containing image content are rejected at the HTTP/CLI admission boundary when the selected model lacks that capability; images are never silently discarded, converted to text, or routed to another model in v1. Model metadata exposes the supported modalities for client discovery.
