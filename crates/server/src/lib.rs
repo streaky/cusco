@@ -1946,6 +1946,9 @@ impl Server {
 }
 
 fn compaction_native_trim(native_tokens: &[i32], token_count: usize) -> Option<Vec<i32>> {
+    if native_tokens.is_empty() {
+        return Some(Vec::new());
+    }
     (token_count <= native_tokens.len()).then_some(
         native_tokens
             .get(native_tokens.len().saturating_sub(token_count)..)?
@@ -3090,8 +3093,14 @@ enum WireProtocol {
 fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
     if matches!(protocol, WireProtocol::OpenAiResponses) {
         match event {
-            StreamEvent::Started { request_id, .. } => return [
-                json!({"type":"response.created","response":{"id":request_id,"status":"in_progress"}}),
+            StreamEvent::Started {
+                request_id,
+                correlation_id,
+                inference_id,
+                execution_session_id,
+                ..
+            } => return [
+                json!({"type":"response.created","response":{"id":request_id,"status":"in_progress","metadata":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}}}),
                 json!({"type":"response.output_item.added","item":{"id":"msg_0","type":"message","role":"assistant","status":"in_progress"},"output_index":0}),
                 json!({"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
             ].into_iter().map(|value| format!("data: {value}\n\n")).collect(),
@@ -5382,5 +5391,140 @@ mod tests {
         assert_eq!(mismatch.target_tokens, None);
         drop(server);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn compacting_request(context_id: ContextId) -> InferRequest {
+        InferRequest {
+            model: "m".into(),
+            prompt: "new question".into(),
+            max_tokens: 2,
+            context_id: Some(context_id),
+            compaction: Some(CompactionRequest {
+                target_tokens: Some(4),
+                ..CompactionRequest::default()
+            }),
+            deadline_ms: None,
+            stop: vec![],
+            raw_continuation: false,
+            sampling: SamplingConfig::default(),
+            scheduling: SchedulingMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn compaction_success_successor_commit() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let source = server
+            .import_context(vec![
+                "<start_of_turn>system".into(),
+                "policy".into(),
+                "<start_of_turn>user".into(),
+                "older question".into(),
+            ])
+            .unwrap();
+        let (response, _) = server.infer("compact-success", compacting_request(source.id.clone())).unwrap();
+        let result = response.usage.compaction_result.unwrap();
+        let successor = server.context(&source.id).unwrap();
+        assert!(result.success);
+        assert_eq!(result.selected_strategy_id.as_deref(), Some("window_tail:v1"));
+        assert_eq!(successor.revision, source.revision + 1);
+        assert!(successor.tokens.iter().any(|token| token.contains("system")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compaction_failure_rolls_back_source_context() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let source = server.import_context(vec!["one".into(), "two".into()]).unwrap();
+        let mut request = compacting_request(source.id.clone());
+        request.compaction.as_mut().unwrap().strategy_preferences = vec!["missing".into()];
+        request.compaction.as_mut().unwrap().fallback_when_no_match =
+            CompactionNoMatchFallback::Reject;
+        assert!(matches!(
+            server.infer("compact-failure", request),
+            Err(Error::BadRequest(_))
+        ));
+        assert_eq!(server.context(&source.id).unwrap(), source);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compaction_cancel_disconnect_race() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let source = server.import_context(vec!["one".into(), "two".into()]).unwrap();
+        server.cancel("compact-cancel");
+        assert!(matches!(
+            server.infer("compact-cancel", compacting_request(source.id.clone())),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(server.context(&source.id).unwrap(), source);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn semantic_regression_pronoun_continuity() {
+        let tokens = vec![
+            "<start_of_turn>system".into(), "Refer to Ada by name.".into(),
+            "<start_of_turn>user".into(), "Ada designed the plan.".into(),
+            "<start_of_turn>assistant".into(), "Ada designed it.".into(),
+            "<start_of_turn>user".into(), "What did she design?".into(),
+        ];
+        let proposal = apply_window_tail_strategy(&tokens, 6, &[]).unwrap();
+        assert!(proposal.resulting_tokens.iter().any(|token| token.contains("Ada")));
+        assert!(proposal.resulting_tokens.iter().any(|token| token.contains("she")));
+    }
+
+    #[test]
+    fn semantic_regression_instruction_retention() {
+        let tokens = vec![
+            "<start_of_turn>system".into(), "Answer in JSON.".into(),
+            "<start_of_turn>user".into(), "old request".into(),
+            "<start_of_turn>assistant".into(), "old response".into(),
+            "<start_of_turn>user".into(), "latest request".into(),
+        ];
+        let proposal = apply_window_tail_strategy(&tokens, 4, &[]).unwrap();
+        assert!(proposal.resulting_tokens.iter().any(|token| token == "Answer in JSON."));
+    }
+
+    #[test]
+    fn semantic_regression_tool_call_consistency() {
+        let tokens = vec![
+            "<start_of_turn>system".into(), "policy".into(),
+            "<start_of_turn>tool".into(), "weather contract".into(),
+            "<start_of_turn>user".into(), "weather?".into(),
+        ];
+        let proposal = apply_window_tail_strategy(&tokens, 4, &[]).unwrap();
+        assert!(proposal.resulting_tokens.iter().any(|token| token.contains("tool")));
+        assert!(proposal.resulting_tokens.iter().any(|token| token == "weather contract"));
+    }
+
+    #[test]
+    fn semantic_regression_followup_fidelity() {
+        let tokens = vec![
+            "<start_of_turn>system".into(), "policy".into(),
+            "<start_of_turn>user".into(), "first".into(),
+            "<start_of_turn>assistant".into(), "answer".into(),
+            "<start_of_turn>user".into(), "follow up".into(),
+        ];
+        let proposal = apply_window_tail_strategy(&tokens, 5, &[]).unwrap();
+        assert!(proposal.resulting_tokens.iter().any(|token| token == "follow up"));
+    }
+
+    #[test]
+    fn openai_responses_stream_correlates_ids() {
+        let row = stream_row(
+            WireProtocol::OpenAiResponses,
+            StreamEvent::Started {
+                request_id: "transport".into(),
+                context_id: ContextId::new(),
+                correlation_id: "correlation".into(),
+                inference_id: "inference".into(),
+                execution_session_id: "session".into(),
+            },
+            false,
+        );
+        assert!(row.contains("\"correlation_id\":\"correlation\""));
+        assert!(row.contains("\"inference_id\":\"inference\""));
+        assert!(row.contains("\"execution_session_id\":\"session\""));
     }
 }

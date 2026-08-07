@@ -160,7 +160,6 @@ pub fn apply_window_tail_strategy(
     let requested_budget = target.max(1);
     let source_message_count = source_messages(source_tokens);
     let anchors = anchor_indices(source_tokens);
-    let turns = split_turns(source_tokens);
 
     if source_tokens.is_empty() {
         return Ok(CompactionProposal {
@@ -205,67 +204,58 @@ pub fn apply_window_tail_strategy(
         });
     }
 
-    let mut retained_turns = Vec::new();
+    let indexed_turns = split_indexed_turns(source_tokens);
+    let mut retained = Vec::new();
     let mut used_tokens = 0usize;
 
-    for turn in turns.iter().rev() {
+    for turn in &indexed_turns {
+        if turn_has_policy_anchor(turn) && used_tokens + turn.len() <= requested_budget {
+            used_tokens += turn.len();
+            retained.extend(turn.iter().cloned());
+        }
+    }
+
+    for turn in indexed_turns.iter().rev() {
+        if turn.iter().any(|(index, _)| anchors.contains(index)) {
+            continue;
+        }
         if used_tokens + turn.len() > requested_budget {
-            if includes_policy_anchor(turn) {
-                continue;
-            }
-            break;
+            continue;
         }
-        retained_turns.push(turn);
         used_tokens += turn.len();
-        if used_tokens >= requested_budget {
-            break;
-        }
+        retained.extend(turn.iter().cloned());
     }
 
-    if retained_turns.is_empty() {
-        let start = anchors.first().copied().unwrap_or(0);
-        let fallback_count = source_tokens.len().saturating_sub(start);
-        let retained_count = fallback_count.min(requested_budget);
-        let resulting_tokens = source_tokens[source_tokens.len() - retained_count..].to_vec();
-        let retained_indices: Vec<usize> = (source_tokens.len() - retained_count..source_tokens.len()).collect();
-        return Ok(CompactionProposal {
-            resulting_tokens,
-            result: CompactionResult {
-                compact_mode: "window_tail".into(),
-                compact_reason: CompactionResultReason::AnchorsOnly,
-                requested_strategy_ids: requested.to_vec(),
-                selected_strategy_id: Some(WINDOW_TAIL_STRATEGY_ID.into()),
-                requested_strategy_budget: requested_budget,
-                resulting_budget: retained_indices.len(),
-                retained_indices,
-                retained_message_count: 1,
-                source_message_count,
-                retained_anchor_count: anchors.len().min(1),
-                success: true,
-                fallback: true,
-                resulting_context_epoch: 1,
-            },
-        });
+
+    if retained.is_empty() {
+        retained.extend(
+            source_tokens
+                .iter()
+                .enumerate()
+                .skip(source_tokens.len().saturating_sub(requested_budget))
+                .map(|(index, token)| (index, token.clone())),
+        );
+        used_tokens = retained.len();
     }
-
-    retained_turns.reverse();
-    let resulting_tokens = retained_turns
-        .into_iter()
-        .flat_map(|turn| turn.iter().cloned())
-        .collect::<Vec<_>>();
-    let retained_indices = resulting_tokens
-        .iter()
-        .map(|token| source_tokens.iter().position(|source| source == token).unwrap_or(0))
-        .collect::<Vec<_>>();
-
+    retained.sort_by_key(|(index, _)| *index);
+    let retained_indices = retained.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+    let resulting_tokens = retained.into_iter().map(|(_, token)| token).collect::<Vec<_>>();
+    let compact_reason = if used_tokens > requested_budget
+        || (!anchors.is_empty()
+            && !retained_indices.iter().any(|index| anchors.contains(index)))
+    {
+        CompactionResultReason::AnchorsOnly
+    } else {
+        CompactionResultReason::BudgetTrimmed
+    };
     Ok(CompactionProposal {
         result: CompactionResult {
             compact_mode: "window_tail".into(),
-            compact_reason: CompactionResultReason::BudgetTrimmed,
+            compact_reason,
             requested_strategy_ids: requested.to_vec(),
             selected_strategy_id: Some(WINDOW_TAIL_STRATEGY_ID.into()),
             requested_strategy_budget: requested_budget,
-            resulting_budget: used_tokens,
+            resulting_budget: resulting_tokens.len(),
             retained_indices: retained_indices.clone(),
             retained_message_count: split_turns(&resulting_tokens).len(),
             source_message_count,
@@ -274,11 +264,26 @@ pub fn apply_window_tail_strategy(
                 .filter(|index| anchors.contains(index))
                 .count(),
             success: true,
-            fallback: false,
+            fallback: used_tokens > requested_budget,
             resulting_context_epoch: 1,
         },
         resulting_tokens,
     })
+}
+
+fn split_indexed_turns(tokens: &[String]) -> Vec<Vec<(usize, String)>> {
+    let mut turns = Vec::new();
+    let mut current = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if is_role_boundary(token) && !current.is_empty() {
+            turns.push(std::mem::take(&mut current));
+        }
+        current.push((index, token.clone()));
+    }
+    if !current.is_empty() {
+        turns.push(current);
+    }
+    turns
 }
 
 fn split_turns(tokens: &[String]) -> Vec<Vec<String>> {
@@ -323,12 +328,13 @@ fn anchor_indices(tokens: &[String]) -> Vec<usize> {
         .collect()
 }
 
-fn includes_policy_anchor(tokens: &[String]) -> bool {
-    tokens
-        .iter()
-        .any(|token| token.starts_with("<start_of_turn>system") || token.starts_with("<start_of_turn>tool"))
-}
 
+
+fn turn_has_policy_anchor(turn: &[(usize, String)]) -> bool {
+    turn.iter().any(|(_, token)| {
+        token.starts_with("<start_of_turn>system") || token.starts_with("<start_of_turn>tool")
+    })
+}
 fn source_messages(tokens: &[String]) -> usize {
     if tokens.is_empty() {
         0
@@ -342,7 +348,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deterministic_ids_are_versioned() {
+    fn strategy_registry_registers_deterministic_ids() {
         let catalog = strategy_catalog();
         assert_eq!(catalog.version, 1);
         assert_eq!(catalog.strategies[0].strategy_id, WINDOW_TAIL_STRATEGY_ID);
@@ -359,9 +365,10 @@ mod tests {
     }
 
     #[test]
-    fn window_tail_keeps_anchor_when_possible() {
+    fn window_tail_preserves_required_anchors() {
         let tokens: Vec<String> = vec![
-            "sys".into(),
+            "<start_of_turn>system".into(),
+            "policy".into(),
             "<start_of_turn>user".into(),
             "hello".into(),
             "world".into(),
@@ -371,15 +378,14 @@ mod tests {
         ];
         let proposal = apply_window_tail_strategy(&tokens, 6, &[WINDOW_TAIL_STRATEGY_ID.into()]).unwrap();
         let expected: Vec<String> = vec![
-            "<start_of_turn>user".into(),
-            "hello".into(),
-            "world".into(),
+            "<start_of_turn>system".into(),
+            "policy".into(),
             "<start_of_turn>assistant".into(),
             "reply".into(),
             "chain".into(),
         ];
         assert_eq!(proposal.resulting_tokens, expected);
-        assert_eq!(proposal.result.retained_anchor_count, 0);
+        assert_eq!(proposal.result.retained_anchor_count, 1);
     }
 
     #[test]
