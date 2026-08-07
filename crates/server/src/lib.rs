@@ -23,9 +23,9 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
     },
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use cusco_executor::SamplingConfig;
 use thiserror::Error;
@@ -2378,6 +2378,7 @@ async fn http_debug_middleware(
             "type": "http_debug",
             "level": debug.level,
             "direction": "in",
+            "request_id": request_id,
             "method": method,
             "path": path,
             "content_type": request_content_type,
@@ -2423,12 +2424,13 @@ async fn http_debug_middleware(
         },
     }));
     let body = body;
-    let mut chunk_index = 0usize;
+    let chunk_index = Arc::new(AtomicUsize::new(0));
     let response_content_type = parts
         .headers
         .get("content-type")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    let chunk_index = chunk_index.clone();
     let body = Body::new(body.map_frame(move |frame| {
         if let Some(bytes) = frame.data_ref() {
             let mut capture = HttpBodyCapture::full();
@@ -2438,7 +2440,7 @@ async fn http_debug_middleware(
                 "level": debug.level,
                 "direction": "out_body",
                 "request_id": request_id,
-                "chunk_index": chunk_index,
+                "chunk_index": chunk_index.fetch_add(1, Ordering::Relaxed),
                 "body": capture.rendered(debug.level, response_content_type.as_deref()),
             }));
         }
@@ -3070,7 +3072,7 @@ fn start_deadline_watchdogs(
         tokio::spawn(async move {
             tokio::time::sleep(deadline).await;
             if !control.is_complete() {
-                control.cancel();
+                control.expire();
             }
         });
     }
