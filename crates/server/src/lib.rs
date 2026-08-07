@@ -35,6 +35,7 @@ use thiserror::Error;
 use uuid::Uuid;
 mod generation;
 mod mapped;
+mod prompt;
 mod scheduler;
 mod vision;
 
@@ -2011,9 +2012,13 @@ struct ImageUrlPart {
     url: String,
 }
 
-fn lower_messages(messages: Vec<ChatMessage>, vision: VisionConfig) -> Result<String, Error> {
+fn lower_messages(
+    family: &str,
+    messages: Vec<ChatMessage>,
+    vision: VisionConfig,
+) -> Result<String, Error> {
     let admission = ImageAdmission::new(vision);
-    let mut lines = Vec::with_capacity(messages.len());
+    let mut normalized = Vec::with_capacity(messages.len());
     for message in messages {
         if !matches!(
             message.role.as_str(),
@@ -2047,9 +2052,12 @@ fn lower_messages(messages: Vec<ChatMessage>, vision: VisionConfig) -> Result<St
                 text
             }
         };
-        lines.push(format!("{}: {}", message.role, text));
+        normalized.push(prompt::Message {
+            role: message.role,
+            content: text,
+        });
     }
-    Ok(lines.join("\n"))
+    prompt::apply_chat_template(family, normalized)
 }
 
 pub fn router(server: Server) -> Router {
@@ -2258,8 +2266,8 @@ async fn chat(
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage);
-    s.model(&r.model)?;
-    let prompt = lower_messages(r.messages, s.vision_config())?;
+    let model = s.model(&r.model)?;
+    let prompt = lower_messages(&model.family, r.messages, s.vision_config())?;
     drop(permit);
     infer_response(
         s,
@@ -2400,8 +2408,8 @@ async fn ollama_chat(
     }: PrequeueJson<OllamaChatRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
-    s.model(&r.model)?;
-    let prompt = lower_messages(r.messages, s.vision_config())?;
+    let model = s.model(&r.model)?;
+    let prompt = lower_messages(&model.family, r.messages, s.vision_config())?;
     drop(permit);
     infer_response(
         s,
