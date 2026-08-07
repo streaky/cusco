@@ -27,6 +27,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+mod catalog;
 mod config;
 mod residency;
 use thiserror::Error;
@@ -36,6 +37,7 @@ mod mapped;
 mod scheduler;
 
 pub use config::{ByteSize, ConfigError, DaemonConfig, DataPaths, ExecutionConfig, VisionConfig};
+pub use catalog::{CatalogError, ModelCatalog, UserModelConfig, UserModels, load_user_models};
 pub use generation::{
     FinishReason, FrontierControl, GenerationFrontier, MAX_STOP_BYTES, MAX_STOP_SEQUENCES,
     StopAlignment,
