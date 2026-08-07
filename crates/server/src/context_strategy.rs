@@ -30,6 +30,25 @@ pub struct CompactionRequest {
     pub target_tokens: Option<usize>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CompactionDeclaration {
+    pub declaration_id: String,
+    pub context_id: String,
+    pub strategy_preferences: Vec<String>,
+    pub target_tokens: Option<usize>,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CreateCompactionDeclaration {
+    pub context_id: String,
+    #[serde(default)]
+    pub strategy_preferences: Vec<String>,
+    #[serde(default)]
+    pub target_tokens: Option<usize>,
+    pub expires_in_ms: u64,
+}
+
 impl Default for CompactionRequest {
     fn default() -> Self {
         Self {

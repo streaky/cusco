@@ -25,7 +25,7 @@ use std::{
         Arc,
         atomic::{AtomicU8, Ordering},
     },
-    time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use cusco_executor::SamplingConfig;
 use thiserror::Error;
@@ -43,10 +43,11 @@ mod residency;
 pub use catalog::{load_user_models, ModelCatalog};
 pub use config::{DaemonConfig, VisionConfig};
 pub use context_strategy::{
-    apply_window_tail_strategy, CompactionNoMatchFallback, CompactionProposal, CompactionRequest,
-    CompactionResult, CompactionResultReason, CompactionStrategyCatalog, CompactionStrategyInfo,
-    CompactionTrigger, WINDOW_TAIL_STRATEGY_ID, deterministic_strategy_id, select_strategy,
-    strategy_catalog,
+    apply_window_tail_strategy, CompactionDeclaration, CompactionNoMatchFallback,
+    CompactionProposal, CompactionRequest, CompactionResult, CompactionResultReason,
+    CompactionStrategyCatalog, CompactionStrategyInfo, CompactionTrigger,
+    CreateCompactionDeclaration, WINDOW_TAIL_STRATEGY_ID, deterministic_strategy_id,
+    select_strategy, strategy_catalog,
 };
 pub use generation::{
     FinishReason, FrontierControl, GenerationFrontier, MAX_STOP_BYTES, MAX_STOP_SEQUENCES,
@@ -1031,6 +1032,7 @@ pub struct Server {
     pre_queue: Arc<PrequeueGate>,
     model_lifecycle: Arc<Mutex<()>>,
     auth: Arc<dyn AuthProvider>,
+    declarations: Arc<Mutex<HashMap<String, CompactionDeclaration>>>,
     engine: Arc<dyn InferenceEngine>,
     catalog: Arc<Mutex<Option<ModelCatalog>>>,
     model_directory: Arc<Mutex<PathBuf>>,
@@ -1095,6 +1097,7 @@ impl Server {
             pre_queue: PrequeueGate::new(config.pre_queue_concurrency),
             model_lifecycle: Arc::new(Mutex::new(())),
             auth,
+            declarations: Arc::new(Mutex::new(HashMap::new())),
             engine,
             catalog: Arc::new(Mutex::new(None)),
             model_directory: Arc::new(Mutex::new(PathBuf::from("./data/models"))),
@@ -1219,6 +1222,49 @@ impl Server {
             .remove(id)
             .ok_or(Error::ContextNotFound)?;
         self.persist()
+    }
+    pub fn create_compaction_declaration(
+        &self,
+        request: CreateCompactionDeclaration,
+    ) -> Result<CompactionDeclaration, Error> {
+        if request.expires_in_ms == 0 || request.expires_in_ms > 3_600_000 {
+            return Err(Error::BadRequest("invalid compaction declaration lifetime".into()));
+        }
+        let context_id = parse_context(request.context_id.clone());
+        self.context(&context_id)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| Error::State("system clock before unix epoch".into()))?
+            .as_millis() as u64;
+        let declaration = CompactionDeclaration {
+            declaration_id: Uuid::new_v4().to_string(),
+            context_id: request.context_id,
+            strategy_preferences: request.strategy_preferences,
+            target_tokens: request.target_tokens,
+            expires_at_ms: now.saturating_add(request.expires_in_ms),
+        };
+        self.declarations
+            .lock()
+            .insert(declaration.declaration_id.clone(), declaration.clone());
+        Ok(declaration)
+    }
+
+    pub fn compaction_declaration(&self, id: &str) -> Result<CompactionDeclaration, Error> {
+        let declaration = self
+            .declarations
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::BadRequest("compaction declaration not found".into()))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| Error::State("system clock before unix epoch".into()))?
+            .as_millis() as u64;
+        if declaration.expires_at_ms <= now {
+            self.declarations.lock().remove(id);
+            return Err(Error::BadRequest("compaction declaration expired".into()));
+        }
+        Ok(declaration)
     }
     pub fn register_model(&self, model: ModelRecord) -> Result<ModelRecord, Error> {
         self.register_model_with(|_| Ok(()), model)
@@ -2256,6 +2302,7 @@ fn routes(server: Server) -> Router {
         .route("/cusco/v1/requests/{id}", delete(cancel_request))
         .route("/cusco/v1/status", get(native_status))
         .route("/cusco/v1/compaction/strategies", get(compaction_strategies))
+        .route("/cusco/v1/compaction/declarations", post(create_compaction_declaration))
         .route("/cusco/v1/contexts/{id}/branches", post(branch_context))
         .with_state(server)
 }
@@ -3269,6 +3316,14 @@ async fn compaction_strategies(
     auth(&s, &headers, Scope::Inference)?;
     Ok(Json(strategy_catalog()))
 }
+async fn create_compaction_declaration(
+    State(s): State<Server>,
+    headers: HeaderMap,
+    Json(request): Json<CreateCompactionDeclaration>,
+) -> Result<Json<CompactionDeclaration>, Error> {
+    auth(&s, &headers, Scope::Inference)?;
+    Ok(Json(s.create_compaction_declaration(request)?))
+}
 fn parse_context(id: String) -> ContextId {
     ContextId(id)
 }
@@ -3398,6 +3453,7 @@ pub fn openapi_document() -> Value {
             Some("ImportContextRequest"),
         ),
         ("/cusco/v1/compaction/strategies", "get", "cuscoCompactionStrategies", None),
+        ("/cusco/v1/compaction/declarations", "post", "cuscoCreateCompactionDeclaration", Some("CreateCompactionDeclaration")),
         ("/cusco/v1/contexts/{id}", "get", "cuscoContext", None),
         (
             "/cusco/v1/contexts/{id}",
