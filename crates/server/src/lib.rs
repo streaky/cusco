@@ -2376,7 +2376,6 @@ async fn http_debug_middleware(
         };
         debug.emit(json!({
             "type": "http_debug",
-            "level": debug.level,
             "direction": "in",
             "request_id": request_id,
             "method": method,
@@ -2411,10 +2410,7 @@ async fn http_debug_middleware(
         HeaderValue::from_str(&request_id).expect("UUID is a valid header value"),
     );
     debug.emit(json!({
-        "type": "http_debug",
-        "level": debug.level,
         "direction": "out",
-        "request_id": request_id,
         "status": parts.status.as_u16(),
         "duration_ms": 0,
         "headers": if debug.level == HttpDebugLevel::Full {
@@ -2435,10 +2431,7 @@ async fn http_debug_middleware(
             let mut capture = HttpBodyCapture::full();
             capture.push(bytes);
             debug.emit(json!({
-                "type": "http_debug",
-                "level": debug.level,
                 "direction": "out_body",
-                "request_id": request_id,
                 "chunk_index": chunk_index,
                 "body": capture.rendered(debug.level, response_content_type.as_deref())
             }));
