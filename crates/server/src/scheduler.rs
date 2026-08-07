@@ -893,7 +893,7 @@ mod tests {
                 path: PathBuf::from("m.gguf"),
                 sha256: String::new(),
                 aliases: vec![],
-                family: "gemma-4-e2b-it".into(),
+                family: "gemma4".into(),
                 size_bytes: 1,
                 epoch: 1,
             },
@@ -902,6 +902,7 @@ mod tests {
                 .join(" "),
             max_tokens: 2,
             prior_tokens: vec![],
+            sampling: Default::default(),
             control: Arc::new(RequestControl::new()),
             scheduling: crate::SchedulingMetadata {
                 class,

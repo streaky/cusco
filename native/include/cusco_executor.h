@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define CUSCO_EXECUTOR_ABI_VERSION 6u
+#define CUSCO_EXECUTOR_ABI_VERSION 7u
 
 /* Opaque, uniquely owned handles. Only the cancellation signal is thread-safe. */
 typedef struct cusco_executor cusco_executor;
@@ -36,6 +36,12 @@ typedef struct {
     int32_t model_layers;
     uint32_t competent;
 } cusco_operating_point;
+typedef struct {
+    float temperature;
+    float top_p;
+    uint32_t seed;
+} cusco_sampler_config;
+
 
 /* logits is borrowed from the executor and remains valid only until the next
  * mutating executor call or cusco_executor_close. The caller must not free it. */
@@ -71,8 +77,10 @@ void cusco_executor_tokens_free(int32_t * tokens);
 cusco_status cusco_executor_render_token(
     cusco_executor *, int32_t token, uint8_t * buffer, size_t capacity, size_t * size);
 
-/* A sampler is request-owned and tied to the executor that created it. */
-cusco_status cusco_sampler_greedy(cusco_executor *, cusco_sampler ** out);
+/* A sampler is request-owned and tied to the executor that created it. A
+ * non-positive temperature selects exact greedy sampling. */
+cusco_status cusco_sampler_create(
+    cusco_executor *, const cusco_sampler_config *, cusco_sampler ** out);
 void cusco_sampler_free(cusco_sampler *);
 cusco_status cusco_sampler_sample(cusco_sampler *, cusco_executor *, int32_t * token);
 /* Mutates executor state. Input tokens are borrowed for the duration of the call. */

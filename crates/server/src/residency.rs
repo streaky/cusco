@@ -738,6 +738,7 @@ mod tests {
             prompt: prompt.into(),
             max_tokens,
             prior_tokens: vec![],
+            sampling: Default::default(),
             control,
             scheduling: SchedulingMetadata::default(),
             prefill_chunk_tokens: 32,
@@ -814,7 +815,7 @@ mod tests {
             path: PathBuf::from("mock://deterministic"),
             sha256: revision.into(),
             aliases: vec![],
-            family: "gemma-4-e2b-it".into(),
+            family: "gemma4".into(),
             size_bytes: bytes,
             epoch,
         }

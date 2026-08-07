@@ -4,7 +4,7 @@ use axum::{
     extract::{FromRequest, Path as AxumPath, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header::RETRY_AFTER},
     middleware::{self, Next},
-    response::{IntoResponse, Response, Sse, sse::Event},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use futures_util::{StreamExt, stream};
@@ -27,13 +27,20 @@ use std::{
     },
     time::{Duration, Instant},
 };
+mod catalog;
+mod config;
 mod residency;
+use cusco_executor::SamplingConfig;
 use thiserror::Error;
 use uuid::Uuid;
 mod generation;
 mod mapped;
+mod prompt;
 mod scheduler;
+mod vision;
 
+pub use catalog::{CatalogError, ModelCatalog, UserModelConfig, UserModels, load_user_models};
+pub use config::{ByteSize, ConfigError, DaemonConfig, DataPaths, ExecutionConfig, VisionConfig};
 pub use generation::{
     FinishReason, FrontierControl, GenerationFrontier, MAX_STOP_BYTES, MAX_STOP_SEQUENCES,
     StopAlignment,
@@ -41,6 +48,7 @@ pub use generation::{
 pub use mapped::{ExecutionProfile, MappedEngine, MappedMetrics};
 pub use residency::{ResidencyConfig, ResidencyMetrics, ResidentEngine, ResidentModelStatus};
 pub use scheduler::{SchedulerMetrics, SchedulerStatus, WorkloadScheduler};
+pub use vision::{AdmittedImage, ImageAdmission, VisionError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -165,6 +173,8 @@ pub struct InferRequest {
     #[serde(default)]
     pub raw_continuation: bool,
     #[serde(skip, default)]
+    pub sampling: SamplingConfig,
+    #[serde(skip, default)]
     pub scheduling: SchedulingMetadata,
 }
 fn default_tokens() -> usize {
@@ -213,7 +223,7 @@ fn initial_model_epoch() -> u64 {
 }
 
 fn default_model_family() -> String {
-    "gemma-4-e2b-it".into()
+    "gemma4".into()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -223,6 +233,8 @@ pub struct ServerConfig {
     pub queue_bytes: usize,
     pub request_bytes: usize,
     pub pre_queue_concurrency: usize,
+    #[serde(default = "default_tokens")]
+    pub default_output_tokens: usize,
     pub header_bytes: usize,
     pub body_timeout_ms: u64,
     pub wall_time_ms: u64,
@@ -238,6 +250,7 @@ impl Default for ServerConfig {
             queue_bytes: 16 << 20,
             request_bytes: 1 << 20,
             pre_queue_concurrency: 16,
+            default_output_tokens: default_tokens(),
             header_bytes: 32 << 10,
             body_timeout_ms: 10_000,
             wall_time_ms: 300_000,
@@ -694,6 +707,7 @@ pub struct EngineRequest {
     pub prompt: String,
     pub max_tokens: usize,
     pub prior_tokens: Vec<i32>,
+    pub sampling: SamplingConfig,
     pub control: Arc<RequestControl>,
     pub scheduling: SchedulingMetadata,
     pub prefill_chunk_tokens: usize,
@@ -1003,6 +1017,9 @@ pub struct Server {
     model_lifecycle: Arc<Mutex<()>>,
     auth: Arc<dyn AuthProvider>,
     engine: Arc<dyn InferenceEngine>,
+    catalog: Arc<Mutex<Option<ModelCatalog>>>,
+    model_directory: Arc<Mutex<PathBuf>>,
+    vision: Arc<Mutex<VisionConfig>>,
 }
 struct AdmissionGuard {
     server: Server,
@@ -1064,9 +1081,28 @@ impl Server {
             model_lifecycle: Arc::new(Mutex::new(())),
             auth,
             engine,
+            catalog: Arc::new(Mutex::new(None)),
+            model_directory: Arc::new(Mutex::new(PathBuf::from("./data/models"))),
+            vision: Arc::new(Mutex::new(VisionConfig::default())),
         };
         server.persist()?;
         Ok(server)
+    }
+    pub fn attach_catalog(&self, catalog: ModelCatalog, model_directory: impl Into<PathBuf>) {
+        *self.catalog.lock() = Some(catalog);
+        *self.model_directory.lock() = model_directory.into();
+    }
+    fn catalog(&self) -> Option<ModelCatalog> {
+        self.catalog.lock().clone()
+    }
+    pub fn configure_vision(&self, config: VisionConfig) {
+        *self.vision.lock() = config;
+    }
+    fn vision_config(&self) -> VisionConfig {
+        self.vision.lock().clone()
+    }
+    fn model_directory(&self) -> PathBuf {
+        self.model_directory.lock().clone()
     }
     fn persist(&self) -> Result<(), Error> {
         let guard = self.inner.lock();
@@ -1169,7 +1205,18 @@ impl Server {
             .ok_or(Error::ContextNotFound)?;
         self.persist()
     }
-    pub fn register_model(&self, mut model: ModelRecord) -> Result<ModelRecord, Error> {
+    pub fn register_model(&self, model: ModelRecord) -> Result<ModelRecord, Error> {
+        self.register_model_with(|_| Ok(()), model)
+    }
+
+    pub fn register_model_with<F>(
+        &self,
+        finalize: F,
+        mut model: ModelRecord,
+    ) -> Result<ModelRecord, Error>
+    where
+        F: FnOnce(&ModelRecord) -> Result<(), Error>,
+    {
         let _lifecycle = self.model_lifecycle.lock();
         model.aliases.sort();
         model.aliases.dedup();
@@ -1203,11 +1250,8 @@ impl Server {
             guard.durable.next_model_epoch = epoch
                 .checked_add(1)
                 .ok_or_else(|| Error::State("model epoch space exhausted".into()))?;
-            (
-                epoch,
-                guard.durable.models.get(&model.id).cloned(),
-                guard.durable.models.clone(),
-            )
+            let previous = guard.durable.models.get(&model.id).cloned();
+            (epoch, previous, guard.durable.models.clone())
         };
         model.epoch = epoch;
         if let Err(error) = self.engine.prepare_model(&model) {
@@ -1231,10 +1275,20 @@ impl Server {
             self.engine.retire_model(&model.id, model.epoch);
             return Err(error);
         }
+        if let Err(error) = finalize(&model) {
+            let mut guard = self.inner.lock();
+            guard.durable.models = previous_models;
+            guard.durable.next_model_epoch = epoch;
+            drop(guard);
+            self.engine.retire_model(&model.id, model.epoch);
+            return Err(error);
+        }
         self.engine
             .commit_model(&model, previous.as_ref().map(|record| record.epoch));
         Ok(model)
     }
+
+
     pub fn models(&self) -> Vec<ModelRecord> {
         self.inner.lock().durable.models.values().cloned().collect()
     }
@@ -1341,6 +1395,7 @@ impl Server {
             || config.queue_bytes == 0
             || config.request_bytes == 0
             || config.pre_queue_concurrency == 0
+            || config.default_output_tokens == 0
             || config.header_bytes == 0
             || config.body_timeout_ms == 0
             || config.wall_time_ms == 0
@@ -1628,6 +1683,7 @@ impl Server {
                 prompt: req.prompt.clone(),
                 max_tokens: req.max_tokens,
                 prior_tokens: prior_tokens.to_vec(),
+                sampling: req.sampling,
                 control: control.clone(),
                 scheduling: req.scheduling.clone(),
                 prefill_chunk_tokens: 32,
@@ -1735,28 +1791,6 @@ fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-#[derive(Clone, Deserialize)]
-struct AliasRequest {
-    alias: String,
-}
-#[derive(Clone, Deserialize)]
-struct RegisterRequest {
-    id: String,
-    revision: String,
-    path: PathBuf,
-    sha256: String,
-    #[serde(default = "default_model_family")]
-    family: String,
-    #[serde(default)]
-    aliases: Vec<String>,
-}
-#[derive(Clone, Deserialize)]
-struct FetchRequest {
-    uri: String,
-    cache: PathBuf,
-    #[serde(default)]
-    sha256: Option<String>,
-}
 struct PrequeueJson<T> {
     headers: HeaderMap,
     value: T,
@@ -1823,6 +1857,7 @@ impl StopInput {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CompletionRequest {
     model: String,
     prompt: String,
@@ -1838,8 +1873,140 @@ struct CompletionRequest {
     raw_continuation: bool,
     #[serde(default)]
     deadline_ms: Option<u64>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReasoningEffort {
+    None,
+    Low,
+    Medium,
+    High,
+    Max,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponseFormat {
+    r#type: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FunctionTool {
+    name: String,
+    description: Option<String>,
+    parameters: Value,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NestedToolDefinition {
+    r#type: String,
+    function: FunctionTool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlatToolDefinition {
+    r#type: String,
+    name: String,
+    description: Option<String>,
+    parameters: Value,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ToolDefinition {
+    Nested(NestedToolDefinition),
+    Flat(FlatToolDefinition),
+}
+
+impl ToolDefinition {
+    fn valid_function(&self) -> bool {
+        match self {
+            Self::Nested(tool) => {
+                tool.r#type == "function"
+                    && !tool.function.name.is_empty()
+                    && tool.function.parameters.is_object()
+            }
+            Self::Flat(tool) => {
+                let _ = &tool.description;
+                tool.r#type == "function" && !tool.name.is_empty() && tool.parameters.is_object()
+            }
+        }
+    }
+}
+
+fn validate_controls(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    tools: &[ToolDefinition],
+    response_format: Option<&ResponseFormat>,
+    reasoning: Option<&ReasoningEffort>,
+) -> Result<(), Error> {
+    if temperature.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
+        return Err(Error::BadRequest(
+            "temperature must be finite and between 0 and 2".into(),
+        ));
+    }
+    if top_p.is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1.0) {
+        return Err(Error::BadRequest(
+            "top_p must be finite, greater than 0, and at most 1".into(),
+        ));
+    }
+    if !tools.is_empty() {
+        for tool in tools {
+            if !tool.valid_function() {
+                return Err(Error::BadRequest("invalid function tool definition".into()));
+            }
+            if let ToolDefinition::Nested(tool) = tool {
+                let _ = &tool.function.description;
+            }
+        }
+        return Err(Error::BadRequest(
+            "unsupported_capability: selected model profile does not advertise tool calling".into(),
+        ));
+    }
+    if response_format.is_some_and(|format| format.r#type != "text") {
+        return Err(Error::BadRequest(
+            "unsupported_capability: structured output requires grammar support".into(),
+        ));
+    }
+    if reasoning.is_some_and(|effort| !matches!(effort, ReasoningEffort::None)) {
+        return Err(Error::BadRequest(
+            "unsupported_capability: selected model does not advertise reasoning levels".into(),
+        ));
+    }
+    Ok(())
+}
+fn sampling_config(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
+) -> Result<SamplingConfig, Error> {
+    let seed = seed
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| Error::BadRequest("seed must be at most 4294967295".into()))?
+        .unwrap_or(u32::MAX);
+    Ok(SamplingConfig {
+        temperature: temperature.unwrap_or(1.0),
+        top_p: top_p.unwrap_or(1.0),
+        seed,
+    })
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
@@ -1853,10 +2020,95 @@ struct ChatRequest {
     stop: Option<StopInput>,
     #[serde(default)]
     deadline_ms: Option<u64>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    tools: Vec<ToolDefinition>,
+    #[serde(default)]
+    response_format: Option<ResponseFormat>,
+    #[serde(default)]
+    reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChatMessage {
-    content: String,
+    #[serde(default = "default_user_role")]
+    role: String,
+    content: ChatContent,
+}
+fn default_user_role() -> String {
+    "user".into()
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ChatContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrlPart },
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageUrlPart {
+    url: String,
+}
+
+fn lower_messages(
+    family: &str,
+    messages: Vec<ChatMessage>,
+    vision: VisionConfig,
+) -> Result<String, Error> {
+    let admission = ImageAdmission::new(vision);
+    let mut normalized = Vec::with_capacity(messages.len());
+    for message in messages {
+        if !matches!(
+            message.role.as_str(),
+            "system" | "user" | "assistant"
+        ) {
+            return Err(Error::BadRequest(format!(
+                "unsupported message role {}",
+                message.role
+            )));
+        }
+        let text = match message.content {
+            ChatContent::Text(text) => text,
+            ChatContent::Parts(parts) => {
+                let mut text = String::new();
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text: part } => text.push_str(&part),
+                        ContentPart::ImageUrl { image_url } => {
+                            if message.role != "user" {
+                                return Err(Error::BadRequest(
+                                    "images are accepted only in user messages".into(),
+                                ));
+                            }
+                            admission
+                                .admit_data_uri(&image_url.url)
+                                .map_err(|error| Error::BadRequest(error.to_string()))?;
+                            return Err(Error::BadRequest("image_unsupported: selected model has no compatible vision projector".into()));
+                        }
+                    }
+                }
+                text
+            }
+        };
+        normalized.push(prompt::Message {
+            role: message.role,
+            content: text,
+        });
+    }
+    prompt::apply_chat_template(family, normalized)
 }
 
 pub fn router(server: Server) -> Router {
@@ -1873,34 +2125,34 @@ pub fn router_with_http_debug(server: Server, debug: HttpDebug) -> Router {
 
 fn routes(server: Server) -> Router {
     Router::new()
-        .route("/openapi.json", get(openapi))
-        .route("/v1/completions", post(completion))
-        .route("/v1/chat/completions", post(chat))
-        .route("/v1/models", get(list_models))
+        .route("/openai/v1/openapi.json", get(openapi))
+        .route("/ollama/api/openapi.json", get(openapi))
+        .route("/cusco/v1/openapi.json", get(openapi))
+        .route("/openai/v1/completions", post(completion))
+        .route("/openai/v1/chat/completions", post(chat))
+        .route("/openai/v1/models", get(list_models))
+        .route("/openai/v1/responses", post(responses))
+        .route("/ollama/api/generate", post(ollama_generate))
+        .route("/ollama/api/chat", post(ollama_chat))
+        .route("/ollama/api/version", get(ollama_version))
+        .route("/ollama/api/tags", get(ollama_tags))
+        .route("/ollama/api/show", post(ollama_show))
+        .route("/ollama/api/pull", post(ollama_pull))
+        .route("/ollama/api/copy", post(ollama_copy))
+        .route("/ollama/api/delete", delete(ollama_delete))
+        .route("/ollama/api/ps", get(ollama_ps))
         .route(
-            "/native/models",
-            get(list_native_models).post(register_model),
+            "/cusco/v1/contexts",
+            get(list_contexts).post(create_context),
         )
-        .route("/native/models/fetch", post(fetch_model))
+        .route("/cusco/v1/contexts/import", post(import_context))
         .route(
-            "/native/models/{id}",
-            get(inspect_model).delete(remove_model),
-        )
-        .route("/native/models/{id}/verify", post(verify_model))
-        .route(
-            "/native/models/{id}/check-update/{revision}",
-            get(check_update),
-        )
-        .route("/native/models/{id}/aliases", post(alias_model))
-        .route("/native/contexts", get(list_contexts).post(create_context))
-        .route("/native/contexts/import", post(import_context))
-        .route(
-            "/native/contexts/{id}",
+            "/cusco/v1/contexts/{id}",
             get(get_context).delete(delete_context),
         )
-        .route("/native/status", get(native_status))
-        .route("/native/contexts/{id}/branches", post(branch_context))
-        .route("/native/requests/{id}", delete(cancel_request))
+        .route("/cusco/v1/status", get(native_status))
+        .route("/cusco/v1/contexts/{id}/branches", post(branch_context))
+        .route("/cusco/v1/requests/{id}", delete(cancel_request))
         .with_state(server)
 }
 
@@ -2020,6 +2272,12 @@ async fn completion(
     }: PrequeueJson<CompletionRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
+    validate_controls(r.temperature, r.top_p, &[], None, None)?;
+    let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
+    let include_usage = r
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage);
     s.model(&r.model)?;
     drop(permit);
     infer_response(
@@ -2027,6 +2285,8 @@ async fn completion(
         r.model,
         r.prompt,
         r.max_tokens,
+        sampling,
+        include_usage,
         r.stream,
         r.context_id,
         r.stop.map(StopInput::into_vec).unwrap_or_default(),
@@ -2034,6 +2294,7 @@ async fn completion(
         r.deadline_ms,
         retained_bytes,
         request_context.principal,
+        WireProtocol::OpenAiCompletion,
     )
     .await
 }
@@ -2047,17 +2308,28 @@ async fn chat(
     }: PrequeueJson<ChatRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
-    s.model(&r.model)?;
+    validate_controls(
+        r.temperature,
+        r.top_p,
+        &r.tools,
+        r.response_format.as_ref(),
+        r.reasoning_effort.as_ref(),
+    )?;
+    let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
+    let include_usage = r
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage);
+    let model = s.model(&r.model)?;
+    let prompt = lower_messages(&model.family, r.messages, s.vision_config())?;
     drop(permit);
     infer_response(
         s,
         r.model,
-        r.messages
-            .into_iter()
-            .map(|m| m.content)
-            .collect::<Vec<_>>()
-            .join("\n"),
+        prompt,
         r.max_tokens,
+        sampling,
+        include_usage,
         r.stream,
         r.context_id,
         r.stop.map(StopInput::into_vec).unwrap_or_default(),
@@ -2065,8 +2337,506 @@ async fn chat(
         r.deadline_ms,
         retained_bytes,
         request_context.principal,
+        WireProtocol::OpenAiChat,
     )
     .await
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ResponsesInput {
+    Text(String),
+    Items(Vec<ResponsesInputItem>),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesInputItem {
+    r#type: String,
+    #[serde(default = "default_user_role")]
+    role: String,
+    content: ResponsesContent,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ResponsesContent {
+    Text(String),
+    Parts(Vec<ResponsesContentPart>),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ResponsesContentPart {
+    InputText { text: String },
+    InputImage { image_url: String },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesRequest {
+    model: String,
+    input: ResponsesInput,
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    tools: Vec<ToolDefinition>,
+    #[serde(default)]
+    response_format: Option<ResponseFormat>,
+    #[serde(default)]
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+async fn responses(
+    State(s): State<Server>,
+    PrequeueJson {
+        headers,
+        value: r,
+        retained_bytes,
+        _permit: permit,
+    }: PrequeueJson<ResponsesRequest>,
+) -> Result<Response, Error> {
+    let request_context = auth(&s, &headers, Scope::Inference)?;
+    validate_controls(
+        r.temperature,
+        r.top_p,
+        &r.tools,
+        r.response_format.as_ref(),
+        r.reasoning_effort.as_ref(),
+    )?;
+    let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
+    let model = s.model(&r.model)?;
+    let input = match r.input {
+        ResponsesInput::Text(text) => text,
+        ResponsesInput::Items(items) => {
+            let mut messages = Vec::with_capacity(items.len());
+            for item in items {
+                if item.r#type != "message" {
+                    return Err(Error::BadRequest(format!(
+                        "unsupported Responses input item type {}",
+                        item.r#type
+                    )));
+                }
+                let content = match item.content {
+                    ResponsesContent::Text(text) => ChatContent::Text(text),
+                    ResponsesContent::Parts(parts) => ChatContent::Parts(
+                        parts
+                            .into_iter()
+                            .map(|part| match part {
+                                ResponsesContentPart::InputText { text } => {
+                                    ContentPart::Text { text }
+                                }
+                                ResponsesContentPart::InputImage { image_url } => {
+                                    ContentPart::ImageUrl {
+                                        image_url: ImageUrlPart { url: image_url },
+                                    }
+                                }
+                            })
+                            .collect(),
+                    ),
+                };
+                messages.push(ChatMessage {
+                    role: item.role,
+                    content,
+                });
+            }
+            lower_messages(&model.family, messages, s.vision_config())?
+        }
+    };
+    drop(permit);
+    infer_response(
+        s,
+        r.model,
+        input,
+        r.max_output_tokens,
+        sampling,
+        true,
+        r.stream,
+        None,
+        vec![],
+        false,
+        None,
+        retained_bytes,
+        request_context.principal,
+        WireProtocol::OpenAiResponses,
+    )
+    .await
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaOptions {
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    num_predict: Option<usize>,
+    #[serde(default)]
+    stop: Option<StopInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaGenerateRequest {
+    model: String,
+    prompt: String,
+    #[serde(default = "default_true")]
+    stream: bool,
+    #[serde(default)]
+    options: OllamaOptions,
+}
+async fn ollama_generate(
+    State(s): State<Server>,
+    PrequeueJson {
+        headers,
+        value: r,
+        retained_bytes,
+        _permit: permit,
+    }: PrequeueJson<OllamaGenerateRequest>,
+) -> Result<Response, Error> {
+    let request_context = auth(&s, &headers, Scope::Inference)?;
+    validate_controls(r.options.temperature, r.options.top_p, &[], None, None)?;
+    let sampling = sampling_config(r.options.temperature, r.options.top_p, r.options.seed)?;
+    s.model(&r.model)?;
+    drop(permit);
+    infer_response(
+        s,
+        r.model,
+        r.prompt,
+        r.options.num_predict,
+        sampling,
+        true,
+        r.stream,
+        None,
+        r.options.stop.map(StopInput::into_vec).unwrap_or_default(),
+        false,
+        None,
+        retained_bytes,
+        request_context.principal,
+        WireProtocol::OllamaGenerate,
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaChatRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    #[serde(default = "default_true")]
+    stream: bool,
+    #[serde(default)]
+    options: OllamaOptions,
+}
+async fn ollama_chat(
+    State(s): State<Server>,
+    PrequeueJson {
+        headers,
+        value: r,
+        retained_bytes,
+        _permit: permit,
+    }: PrequeueJson<OllamaChatRequest>,
+) -> Result<Response, Error> {
+    let request_context = auth(&s, &headers, Scope::Inference)?;
+    validate_controls(r.options.temperature, r.options.top_p, &[], None, None)?;
+    let sampling = sampling_config(r.options.temperature, r.options.top_p, r.options.seed)?;
+    let model = s.model(&r.model)?;
+    let prompt = lower_messages(&model.family, r.messages, s.vision_config())?;
+    drop(permit);
+    infer_response(
+        s,
+        r.model,
+        prompt,
+        r.options.num_predict,
+        sampling,
+        true,
+        r.stream,
+        None,
+        r.options.stop.map(StopInput::into_vec).unwrap_or_default(),
+        false,
+        None,
+        retained_bytes,
+        request_context.principal,
+        WireProtocol::OllamaChat,
+    )
+    .await
+}
+
+async fn ollama_version(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
+    auth(&s, &headers, Scope::Inference)?;
+    Ok(Json(json!({"version": env!("CARGO_PKG_VERSION")})))
+}
+
+async fn ollama_tags(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
+    auth(&s, &headers, Scope::Inference)?;
+    Ok(Json(json!({"models": s.models()})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaModelRequest {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl OllamaModelRequest {
+    fn model_name(&self) -> Result<&str, Error> {
+        match (self.model.as_deref(), self.name.as_deref()) {
+            (Some(model), Some(name)) if model != name => Err(Error::BadRequest(
+                "`model` and `name` must identify the same model".into(),
+            )),
+            (Some(model), _) | (_, Some(model)) if !model.is_empty() => Ok(model),
+            _ => Err(Error::BadRequest(
+                "one of `model` or `name` is required".into(),
+            )),
+        }
+    }
+}
+
+async fn ollama_show(
+    State(s): State<Server>,
+    headers: HeaderMap,
+    Json(r): Json<OllamaModelRequest>,
+) -> Result<Json<ModelRecord>, Error> {
+    auth(&s, &headers, Scope::Inference)?;
+    Ok(Json(s.model(r.model_name()?)?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaCopyRequest {
+    source: String,
+    destination: String,
+}
+async fn ollama_copy(
+    State(s): State<Server>,
+    headers: HeaderMap,
+    Json(r): Json<OllamaCopyRequest>,
+) -> Result<StatusCode, Error> {
+    auth(&s, &headers, Scope::Admin)?;
+    let model = s.alias_model(&r.source, r.destination)?;
+    if let Some(catalog) = s.catalog() {
+        catalog.publish(&model).map_err(state_err)?;
+    }
+    Ok(StatusCode::OK)
+}
+async fn ollama_delete(
+    State(s): State<Server>,
+    headers: HeaderMap,
+    Json(r): Json<OllamaModelRequest>,
+) -> Result<StatusCode, Error> {
+    auth(&s, &headers, Scope::Admin)?;
+    let model = r.model_name()?.to_owned();
+    s.remove_model(&model)?;
+    if let Some(catalog) = s.catalog() {
+        catalog.remove(&model).map_err(state_err)?;
+    }
+    Ok(StatusCode::OK)
+}
+
+async fn ollama_ps(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
+    auth(&s, &headers, Scope::Inference)?;
+    let models = s
+        .engine
+        .residency_status()
+        .and_then(|status| status.get("models").cloned())
+        .and_then(|models| models.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|status| !status["retiring"].as_bool().unwrap_or(false))
+        .filter_map(|status| {
+            let id = status["id"].as_str()?;
+            let model = s.model(id).ok()?;
+            Some(json!({
+                "name": model.id,
+                "model": model.id,
+                "size": model.size_bytes,
+                "digest": model.sha256,
+                "details": {
+                    "format": "gguf",
+                    "family": model.family,
+                    "families": [model.family],
+                },
+                "size_vram": status["operating_point"]["device_bytes"],
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"models": models})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaPullRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    insecure: bool,
+    #[serde(default = "default_true")]
+    stream: bool,
+}
+
+impl OllamaPullRequest {
+    fn model_name(&self) -> Result<&str, Error> {
+        match (self.name.as_deref(), self.model.as_deref()) {
+            (Some(name), Some(model)) if name != model => Err(Error::BadRequest(
+                "`name` and `model` must identify the same model".into(),
+            )),
+            (Some(name), _) | (_, Some(name)) if !name.is_empty() => Ok(name),
+            _ => Err(Error::BadRequest(
+                "one of `name` or `model` is required".into(),
+            )),
+        }
+    }
+}
+async fn ollama_pull(
+    State(s): State<Server>,
+    headers: HeaderMap,
+    Json(r): Json<OllamaPullRequest>,
+) -> Result<Response, Error> {
+    auth(&s, &headers, Scope::Admin)?;
+    if s.catalog().is_none() {
+        return Err(Error::State("model catalog is not configured".into()));
+    }
+    let name = r.model_name()?.to_owned();
+    // `insecure` permits an insecure transport; Cusco's Hugging Face fetcher always
+    // uses authenticated HTTPS, so accepting it never weakens transport security.
+    let _insecure = r.insecure;
+    if !r.stream {
+        return Ok(Json(perform_ollama_pull(s, name, r.sha256, None).await?).into_response());
+    }
+
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Value>(16);
+    tokio::spawn(async move {
+        if let Err(error) = perform_ollama_pull(s, name, r.sha256, Some(sender.clone())).await {
+            let _ = sender.send(json!({"error":error.to_string()})).await;
+        }
+    });
+    let rows = stream::unfold(receiver, |mut receiver| async move {
+        receiver
+            .recv()
+            .await
+            .map(|value| (Ok::<_, Infallible>(format!("{value}\n")), receiver))
+    });
+    Ok(Response::builder()
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from_stream(rows))
+        .expect("streaming Ollama pull response is valid"))
+}
+
+async fn perform_ollama_pull(
+    s: Server,
+    name: String,
+    expected: Option<String>,
+    progress: Option<tokio::sync::mpsc::Sender<Value>>,
+) -> Result<Value, Error> {
+    let catalog = s
+        .catalog()
+        .ok_or_else(|| Error::State("model catalog is not configured".into()))?;
+    let operation = Uuid::new_v4().to_string();
+    catalog
+        .begin_operation(&operation, &name, "pull")
+        .map_err(state_err)?;
+    if let Some(sender) = &progress {
+        let _ = sender.send(json!({"status":"pulling manifest"})).await;
+    }
+    let cache = s.model_directory();
+    let progress_sender = progress.clone();
+    let fetched = tokio::task::spawn_blocking({
+        let name = name.clone();
+        move || {
+            cusco_model_registry::fetch_hf_with_progress(
+                &name,
+                &cache,
+                expected.as_deref(),
+                |update| {
+                    if let Some(sender) = &progress_sender {
+                        let mut row = json!({
+                            "status":"pulling model",
+                            "completed":update.completed
+                        });
+                        if let Some(total) = update.total {
+                            row["total"] = total.into();
+                        }
+                        let _ = sender.blocking_send(row);
+                    }
+                },
+            )
+        }
+    })
+    .await
+    .map_err(state_err);
+    let fetched = match fetched {
+        Ok(Ok(fetched)) => fetched,
+        Ok(Err(error)) => {
+            catalog
+                .finish_operation(&operation, "failed", Some(&error.to_string()))
+                .map_err(state_err)?;
+            return Err(state_err(error));
+        }
+        Err(error) => {
+            catalog
+                .finish_operation(&operation, "failed", Some(&error.to_string()))
+                .map_err(state_err)?;
+            return Err(state_err(error));
+        }
+    };
+    if let Some(sender) = &progress {
+        let _ = sender
+            .send(json!({"status":"verifying sha256 digest","digest":fetched.sha256}))
+            .await;
+    }
+    let metadata = tokio::task::spawn_blocking({
+        let path = fetched.path.clone();
+        move || cusco_model_registry::probe_gguf(path)
+    })
+    .await
+    .map_err(state_err)?
+    .map_err(state_err)?;
+    if let Some(sender) = &progress {
+        let _ = sender.send(json!({"status":"writing manifest"})).await;
+    }
+    let model = s.register_model_with(
+        |model| catalog.publish(model).map_err(state_err),
+        ModelRecord {
+            id: name,
+            revision: fetched.identity.clone(),
+            path: fetched.path,
+            sha256: fetched.sha256,
+            aliases: vec![],
+            family: metadata.architecture,
+            size_bytes: fetched.size,
+            epoch: 0,
+        },
+    )?;
+    catalog
+        .finish_operation(&operation, "complete", None)
+        .map_err(state_err)?;
+    let result = json!({"status":"success"});
+    if let Some(sender) = progress {
+        let _ = sender.send(result.clone()).await;
+    }
+    Ok(result)
 }
 struct DisconnectGuard {
     control: Arc<RequestControl>,
@@ -2110,11 +2880,117 @@ fn start_deadline_watchdogs(
     }
 }
 
+#[derive(Clone, Copy)]
+enum WireProtocol {
+    OpenAiCompletion,
+    OpenAiChat,
+    OpenAiResponses,
+    OllamaGenerate,
+    OllamaChat,
+}
+
+fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
+    let value = match (protocol, event) {
+        (WireProtocol::OpenAiCompletion, StreamEvent::Token { token, .. }) => {
+            json!({"object":"text_completion","choices":[{"text":token,"index":0,"finish_reason":null}]})
+        }
+        (WireProtocol::OpenAiChat, StreamEvent::Token { token, .. }) => {
+            json!({"object":"chat.completion.chunk","choices":[{"delta":{"content":token},"index":0,"finish_reason":null}]})
+        }
+        (WireProtocol::OpenAiResponses, StreamEvent::Token { token, .. }) => {
+            json!({"type":"response.output_text.delta","delta":token})
+        }
+        (WireProtocol::OllamaGenerate, StreamEvent::Token { token, .. }) => {
+            json!({"response":token,"done":false})
+        }
+        (WireProtocol::OllamaChat, StreamEvent::Token { token, .. }) => {
+            json!({"message":{"role":"assistant","content":token},"done":false})
+        }
+        (
+            WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat,
+            StreamEvent::Finished { reason, usage },
+        ) => {
+            let mut value = json!({"choices":[{"index":0,"finish_reason":reason}]});
+            if include_usage {
+                value["usage"] = json!({"prompt_tokens":usage.input_tokens,"completion_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens});
+            }
+            value
+        }
+        (WireProtocol::OpenAiResponses, StreamEvent::Finished { reason, usage }) => {
+            json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}})
+        }
+        (
+            WireProtocol::OllamaGenerate | WireProtocol::OllamaChat,
+            StreamEvent::Finished { reason, usage },
+        ) => {
+            json!({"done":true,"done_reason":reason,"prompt_eval_count":usage.input_tokens,"eval_count":usage.generated_tokens})
+        }
+        (_, StreamEvent::Error { message }) => {
+            json!({"error":{"message":message,"type":"server_error"}})
+        }
+        (WireProtocol::OpenAiChat, StreamEvent::Started { request_id, .. }) => {
+            json!({"id":request_id,"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]})
+        }
+        (WireProtocol::OpenAiCompletion, StreamEvent::Started { request_id, .. }) => {
+            json!({"id":request_id,"object":"text_completion","choices":[]})
+        }
+        (WireProtocol::OpenAiResponses, StreamEvent::Started { request_id, .. }) => {
+            json!({"type":"response.created","response":{"id":request_id,"status":"in_progress"}})
+        }
+        (_, StreamEvent::Started { request_id, .. }) => json!({"id":request_id}),
+    };
+    let row = match protocol {
+        WireProtocol::OpenAiCompletion
+        | WireProtocol::OpenAiChat
+        | WireProtocol::OpenAiResponses => format!("data: {value}\n\n"),
+        WireProtocol::OllamaGenerate | WireProtocol::OllamaChat => format!("{value}\n"),
+    };
+    if matches!(
+        protocol,
+        WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat
+    ) && value["choices"]
+        .as_array()
+        .and_then(|choices| choices.first())
+        .is_some_and(|choice| !choice["finish_reason"].is_null())
+    {
+        format!("{row}data: [DONE]\n\n")
+    } else {
+        row
+    }
+}
+
+fn completed_response(
+    protocol: WireProtocol,
+    response: InferResponse,
+    finish_reason: FinishReason,
+) -> Value {
+    let usage = json!({"prompt_tokens":response.usage.input_tokens,"completion_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens});
+    match protocol {
+        WireProtocol::OpenAiCompletion => {
+            json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text,"index":0,"finish_reason":finish_reason}],"usage":usage})
+        }
+        WireProtocol::OpenAiChat => {
+            json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":finish_reason}],"usage":usage})
+        }
+        WireProtocol::OpenAiResponses => {
+            json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"finish_reason":finish_reason,"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens}})
+        }
+        WireProtocol::OllamaGenerate => {
+            json!({"model":response.usage.model,"response":response.text,"done":true,"done_reason":finish_reason,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens})
+        }
+        WireProtocol::OllamaChat => {
+            json!({"model":response.usage.model,"message":{"role":"assistant","content":response.text},"done":true,"done_reason":finish_reason,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens})
+        }
+    }
+}
+
 async fn infer_response(
     server: Server,
     model: String,
     prompt: String,
     max_tokens: Option<usize>,
+    sampling: SamplingConfig,
+    include_usage: bool,
     streaming: bool,
     context_id: Option<ContextId>,
     stop: Vec<String>,
@@ -2122,6 +2998,7 @@ async fn infer_response(
     deadline_ms: Option<u64>,
     retained_bytes: usize,
     principal: String,
+    protocol: WireProtocol,
 ) -> Result<Response, Error> {
     server.model(&model)?;
     let id = Uuid::new_v4().to_string();
@@ -2148,7 +3025,8 @@ async fn infer_response(
     let request = InferRequest {
         model,
         prompt,
-        max_tokens: max_tokens.unwrap_or_else(default_tokens),
+        max_tokens: max_tokens.unwrap_or(config.default_output_tokens),
+        sampling,
         context_id,
         deadline_ms: Some(
             u64::try_from(wall_remaining.as_millis())
@@ -2183,8 +3061,18 @@ async fn infer_response(
         );
         let rows = first
             .chain(rest)
-            .map(|event| Ok::<_, Infallible>(Event::default().json_data(event).unwrap()));
-        let mut response = Sse::new(rows).into_response();
+            .map(move |event| Ok::<_, Infallible>(stream_row(protocol, event, include_usage)));
+        let content_type = match protocol {
+            WireProtocol::OpenAiCompletion
+            | WireProtocol::OpenAiChat
+            | WireProtocol::OpenAiResponses => "text/event-stream",
+            WireProtocol::OllamaGenerate | WireProtocol::OllamaChat => "application/x-ndjson",
+        };
+        let mut response = Response::new(Body::from_stream(rows));
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static(content_type),
+        );
         response.headers_mut().insert(
             "x-request-id",
             HeaderValue::from_str(&correlation_id).expect("UUID is a valid header value"),
@@ -2199,8 +3087,17 @@ async fn infer_response(
         .await
         .map_err(state_err)?;
         disconnect.disarm();
-        let (response, _) = result?;
-        let mut response = Json(json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text}],"usage":response.usage})).into_response();
+        let (response, events) = result?;
+        let finish_reason = events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                StreamEvent::Finished { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .ok_or_else(|| Error::State("inference completed without a finish reason".into()))?;
+        let mut response =
+            Json(completed_response(protocol, response, finish_reason)).into_response();
         response.headers_mut().insert(
             "x-request-id",
             HeaderValue::from_str(&correlation_id).expect("UUID is a valid header value"),
@@ -2212,64 +3109,6 @@ async fn list_models(State(s): State<Server>, headers: HeaderMap) -> Result<Json
     auth(&s, &headers, Scope::Inference)?;
     Ok(Json(json!({"data":s.models()})))
 }
-async fn list_native_models(
-    State(s): State<Server>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    Ok(Json(json!({"data":s.models()})))
-}
-async fn register_model(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    Json(r): Json<RegisterRequest>,
-) -> Result<Json<ModelRecord>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    Ok(Json(s.register_model(ModelRecord {
-        id: r.id,
-        revision: r.revision,
-        path: r.path,
-        sha256: r.sha256,
-        aliases: r.aliases,
-        family: r.family,
-        size_bytes: 0,
-        epoch: 0,
-    })?))
-}
-async fn fetch_model(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    Json(r): Json<FetchRequest>,
-) -> Result<Json<ModelRecord>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    let fetched =
-        cusco_model_registry::fetch_hf(&r.uri, &r.cache, r.sha256.as_deref()).map_err(state_err)?;
-    let revision = r
-        .uri
-        .split_once('@')
-        .and_then(|(_, value)| value.split_once('/'))
-        .map(|(value, _)| value)
-        .unwrap_or("unknown")
-        .to_owned();
-    Ok(Json(s.register_model(ModelRecord {
-        id: fetched.identity,
-        revision,
-        path: fetched.path,
-        sha256: fetched.sha256,
-        aliases: vec![],
-        family: "gemma-phase6".into(),
-        size_bytes: fetched.size,
-        epoch: 0,
-    })?))
-}
-async fn inspect_model(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Json<ModelRecord>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    Ok(Json(s.model(&id)?))
-}
 async fn native_status(
     State(server): State<Server>,
     headers: HeaderMap,
@@ -2280,42 +3119,6 @@ async fn native_status(
         "admission": server.admission_metrics(),
         "residency": server.engine.residency_status(),
     })))
-}
-async fn verify_model(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Json<Value>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    Ok(Json(json!({"valid":s.verify_model(&id)?})))
-}
-async fn check_update(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    AxumPath((id, revision)): AxumPath<(String, String)>,
-) -> Result<Json<Value>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    Ok(Json(
-        json!({"update_available":s.check_update(&id,&revision)?}),
-    ))
-}
-async fn alias_model(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-    Json(r): Json<AliasRequest>,
-) -> Result<Json<ModelRecord>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    Ok(Json(s.alias_model(&id, r.alias)?))
-}
-async fn remove_model(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> Result<StatusCode, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    s.remove_model(&id)?;
-    Ok(StatusCode::NO_CONTENT)
 }
 async fn create_context(
     State(s): State<Server>,
@@ -2379,16 +3182,155 @@ async fn cancel_request(
 async fn openapi() -> Json<Value> {
     Json(openapi_document())
 }
+fn openapi_operation(operation_id: &str, request_schema: Option<&str>) -> Value {
+    let mut operation = json!({
+        "operationId": operation_id,
+        "responses": {
+            "200": {"description": "Successful response"},
+            "400": {"description": "Invalid request"},
+            "401": {"description": "Authentication required"},
+            "500": {"description": "Server error"}
+        }
+    });
+    if let Some(schema) = request_schema {
+        operation["requestBody"] = json!({
+            "required": true,
+            "content": {"application/json": {"schema": {"$ref": format!("#/components/schemas/{schema}")}}}
+        });
+    }
+    operation
+}
+
 pub fn openapi_document() -> Value {
-    json!({"openapi":"3.1.0","info":{"title":"Cusco API","version":"0.1.0"},"paths":{
-        "/v1/completions":{"post":{}},"/v1/chat/completions":{"post":{}},"/v1/models":{"get":{}},
-        "/native/models":{"get":{},"post":{}},"/native/models/fetch":{"post":{}},
-        "/native/models/{id}":{"get":{},"delete":{}},"/native/models/{id}/verify":{"post":{}},
-        "/native/models/{id}/check-update/{revision}":{"get":{}},"/native/models/{id}/aliases":{"post":{}},
-        "/native/contexts":{"get":{},"post":{}},"/native/contexts/import":{"post":{}},
-        "/native/contexts/{id}":{"get":{},"delete":{}},"/native/contexts/{id}/branches":{"post":{}},
-        "/native/requests/{id}":{"delete":{}},"/native/status":{"get":{}}
-    }})
+    let mut paths = serde_json::Map::new();
+    let operations = [
+        (
+            "/openai/v1/completions",
+            "post",
+            "openaiCompletion",
+            Some("CompletionRequest"),
+        ),
+        (
+            "/openai/v1/chat/completions",
+            "post",
+            "openaiChatCompletion",
+            Some("ChatRequest"),
+        ),
+        (
+            "/openai/v1/responses",
+            "post",
+            "openaiResponse",
+            Some("ResponsesRequest"),
+        ),
+        ("/openai/v1/models", "get", "openaiModels", None),
+        (
+            "/ollama/api/generate",
+            "post",
+            "ollamaGenerate",
+            Some("OllamaGenerateRequest"),
+        ),
+        (
+            "/ollama/api/chat",
+            "post",
+            "ollamaChat",
+            Some("OllamaChatRequest"),
+        ),
+        ("/ollama/api/tags", "get", "ollamaTags", None),
+        ("/ollama/api/version", "get", "ollamaVersion", None),
+        (
+            "/ollama/api/show",
+            "post",
+            "ollamaShow",
+            Some("OllamaModelRequest"),
+        ),
+        (
+            "/ollama/api/pull",
+            "post",
+            "ollamaPull",
+            Some("OllamaPullRequest"),
+        ),
+        (
+            "/ollama/api/copy",
+            "post",
+            "ollamaCopy",
+            Some("OllamaCopyRequest"),
+        ),
+        (
+            "/ollama/api/delete",
+            "delete",
+            "ollamaDelete",
+            Some("OllamaModelRequest"),
+        ),
+        ("/ollama/api/ps", "get", "ollamaPs", None),
+        ("/cusco/v1/contexts", "get", "cuscoContexts", None),
+        ("/cusco/v1/contexts", "post", "cuscoCreateContext", None),
+        (
+            "/cusco/v1/contexts/import",
+            "post",
+            "cuscoImportContext",
+            Some("ImportContextRequest"),
+        ),
+        ("/cusco/v1/contexts/{id}", "get", "cuscoContext", None),
+        (
+            "/cusco/v1/contexts/{id}",
+            "delete",
+            "cuscoDeleteContext",
+            None,
+        ),
+        (
+            "/cusco/v1/contexts/{id}/branches",
+            "post",
+            "cuscoBranchContext",
+            None,
+        ),
+        (
+            "/cusco/v1/requests/{id}",
+            "delete",
+            "cuscoCancelRequest",
+            None,
+        ),
+        ("/cusco/v1/status", "get", "cuscoStatus", None),
+    ];
+    for (path, method, operation_id, schema) in operations {
+        paths
+            .entry(path)
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))[method] =
+            openapi_operation(operation_id, schema);
+    }
+    paths["/ollama/api/pull"]["post"]["responses"]["200"]["content"] = json!({
+        "application/json": {"schema": {"$ref": "#/components/schemas/OllamaPullProgress"}},
+        "application/x-ndjson": {"schema": {"$ref": "#/components/schemas/OllamaPullProgress"}}
+    });
+    json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Cusco v1 APIs", "version": "1.0.0"},
+        "paths": paths,
+        "components": {"schemas": {
+            "CompletionRequest": {
+                "type": "object", "additionalProperties": false, "required": ["model", "prompt"],
+                "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "max_tokens": {"type": "integer", "minimum": 0}, "stream": {"type": "boolean"}, "temperature": {"type": "number", "minimum": 0, "maximum": 2}, "top_p": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}, "seed": {"type": "integer", "minimum": 0}}
+            },
+            "ChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}}},
+            "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"oneOf": [{"type": "string"}, {"type": "array"}]}, "stream": {"type": "boolean"}, "tools": {"type": "array", "items": {"$ref": "#/components/schemas/ResponsesFunctionTool"}}}},
+            "ResponsesFunctionTool": {"type": "object", "additionalProperties": false, "required": ["type", "name", "parameters"], "properties": {"type": {"const": "function"}, "name": {"type": "string", "minLength": 1}, "description": {"type": "string"}, "parameters": {"type": "object"}}},
+            "OllamaGenerateRequest": {"type": "object", "additionalProperties": false, "required": ["model", "prompt"], "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
+            "OllamaChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
+            "OllamaModelRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["model"]}, {"required": ["name"]}], "properties": {"model": {"type": "string"}, "name": {"type": "string"}}},
+            "OllamaPullRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["name"]}, {"required": ["model"]}], "properties": {"name": {"type": "string"}, "model": {"type": "string"}, "sha256": {"type": "string"}, "insecure": {"type": "boolean"}, "stream": {"type": "boolean"}}},
+            "OllamaPullProgress": {
+                "type": "object",
+                "oneOf": [{"required": ["status"]}, {"required": ["error"]}],
+                "properties": {
+                    "status": {"type": "string"},
+                    "digest": {"type": "string"},
+                    "total": {"type": "integer", "minimum": 0},
+                    "completed": {"type": "integer", "minimum": 0},
+                    "error": {"type": "string"}
+                }
+            },
+            "ImportContextRequest": {"type": "object", "additionalProperties": false, "required": ["tokens"], "properties": {"tokens": {"type": "array", "items": {"type": "string"}}}}
+        }}
+    })
 }
 
 pub async fn serve(
@@ -2510,7 +3452,7 @@ mod tests {
             path: model,
             sha256: hex_digest(b"model"),
             aliases: vec!["latest".into()],
-            family: "gemma-4-e2b-it".into(),
+            family: "gemma4".into(),
             size_bytes: 5,
             epoch: 0,
         })
@@ -2522,6 +3464,27 @@ mod tests {
     impl InferenceEngine for FailingEngine {
         fn start_session(&self, _: EngineRequest) -> Result<Box<dyn ExecutionSession>, Error> {
             Err(Error::State("generation failed".into()))
+        }
+    }
+
+    struct ResidentStatusEngine;
+
+    impl InferenceEngine for ResidentStatusEngine {
+        fn start_session(
+            &self,
+            request: EngineRequest,
+        ) -> Result<Box<dyn ExecutionSession>, Error> {
+            DeterministicEngine.start_session(request)
+        }
+
+        fn residency_status(&self) -> Option<Value> {
+            Some(json!({
+                "models": [{
+                    "id": "m",
+                    "retiring": false,
+                    "operating_point": {"device_bytes": 3}
+                }]
+            }))
         }
     }
 
@@ -2619,6 +3582,7 @@ mod tests {
             scheduling: SchedulingMetadata::default(),
             stop: vec![],
             raw_continuation: false,
+            sampling: SamplingConfig::default(),
         };
         let (out, events) = s.infer("r", req).unwrap();
         assert_eq!(out.text, "two one");
@@ -2638,6 +3602,7 @@ mod tests {
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                 },
             )
             .unwrap_err();
@@ -2655,6 +3620,7 @@ mod tests {
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                 }
             ),
             Err(Error::Deadline)
@@ -2672,6 +3638,7 @@ mod tests {
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                 },
             ),
             Err(Error::Busy)
@@ -2696,6 +3663,7 @@ mod tests {
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                 }
             ),
             Err(Error::State(_))
@@ -2723,7 +3691,7 @@ mod tests {
             path: second_path,
             sha256: hex_digest(b"second"),
             aliases: vec!["latest".into()],
-            family: "gemma-4-e2b-it".into(),
+            family: "gemma4".into(),
             size_bytes: 6,
             epoch: 0,
         })
@@ -2749,11 +3717,78 @@ mod tests {
         fs::remove_dir_all(d).unwrap()
     }
     #[test]
+    fn accepts_endpoint_specific_openai_function_tool_shapes() {
+        let responses: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hello",
+            "tools": [{
+                "type": "function",
+                "name": "get_current_timestamp",
+                "description": "Get the current Unix timestamp.",
+                "parameters": {"type": "object", "properties": {}}
+            }]
+        }))
+        .unwrap();
+        assert!(responses.tools[0].valid_function());
+        assert!(matches!(
+            responses.tools.as_slice(),
+            [ToolDefinition::Flat(_)]
+        ));
+        assert!(matches!(
+            validate_controls(None, None, &responses.tools, None, None),
+            Err(Error::BadRequest(message)) if message.contains("does not advertise tool calling")
+        ));
+
+        let chat: ChatRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_current_timestamp",
+                    "description": "Get the current Unix timestamp.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        }))
+        .unwrap();
+        assert!(chat.tools[0].valid_function());
+        assert!(matches!(chat.tools.as_slice(), [ToolDefinition::Nested(_)]));
+    }
+    #[test]
+    fn accepts_canonical_responses_message_input() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "hey"
+                }]
+            }]
+        }))
+        .unwrap();
+        let ResponsesInput::Items(items) = request.input else {
+            panic!("canonical message input must parse as items");
+        };
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0].content,
+            ResponsesContent::Parts(parts)
+                if matches!(
+                    parts.as_slice(),
+                    [ResponsesContentPart::InputText { text }] if text == "hey"
+                )
+        ));
+    }
+    #[test]
     fn scheduler_uses_transition_cost_priority_and_wait() {
         let c = vec![
             SlotCandidate {
                 slot: 1,
                 valid_prefix: 1,
+
                 transfer_bytes: 5000,
                 rollback_tokens: 0,
                 quiesce_cost: 0,
@@ -2784,15 +3819,95 @@ mod tests {
         assert_eq!(select_slot(&[]), None)
     }
     #[tokio::test]
+    async fn ollama_pull_accepts_client_model_alias_and_known_controls() {
+        let request: OllamaPullRequest = serde_json::from_value(json!({
+            "name": "hf://repo/model.gguf",
+            "model": "hf://repo/model.gguf",
+            "insecure": true
+        }))
+        .unwrap();
+        assert_eq!(request.model_name().unwrap(), "hf://repo/model.gguf");
+        assert!(request.insecure);
+        assert!(request.stream);
+
+        let model_only: OllamaPullRequest =
+            serde_json::from_value(json!({"model": "hf://repo/model.gguf", "stream": false}))
+                .unwrap();
+        assert_eq!(model_only.model_name().unwrap(), "hf://repo/model.gguf");
+        assert!(!model_only.stream);
+
+        let mismatch: OllamaPullRequest =
+            serde_json::from_value(json!({"name": "a", "model": "b"})).unwrap();
+        assert!(matches!(mismatch.model_name(), Err(Error::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn ollama_pull_streams_status_and_terminal_errors_as_ndjson() {
+        let (server, directory) = setup(Arc::new(BearerAuth::new("secret")));
+        server.attach_catalog(
+            ModelCatalog::open(directory.join("catalog.sqlite")).unwrap(),
+            directory.join("models"),
+        );
+        let app = router(server);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ollama/api/pull")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"not-a-hugging-face-uri"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/x-ndjson");
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let rows = body
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows[0], json!({"status":"pulling manifest"}));
+        assert_eq!(rows[1], json!({"error":"state error: invalid hf uri"}));
+        assert_eq!(rows.len(), 2);
+
+        let buffered = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ollama/api/pull")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"not-a-hugging-face-uri","stream":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(buffered.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(buffered.headers()["content-type"], "application/json");
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[tokio::test]
     async fn http_auth_openapi_completion_and_context_api() {
         let (s, d) = setup(Arc::new(BearerAuth::new("secret")));
         let app = router(s);
+
         let denied = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/v1/models")
+                    .uri("/openai/v1/models")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2801,7 +3916,7 @@ mod tests {
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
         let req = Request::builder()
             .method("POST")
-            .uri("/v1/completions")
+            .uri("/openai/v1/completions")
             .header("authorization", "Bearer secret")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -2814,36 +3929,66 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["choices"][0]["text"], "world hello");
-        let context_id = body["usage"]["context_id"].as_str().unwrap();
-        let continuation = Request::builder()
-            .method("POST")
-            .uri("/v1/completions")
-            .header("authorization", "Bearer secret")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({
-                    "model": "m",
-                    "prompt": "again",
-                    "max_tokens": 1,
-                    "context_id": context_id
-                })
-                .to_string(),
-            ))
+        let version = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ollama/api/version")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
             .unwrap();
-        let continuation = app.clone().oneshot(continuation).await.unwrap();
-        assert_eq!(continuation.status(), StatusCode::OK);
-        let continuation: Value = serde_json::from_slice(
-            &to_bytes(continuation.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(continuation["usage"]["context_id"], context_id);
+        assert_eq!(version.status(), StatusCode::OK);
+        let version: Value =
+            serde_json::from_slice(&to_bytes(version.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(version, json!({"version": env!("CARGO_PKG_VERSION")}));
         let spec = openapi_document();
         assert_eq!(spec["openapi"], "3.1.0");
-        assert!(spec["paths"]["/v1/chat/completions"].is_object());
-        assert!(spec["paths"]["/native/status"].is_object());
+        assert!(spec["paths"]["/openai/v1/chat/completions"].is_object());
+        assert!(spec["paths"]["/cusco/v1/status"].is_object());
+        assert!(spec["paths"]["/ollama/api/version"].is_object());
+        for path in spec["paths"].as_object().unwrap().values() {
+            for operation in path.as_object().unwrap().values() {
+                assert!(operation["operationId"].is_string());
+                assert!(operation["responses"]["200"].is_object());
+            }
+        }
+        assert_eq!(
+            spec["paths"]["/openai/v1/completions"]["post"]["requestBody"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/CompletionRequest"
+        );
         fs::remove_dir_all(d).unwrap()
+    }
+
+    #[tokio::test]
+    async fn adapters_use_configured_default_output_tokens_when_omitted() {
+        let (configured, directory) = setup(Arc::new(AnonymousAdmin));
+        configured
+            .configure(ServerConfig {
+                default_output_tokens: 3,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        let response = router(configured)
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({"model": "m", "input": "hello world"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["output"][0]["content"][0]["text"], "world hello world");
+        assert_eq!(body["usage"]["output_tokens"], 3);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn request(method: &str, uri: &str, body: Value) -> Request<Body> {
@@ -2856,54 +4001,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_lifecycle_chat_streaming_and_context_routes() {
+    async fn namespaced_chat_streaming_and_context_routes() {
         let (s, d) = setup(Arc::new(AnonymousAdmin));
         let app = router(s);
-        let second = d.join("second.gguf");
-        fs::write(&second, b"second").unwrap();
-        let register = json!({
-            "id":"second",
-            "revision":"r2",
-            "path":second,
-            "sha256":hex_digest(b"second")
-        });
-        for (method, uri, body, expected) in [
-            ("POST", "/native/models", register, StatusCode::OK),
-            ("GET", "/native/models", json!(null), StatusCode::OK),
-            ("GET", "/native/models/second", json!(null), StatusCode::OK),
-            ("GET", "/native/status", json!(null), StatusCode::OK),
-            (
-                "POST",
-                "/native/models/second/aliases",
-                json!({"alias":"stable"}),
-                StatusCode::OK,
-            ),
-            (
-                "GET",
-                "/native/models/second/check-update/r1",
-                json!(null),
-                StatusCode::OK,
-            ),
-            (
-                "POST",
-                "/native/models/second/verify",
-                json!(null),
-                StatusCode::OK,
-            ),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(request(method, uri, body))
-                .await
-                .unwrap();
-            if response.status() != expected {
-                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-                panic!("{method} {uri}: {}", String::from_utf8_lossy(&bytes));
-            }
-        }
         assert_eq!(
             app.clone()
-                .oneshot(request("GET", "/native/contexts", json!(null)))
+                .oneshot(request("GET", "/cusco/v1/status", json!(null)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request("GET", "/cusco/v1/contexts", json!(null)))
                 .await
                 .unwrap()
                 .status(),
@@ -2913,7 +4024,7 @@ mod tests {
             .clone()
             .oneshot(request(
                 "POST",
-                "/native/contexts/import",
+                "/cusco/v1/contexts/import",
                 json!({"tokens":["durable","state"]}),
             ))
             .await
@@ -2924,13 +4035,13 @@ mod tests {
         assert_eq!(imported.tokens, vec!["durable", "state"]);
         let created = app
             .clone()
-            .oneshot(request("POST", "/native/contexts", json!(null)))
+            .oneshot(request("POST", "/cusco/v1/contexts", json!(null)))
             .await
             .unwrap();
         let created: ContextRecord =
             serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        let context_uri = format!("/native/contexts/{}", created.id.0);
+        let context_uri = format!("/cusco/v1/contexts/{}", created.id.0);
         assert_eq!(
             app.clone()
                 .oneshot(request("GET", &context_uri, json!(null)))
@@ -2958,7 +4069,7 @@ mod tests {
         );
         assert_eq!(
             app.clone()
-                .oneshot(request("DELETE", "/native/requests/pending", json!(null)))
+                .oneshot(request("DELETE", "/cusco/v1/requests/pending", json!(null)))
                 .await
                 .unwrap()
                 .status(),
@@ -2967,7 +4078,7 @@ mod tests {
         let chat = json!({"model":"m","messages":[{"content":"hello world"}],"max_tokens":2,"stream":true});
         let streamed = app
             .clone()
-            .oneshot(request("POST", "/v1/chat/completions", chat))
+            .oneshot(request("POST", "/openai/v1/chat/completions", chat))
             .await
             .unwrap();
         assert_eq!(streamed.status(), StatusCode::OK);
@@ -2979,12 +4090,11 @@ mod tests {
         );
         to_bytes(streamed.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
-            app.clone()
-                .oneshot(request("DELETE", "/native/models/second", json!(null)))
+            app.oneshot(request("GET", "/native/models", json!(null)))
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::NO_CONTENT
+            StatusCode::NOT_FOUND
         );
         fs::remove_dir_all(d).unwrap();
     }
@@ -3197,6 +4307,7 @@ mod tests {
                     deadline_ms: None,
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                     scheduling: SchedulingMetadata::default(),
                 },
                 admission,
@@ -3244,6 +4355,7 @@ mod tests {
                     deadline_ms: None,
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                     scheduling: SchedulingMetadata::default(),
                 },
                 admission,
@@ -3303,6 +4415,7 @@ mod tests {
                         deadline_ms: None,
                         stop: vec![],
                         raw_continuation: false,
+                        sampling: SamplingConfig::default(),
                         scheduling: SchedulingMetadata::default(),
                     },
                 )
@@ -3323,6 +4436,7 @@ mod tests {
                     deadline_ms: Some(5),
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                     scheduling: SchedulingMetadata::default(),
                 },
             ),
@@ -3357,6 +4471,7 @@ mod tests {
                 queue_bytes: 16 << 20,
                 request_bytes: 1 << 20,
                 pre_queue_concurrency: 16,
+                default_output_tokens: default_tokens(),
                 header_bytes: 32 << 10,
                 body_timeout_ms: 10_000,
                 wall_time_ms: 300_000,
@@ -3402,7 +4517,7 @@ mod tests {
 
         let invalid = router(server.clone())
             .oneshot(
-                Request::post("/v1/completions")
+                Request::post("/openai/v1/completions")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"model":"missing","prompt":"hello"}"#))
                     .unwrap(),
@@ -3413,7 +4528,7 @@ mod tests {
 
         let overloaded = router(server.clone())
             .oneshot(
-                Request::post("/v1/completions")
+                Request::post("/openai/v1/completions")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"model":"m","prompt":"hello"}"#))
                     .unwrap(),
@@ -3447,7 +4562,7 @@ mod tests {
             .unwrap();
         let headers = router(server.clone())
             .oneshot(
-                Request::post("/v1/completions")
+                Request::post("/openai/v1/completions")
                     .header("content-type", "application/json")
                     .header("x-oversized", "01234567890123456789")
                     .body(Body::from("{}"))
@@ -3470,7 +4585,7 @@ mod tests {
             .unwrap();
         let body = router(server.clone())
             .oneshot(
-                Request::post("/v1/completions")
+                Request::post("/openai/v1/completions")
                     .header("content-type", "application/json")
                     .body(Body::from("x".repeat(33)))
                     .unwrap(),
@@ -3492,7 +4607,7 @@ mod tests {
         }));
         let timed_out = router(server.clone())
             .oneshot(
-                Request::post("/v1/completions")
+                Request::post("/openai/v1/completions")
                     .header("content-type", "application/json")
                     .body(slow_body)
                     .unwrap(),
@@ -3547,6 +4662,78 @@ mod tests {
         assert_eq!(server.pre_queue.semaphore.available_permits(), 2);
         drop(third);
         assert_eq!(server.pre_queue.semaphore.available_permits(), 3);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn ollama_delete_uses_delete_and_accepts_canonical_model_field() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let app = router_with_http_debug(
+            server.clone(),
+            HttpDebug::new(HttpDebugLevel::Full, move |line| {
+                captured.lock().push(line.to_owned())
+            }),
+        );
+        let response = app
+            .oneshot(
+                Request::delete("/ollama/api/delete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"m"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(server.model("m"), Err(Error::ModelNotFound(_))));
+        let records = records
+            .lock()
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["method"], "DELETE");
+        assert_eq!(records[0]["body"]["utf8"], r#"{"model":"m"}"#);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ollama_ps_reports_resident_models() {
+        let dir = dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.gguf");
+        fs::write(&path, b"model").unwrap();
+        let server = Server::open(
+            dir.join("state.json"),
+            Arc::new(AnonymousAdmin),
+            Arc::new(ResidentStatusEngine),
+        )
+        .unwrap();
+        server
+            .register_model(ModelRecord {
+                id: "m".into(),
+                revision: "r1".into(),
+                path,
+                sha256: hex_digest(b"model"),
+                aliases: vec![],
+                family: "gemma4".into(),
+                size_bytes: 5,
+                epoch: 0,
+            })
+            .unwrap();
+        let response = router(server)
+            .oneshot(Request::get("/ollama/api/ps").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["models"][0]["name"], "m");
+        assert_eq!(body["models"][0]["model"], "m");
+        assert_eq!(body["models"][0]["size"], 5);
+        assert_eq!(body["models"][0]["size_vram"], 3);
+        assert_eq!(body["models"][0]["details"]["format"], "gguf");
+        assert_eq!(body["models"][0]["details"]["family"], "gemma4");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3604,11 +4791,11 @@ mod tests {
         );
         let response = app
             .oneshot(
-                Request::post("/v1/completions")
+                Request::post("/openai/v1/completions")
                     .header("authorization", "Bearer header-secret")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"model":"m","prompt":"private prompt","max_tokens":2,"api_key":"body-secret"}"#,
+                        r#"{"model":"m","prompt":"private prompt","max_tokens":2}"#,
                     ))
                     .unwrap(),
             )
@@ -3630,10 +4817,9 @@ mod tests {
         assert_eq!(records[0]["direction"], "in");
         assert_eq!(records[0]["request_id"], request_id);
         assert_eq!(records[0]["method"], "POST");
-        assert_eq!(records[0]["path"], "/v1/completions");
+        assert_eq!(records[0]["path"], "/openai/v1/completions");
         assert_eq!(records[0]["body"]["json"]["model"], "[REDACTED]");
         assert_eq!(records[0]["body"]["json"]["prompt"], "[REDACTED]");
-        assert_eq!(records[0]["body"]["json"]["api_key"], "[REDACTED]");
         assert_eq!(records[0]["body"]["json"]["max_tokens"], 2);
         assert_eq!(records[1]["direction"], "out");
         assert_eq!(records[1]["status"], 200);
@@ -3663,7 +4849,7 @@ mod tests {
         );
         let response = app
             .oneshot(
-                Request::post("/v1/completions?trace_token=query-secret")
+                Request::post("/openai/v1/completions?trace_token=query-secret")
                     .header("authorization", "Bearer header-secret")
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -3684,7 +4870,7 @@ mod tests {
         assert_eq!(records[0]["level"], "full");
         assert_eq!(
             records[0]["uri"],
-            "/v1/completions?trace_token=query-secret"
+            "/openai/v1/completions?trace_token=query-secret"
         );
         assert!(
             records[0]["headers"]
@@ -3721,7 +4907,11 @@ mod tests {
             }),
         );
         let response = app
-            .oneshot(Request::get("/openapi.json").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/openai/v1/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -3743,7 +4933,7 @@ mod tests {
         );
         let response = app
             .oneshot(
-                Request::post("/v1/completions")
+                Request::post("/openai/v1/completions")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"model":"m","prompt":"stream secret","max_tokens":2,"stream":true}"#,
@@ -3830,7 +5020,7 @@ mod tests {
                 .expect("HTTP server became ready");
             std::io::Write::write_all(
                 &mut socket,
-                b"GET /openapi.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                b"GET /openai/v1/openapi.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
             )
             .unwrap();
             let mut response = String::new();
@@ -3858,5 +5048,64 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(matches!(wall.check(), Err(Error::Deadline)));
         assert!(matches!(active.check(), Err(Error::Deadline)));
+    }
+    #[tokio::test]
+    async fn responses_accept_structured_message_input() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let response = router(server)
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({
+                    "model": "m",
+                    "input": [{"role": "user", "content": "hello"}],
+                    "max_output_tokens": 1
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["object"], "response");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn openai_streams_honor_usage_option_and_end_with_done() {
+        let started = stream_row(
+            WireProtocol::OpenAiChat,
+            StreamEvent::Started {
+                request_id: "request".into(),
+                context_id: ContextId::new(),
+            },
+            false,
+        );
+        assert!(started.contains("\"role\":\"assistant\""));
+
+        let terminal = StreamEvent::Finished {
+            reason: FinishReason::Length,
+            usage: Usage {
+                input_tokens: 1,
+                generated_tokens: 2,
+                evaluated_tokens: 1,
+                cached_tokens: 0,
+                prefill: PrefillMetrics::default(),
+                model: "model".into(),
+                model_revision: "revision".into(),
+                context_id: ContextId::new(),
+                latency_ms: 1,
+                status: "completed".into(),
+            },
+        };
+        let without_usage = stream_row(WireProtocol::OpenAiChat, terminal.clone(), false);
+        assert!(!without_usage.contains("\"usage\""));
+        assert!(without_usage.ends_with("data: [DONE]\n\n"));
+        assert!(without_usage.contains("\"finish_reason\":\"length\""));
+
+        let with_usage = stream_row(WireProtocol::OpenAiChat, terminal, true);
+        assert!(with_usage.contains("\"usage\""));
+        assert!(with_usage.ends_with("data: [DONE]\n\n"));
     }
 }

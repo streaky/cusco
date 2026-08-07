@@ -1,8 +1,8 @@
 schema_version: 1
 families:
-  - id: gemma-4-e2b-it
-    architecture: gemma3
-    model_type: gemma3_text
+  - id: gemma4
+    architecture: gemma4
+    model_type: gemma4_text
     block_size: 32
     recurrent_checkpoint_interval: 8
     context_limit: 4096

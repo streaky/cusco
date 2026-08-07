@@ -6,26 +6,27 @@ The project separates responsibilities deliberately: Rust will manage logical co
 
 ## Current state
 
-Cusco has completed Phases 1 through 8. The executor proof established exact
-checkpoint continuation for a hybrid/recurrent Gemma model, and the Rust layers
-now provide durable logical contexts, capacity-accounted physical state,
-transactional mapped activation, an authenticated HTTP API, immutable model
-epochs, bounded live inference, dynamic model residency, and resumable
-priority-aware workload scheduling.
+Cusco has completed Phases 1 through 9. In addition to exact checkpoint
+continuation, transactional mapped execution, multi-model residency, and
+priority-aware scheduling, the server now exposes cleanly namespaced OpenAI,
+Ollama, and Cusco APIs. Phase 9 adds strict compatibility request validation,
+OpenAI- and Ollama-native streaming frames, Responses, bounded inline images,
+tool and structured-output controls, immutable Hub resolution, a migrated
+SQLite model catalog, versioned daemon configuration, and a production
+Compose profile.
 
-Phase 8 schedules bounded prefill and one-token decode quanta with
-priority-aware deficit round robin, per-principal fairness, FIFO ordering, and
-monotonic age promotion. Request-owned execution sessions preserve unpublished
-successor state across quanta, while bounded asynchronous scheduler diagnostics
-attribute decisions without backpressuring inference. The checked-in versioned
-mixed workload gates fairness, starvation, cancellation, deadlines, capacity
-recovery, diagnostic loss, and relative first-event and per-quantum latency on
-the declared real model and GPU.
+Model identity, immutable revision, aliases, and lifecycle operation records
+survive restart. Logical contexts, active requests, queues, native execution
+state, and spill state are intentionally disposable in the v1 restart model.
 
 ## Run the real-model inference integration test
 
-With the validation GGUF at `models/gemma-4-e2b-it.gguf`, Docker's NVIDIA
-runtime configured, and an available NVIDIA GPU, run:
+The workflow uses
+`hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf`.
+It keeps the immutable Hugging Face artifact under `models/cache` and
+materializes the stable `models/gemma-4-e2b-it.gguf` test path. The cache is
+reused across runs; the model is downloaded only when it is absent or invalid.
+With Docker's NVIDIA runtime configured and an available NVIDIA GPU, run:
 
 ```sh
 tools/inference-integration-test.sh
@@ -105,34 +106,34 @@ and workload provenance, and selected GPU in `results/phase8-server.json`.
 
 ## Run the production Compose service
 
-Place the initial model at `data/models/gemma-4-e2b-it.gguf`, then provide an
-authentication token and start the release-binary service:
+Copy `config/config.yaml` to an operator-owned location, configure
+`config/user.yaml` with local model declarations, provide an authentication
+token, and start the release service:
 
 ```sh
-mkdir -p data/models data/state data/spill
+mkdir -p data/models data/state data/spill data/user-models
 CUSCO_BEARER_TOKEN='replace-with-a-secret' docker compose up --build -d server
 ```
 
-The production definition listens on `127.0.0.1:8080` by default, persists the
-catalog and contexts under `data/state`, and keeps bounded context spills under
-`data/spill`. `CUSCO_LISTEN_ADDRESS`, `CUSCO_PORT`, `CUSCO_GPU_DEVICE_ID`,
-`CUSCO_MODEL_FILE`, and the documented capacity environment variables can
-override the defaults. The entire `data/` tree is intentionally ignored by
-Git and excluded from image build contexts.
+The production definition mounts the versioned daemon configuration read-only,
+listens on `127.0.0.1:8080` by default, persists the migrated SQLite catalog
+under `data/state`, and uses bounded storage under `data/spill`. Override
+`CUSCO_LISTEN_ADDRESS`, `CUSCO_PORT`, and `CUSCO_GPU_DEVICE_ID` as needed.
+The entire `data/` tree is ignored by Git and excluded from image build
+contexts.
 
-## Run the minimal server
+## Run the daemon directly
 
-The unauthenticated development provider is restricted to loopback:
+The daemon accepts one versioned configuration path:
 
 ```sh
-cargo run -p cusco -- serve \
-  --listen 127.0.0.1:8080 \
-  --state ./data/cusco-state.json
+cargo run -p cusco -- serve --config ./config/config.yaml
 ```
 
-Pass `--bearer-token` to require authentication. Listening anonymously on a
-non-loopback address is rejected unless
-`--unsafe-public-unauthenticated` is explicitly supplied.
+Unknown, missing, invalid, or unsupported-version configuration is rejected
+before model execution starts. `CUSCO_BEARER_TOKEN` may supply the secret
+without placing it in the configuration file. Anonymous serving is restricted
+to loopback unless the explicit unsafe-public setting is enabled.
 
 HTTP transport diagnostics have three levels selected with
 `--http-debug <off|safe|full>` or `CUSCO_HTTP_DEBUG`. An explicit CLI value
@@ -147,21 +148,17 @@ credentials and generated content and must be enabled only in a controlled
 diagnostic environment. Traced responses include the correlation ID in
 `x-request-id`.
 
-The checked OpenAPI document is served at `/openapi.json`. The current minimal
-completion and chat entry points are `/v1/completions`,
-`/v1/chat/completions`, and `/v1/models`; they do not yet claim the Phase 9
-OpenAI compatibility contract, including chat-template and tool semantics or
-OpenAI-native streaming chunks.
-Native `/native/models`, `/native/contexts`, and `/native/requests` operations
-cover model lifecycle, durable contexts and branches, imports, and
-cancellation. Server inference uses registered local model paths and does not
-implicitly fetch models.
+The checked OpenAPI documents are served at
+`/openai/v1/openapi.json`, `/ollama/api/openapi.json`, and
+`/cusco/v1/openapi.json`. OpenAI-compatible endpoints live under
+`/openai/v1/*`; Ollama-native endpoints live under `/ollama/api/*`; durable
+Cusco lifecycle and diagnostics endpoints live under `/cusco/v1/*`.
+The former unprefixed `/v1/*` and `/native/*` routes do not exist.
 
 ## Future goals
 
-Development now proceeds from measured workload scheduling toward:
+Development now proceeds from the Phase 9 product contract toward:
 
-- compatibility, persistence, daemon configuration, and production packaging;
 - broader model compatibility and later execution-policy optimization;
 - optional semantic context compaction once the underlying state system is proven reliable.
 
