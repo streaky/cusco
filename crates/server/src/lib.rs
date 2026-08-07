@@ -1348,6 +1348,14 @@ impl Server {
             .commit_model(&model, previous.as_ref().map(|record| record.epoch));
         Ok(model)
     }
+    fn effective_stop_sequences(&self, req: &InferRequest) -> Result<Vec<String>, Error> {
+        let mut stops = req.stop.clone();
+        let model = self.model(&req.model)?;
+        if model.family == "gemma4" && !stops.iter().any(|stop| stop == "<end_of_turn>") {
+            stops.push("<end_of_turn>".into());
+        }
+        Ok(stops)
+    }
 
 
     pub fn models(&self) -> Vec<ModelRecord> {
@@ -1513,8 +1521,9 @@ impl Server {
         request_id: &str,
         req: InferRequest,
     ) -> Result<(InferResponse, Vec<StreamEvent>), Error> {
+        let stops = self.effective_stop_sequences(&req)?;
         let frontier =
-            GenerationFrontier::new(&req.stop, req.raw_continuation).map_err(state_err)?;
+            GenerationFrontier::new(&stops, req.raw_continuation).map_err(state_err)?;
         let successor_id = req.context_id.clone().unwrap_or_else(ContextId::new);
         let execution_session_id = req.scheduling.inference_id.clone();
         let mut events = vec![StreamEvent::Started {
@@ -1538,8 +1547,9 @@ impl Server {
         req: InferRequest,
         admission: AdmissionGuard,
     ) -> Result<(StreamEvent, tokio::sync::mpsc::Receiver<StreamEvent>), Error> {
+        let stops = self.effective_stop_sequences(&req)?;
         let frontier =
-            GenerationFrontier::new(&req.stop, req.raw_continuation).map_err(state_err)?;
+            GenerationFrontier::new(&stops, req.raw_continuation).map_err(state_err)?;
         let successor_id = req.context_id.clone().unwrap_or_else(ContextId::new);
         let started = StreamEvent::Started {
             request_id: request_id.clone(),
