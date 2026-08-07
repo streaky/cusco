@@ -1759,7 +1759,7 @@ The initial Phase 9 release deliberately favors a useful, bounded compatibility 
   - `removed_turns`: number of turns removed
   - `removed_messages`: number of messages removed
   - `retained_message_ids`: message IDs retained for deterministic replay
-  - `resulting_context_epoch`: opaque identity for the new context branch/lineage
+- `resulting_context_epoch`: opaque identity for the new context branch/lineage; this should be a monotonic compaction sequence/turn token for the current lineage, not an absolute message-position offset.
   - `strategy_parameters`: resolved strategy parameters
   - `succeeded`: boolean for whether compaction planning and proposal publication succeeded
   - `fallback_used`: boolean
@@ -1848,6 +1848,8 @@ The out-of-box compaction surface is intentionally conservative and deterministi
   - Trims at logical turn/message boundaries only: v1 never retains a partial message, so role and envelope integrity are preserved.
   - Aligns truncation to compaction block geometry where possible to avoid immediately invalidating reusable block boundaries.
   - Treats `target` as a target, not a hard cap: if policy anchors alone exceed the target and cannot be reduced, compaction returns an `AnchorsOnly` result (no additional conversational window), continues execution, and emits runtime metadata with reason `PolicyBudgetExceeded` so clients can distinguish this from admission/resource failures.
+  - Compaction is turn-scoped and non-recursive per request: each request triggers at most one compaction pass over the current source head, producing at most one candidate successor.
+  - Periodic recompression is expected: later turns may compact the newly adopted head again if it again risks fitting pressure, preserving tail semantics across time.
   - Records explicit runtime metadata: budget, anchor policy, compact mode, and compact-reason.
 #### Phase 10 baseline exit checklist (window_tail only)
 
