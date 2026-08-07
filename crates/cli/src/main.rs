@@ -1000,7 +1000,7 @@ mod tests {
             serde_json::to_vec(&json!({
                 "version": 1,
                 "name": "model-free",
-                "model_family": "gemma3",
+                "model_family": "gemma4",
                 "policy": {
                     "version": 1,
                     "interactive_weight": 4,

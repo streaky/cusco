@@ -8,14 +8,14 @@ pub(crate) struct Message {
 
 pub(crate) fn apply_chat_template(family: &str, messages: Vec<Message>) -> Result<String, Error> {
     match family {
-        "gemma3" => gemma3(messages),
+        "gemma4" => gemma4(messages),
         _ => Err(Error::BadRequest(format!(
             "unsupported_capability: model family {family} has no chat template"
         ))),
     }
 }
 
-fn gemma3(mut messages: Vec<Message>) -> Result<String, Error> {
+fn gemma4(mut messages: Vec<Message>) -> Result<String, Error> {
     if messages.is_empty() {
         return Err(Error::BadRequest("messages must not be empty".into()));
     }
@@ -72,7 +72,7 @@ mod tests {
     #[test]
     fn applies_gemma_template_once_and_maps_roles() {
         let prompt = apply_chat_template(
-            "gemma3",
+            "gemma4",
             vec![
                 Message {
                     role: "system".into(),
@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn rejects_non_alternating_and_tool_messages() {
         let error = apply_chat_template(
-            "gemma3",
+            "gemma4",
             vec![Message {
                 role: "tool".into(),
                 content: "result".into(),

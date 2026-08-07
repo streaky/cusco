@@ -528,9 +528,9 @@ mod tests {
         bytes.extend_from_slice(b"general.architecture");
         bytes.extend_from_slice(&8_u32.to_le_bytes());
         bytes.extend_from_slice(&6_u64.to_le_bytes());
-        bytes.extend_from_slice(b"gemma3");
+        bytes.extend_from_slice(b"gemma4");
         fs::write(&path, bytes).unwrap();
-        assert_eq!(probe_gguf(&path).unwrap().architecture, "gemma3");
+        assert_eq!(probe_gguf(&path).unwrap().architecture, "gemma4");
         fs::remove_file(path).unwrap();
     }
     #[test]

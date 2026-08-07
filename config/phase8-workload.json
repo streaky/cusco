@@ -1,7 +1,7 @@
 {
   "version": 2,
   "name": "gemma-4-e2b-it-mixed-scheduler-v2",
-  "model_family": "gemma3",
+  "model_family": "gemma4",
   "policy": {
     "version": 1,
     "interactive_weight": 4,

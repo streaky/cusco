@@ -94,8 +94,8 @@ impl ExecutionProfile {
 
     fn validate(&self) -> Result<(), Error> {
         if self.id.is_empty()
-            || self.architecture != "gemma3"
-            || self.model_type != "gemma3_text"
+            || self.architecture != "gemma4"
+            || self.model_type != "gemma4_text"
             || self.block_size == 0
             || self.recurrent_checkpoint_interval == 0
             || self.context_limit < self.block_size
@@ -1052,7 +1052,7 @@ mod tests {
             path: PathBuf::from("mock://deterministic"),
             sha256: "mock".into(),
             aliases: vec![],
-            family: "gemma3".into(),
+            family: "gemma4".into(),
             size_bytes: 1,
             epoch: 1,
         }
@@ -1136,7 +1136,7 @@ mod tests {
     #[test]
     fn mapped_state_is_reused_without_activation_copying() {
         let engine =
-            MappedEngine::open("gemma3", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
                 .unwrap();
         let model = model();
         let first = engine
@@ -1164,7 +1164,7 @@ mod tests {
         fs::write(spill_dir.join("operator-note"), b"keep").unwrap();
 
         let _engine = MappedEngine::open_at_epoch_with_spill(
-            "gemma3",
+            "gemma4",
             "mock://deterministic",
             4096,
             0,
@@ -1186,7 +1186,7 @@ mod tests {
     fn spilled_mapping_restores_exact_continuation() {
         let spill_dir = std::env::temp_dir().join(format!("cusco-spill-{}", uuid::Uuid::new_v4()));
         let engine = MappedEngine::open_at_epoch_with_spill(
-            "gemma3",
+            "gemma4",
             "mock://deterministic",
             4096,
             0,
@@ -1205,7 +1205,7 @@ mod tests {
             .generate_collected(test_request(&model, &"b".repeat(40), 1, &[]))
             .unwrap();
         let control =
-            MappedEngine::open("gemma3", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
                 .unwrap();
         let control_first = control
             .generate_collected(test_request(&model, &"a".repeat(40), 2, &[]))
@@ -1234,7 +1234,7 @@ mod tests {
     #[test]
     fn capacity_rejection_precedes_decode_and_preserves_metrics() {
         let engine =
-            MappedEngine::open("gemma3", "mock://deterministic", 64, 0, 1 << 20, 1 << 20).unwrap();
+            MappedEngine::open("gemma4", "mock://deterministic", 64, 0, 1 << 20, 1 << 20).unwrap();
         let model = model();
         let error = engine
             .generate_collected(test_request(&model, &"x".repeat(65), 1, &[]))
@@ -1246,7 +1246,7 @@ mod tests {
     #[test]
     fn publication_failure_keeps_the_prior_mapping_reusable() {
         let engine =
-            MappedEngine::open("gemma3", "mock://deterministic", 4096, 0, 250_000, 1 << 20)
+            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 250_000, 1 << 20)
                 .unwrap();
         let model = model();
         let first = engine
@@ -1270,7 +1270,7 @@ mod tests {
     #[test]
     fn exact_cached_prefix_resumes_from_its_saved_logits() {
         let engine =
-            MappedEngine::open("gemma3", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
                 .unwrap();
         let model = model();
         let primed = engine
@@ -1291,7 +1291,7 @@ mod tests {
             std::env::temp_dir().join(format!("cusco-mapped-server-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let engine =
-            MappedEngine::open("gemma3", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
                 .unwrap();
         let server = Server::open(
             directory.join("state.json"),

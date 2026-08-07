@@ -223,7 +223,7 @@ fn initial_model_epoch() -> u64 {
 }
 
 fn default_model_family() -> String {
-    "gemma3".into()
+    "gemma4".into()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -3309,7 +3309,7 @@ mod tests {
             path: model,
             sha256: hex_digest(b"model"),
             aliases: vec!["latest".into()],
-            family: "gemma3".into(),
+            family: "gemma4".into(),
             size_bytes: 5,
             epoch: 0,
         })
@@ -3527,7 +3527,7 @@ mod tests {
             path: second_path,
             sha256: hex_digest(b"second"),
             aliases: vec!["latest".into()],
-            family: "gemma3".into(),
+            family: "gemma4".into(),
             size_bytes: 6,
             epoch: 0,
         })

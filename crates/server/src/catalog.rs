@@ -244,7 +244,7 @@ mod tests {
             path: "/m.gguf".into(),
             sha256: "abc".into(),
             aliases: vec!["latest".into()],
-            family: "gemma3".into(),
+            family: "gemma4".into(),
             size_bytes: 7,
             epoch: 0,
         };
