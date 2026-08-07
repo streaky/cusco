@@ -4512,6 +4512,29 @@ mod tests {
         assert!(matches!(wall.check(), Err(Error::Deadline)));
         assert!(matches!(active.check(), Err(Error::Deadline)));
     }
+    #[tokio::test]
+    async fn responses_accept_structured_message_input() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let response = router(server)
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({
+                    "model": "m",
+                    "input": [{"role": "user", "content": "hello"}],
+                    "max_output_tokens": 1
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["object"], "response");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn openai_streams_honor_usage_option_and_end_with_done() {
         let started = stream_row(
