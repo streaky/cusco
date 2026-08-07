@@ -3669,6 +3669,10 @@ mod tests {
         .unwrap();
         assert!(responses.tools[0].valid_function());
         assert!(matches!(
+            responses.tools.as_slice(),
+            [ToolDefinition::Flat(_)]
+        ));
+        assert!(matches!(
             validate_controls(None, None, &responses.tools, None, None),
             Err(Error::BadRequest(message)) if message.contains("does not advertise tool calling")
         ));
@@ -3687,6 +3691,7 @@ mod tests {
         }))
         .unwrap();
         assert!(chat.tools[0].valid_function());
+        assert!(matches!(chat.tools.as_slice(), [ToolDefinition::Nested(_)]));
     }
     #[test]
     fn scheduler_uses_transition_cost_priority_and_wait() {
