@@ -19,6 +19,8 @@ pub enum Error {
     Http(#[from] ureq::Error),
     #[error("invalid GGUF metadata: {0}")]
     InvalidMetadata(String),
+    #[error("invalid Hub metadata: {0}")]
+    Json(#[from] serde_json::Error),
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelRecord {
@@ -126,7 +128,7 @@ fn parse_hf(uri: &str) -> Result<(String, String, String), Error> {
         .components()
         .all(|component| matches!(component, std::path::Component::Normal(_)))
         && Path::new(file).components().count() == 1;
-    if org.is_empty() || model.is_empty() || revision.len() != 40 || file.is_empty() || !simple_file
+    if org.is_empty() || model.is_empty() || revision.is_empty() || revision.contains('/') || file.is_empty() || !simple_file
     {
         return Err(Error::InvalidUri);
     }
@@ -136,14 +138,26 @@ fn parse_hf(uri: &str) -> Result<(String, String, String), Error> {
         file.to_owned(),
     ))
 }
+fn resolve_revision(repo: &str, revision: &str) -> Result<String, Error> {
+    if revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(revision.to_ascii_lowercase());
+    }
+    let url = format!("https://huggingface.co/api/models/{repo}/revision/{revision}");
+    let mut response = ureq::get(url).call()?;
+    let value: serde_json::Value = serde_json::from_reader(response.body_mut().as_reader())?;
+    let sha = value.get("sha").and_then(serde_json::Value::as_str).ok_or(Error::InvalidUri)?;
+    if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err(Error::InvalidUri); }
+    Ok(sha.to_ascii_lowercase())
+}
 pub fn fetch_hf(uri: &str, cache: &Path, expected: Option<&str>) -> Result<ModelRecord, Error> {
-    let (repo, revision, file) = parse_hf(uri)?;
-    let dir = cache
-        .join("models")
-        .join(repo.replace('/', "--"))
-        .join(&revision);
+    let (repo, requested_revision, file) = parse_hf(uri)?;
+    let revision = resolve_revision(&repo, &requested_revision)?;
+    let dir = cache.join("models").join(repo.replace('/', "--")).join(&revision);
     fs::create_dir_all(&dir)?;
     let destination = dir.join(&file);
+    if destination.exists() && register_local(&destination, uri, expected).is_err() {
+        fs::remove_file(&destination)?;
+    }
     if !destination.exists() {
         let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{file}");
         let tmp = destination.with_extension("partial");
@@ -153,7 +167,8 @@ pub fn fetch_hf(uri: &str, cache: &Path, expected: Option<&str>) -> Result<Model
         output.flush()?;
         fs::rename(tmp, &destination)?;
     }
-    register_local(destination, uri, expected)
+    let identity = format!("hf://models/{repo}@{revision}/{file}");
+    register_local(destination, &identity, expected)
 }
 #[cfg(test)]
 mod tests {
@@ -183,10 +198,7 @@ mod tests {
             "0314792d7f1f7e229411f620751375812bb9faf2"
         );
         assert!(matches!(parse_hf("https://bad"), Err(Error::InvalidUri)));
-        assert!(matches!(
-            parse_hf("hf://models/a/b@short/f"),
-            Err(Error::InvalidUri)
-        ));
+        assert_eq!(parse_hf("hf://models/a/b@main/f").unwrap().1, "main");
         assert!(matches!(
             parse_hf("hf://models/a/b@0123456789012345678901234567890123456789/../escape.gguf"),
             Err(Error::InvalidUri)

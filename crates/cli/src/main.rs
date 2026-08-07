@@ -183,6 +183,7 @@ fn run(command: Command) -> Result<()> {
             let server = Server::open(&transient_state, auth, engine)?;
             server.configure(config.server)?;
             let catalog = ModelCatalog::open(&config.paths.database)?;
+            server.attach_catalog(catalog.clone(), config.paths.models.clone());
             for model in catalog.models()? {
                 server.register_model(model)?;
             }

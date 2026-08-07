@@ -1009,6 +1009,8 @@ pub struct Server {
     model_lifecycle: Arc<Mutex<()>>,
     auth: Arc<dyn AuthProvider>,
     engine: Arc<dyn InferenceEngine>,
+    catalog: Arc<Mutex<Option<ModelCatalog>>>,
+    model_directory: Arc<Mutex<PathBuf>>,
 }
 struct AdmissionGuard {
     server: Server,
@@ -1070,10 +1072,18 @@ impl Server {
             model_lifecycle: Arc::new(Mutex::new(())),
             auth,
             engine,
+            catalog: Arc::new(Mutex::new(None)),
+            model_directory: Arc::new(Mutex::new(PathBuf::from("./data/models"))),
         };
         server.persist()?;
         Ok(server)
     }
+    pub fn attach_catalog(&self, catalog: ModelCatalog, model_directory: impl Into<PathBuf>) {
+        *self.catalog.lock() = Some(catalog);
+        *self.model_directory.lock() = model_directory.into();
+    }
+    fn catalog(&self) -> Option<ModelCatalog> { self.catalog.lock().clone() }
+    fn model_directory(&self) -> PathBuf { self.model_directory.lock().clone() }
     fn persist(&self) -> Result<(), Error> {
         let guard = self.inner.lock();
         let bytes = serde_json::to_vec_pretty(&guard.durable).map_err(state_err)?;
@@ -2264,12 +2274,14 @@ async fn ollama_show(State(s): State<Server>, headers: HeaderMap, Json(r): Json<
 struct OllamaCopyRequest { source: String, destination: String }
 async fn ollama_copy(State(s): State<Server>, headers: HeaderMap, Json(r): Json<OllamaCopyRequest>) -> Result<StatusCode, Error> {
     auth(&s, &headers, Scope::Admin)?;
-    s.alias_model(&r.source, r.destination)?;
+    let model = s.alias_model(&r.source, r.destination)?;
+    if let Some(catalog) = s.catalog() { catalog.publish(&model).map_err(state_err)?; }
     Ok(StatusCode::OK)
 }
 async fn ollama_delete(State(s): State<Server>, headers: HeaderMap, Json(r): Json<OllamaNameRequest>) -> Result<StatusCode, Error> {
     auth(&s, &headers, Scope::Admin)?;
     s.remove_model(&r.name)?;
+    if let Some(catalog) = s.catalog() { catalog.remove(&r.name).map_err(state_err)?; }
     Ok(StatusCode::OK)
 }
 
@@ -2282,11 +2294,34 @@ struct OllamaPullRequest {
 }
 async fn ollama_pull(State(s): State<Server>, headers: HeaderMap, Json(r): Json<OllamaPullRequest>) -> Result<Json<Value>, Error> {
     auth(&s, &headers, Scope::Admin)?;
+    let catalog = s.catalog().ok_or_else(|| Error::State("model catalog is not configured".into()))?;
+    let operation = Uuid::new_v4().to_string();
+    catalog.begin_operation(&operation, &r.name, "pull").map_err(state_err)?;
     let name = r.name;
     let expected = r.sha256;
-    let fetched = tokio::task::spawn_blocking(move || cusco_model_registry::fetch_hf(&name, Path::new("./data/models"), expected.as_deref()))
-        .await.map_err(state_err)?.map_err(state_err)?;
-    let model = s.register_model(ModelRecord { id: fetched.identity.clone(), revision: fetched.sha256.clone(), path: fetched.path, sha256: fetched.sha256, aliases: vec![], family: default_model_family(), size_bytes: fetched.size, epoch: 0 })?;
+    let cache = s.model_directory();
+    let fetched = tokio::task::spawn_blocking({
+        let name = name.clone();
+        move || cusco_model_registry::fetch_hf(&name, &cache, expected.as_deref())
+    }).await.map_err(state_err);
+    let fetched = match fetched {
+        Ok(Ok(fetched)) => fetched,
+        Ok(Err(error)) => {
+            catalog.finish_operation(&operation, "failed", Some(&error.to_string())).map_err(state_err)?;
+            return Err(state_err(error));
+        }
+        Err(error) => {
+            catalog.finish_operation(&operation, "failed", Some(&error.to_string())).map_err(state_err)?;
+            return Err(error);
+        }
+    };
+    let metadata = tokio::task::spawn_blocking({
+        let path = fetched.path.clone();
+        move || cusco_model_registry::probe_gguf(path)
+    }).await.map_err(state_err)?.map_err(state_err)?;
+    let model = s.register_model(ModelRecord { id: name, revision: fetched.identity.clone(), path: fetched.path, sha256: fetched.sha256, aliases: vec![], family: metadata.architecture, size_bytes: fetched.size, epoch: 0 })?;
+    catalog.publish(&model).map_err(state_err)?;
+    catalog.finish_operation(&operation, "complete", None).map_err(state_err)?;
     Ok(Json(json!({"status":"success","model":model})))
 }
 struct DisconnectGuard {
