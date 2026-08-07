@@ -3522,7 +3522,8 @@ pub fn openapi_document() -> Value {
                     "error": {"type": "string"}
                 }
             },
-            "ImportContextRequest": {"type": "object", "additionalProperties": false, "required": ["tokens"], "properties": {"tokens": {"type": "array", "items": {"type": "string"}}}}
+            "ImportContextRequest": {"type": "object", "additionalProperties": false, "required": ["tokens"], "properties": {"tokens": {"type": "array", "items": {"type": "string"}}}},
+            "CreateCompactionDeclaration": {"type": "object", "additionalProperties": false, "required": ["context_id", "expires_in_ms"], "properties": {"context_id": {"type": "string"}, "strategy_preferences": {"type": "array", "items": {"type": "string"}}, "target_tokens": {"type": "integer", "minimum": 1}, "expires_in_ms": {"type": "integer", "minimum": 1, "maximum": 3600000}}}
         }}
     })
 }
