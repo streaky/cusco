@@ -2083,6 +2083,7 @@ fn routes(server: Server) -> Router {
         .route("/openai/v1/responses", post(responses))
         .route("/ollama/api/generate", post(ollama_generate))
         .route("/ollama/api/chat", post(ollama_chat))
+        .route("/ollama/api/version", get(ollama_version))
         .route("/ollama/api/tags", get(ollama_tags))
         .route("/ollama/api/show", post(ollama_show))
         .route("/ollama/api/pull", post(ollama_pull))
@@ -2484,6 +2485,11 @@ async fn ollama_chat(
         WireProtocol::OllamaChat,
     )
     .await
+}
+
+async fn ollama_version(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
+    auth(&s, &headers, Scope::Inference)?;
+    Ok(Json(json!({"version": env!("CARGO_PKG_VERSION")})))
 }
 
 async fn ollama_tags(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
@@ -3001,6 +3007,7 @@ pub fn openapi_document() -> Value {
             Some("OllamaChatRequest"),
         ),
         ("/ollama/api/tags", "get", "ollamaTags", None),
+        ("/ollama/api/version", "get", "ollamaVersion", None),
         (
             "/ollama/api/show",
             "post",
@@ -3509,10 +3516,28 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["choices"][0]["text"], "world hello");
+        let version = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ollama/api/version")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(version.status(), StatusCode::OK);
+        let version: Value =
+            serde_json::from_slice(&to_bytes(version.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(version, json!({"version": env!("CARGO_PKG_VERSION")}));
         let spec = openapi_document();
         assert_eq!(spec["openapi"], "3.1.0");
         assert!(spec["paths"]["/openai/v1/chat/completions"].is_object());
         assert!(spec["paths"]["/cusco/v1/status"].is_object());
+        assert!(spec["paths"]["/ollama/api/version"].is_object());
         for path in spec["paths"].as_object().unwrap().values() {
             for operation in path.as_object().unwrap().values() {
                 assert!(operation["operationId"].is_string());
