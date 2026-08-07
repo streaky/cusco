@@ -104,6 +104,19 @@ injections, post-workload capacity recovery, scheduler policy and counters,
 fully drained attributed decision records, latency/starvation thresholds, build
 and workload provenance, and selected GPU in `results/phase8-server.json`.
 
+## Run the unified API smoke report
+
+```sh
+CUSCO_GPU_DEVICE_ID=0 docker compose -f compose.test.yaml run --rm api-smoke
+```
+
+This deterministic, model-backed smoke suite exercises the primary OpenAI,
+Cusco context/compaction, and status APIs against the standard Gemma test model.
+It writes `results/smoke-report.json` with per-scenario status and latency,
+request/token totals, and aggregate min/median/max latency. The report is the
+common high-level API gate; the phase-specific reports remain available for
+focused scheduler, residency, and executor evidence.
+
 ## Run the production Compose service
 
 Copy `config/config.yaml` to an operator-owned location, configure
