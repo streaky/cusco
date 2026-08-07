@@ -30,6 +30,12 @@ pub struct ModelRecord {
     pub size: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DownloadProgress {
+    pub total: Option<u64>,
+    pub completed: u64,
+}
+
 #[derive(Deserialize, Serialize)]
 struct CacheStamp {
     sha256: String,
@@ -270,11 +276,32 @@ fn resolve_revision(repo: &str, revision: &str, cache: &Path) -> Result<String, 
     fs::write(reference, &sha)?;
     Ok(sha)
 }
-fn download_resumable(url: &str, partial: &Path) -> Result<(), Error> {
-    let offset = fs::metadata(partial).map_or(0, |metadata| metadata.len());
+fn response_total(response: &ureq::http::Response<ureq::Body>, offset: u64) -> Option<u64> {
+    response
+        .headers()
+        .get("content-range")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit_once('/'))
+        .and_then(|(_, total)| total.parse().ok())
+        .or_else(|| {
+            response
+                .headers()
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|length| length.saturating_add(offset))
+        })
+}
+
+fn download_resumable(
+    url: &str,
+    partial: &Path,
+    progress: &mut impl FnMut(DownloadProgress),
+) -> Result<(), Error> {
+    let requested_offset = fs::metadata(partial).map_or(0, |metadata| metadata.len());
     let mut request = ureq::get(url);
-    if offset > 0 {
-        request = request.header("Range", &format!("bytes={offset}-"));
+    if requested_offset > 0 {
+        request = request.header("Range", &format!("bytes={requested_offset}-"));
     }
     let mut response = request.call()?;
     let resumes_at_offset = response.status().as_u16() == 206
@@ -282,18 +309,45 @@ fn download_resumable(url: &str, partial: &Path) -> Result<(), Error> {
             .headers()
             .get("content-range")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with(&format!("bytes {offset}-")));
-    let mut output = if offset > 0 && resumes_at_offset {
+            .is_some_and(|value| value.starts_with(&format!("bytes {requested_offset}-")));
+    let offset = if resumes_at_offset {
+        requested_offset
+    } else {
+        0
+    };
+    let total = response_total(&response, offset);
+    let mut output = if offset > 0 {
         OpenOptions::new().append(true).open(partial)?
     } else {
         File::create(partial)?
     };
-    std::io::copy(&mut response.body_mut().as_reader(), &mut output)?;
+    let mut completed = offset;
+    progress(DownloadProgress { total, completed });
+    let mut buffer = [0; 256 * 1024];
+    let mut input = response.body_mut().as_reader();
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        completed = completed.saturating_add(read as u64);
+        progress(DownloadProgress { total, completed });
+    }
     output.flush()?;
     Ok(())
 }
 
 pub fn fetch_hf(uri: &str, cache: &Path, expected: Option<&str>) -> Result<ModelRecord, Error> {
+    fetch_hf_with_progress(uri, cache, expected, |_| {})
+}
+
+pub fn fetch_hf_with_progress(
+    uri: &str,
+    cache: &Path,
+    expected: Option<&str>,
+    mut progress: impl FnMut(DownloadProgress),
+) -> Result<ModelRecord, Error> {
     let (repo, requested_revision, file) = parse_hf(uri)?;
     let revision = resolve_revision(&repo, &requested_revision, cache)?;
     let dir = cache
@@ -311,8 +365,14 @@ pub fn fetch_hf(uri: &str, cache: &Path, expected: Option<&str>) -> Result<Model
     if !destination.exists() {
         let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{file}");
         let tmp = destination.with_extension("partial");
-        download_resumable(&url, &tmp)?;
+        download_resumable(&url, &tmp, &mut progress)?;
         fs::rename(tmp, &destination)?;
+    } else {
+        let size = fs::metadata(&destination)?.len();
+        progress(DownloadProgress {
+            total: Some(size),
+            completed: size,
+        });
     }
     let identity = format!("hf://{repo}@{revision}/{file}");
     if let Some(record) = cached_record(&destination, &identity, expected)? {
@@ -368,7 +428,10 @@ mod tests {
         );
         fs::remove_dir_all(cache).unwrap();
     }
-    fn download_from(response: &'static str, initial: &[u8]) -> (Vec<u8>, String) {
+    fn download_from(
+        response: &'static str,
+        initial: &[u8],
+    ) -> (Vec<u8>, String, Vec<DownloadProgress>) {
         use std::{
             io::{Read as _, Write as _},
             net::TcpListener,
@@ -393,31 +456,54 @@ mod tests {
             address.port()
         ));
         fs::write(&partial, initial).unwrap();
-        download_resumable(&format!("http://{address}/model"), &partial).unwrap();
+        let mut progress = Vec::new();
+        download_resumable(
+            &format!("http://{address}/model"),
+            &partial,
+            &mut |update| {
+                progress.push(update);
+            },
+        )
+        .unwrap();
         let bytes = fs::read(&partial).unwrap();
         fs::remove_file(partial).unwrap();
         server.join().unwrap();
-        (bytes, receiver.recv().unwrap())
+        (bytes, receiver.recv().unwrap(), progress)
     }
 
     #[test]
     fn resumes_partial_downloads_with_a_valid_content_range() {
-        let (bytes, request) = download_from(
+        let (bytes, request, progress) = download_from(
             "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-10/11\r\nContent-Length: 6\r\nConnection: close\r\n\r\n world",
             b"hello",
         );
         assert_eq!(bytes, b"hello world");
         assert!(request.to_ascii_lowercase().contains("range: bytes=5-"));
+        assert_eq!(
+            progress,
+            vec![
+                DownloadProgress {
+                    total: Some(11),
+                    completed: 5
+                },
+                DownloadProgress {
+                    total: Some(11),
+                    completed: 11
+                }
+            ]
+        );
     }
 
     #[test]
     fn restarts_partial_download_when_the_server_ignores_range() {
-        let (bytes, request) = download_from(
+        let (bytes, request, progress) = download_from(
             "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world",
             b"stale",
         );
         assert_eq!(bytes, b"hello world");
         assert!(request.to_ascii_lowercase().contains("range: bytes=5-"));
+        assert_eq!(progress.last().unwrap().completed, 11);
+        assert_eq!(progress.last().unwrap().total, Some(11));
     }
     #[test]
     fn parses_locked_and_default_revision_uris() {

@@ -2576,23 +2576,74 @@ async fn ollama_pull(
     Json(r): Json<OllamaPullRequest>,
 ) -> Result<Response, Error> {
     auth(&s, &headers, Scope::Admin)?;
-    let catalog = s
-        .catalog()
-        .ok_or_else(|| Error::State("model catalog is not configured".into()))?;
+    if s.catalog().is_none() {
+        return Err(Error::State("model catalog is not configured".into()));
+    }
     let name = r.model_name()?.to_owned();
     // `insecure` permits an insecure transport; Cusco's Hugging Face fetcher always
     // uses authenticated HTTPS, so accepting it never weakens transport security.
     let _insecure = r.insecure;
-    let stream = r.stream;
+    if !r.stream {
+        return Ok(Json(perform_ollama_pull(s, name, r.sha256, None).await?).into_response());
+    }
+
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Value>(16);
+    tokio::spawn(async move {
+        if let Err(error) = perform_ollama_pull(s, name, r.sha256, Some(sender.clone())).await {
+            let _ = sender.send(json!({"error":error.to_string()})).await;
+        }
+    });
+    let rows = stream::unfold(receiver, |mut receiver| async move {
+        receiver
+            .recv()
+            .await
+            .map(|value| (Ok::<_, Infallible>(format!("{value}\n")), receiver))
+    });
+    Ok(Response::builder()
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from_stream(rows))
+        .expect("streaming Ollama pull response is valid"))
+}
+
+async fn perform_ollama_pull(
+    s: Server,
+    name: String,
+    expected: Option<String>,
+    progress: Option<tokio::sync::mpsc::Sender<Value>>,
+) -> Result<Value, Error> {
+    let catalog = s
+        .catalog()
+        .ok_or_else(|| Error::State("model catalog is not configured".into()))?;
     let operation = Uuid::new_v4().to_string();
     catalog
         .begin_operation(&operation, &name, "pull")
         .map_err(state_err)?;
-    let expected = r.sha256;
+    if let Some(sender) = &progress {
+        let _ = sender.send(json!({"status":"pulling manifest"})).await;
+    }
     let cache = s.model_directory();
+    let progress_sender = progress.clone();
     let fetched = tokio::task::spawn_blocking({
         let name = name.clone();
-        move || cusco_model_registry::fetch_hf(&name, &cache, expected.as_deref())
+        move || {
+            cusco_model_registry::fetch_hf_with_progress(
+                &name,
+                &cache,
+                expected.as_deref(),
+                |update| {
+                    if let Some(sender) = &progress_sender {
+                        let mut row = json!({
+                            "status":"pulling model",
+                            "completed":update.completed
+                        });
+                        if let Some(total) = update.total {
+                            row["total"] = total.into();
+                        }
+                        let _ = sender.blocking_send(row);
+                    }
+                },
+            )
+        }
     })
     .await
     .map_err(state_err);
@@ -2611,6 +2662,11 @@ async fn ollama_pull(
             return Err(error);
         }
     };
+    if let Some(sender) = &progress {
+        let _ = sender
+            .send(json!({"status":"verifying sha256 digest","digest":fetched.sha256}))
+            .await;
+    }
     let metadata = tokio::task::spawn_blocking({
         let path = fetched.path.clone();
         move || cusco_model_registry::probe_gguf(path)
@@ -2618,6 +2674,9 @@ async fn ollama_pull(
     .await
     .map_err(state_err)?
     .map_err(state_err)?;
+    if let Some(sender) = &progress {
+        let _ = sender.send(json!({"status":"writing manifest"})).await;
+    }
     let model = s.register_model(ModelRecord {
         id: name,
         revision: fetched.identity.clone(),
@@ -2632,19 +2691,11 @@ async fn ollama_pull(
     catalog
         .finish_operation(&operation, "complete", None)
         .map_err(state_err)?;
-    let result = json!({"status":"success","model":model});
-    Ok(ollama_pull_response(result, stream))
-}
-
-fn ollama_pull_response(result: Value, stream: bool) -> Response {
-    if stream {
-        Response::builder()
-            .header("content-type", "application/x-ndjson")
-            .body(Body::from(format!("{result}\n")))
-            .expect("static Ollama pull response is valid")
-    } else {
-        Json(result).into_response()
+    let result = json!({"status":"success"});
+    if let Some(sender) = progress {
+        let _ = sender.send(result.clone()).await;
     }
+    Ok(result)
 }
 struct DisconnectGuard {
     control: Arc<RequestControl>,
@@ -3104,6 +3155,10 @@ pub fn openapi_document() -> Value {
             .or_insert_with(|| Value::Object(serde_json::Map::new()))[method] =
             openapi_operation(operation_id, schema);
     }
+    paths["/ollama/api/pull"]["post"]["responses"]["200"]["content"] = json!({
+        "application/json": {"schema": {"$ref": "#/components/schemas/OllamaPullProgress"}},
+        "application/x-ndjson": {"schema": {"$ref": "#/components/schemas/OllamaPullProgress"}}
+    });
     json!({
         "openapi": "3.1.0",
         "info": {"title": "Cusco v1 APIs", "version": "1.0.0"},
@@ -3119,6 +3174,17 @@ pub fn openapi_document() -> Value {
             "OllamaChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
             "OllamaNameRequest": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string"}}},
             "OllamaPullRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["name"]}, {"required": ["model"]}], "properties": {"name": {"type": "string"}, "model": {"type": "string"}, "sha256": {"type": "string"}, "insecure": {"type": "boolean"}, "stream": {"type": "boolean"}}},
+            "OllamaPullProgress": {
+                "type": "object",
+                "oneOf": [{"required": ["status"]}, {"required": ["error"]}],
+                "properties": {
+                    "status": {"type": "string"},
+                    "digest": {"type": "string"},
+                    "total": {"type": "integer", "minimum": 0},
+                    "completed": {"type": "integer", "minimum": 0},
+                    "error": {"type": "string"}
+                }
+            },
             "ImportContextRequest": {"type": "object", "additionalProperties": false, "required": ["tokens"], "properties": {"tokens": {"type": "array", "items": {"type": "string"}}}}
         }}
     })
@@ -3539,17 +3605,66 @@ mod tests {
         assert_eq!(model_only.model_name().unwrap(), "hf://repo/model.gguf");
         assert!(!model_only.stream);
 
-        let streamed = ollama_pull_response(json!({"status":"success"}), true);
-        assert_eq!(streamed.headers()["content-type"], "application/x-ndjson");
-        assert_eq!(
-            to_bytes(streamed.into_body(), usize::MAX).await.unwrap(),
-            "{\"status\":\"success\"}\n"
-        );
-        let buffered = ollama_pull_response(json!({"status":"success"}), false);
-        assert_eq!(buffered.headers()["content-type"], "application/json");
         let mismatch: OllamaPullRequest =
             serde_json::from_value(json!({"name": "a", "model": "b"})).unwrap();
         assert!(matches!(mismatch.model_name(), Err(Error::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn ollama_pull_streams_status_and_terminal_errors_as_ndjson() {
+        let (server, directory) = setup(Arc::new(BearerAuth::new("secret")));
+        server.attach_catalog(
+            ModelCatalog::open(directory.join("catalog.sqlite")).unwrap(),
+            directory.join("models"),
+        );
+        let app = router(server);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ollama/api/pull")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"not-a-hugging-face-uri"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/x-ndjson");
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let rows = body
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows[0], json!({"status":"pulling manifest"}));
+        assert_eq!(rows[1], json!({"error":"state error: invalid hf uri"}));
+        assert_eq!(rows.len(), 2);
+
+        let buffered = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ollama/api/pull")
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"not-a-hugging-face-uri","stream":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(buffered.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(buffered.headers()["content-type"], "application/json");
+        fs::remove_dir_all(directory).unwrap();
     }
     #[tokio::test]
     async fn http_auth_openapi_completion_and_context_api() {
