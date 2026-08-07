@@ -1855,6 +1855,8 @@ The out-of-box compaction surface is intentionally conservative and deterministi
   - Records explicit runtime metadata: budget, anchor policy, compact mode, and compact-reason.
 #### Phase 10 baseline exit checklist (window_tail only)
 
+This checklist is scoped to v1 request-tied execution only: Phase 10 baseline implementations must not spawn tick-based background speculation or preemptive compaction workers.
+
 Baseline completion for v1 requires all checks below to pass:
 
 | Domain | Test | Acceptance |
