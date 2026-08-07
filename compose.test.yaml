@@ -1,3 +1,5 @@
+name: cusco-test
+
 services:
   test:
     build: &test-build
