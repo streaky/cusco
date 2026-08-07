@@ -592,6 +592,7 @@ Strategy execution should use a request/response protocol with version negotiati
 
 A dedicated declaration path is still supported for long-lived sessions where inference requests are not continuous. It accepts the same strategy enum semantics (`None` or registered strategy ID) and scope/lifetime constraints, but it does not replace an explicit request field when one is available.
 
+In v1, declaration is a user preference only: if the request flow reaches an eligibility point where compaction would run, the declared intent is applied; otherwise it is not proactively executed.
 ### Cache-aware compaction boundaries
 
 The planner should account for known cache geometry when choosing the compacted target length. If the likely next prompt would otherwise force an immediate trim, producing a short terminal cache block that will be invalidated on the next append wastes evaluation and residency. Subject to the strategy's semantic constraints and required headroom, the planner should prefer a target whose evaluated prefix ends on a reusable canonical boundary and leaves room for the expected next user turn and reply.
