@@ -399,4 +399,41 @@ mod tests {
         assert_eq!(first.resulting_tokens, second.resulting_tokens);
         assert_eq!(first.result, second.result);
     }
+
+    #[test]
+    fn empty_and_already_small_contexts_report_distinct_results() {
+        let empty = apply_window_tail_strategy(&[], 10, &[]).unwrap();
+        assert_eq!(empty.result.compact_reason, CompactionResultReason::None);
+        assert!(empty.resulting_tokens.is_empty());
+
+        let tokens = vec!["one".into(), "two".into()];
+        let small = apply_window_tail_strategy(&tokens, 10, &[]).unwrap();
+        assert_eq!(small.result.compact_reason, CompactionResultReason::RequestSatisfied);
+        assert_eq!(small.resulting_tokens, tokens);
+        assert_eq!(small.result.retained_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn selection_and_defaults_cover_no_match_paths() {
+        assert_eq!(select_strategy(&[]).as_deref(), Some(WINDOW_TAIL_STRATEGY_ID));
+        assert_eq!(select_strategy(&["missing".into()]), None);
+        assert_eq!(canonical_strategy_ids(), vec![WINDOW_TAIL_STRATEGY_ID]);
+        assert_eq!(deterministic_strategy_id(WINDOW_TAIL_STRATEGY_ID), "window_tail:v1");
+        assert_eq!(CompactionRequest::default().target_tokens, None);
+    }
+
+    #[test]
+    fn policy_anchor_is_skipped_when_budget_cannot_fit_it() {
+        let tokens = vec![
+            "<start_of_turn>system".into(),
+            "policy".into(),
+            "<start_of_turn>user".into(),
+            "question".into(),
+            "<start_of_turn>assistant".into(),
+            "answer".into(),
+        ];
+        let proposal = apply_window_tail_strategy(&tokens, 1, &[]).unwrap();
+        assert_eq!(proposal.resulting_tokens, vec!["answer".to_string()]);
+        assert_eq!(proposal.result.compact_reason, CompactionResultReason::AnchorsOnly);
+    }
 }

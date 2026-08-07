@@ -2413,7 +2413,7 @@ async fn http_debug_middleware(
             json!([])
         },
     }));
-    let mut body = body;
+    let body = body;
     let mut chunk_index = 0usize;
     let response_content_type = parts
         .headers
