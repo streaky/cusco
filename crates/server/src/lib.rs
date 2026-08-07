@@ -3152,11 +3152,29 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
         (_, StreamEvent::Error { message }) => {
             json!({"error":{"message":message,"type":"server_error"}})
         }
-        (WireProtocol::OpenAiChat, StreamEvent::Started { request_id, .. }) => {
-            json!({"id":request_id,"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]})
+        (
+            WireProtocol::OpenAiChat,
+            StreamEvent::Started {
+                request_id,
+                correlation_id,
+                inference_id,
+                execution_session_id,
+                ..
+            },
+        ) => {
+            json!({"id":request_id,"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}],"cusco":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}})
         }
-        (WireProtocol::OpenAiCompletion, StreamEvent::Started { request_id, .. }) => {
-            json!({"id":request_id,"object":"text_completion","choices":[]})
+        (
+            WireProtocol::OpenAiCompletion,
+            StreamEvent::Started {
+                request_id,
+                correlation_id,
+                inference_id,
+                execution_session_id,
+                ..
+            },
+        ) => {
+            json!({"id":request_id,"object":"text_completion","choices":[],"cusco":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}})
         }
         (WireProtocol::OpenAiResponses, StreamEvent::Started { request_id, .. }) => {
             json!({"type":"response.created","response":{"id":request_id,"status":"in_progress"}})
@@ -5340,6 +5358,9 @@ mod tests {
             },
             false,
         );
+        assert!(started.contains("\"correlation_id\":\"corr\""));
+        assert!(started.contains("\"inference_id\":\"inf\""));
+        assert!(started.contains("\"execution_session_id\":\"sess\""));
         let terminal = StreamEvent::Finished {
             reason: FinishReason::Length,
             usage: Usage {
