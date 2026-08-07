@@ -2221,7 +2221,7 @@ async fn completion(
     let request_context = auth(&s, &headers, Scope::Inference)?;
     validate_controls(r.temperature, r.top_p, &[], None, None)?;
     let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
-    let _include_usage = r
+    let include_usage = r
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage);
@@ -2233,6 +2233,7 @@ async fn completion(
         r.prompt,
         r.max_tokens,
         sampling,
+        include_usage,
         r.stream,
         r.context_id,
         r.stop.map(StopInput::into_vec).unwrap_or_default(),
@@ -2262,7 +2263,7 @@ async fn chat(
         r.reasoning_effort.as_ref(),
     )?;
     let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
-    let _include_usage = r
+    let include_usage = r
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage);
@@ -2275,6 +2276,7 @@ async fn chat(
         prompt,
         r.max_tokens,
         sampling,
+        include_usage,
         r.stream,
         r.context_id,
         r.stop.map(StopInput::into_vec).unwrap_or_default(),
@@ -2336,6 +2338,7 @@ async fn responses(
         r.input,
         r.max_output_tokens,
         sampling,
+        true,
         r.stream,
         None,
         vec![],
@@ -2378,6 +2381,7 @@ async fn ollama_generate(
         r.prompt,
         None,
         SamplingConfig::default(),
+        true,
         r.stream,
         None,
         vec![],
@@ -2417,6 +2421,7 @@ async fn ollama_chat(
         prompt,
         None,
         SamplingConfig::default(),
+        true,
         r.stream,
         None,
         vec![],
@@ -2597,7 +2602,7 @@ enum WireProtocol {
     OllamaChat,
 }
 
-fn stream_row(protocol: WireProtocol, event: StreamEvent) -> String {
+fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
     let value = match (protocol, event) {
         (WireProtocol::OpenAiCompletion, StreamEvent::Token { token, .. }) => {
             json!({"object":"text_completion","choices":[{"text":token,"index":0,"finish_reason":null}]})
@@ -2618,7 +2623,11 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent) -> String {
             WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat,
             StreamEvent::Finished { reason, usage },
         ) => {
-            json!({"choices":[{"index":0,"finish_reason":reason}],"usage":{"prompt_tokens":usage.input_tokens,"completion_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}})
+            let mut value = json!({"choices":[{"index":0,"finish_reason":reason}]});
+            if include_usage {
+                value["usage"] = json!({"prompt_tokens":usage.input_tokens,"completion_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens});
+            }
+            value
         }
         (WireProtocol::OpenAiResponses, StreamEvent::Finished { reason, usage }) => {
             json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}})
@@ -2632,33 +2641,58 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent) -> String {
         (_, StreamEvent::Error { message }) => {
             json!({"error":{"message":message,"type":"server_error"}})
         }
+        (WireProtocol::OpenAiChat, StreamEvent::Started { request_id, .. }) => {
+            json!({"id":request_id,"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]})
+        }
+        (WireProtocol::OpenAiCompletion, StreamEvent::Started { request_id, .. }) => {
+            json!({"id":request_id,"object":"text_completion","choices":[]})
+        }
+        (WireProtocol::OpenAiResponses, StreamEvent::Started { request_id, .. }) => {
+            json!({"type":"response.created","response":{"id":request_id,"status":"in_progress"}})
+        }
         (_, StreamEvent::Started { request_id, .. }) => json!({"id":request_id}),
     };
-    match protocol {
+    let row = match protocol {
         WireProtocol::OpenAiCompletion
         | WireProtocol::OpenAiChat
         | WireProtocol::OpenAiResponses => format!("data: {value}\n\n"),
         WireProtocol::OllamaGenerate | WireProtocol::OllamaChat => format!("{value}\n"),
+    };
+    if matches!(
+        protocol,
+        WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat
+    ) && value["choices"]
+        .as_array()
+        .and_then(|choices| choices.first())
+        .is_some_and(|choice| !choice["finish_reason"].is_null())
+    {
+        format!("{row}data: [DONE]\n\n")
+    } else {
+        row
     }
 }
 
-fn completed_response(protocol: WireProtocol, response: InferResponse) -> Value {
+fn completed_response(
+    protocol: WireProtocol,
+    response: InferResponse,
+    finish_reason: FinishReason,
+) -> Value {
     let usage = json!({"prompt_tokens":response.usage.input_tokens,"completion_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens});
     match protocol {
         WireProtocol::OpenAiCompletion => {
-            json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text,"index":0,"finish_reason":"stop"}],"usage":usage})
+            json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text,"index":0,"finish_reason":finish_reason}],"usage":usage})
         }
         WireProtocol::OpenAiChat => {
-            json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":"stop"}],"usage":usage})
+            json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":finish_reason}],"usage":usage})
         }
         WireProtocol::OpenAiResponses => {
-            json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens}})
+            json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"finish_reason":finish_reason,"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens}})
         }
         WireProtocol::OllamaGenerate => {
-            json!({"model":response.usage.model,"response":response.text,"done":true,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens})
+            json!({"model":response.usage.model,"response":response.text,"done":true,"done_reason":finish_reason,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens})
         }
         WireProtocol::OllamaChat => {
-            json!({"model":response.usage.model,"message":{"role":"assistant","content":response.text},"done":true,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens})
+            json!({"model":response.usage.model,"message":{"role":"assistant","content":response.text},"done":true,"done_reason":finish_reason,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens})
         }
     }
 }
@@ -2669,6 +2703,7 @@ async fn infer_response(
     prompt: String,
     max_tokens: Option<usize>,
     sampling: SamplingConfig,
+    include_usage: bool,
     streaming: bool,
     context_id: Option<ContextId>,
     stop: Vec<String>,
@@ -2739,7 +2774,7 @@ async fn infer_response(
         );
         let rows = first
             .chain(rest)
-            .map(move |event| Ok::<_, Infallible>(stream_row(protocol, event)));
+            .map(move |event| Ok::<_, Infallible>(stream_row(protocol, event, include_usage)));
         let content_type = match protocol {
             WireProtocol::OpenAiCompletion
             | WireProtocol::OpenAiChat
@@ -2765,8 +2800,17 @@ async fn infer_response(
         .await
         .map_err(state_err)?;
         disconnect.disarm();
-        let (response, _) = result?;
-        let mut response = Json(completed_response(protocol, response)).into_response();
+        let (response, events) = result?;
+        let finish_reason = events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                StreamEvent::Finished { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .ok_or_else(|| Error::State("inference completed without a finish reason".into()))?;
+        let mut response =
+            Json(completed_response(protocol, response, finish_reason)).into_response();
         response.headers_mut().insert(
             "x-request-id",
             HeaderValue::from_str(&correlation_id).expect("UUID is a valid header value"),
@@ -4296,5 +4340,41 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(matches!(wall.check(), Err(Error::Deadline)));
         assert!(matches!(active.check(), Err(Error::Deadline)));
+    }
+    #[test]
+    fn openai_streams_honor_usage_option_and_end_with_done() {
+        let started = stream_row(
+            WireProtocol::OpenAiChat,
+            StreamEvent::Started {
+                request_id: "request".into(),
+                context_id: ContextId::new(),
+            },
+            false,
+        );
+        assert!(started.contains("\"role\":\"assistant\""));
+
+        let terminal = StreamEvent::Finished {
+            reason: FinishReason::Length,
+            usage: Usage {
+                input_tokens: 1,
+                generated_tokens: 2,
+                evaluated_tokens: 1,
+                cached_tokens: 0,
+                prefill: PrefillMetrics::default(),
+                model: "model".into(),
+                model_revision: "revision".into(),
+                context_id: ContextId::new(),
+                latency_ms: 1,
+                status: "completed".into(),
+            },
+        };
+        let without_usage = stream_row(WireProtocol::OpenAiChat, terminal.clone(), false);
+        assert!(!without_usage.contains("\"usage\""));
+        assert!(without_usage.ends_with("data: [DONE]\n\n"));
+        assert!(without_usage.contains("\"finish_reason\":\"length\""));
+
+        let with_usage = stream_row(WireProtocol::OpenAiChat, terminal, true);
+        assert!(with_usage.contains("\"usage\""));
+        assert!(with_usage.ends_with("data: [DONE]\n\n"));
     }
 }
