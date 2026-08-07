@@ -1825,14 +1825,8 @@ The out-of-box compaction surface is intentionally conservative and deterministi
   - Trims conversational content by selecting a contiguous retained window under the target token/window budget (favoring continuity around the latest active exchange and preserving required anchors), rather than always dropping strict chronological prefix order.
   - Trims at logical turn/message boundaries only: v1 never retains a partial message, so role and envelope integrity are preserved.
   - Aligns truncation to compaction block geometry where possible to avoid immediately invalidating reusable block boundaries.
-  - Records explicit runtime metadata: budget, anchor policy, and rejection reason.
-Selection policy:
-
-- default strategy is `window_tail`;
-- strategy execution requires explicit per-context policy opt-in and declared remaining budget constraints.
-
-- No in-process model-based or user-authored strategies are in the out-of-box phase. Custom strategy workers (including user-authored Python/Rust implementations) are explicitly deferred to post-v1.
-
+  - Treats `target` as a target, not a hard cap: if policy anchors alone exceed the target and cannot be reduced, compaction returns an `AnchorsOnly` result (no additional conversational window), continues execution, and emits runtime metadata with reason `PolicyBudgetExceeded` so clients can distinguish this from admission/resource failures.
+  - Records explicit runtime metadata: budget, anchor policy, compact mode, and compact-reason.
 #### Phase 10 baseline exit checklist (window_tail only)
 
 Baseline completion for v1 requires all checks below to pass:
