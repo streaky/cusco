@@ -2330,9 +2330,24 @@ enum ResponsesInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResponsesInputItem {
+    r#type: String,
     #[serde(default = "default_user_role")]
     role: String,
-    content: ChatContent,
+    content: ResponsesContent,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ResponsesContent {
+    Text(String),
+    Parts(Vec<ResponsesContentPart>),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ResponsesContentPart {
+    InputText { text: String },
+    InputImage { image_url: String },
 }
 
 #[derive(Deserialize)]
@@ -2379,17 +2394,40 @@ async fn responses(
     let model = s.model(&r.model)?;
     let input = match r.input {
         ResponsesInput::Text(text) => text,
-        ResponsesInput::Items(items) => lower_messages(
-            &model.family,
-            items
-                .into_iter()
-                .map(|item| ChatMessage {
+        ResponsesInput::Items(items) => {
+            let mut messages = Vec::with_capacity(items.len());
+            for item in items {
+                if item.r#type != "message" {
+                    return Err(Error::BadRequest(format!(
+                        "unsupported Responses input item type {}",
+                        item.r#type
+                    )));
+                }
+                let content = match item.content {
+                    ResponsesContent::Text(text) => ChatContent::Text(text),
+                    ResponsesContent::Parts(parts) => ChatContent::Parts(
+                        parts
+                            .into_iter()
+                            .map(|part| match part {
+                                ResponsesContentPart::InputText { text } => {
+                                    ContentPart::Text { text }
+                                }
+                                ResponsesContentPart::InputImage { image_url } => {
+                                    ContentPart::ImageUrl {
+                                        image_url: ImageUrlPart { url: image_url },
+                                    }
+                                }
+                            })
+                            .collect(),
+                    ),
+                };
+                messages.push(ChatMessage {
                     role: item.role,
-                    content: item.content,
-                })
-                .collect(),
-            s.vision_config(),
-        )?,
+                    content,
+                });
+            }
+            lower_messages(&model.family, messages, s.vision_config())?
+        }
     };
     drop(permit);
     infer_response(
@@ -3692,6 +3730,33 @@ mod tests {
         .unwrap();
         assert!(chat.tools[0].valid_function());
         assert!(matches!(chat.tools.as_slice(), [ToolDefinition::Nested(_)]));
+    }
+    #[test]
+    fn accepts_canonical_responses_message_input() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "hey"
+                }]
+            }]
+        }))
+        .unwrap();
+        let ResponsesInput::Items(items) = request.input else {
+            panic!("canonical message input must parse as items");
+        };
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0].content,
+            ResponsesContent::Parts(parts)
+                if matches!(
+                    parts.as_slice(),
+                    [ResponsesContentPart::InputText { text }] if text == "hey"
+                )
+        ));
     }
     #[test]
     fn scheduler_uses_transition_cost_priority_and_wait() {
