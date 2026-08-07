@@ -579,10 +579,10 @@ struct CompactionProposal {
 
 The server should not guess that another turn is imminent from traffic heuristics. Request intent must drive compaction work:
 
-- if `trigger = Predictive`, run explicit request-driven prefetch scheduling after the current reply;  
+- if `trigger = Predictive`, schedule request-tied prefetch execution only after the current reply and before the turn advances, using an explicit declaration/context hint from that request.
 - if omitted, no predictive compaction request is inferred.
 
-A separate declaration endpoint remains useful for long-lived sessions where clients want to predeclare intent before their next request, but this endpoint never replaces an explicit request field when one is available.
+For v1, compaction is **request-first only**: there is no autonomous tick-based speculation. Declaration endpoints are control inputs for next-available request planning, not triggers for immediate background work.
 
 The exact wire schema can evolve, but `StrategyId`, opaque validated strategy configuration, trigger policy, and successor selection must be carried by the canonical API rather than hidden in an OpenAI- or Ollama-specific field. Protocol adapters may map their own extension fields onto these types. The native administrative API should expose context policy and activity updates explicitly. In the initial implementation these fields may be accepted, validated, persisted, and reported as unsupported for execution; reserving them early prevents later API and context-record migrations.
 
@@ -590,7 +590,7 @@ Strategy execution should use a request/response protocol with version negotiati
 
 ### Explicit predictive compaction intent
 
-A dedicated declaration path is still supported for long-lived sessions where inference requests are not continuous. It accepts the same strategy enum semantics (`None` or registered strategy ID) and scope/lifetime constraints, but it does not replace explicit inference-request compaction fields when those are present.
+A dedicated declaration path is still supported for long-lived sessions where inference requests are not continuous. It accepts the same strategy enum semantics (`None` or registered strategy ID) and scope/lifetime constraints, but it does not replace an explicit request field when one is available.
 
 ### Cache-aware compaction boundaries
 
@@ -598,7 +598,9 @@ The planner should account for known cache geometry when choosing the compacted 
 
 This is an optimization, not permission to delete meaningful content merely to fill blocks. The trace should report requested headroom, chosen boundary, any unavoidable partial tail, work performed speculatively, work later reused, and work abandoned because the original branch continued instead.
 
-Speculative compaction must have its own admission class. It may consume only capacity left after active bindings, active-growth guarantees, and transition reservations; it must be preemptible before interactive work waits. At most one proposal for the same context, policy version, and source head should execute at once. A new turn, policy update, model epoch change, or context deletion cancels or obsoletes earlier work without invalidating the source branch. Prepared successors may be retained briefly under normal cache policy, but speculation cannot create an unbounded second copy of every conversation.
+For v1, speculative compaction remains request-tied; speculative background worker queues, admission classes, and retention policies are deferred to post-v1 implementation.
+
+In speculative implementations, at most one proposal for the same context, policy version, and source head should execute at once. A new turn, policy update, model epoch change, or context deletion cancels or obsoletes earlier work without invalidating the source branch. Prepared successors may be retained briefly under normal cache policy, but speculation cannot create an unbounded second copy of every conversation.
 
 ## Token identity is not evaluated-state identity
 
@@ -1833,7 +1835,7 @@ Implement only after the live executor, residency, context-placement, request sc
   - `window_tail`: preserve required anchors (system/dev and policy scope), then trim by selecting a contiguous retained window under the target token/window budget with block-aware safety.
 - in-process deterministic built-in strategy implementations in the `context-strategy` service;
 - compacted-successor creation through the ordinary tokenize, evaluate, validate, and atomic publication path;
-- a dedicated authorized declaration API with bounded lifetime, disconnect handling, expiry, and rate limits;
+- a dedicated authorized declaration API with bounded lifetime, disconnect handling, expiry, and rate limits; request intent is required for execution (no preemptive background compaction in v1);
 - cache-block-aware target planning without weakening semantic constraints;
 - cancellation, obsolescence, resource accounting, provenance, and operator controls;
 - execute compaction planning and strategy execution without blocking the async runtime: declarations, expiry, cancellation, and event delivery remain async and bounded, while context-inspection, strategy proposals, validation, and native publication use bounded blocking workers with explicit completion limits; worker queue limits, disconnects, shutdown behavior, and backpressure must not delay admitted interactive inference;
