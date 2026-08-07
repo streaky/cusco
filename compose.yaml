@@ -10,8 +10,6 @@ services:
       - serve
       - --config
       - /data/config.yaml
-    env_file:
-      - .env
     environment:
       CUSCO_BEARER_TOKEN: "${CUSCO_BEARER_TOKEN:?set CUSCO_BEARER_TOKEN}"
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-0}"
