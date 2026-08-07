@@ -233,6 +233,8 @@ pub struct ServerConfig {
     pub queue_bytes: usize,
     pub request_bytes: usize,
     pub pre_queue_concurrency: usize,
+    #[serde(default = "default_tokens")]
+    pub default_output_tokens: usize,
     pub header_bytes: usize,
     pub body_timeout_ms: u64,
     pub wall_time_ms: u64,
@@ -248,6 +250,7 @@ impl Default for ServerConfig {
             queue_bytes: 16 << 20,
             request_bytes: 1 << 20,
             pre_queue_concurrency: 16,
+            default_output_tokens: default_tokens(),
             header_bytes: 32 << 10,
             body_timeout_ms: 10_000,
             wall_time_ms: 300_000,
@@ -1374,6 +1377,7 @@ impl Server {
             || config.queue_bytes == 0
             || config.request_bytes == 0
             || config.pre_queue_concurrency == 0
+            || config.default_output_tokens == 0
             || config.header_bytes == 0
             || config.body_timeout_ms == 0
             || config.wall_time_ms == 0
@@ -3001,7 +3005,7 @@ async fn infer_response(
     let request = InferRequest {
         model,
         prompt,
-        max_tokens: max_tokens.unwrap_or_else(default_tokens),
+        max_tokens: max_tokens.unwrap_or(config.default_output_tokens),
         sampling,
         context_id,
         deadline_ms: Some(
@@ -3941,6 +3945,32 @@ mod tests {
         fs::remove_dir_all(d).unwrap()
     }
 
+    #[tokio::test]
+    async fn adapters_use_configured_default_output_tokens_when_omitted() {
+        let (configured, directory) = setup(Arc::new(AnonymousAdmin));
+        configured
+            .configure(ServerConfig {
+                default_output_tokens: 3,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+        let response = router(configured)
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({"model": "m", "input": "hello world"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["output"][0]["content"][0]["text"], "world hello world");
+        assert_eq!(body["usage"]["output_tokens"], 3);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn request(method: &str, uri: &str, body: Value) -> Request<Body> {
         Request::builder()
             .method(method)
@@ -4421,6 +4451,7 @@ mod tests {
                 queue_bytes: 16 << 20,
                 request_bytes: 1 << 20,
                 pre_queue_concurrency: 16,
+                default_output_tokens: default_tokens(),
                 header_bytes: 32 << 10,
                 body_timeout_ms: 10_000,
                 wall_time_ms: 300_000,

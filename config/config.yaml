@@ -22,6 +22,8 @@ server:
   queue_bytes: 16777216
   request_bytes: 1048576
   pre_queue_concurrency: 16
+  # Applied when an inference adapter omits max_tokens or max_output_tokens.
+  default_output_tokens: 128
   header_bytes: 32768
   body_timeout_ms: 10000
   wall_time_ms: 300000
