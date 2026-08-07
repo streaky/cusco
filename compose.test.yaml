@@ -8,9 +8,28 @@ services:
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
       - cargo-target:/work/target
+  model-fetch:
+    build: *test-build
+    command:
+      - cargo
+      - run
+      - -p
+      - cusco
+      - --
+      - fetch
+      - hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf
+      - --cache
+      - /models/cache
+      - --output
+      - /models/gemma-4-e2b-it.gguf
+    volumes:
+      - "${CUSCO_MODEL_DIR:-./models}:/models"
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
   executor-proof:
     build: *test-build
-    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid --format=csv,noheader && cargo run -p cusco -- proof /models/gemma-4-e2b-it.gguf --sha256 90293b8cdaf9c973012bf4df8a1e92bde7d74ad66a4fe56cf905ccd563d660c5"]
+    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid --format=csv,noheader && cargo run -p cusco -- proof /models/gemma-4-e2b-it.gguf --sha256 740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8"]
     environment:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"

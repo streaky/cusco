@@ -21,8 +21,12 @@ state, and spill state are intentionally disposable in the v1 restart model.
 
 ## Run the real-model inference integration test
 
-With the validation GGUF at `models/gemma-4-e2b-it.gguf`, Docker's NVIDIA
-runtime configured, and an available NVIDIA GPU, run:
+The workflow uses
+`hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf`.
+It keeps the immutable Hugging Face artifact under `models/cache` and
+materializes the stable `models/gemma-4-e2b-it.gguf` test path. The cache is
+reused across runs; the model is downloaded only when it is absent or invalid.
+With Docker's NVIDIA runtime configured and an available NVIDIA GPU, run:
 
 ```sh
 tools/inference-integration-test.sh

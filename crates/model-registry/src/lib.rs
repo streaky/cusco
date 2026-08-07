@@ -1,12 +1,12 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
 use thiserror::Error;
-pub const GEMMA_URI: &str = "hf://models/unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2/gemma-4-E2B-it-Q3_K_M.gguf";
+pub const GEMMA_URI: &str = "hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf";
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("invalid hf uri")]
@@ -30,6 +30,12 @@ pub struct ModelRecord {
     pub size: u64,
 }
 
+#[derive(Deserialize, Serialize)]
+struct CacheStamp {
+    sha256: String,
+    size: u64,
+    modified_ns: u128,
+}
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ModelMetadata {
     pub architecture: String,
@@ -170,11 +176,50 @@ pub fn register_local(
         size,
     })
 }
+fn cached_record(
+    path: &Path,
+    identity: &str,
+    expected: Option<&str>,
+) -> Result<Option<ModelRecord>, Error> {
+    let metadata = fs::metadata(path)?;
+    let modified_ns = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_nanos();
+    let stamp_path = path.with_extension("cache.json");
+    let Ok(stamp) = fs::read(&stamp_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CacheStamp>(&bytes).ok())
+        .ok_or(())
+    else {
+        return Ok(None);
+    };
+    if stamp.size != metadata.len()
+        || stamp.modified_ns != modified_ns
+        || expected.is_some_and(|value| !value.eq_ignore_ascii_case(&stamp.sha256))
+    {
+        return Ok(None);
+    }
+    Ok(Some(ModelRecord {
+        identity: identity.to_owned(),
+        path: fs::canonicalize(path)?,
+        sha256: stamp.sha256,
+        size: stamp.size,
+    }))
+}
 fn parse_hf(uri: &str) -> Result<(String, String, String), Error> {
-    let rest = uri.strip_prefix("hf://models/").ok_or(Error::InvalidUri)?;
+    let rest = uri
+        .strip_prefix("hf://models/")
+        .or_else(|| uri.strip_prefix("hf://"))
+        .ok_or(Error::InvalidUri)?;
     let (org, remainder) = rest.split_once('/').ok_or(Error::InvalidUri)?;
     let (model_revision, file) = remainder.split_once('/').ok_or(Error::InvalidUri)?;
-    let (model, revision) = model_revision.rsplit_once('@').ok_or(Error::InvalidUri)?;
+    let (model, revision) = model_revision
+        .rsplit_once('@')
+        .map_or((model_revision, "main"), |(model, revision)| {
+            (model, revision)
+        });
     let simple_file = Path::new(file)
         .components()
         .all(|component| matches!(component, std::path::Component::Normal(_)))
@@ -194,9 +239,19 @@ fn parse_hf(uri: &str) -> Result<(String, String, String), Error> {
         file.to_owned(),
     ))
 }
-fn resolve_revision(repo: &str, revision: &str) -> Result<String, Error> {
+fn resolve_revision(repo: &str, revision: &str, cache: &Path) -> Result<String, Error> {
     if revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Ok(revision.to_ascii_lowercase());
+    }
+    let reference = cache
+        .join("refs")
+        .join(repo.replace('/', "--"))
+        .join(revision);
+    if let Ok(value) = fs::read_to_string(&reference) {
+        let value = value.trim();
+        if value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(value.to_ascii_lowercase());
+        }
     }
     let url = format!("https://huggingface.co/api/models/{repo}/revision/{revision}");
     let mut response = ureq::get(url).call()?;
@@ -208,31 +263,77 @@ fn resolve_revision(repo: &str, revision: &str) -> Result<String, Error> {
     if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(Error::InvalidUri);
     }
-    Ok(sha.to_ascii_lowercase())
+    let sha = sha.to_ascii_lowercase();
+    if let Some(parent) = reference.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(reference, &sha)?;
+    Ok(sha)
 }
+fn download_resumable(url: &str, partial: &Path) -> Result<(), Error> {
+    let offset = fs::metadata(partial).map_or(0, |metadata| metadata.len());
+    let mut request = ureq::get(url);
+    if offset > 0 {
+        request = request.header("Range", &format!("bytes={offset}-"));
+    }
+    let mut response = request.call()?;
+    let resumes_at_offset = response.status().as_u16() == 206
+        && response
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with(&format!("bytes {offset}-")));
+    let mut output = if offset > 0 && resumes_at_offset {
+        OpenOptions::new().append(true).open(partial)?
+    } else {
+        File::create(partial)?
+    };
+    std::io::copy(&mut response.body_mut().as_reader(), &mut output)?;
+    output.flush()?;
+    Ok(())
+}
+
 pub fn fetch_hf(uri: &str, cache: &Path, expected: Option<&str>) -> Result<ModelRecord, Error> {
     let (repo, requested_revision, file) = parse_hf(uri)?;
-    let revision = resolve_revision(&repo, &requested_revision)?;
+    let revision = resolve_revision(&repo, &requested_revision, cache)?;
     let dir = cache
         .join("models")
         .join(repo.replace('/', "--"))
         .join(&revision);
     fs::create_dir_all(&dir)?;
     let destination = dir.join(&file);
-    if destination.exists() && register_local(&destination, uri, expected).is_err() {
+    if destination.exists()
+        && cached_record(&destination, uri, expected)?.is_none()
+        && register_local(&destination, uri, expected).is_err()
+    {
         fs::remove_file(&destination)?;
     }
     if !destination.exists() {
         let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{file}");
         let tmp = destination.with_extension("partial");
-        let mut response = ureq::get(url).call()?;
-        let mut output = File::create(&tmp)?;
-        std::io::copy(&mut response.body_mut().as_reader(), &mut output)?;
-        output.flush()?;
+        download_resumable(&url, &tmp)?;
         fs::rename(tmp, &destination)?;
     }
-    let identity = format!("hf://models/{repo}@{revision}/{file}");
-    register_local(destination, &identity, expected)
+    let identity = format!("hf://{repo}@{revision}/{file}");
+    if let Some(record) = cached_record(&destination, &identity, expected)? {
+        return Ok(record);
+    }
+    let record = register_local(&destination, &identity, expected)?;
+    let metadata = fs::metadata(&destination)?;
+    let stamp = CacheStamp {
+        sha256: record.sha256.clone(),
+        size: record.size,
+        modified_ns: metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos(),
+    };
+    fs::write(
+        destination.with_extension("cache.json"),
+        serde_json::to_vec(&stamp)?,
+    )?;
+    Ok(record)
 }
 #[cfg(test)]
 mod tests {
@@ -256,13 +357,74 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn parses_locked_uri() {
+    fn reuses_cached_symbolic_revision_without_network() {
+        let cache = std::env::temp_dir().join(format!("cusco-hf-ref-{}", std::process::id()));
+        let reference = cache.join("refs").join("a--b").join("main");
+        fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        fs::write(&reference, "0123456789012345678901234567890123456789\n").unwrap();
         assert_eq!(
-            parse_hf(GEMMA_URI).unwrap().1,
-            "0314792d7f1f7e229411f620751375812bb9faf2"
+            resolve_revision("a/b", "main", &cache).unwrap(),
+            "0123456789012345678901234567890123456789"
         );
+        fs::remove_dir_all(cache).unwrap();
+    }
+    fn download_from(response: &'static str, initial: &[u8]) -> (Vec<u8>, String) {
+        use std::{
+            io::{Read as _, Write as _},
+            net::TcpListener,
+            sync::mpsc,
+            thread,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let length = stream.read(&mut request).unwrap();
+            sender
+                .send(String::from_utf8_lossy(&request[..length]).into_owned())
+                .unwrap();
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let partial = std::env::temp_dir().join(format!(
+            "cusco-download-{}-{}",
+            std::process::id(),
+            address.port()
+        ));
+        fs::write(&partial, initial).unwrap();
+        download_resumable(&format!("http://{address}/model"), &partial).unwrap();
+        let bytes = fs::read(&partial).unwrap();
+        fs::remove_file(partial).unwrap();
+        server.join().unwrap();
+        (bytes, receiver.recv().unwrap())
+    }
+
+    #[test]
+    fn resumes_partial_downloads_with_a_valid_content_range() {
+        let (bytes, request) = download_from(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-10/11\r\nContent-Length: 6\r\nConnection: close\r\n\r\n world",
+            b"hello",
+        );
+        assert_eq!(bytes, b"hello world");
+        assert!(request.to_ascii_lowercase().contains("range: bytes=5-"));
+    }
+
+    #[test]
+    fn restarts_partial_download_when_the_server_ignores_range() {
+        let (bytes, request) = download_from(
+            "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world",
+            b"stale",
+        );
+        assert_eq!(bytes, b"hello world");
+        assert!(request.to_ascii_lowercase().contains("range: bytes=5-"));
+    }
+    #[test]
+    fn parses_locked_and_default_revision_uris() {
+        assert_eq!(parse_hf(GEMMA_URI).unwrap().1, "main");
         assert!(matches!(parse_hf("https://bad"), Err(Error::InvalidUri)));
         assert_eq!(parse_hf("hf://models/a/b@main/f").unwrap().1, "main");
+        assert_eq!(parse_hf("hf://a/b/f").unwrap().1, "main");
         assert!(matches!(
             parse_hf("hf://models/a/b@0123456789012345678901234567890123456789/../escape.gguf"),
             Err(Error::InvalidUri)

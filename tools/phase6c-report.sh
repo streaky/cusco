@@ -27,6 +27,7 @@ trap cleanup EXIT INT TERM
 compose run --build --rm test
 printf '%s\n' '{"passed":true,"command":"docker compose -f compose.test.yaml run --build --rm test","per_file_line_floor_percent":80}' \
     > "$result_dir/phase6c-coverage.json"
+compose run --build --rm model-fetch
 compose run --build --rm executor-proof
 compose run --build --rm mapped-proof
 compose run --build --rm --no-deps --entrypoint chmod "$service" a+rwx /results

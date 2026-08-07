@@ -34,6 +34,8 @@ enum Command {
         cache: PathBuf,
         #[arg(long)]
         sha256: Option<String>,
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     Register {
         path: PathBuf,
@@ -96,12 +98,45 @@ enum Command {
 fn main() -> Result<()> {
     run(Args::parse().command)
 }
+fn materialize_model(record: &ModelRecord, output: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(source), Ok(target)) = (fs::metadata(&record.path), fs::metadata(output)) {
+            if source.dev() == target.dev() && source.ino() == target.ino() {
+                return Ok(());
+            }
+        }
+    }
+    if output.exists() && register_local(output, &record.identity, Some(&record.sha256)).is_ok() {
+        return Ok(());
+    }
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = output.with_extension(format!("partial-{}", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    if fs::hard_link(&record.path, &temporary).is_err() {
+        fs::copy(&record.path, &temporary)?;
+    }
+    fs::rename(temporary, output)?;
+    Ok(())
+}
 fn run(command: Command) -> Result<()> {
     match command {
-        Command::Fetch { uri, cache, sha256 } => println!(
-            "{}",
-            serde_json::to_string_pretty(&fetch_hf(&uri, &cache, sha256.as_deref())?)?
-        ),
+        Command::Fetch {
+            uri,
+            cache,
+            sha256,
+            output,
+        } => {
+            let mut record = fetch_hf(&uri, &cache, sha256.as_deref())?;
+            if let Some(output) = output {
+                materialize_model(&record, &output)?;
+                record = register_local(output, &record.identity, Some(&record.sha256))?;
+            }
+            println!("{}", serde_json::to_string_pretty(&record)?);
+        }
         Command::Register { path, sha256 } => println!(
             "{}",
             serde_json::to_string_pretty(&register_local(path, "local", sha256.as_deref())?)?
@@ -887,9 +922,9 @@ mod tests {
         })
         .unwrap();
         let (uri, revision, file) = (
-            GEMMA_URI,
+            "hf://unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2/gemma-4-E2B-it-Q4_K_M.gguf",
             "0314792d7f1f7e229411f620751375812bb9faf2",
-            "gemma-4-E2B-it-Q3_K_M.gguf",
+            "gemma-4-E2B-it-Q4_K_M.gguf",
         );
         let cached = root
             .join("models")
@@ -897,12 +932,16 @@ mod tests {
             .join(revision);
         fs::create_dir_all(&cached).unwrap();
         fs::write(cached.join(file), b"model").unwrap();
+        let output_model = root.join("fixture.gguf");
+        fs::write(&output_model, b"stale").unwrap();
         run(Command::Fetch {
             uri: uri.into(),
             cache: root.clone(),
             sha256: None,
+            output: Some(output_model.clone()),
         })
         .unwrap();
+        assert_eq!(fs::read(output_model).unwrap(), b"model");
         let output = root.join("proof.json");
         run(Command::Proof {
             model: PathBuf::from("mock://deterministic"),
