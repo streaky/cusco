@@ -2545,24 +2545,49 @@ async fn ollama_delete(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OllamaPullRequest {
-    name: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     sha256: Option<String>,
+    #[serde(default)]
+    insecure: bool,
+    #[serde(default = "default_true")]
+    stream: bool,
+}
+
+impl OllamaPullRequest {
+    fn model_name(&self) -> Result<&str, Error> {
+        match (self.name.as_deref(), self.model.as_deref()) {
+            (Some(name), Some(model)) if name != model => Err(Error::BadRequest(
+                "`name` and `model` must identify the same model".into(),
+            )),
+            (Some(name), _) | (_, Some(name)) if !name.is_empty() => Ok(name),
+            _ => Err(Error::BadRequest(
+                "one of `name` or `model` is required".into(),
+            )),
+        }
+    }
 }
 async fn ollama_pull(
     State(s): State<Server>,
     headers: HeaderMap,
     Json(r): Json<OllamaPullRequest>,
-) -> Result<Json<Value>, Error> {
+) -> Result<Response, Error> {
     auth(&s, &headers, Scope::Admin)?;
     let catalog = s
         .catalog()
         .ok_or_else(|| Error::State("model catalog is not configured".into()))?;
+    let name = r.model_name()?.to_owned();
+    // `insecure` permits an insecure transport; Cusco's Hugging Face fetcher always
+    // uses authenticated HTTPS, so accepting it never weakens transport security.
+    let _insecure = r.insecure;
+    let stream = r.stream;
     let operation = Uuid::new_v4().to_string();
     catalog
-        .begin_operation(&operation, &r.name, "pull")
+        .begin_operation(&operation, &name, "pull")
         .map_err(state_err)?;
-    let name = r.name;
     let expected = r.sha256;
     let cache = s.model_directory();
     let fetched = tokio::task::spawn_blocking({
@@ -2607,7 +2632,19 @@ async fn ollama_pull(
     catalog
         .finish_operation(&operation, "complete", None)
         .map_err(state_err)?;
-    Ok(Json(json!({"status":"success","model":model})))
+    let result = json!({"status":"success","model":model});
+    Ok(ollama_pull_response(result, stream))
+}
+
+fn ollama_pull_response(result: Value, stream: bool) -> Response {
+    if stream {
+        Response::builder()
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from(format!("{result}\n")))
+            .expect("static Ollama pull response is valid")
+    } else {
+        Json(result).into_response()
+    }
 }
 struct DisconnectGuard {
     control: Arc<RequestControl>,
@@ -3081,8 +3118,7 @@ pub fn openapi_document() -> Value {
             "OllamaGenerateRequest": {"type": "object", "additionalProperties": false, "required": ["model", "prompt"], "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
             "OllamaChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
             "OllamaNameRequest": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string"}}},
-            "OllamaPullRequest": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string"}, "sha256": {"type": "string"}}},
-            "OllamaCopyRequest": {"type": "object", "additionalProperties": false, "required": ["source", "destination"], "properties": {"source": {"type": "string"}, "destination": {"type": "string"}}},
+            "OllamaPullRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["name"]}, {"required": ["model"]}], "properties": {"name": {"type": "string"}, "model": {"type": "string"}, "sha256": {"type": "string"}, "insecure": {"type": "boolean"}, "stream": {"type": "boolean"}}},
             "ImportContextRequest": {"type": "object", "additionalProperties": false, "required": ["tokens"], "properties": {"tokens": {"type": "array", "items": {"type": "string"}}}}
         }}
     })
@@ -3486,9 +3522,40 @@ mod tests {
         assert_eq!(select_slot(&[]), None)
     }
     #[tokio::test]
+    async fn ollama_pull_accepts_client_model_alias_and_known_controls() {
+        let request: OllamaPullRequest = serde_json::from_value(json!({
+            "name": "hf://repo/model.gguf",
+            "model": "hf://repo/model.gguf",
+            "insecure": true
+        }))
+        .unwrap();
+        assert_eq!(request.model_name().unwrap(), "hf://repo/model.gguf");
+        assert!(request.insecure);
+        assert!(request.stream);
+
+        let model_only: OllamaPullRequest =
+            serde_json::from_value(json!({"model": "hf://repo/model.gguf", "stream": false}))
+                .unwrap();
+        assert_eq!(model_only.model_name().unwrap(), "hf://repo/model.gguf");
+        assert!(!model_only.stream);
+
+        let streamed = ollama_pull_response(json!({"status":"success"}), true);
+        assert_eq!(streamed.headers()["content-type"], "application/x-ndjson");
+        assert_eq!(
+            to_bytes(streamed.into_body(), usize::MAX).await.unwrap(),
+            "{\"status\":\"success\"}\n"
+        );
+        let buffered = ollama_pull_response(json!({"status":"success"}), false);
+        assert_eq!(buffered.headers()["content-type"], "application/json");
+        let mismatch: OllamaPullRequest =
+            serde_json::from_value(json!({"name": "a", "model": "b"})).unwrap();
+        assert!(matches!(mismatch.model_name(), Err(Error::BadRequest(_))));
+    }
+    #[tokio::test]
     async fn http_auth_openapi_completion_and_context_api() {
         let (s, d) = setup(Arc::new(BearerAuth::new("secret")));
         let app = router(s);
+
         let denied = app
             .clone()
             .oneshot(
