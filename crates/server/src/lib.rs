@@ -2055,7 +2055,7 @@ fn lower_messages(
     for message in messages {
         if !matches!(
             message.role.as_str(),
-            "system" | "user" | "assistant" | "tool"
+            "system" | "user" | "assistant"
         ) {
             return Err(Error::BadRequest(format!(
                 "unsupported message role {}",
