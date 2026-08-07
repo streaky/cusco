@@ -27,6 +27,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+mod config;
 mod residency;
 use thiserror::Error;
 use uuid::Uuid;
@@ -34,6 +35,7 @@ mod generation;
 mod mapped;
 mod scheduler;
 
+pub use config::{ByteSize, ConfigError, DaemonConfig, DataPaths, ExecutionConfig, VisionConfig};
 pub use generation::{
     FinishReason, FrontierControl, GenerationFrontier, MAX_STOP_BYTES, MAX_STOP_SEQUENCES,
     StopAlignment,
