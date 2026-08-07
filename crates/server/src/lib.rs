@@ -3072,7 +3072,6 @@ fn start_deadline_watchdogs(
         tokio::spawn(async move {
             tokio::time::sleep(deadline).await;
             if !control.is_complete() {
-                control.expire();
             }
         });
     }
@@ -3088,6 +3087,23 @@ enum WireProtocol {
 }
 
 fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
+    if matches!(protocol, WireProtocol::OpenAiResponses) {
+        match event {
+            StreamEvent::Started { request_id, .. } => return [
+                json!({"type":"response.created","response":{"id":request_id,"status":"in_progress"}}),
+                json!({"type":"response.output_item.added","item":{"id":"msg_0","type":"message","role":"assistant","status":"in_progress"},"output_index":0}),
+                json!({"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
+            ].into_iter().map(|value| format!("data: {value}\n\n")).collect(),
+            StreamEvent::Token { token, index } => return format!("data: {}\n\n", json!({"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":token,"sequence_number":index})),
+            StreamEvent::Finished { reason, usage } => return [
+                json!({"type":"response.output_text.done","item_id":"msg_0","output_index":0,"content_index":0,"text":""}),
+                json!({"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":0}),
+                json!({"type":"response.output_item.done","item":{"id":"msg_0","type":"message","role":"assistant","status":"completed"},"output_index":0}),
+                json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}}),
+            ].into_iter().map(|value| format!("data: {value}\n\n")).collect(),
+            StreamEvent::Error { message } => return format!("data: {}\n\n", json!({"type":"error","error":{"message":message,"type":"server_error"}})),
+        }
+    }
     let value = match (protocol, event) {
         (WireProtocol::OpenAiCompletion, StreamEvent::Token { token, .. }) => {
             json!({"object":"text_completion","choices":[{"text":token,"index":0,"finish_reason":null}]})
