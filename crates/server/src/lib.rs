@@ -2918,29 +2918,137 @@ async fn cancel_request(
 async fn openapi() -> Json<Value> {
     Json(openapi_document())
 }
-pub fn openapi_document() -> Value {
-    json!({
-        "openapi":"3.1.0",
-        "info":{"title":"Cusco v1 APIs","version":"1.0.0"},
-        "paths":{
-            "/openai/v1/completions":{"post":{"operationId":"openaiCompletion"}},
-            "/openai/v1/chat/completions":{"post":{"operationId":"openaiChatCompletion"}},
-            "/openai/v1/responses":{"post":{"operationId":"openaiResponse"}},
-            "/openai/v1/models":{"get":{"operationId":"openaiModels"}},
-            "/ollama/api/generate":{"post":{"operationId":"ollamaGenerate"}},
-            "/ollama/api/chat":{"post":{"operationId":"ollamaChat"}},
-            "/ollama/api/tags":{"get":{"operationId":"ollamaTags"}},
-            "/ollama/api/show":{"post":{"operationId":"ollamaShow"}},
-            "/ollama/api/pull":{"post":{"operationId":"ollamaPull"}},
-            "/ollama/api/copy":{"post":{"operationId":"ollamaCopy"}},
-            "/ollama/api/delete":{"post":{"operationId":"ollamaDelete"}},
-            "/cusco/v1/contexts":{"get":{"operationId":"cuscoContexts"},"post":{"operationId":"cuscoCreateContext"}},
-            "/cusco/v1/contexts/import":{"post":{"operationId":"cuscoImportContext"}},
-            "/cusco/v1/contexts/{id}":{"get":{"operationId":"cuscoContext"},"delete":{"operationId":"cuscoDeleteContext"}},
-            "/cusco/v1/contexts/{id}/branches":{"post":{"operationId":"cuscoBranchContext"}},
-            "/cusco/v1/requests/{id}":{"delete":{"operationId":"cuscoCancelRequest"}},
-            "/cusco/v1/status":{"get":{"operationId":"cuscoStatus"}}
+fn openapi_operation(operation_id: &str, request_schema: Option<&str>) -> Value {
+    let mut operation = json!({
+        "operationId": operation_id,
+        "responses": {
+            "200": {"description": "Successful response"},
+            "400": {"description": "Invalid request"},
+            "401": {"description": "Authentication required"},
+            "500": {"description": "Server error"}
         }
+    });
+    if let Some(schema) = request_schema {
+        operation["requestBody"] = json!({
+            "required": true,
+            "content": {"application/json": {"schema": {"$ref": format!("#/components/schemas/{schema}")}}}
+        });
+    }
+    operation
+}
+
+pub fn openapi_document() -> Value {
+    let mut paths = serde_json::Map::new();
+    let operations = [
+        (
+            "/openai/v1/completions",
+            "post",
+            "openaiCompletion",
+            Some("CompletionRequest"),
+        ),
+        (
+            "/openai/v1/chat/completions",
+            "post",
+            "openaiChatCompletion",
+            Some("ChatRequest"),
+        ),
+        (
+            "/openai/v1/responses",
+            "post",
+            "openaiResponse",
+            Some("ResponsesRequest"),
+        ),
+        ("/openai/v1/models", "get", "openaiModels", None),
+        (
+            "/ollama/api/generate",
+            "post",
+            "ollamaGenerate",
+            Some("OllamaGenerateRequest"),
+        ),
+        (
+            "/ollama/api/chat",
+            "post",
+            "ollamaChat",
+            Some("OllamaChatRequest"),
+        ),
+        ("/ollama/api/tags", "get", "ollamaTags", None),
+        (
+            "/ollama/api/show",
+            "post",
+            "ollamaShow",
+            Some("OllamaNameRequest"),
+        ),
+        (
+            "/ollama/api/pull",
+            "post",
+            "ollamaPull",
+            Some("OllamaPullRequest"),
+        ),
+        (
+            "/ollama/api/copy",
+            "post",
+            "ollamaCopy",
+            Some("OllamaCopyRequest"),
+        ),
+        (
+            "/ollama/api/delete",
+            "post",
+            "ollamaDelete",
+            Some("OllamaNameRequest"),
+        ),
+        ("/cusco/v1/contexts", "get", "cuscoContexts", None),
+        ("/cusco/v1/contexts", "post", "cuscoCreateContext", None),
+        (
+            "/cusco/v1/contexts/import",
+            "post",
+            "cuscoImportContext",
+            Some("ImportContextRequest"),
+        ),
+        ("/cusco/v1/contexts/{id}", "get", "cuscoContext", None),
+        (
+            "/cusco/v1/contexts/{id}",
+            "delete",
+            "cuscoDeleteContext",
+            None,
+        ),
+        (
+            "/cusco/v1/contexts/{id}/branches",
+            "post",
+            "cuscoBranchContext",
+            None,
+        ),
+        (
+            "/cusco/v1/requests/{id}",
+            "delete",
+            "cuscoCancelRequest",
+            None,
+        ),
+        ("/cusco/v1/status", "get", "cuscoStatus", None),
+    ];
+    for (path, method, operation_id, schema) in operations {
+        paths
+            .entry(path)
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))[method] =
+            openapi_operation(operation_id, schema);
+    }
+    json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Cusco v1 APIs", "version": "1.0.0"},
+        "paths": paths,
+        "components": {"schemas": {
+            "CompletionRequest": {
+                "type": "object", "additionalProperties": false, "required": ["model", "prompt"],
+                "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "max_tokens": {"type": "integer", "minimum": 0}, "stream": {"type": "boolean"}, "temperature": {"type": "number", "minimum": 0, "maximum": 2}, "top_p": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}, "seed": {"type": "integer", "minimum": 0}}
+            },
+            "ChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}}},
+            "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"type": "string"}, "stream": {"type": "boolean"}}},
+            "OllamaGenerateRequest": {"type": "object", "additionalProperties": false, "required": ["model", "prompt"], "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
+            "OllamaChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
+            "OllamaNameRequest": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string"}}},
+            "OllamaPullRequest": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string"}, "sha256": {"type": "string"}}},
+            "OllamaCopyRequest": {"type": "object", "additionalProperties": false, "required": ["source", "destination"], "properties": {"source": {"type": "string"}, "destination": {"type": "string"}}},
+            "ImportContextRequest": {"type": "object", "additionalProperties": false, "required": ["tokens"], "properties": {"tokens": {"type": "array", "items": {"type": "string"}}}}
+        }}
     })
 }
 
@@ -3376,6 +3484,17 @@ mod tests {
         assert_eq!(spec["openapi"], "3.1.0");
         assert!(spec["paths"]["/openai/v1/chat/completions"].is_object());
         assert!(spec["paths"]["/cusco/v1/status"].is_object());
+        for path in spec["paths"].as_object().unwrap().values() {
+            for operation in path.as_object().unwrap().values() {
+                assert!(operation["operationId"].is_string());
+                assert!(operation["responses"]["200"].is_object());
+            }
+        }
+        assert_eq!(
+            spec["paths"]["/openai/v1/completions"]["post"]["requestBody"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/CompletionRequest"
+        );
         fs::remove_dir_all(d).unwrap()
     }
 
