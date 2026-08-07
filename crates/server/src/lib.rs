@@ -2483,6 +2483,7 @@ async fn completion(
         r.raw_continuation,
         r.deadline_ms,
         retained_bytes,
+        request_context.request_id,
         request_context.principal,
         WireProtocol::OpenAiCompletion,
     )
@@ -2526,6 +2527,7 @@ async fn chat(
         r.raw_continuation,
         r.deadline_ms,
         retained_bytes,
+        request_context.request_id,
         request_context.principal,
         WireProtocol::OpenAiChat,
     )
@@ -2656,6 +2658,7 @@ async fn responses(
         false,
         None,
         retained_bytes,
+        request_context.request_id,
         request_context.principal,
         WireProtocol::OpenAiResponses,
     )
@@ -2719,6 +2722,7 @@ async fn ollama_generate(
         false,
         None,
         retained_bytes,
+        request_context.request_id,
         request_context.principal,
         WireProtocol::OllamaGenerate,
     )
@@ -2764,6 +2768,7 @@ async fn ollama_chat(
         false,
         None,
         retained_bytes,
+        request_context.request_id,
         request_context.principal,
         WireProtocol::OllamaChat,
     )
@@ -3191,11 +3196,12 @@ async fn infer_response(
     raw_continuation: bool,
     deadline_ms: Option<u64>,
     retained_bytes: usize,
+    request_id: String,
     principal: String,
     protocol: WireProtocol,
 ) -> Result<Response, Error> {
     server.model(&model)?;
-    let id = Uuid::new_v4().to_string();
+    let id = request_id;
     let correlation_id = id.clone();
     let config = server.config();
     let wall_limit = Duration::from_millis(
