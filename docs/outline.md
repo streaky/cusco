@@ -276,10 +276,11 @@ enum CompactionTrigger {
 }
 ```
 
-All external APIs that can influence generation must accept an explicit `compaction` request parameter with the same type requirement. If present, `compaction.strategy` must name a concrete built-in strategy (currently `window_tail`); if absent, no compaction work is triggered on that request.
+All external APIs that can influence generation must accept an explicit `compaction` request parameter with the same type requirement. If present, `compaction.strategy` must name a concrete built-in strategy identifier from the v1 strategy registry snapshot (currently `window_tail`). Unknown values are rejected as validation errors at admission.
+
+The accepted strategy identifier set is dynamic across release versions, but for the current v1 baseline it is build-time closed-world: only identifiers compiled and registered in this release are valid on admission. Later releases may widen this set by changing the compiled strategy registry contract (for example to add custom/native policy kinds), and clients must adapt by negotiating the new version.
 
 Protocol adapters may map their own extension fields onto this canonical object (for example, an OpenAI extension field `cusco_compaction` and an Ollama options field `cusco_compaction`). Inference adapters must validate and reject unknown enum values instead of treating the request as a boolean toggle.
-
 A separate context-lifecycle service should still accept advisory client-presence signals and expose strategy discovery without making any external protocol adapter responsible for compaction policy:
 
 ```rust
