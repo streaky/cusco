@@ -1890,9 +1890,39 @@ struct FunctionTool {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ToolDefinition {
+struct NestedToolDefinition {
     r#type: String,
     function: FunctionTool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlatToolDefinition {
+    r#type: String,
+    name: String,
+    description: Option<String>,
+    parameters: Value,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ToolDefinition {
+    Nested(NestedToolDefinition),
+    Flat(FlatToolDefinition),
+}
+
+impl ToolDefinition {
+    fn valid_function(&self) -> bool {
+        match self {
+            Self::Nested(tool) => {
+                tool.r#type == "function"
+                    && !tool.function.name.is_empty()
+                    && tool.function.parameters.is_object()
+            }
+            Self::Flat(tool) => {
+                let _ = &tool.description;
+                tool.r#type == "function" && !tool.name.is_empty() && tool.parameters.is_object()
+            }
+        }
+    }
 }
 
 fn validate_controls(
@@ -1914,13 +1944,12 @@ fn validate_controls(
     }
     if !tools.is_empty() {
         for tool in tools {
-            if tool.r#type != "function"
-                || tool.function.name.is_empty()
-                || !tool.function.parameters.is_object()
-            {
+            if !tool.valid_function() {
                 return Err(Error::BadRequest("invalid function tool definition".into()));
             }
-            let _ = &tool.function.description;
+            if let ToolDefinition::Nested(tool) = tool {
+                let _ = &tool.function.description;
+            }
         }
         return Err(Error::BadRequest(
             "unsupported_capability: selected model profile does not advertise tool calling".into(),
@@ -3220,7 +3249,8 @@ pub fn openapi_document() -> Value {
                 "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "max_tokens": {"type": "integer", "minimum": 0}, "stream": {"type": "boolean"}, "temperature": {"type": "number", "minimum": 0, "maximum": 2}, "top_p": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}, "seed": {"type": "integer", "minimum": 0}}
             },
             "ChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}}},
-            "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"type": "string"}, "stream": {"type": "boolean"}}},
+            "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"oneOf": [{"type": "string"}, {"type": "array"}]}, "stream": {"type": "boolean"}, "tools": {"type": "array", "items": {"$ref": "#/components/schemas/ResponsesFunctionTool"}}}},
+            "ResponsesFunctionTool": {"type": "object", "additionalProperties": false, "required": ["type", "name", "parameters"], "properties": {"type": {"const": "function"}, "name": {"type": "string", "minLength": 1}, "description": {"type": "string"}, "parameters": {"type": "object"}}},
             "OllamaGenerateRequest": {"type": "object", "additionalProperties": false, "required": ["model", "prompt"], "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
             "OllamaChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
             "OllamaModelRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["model"]}, {"required": ["name"]}], "properties": {"model": {"type": "string"}, "name": {"type": "string"}}},
@@ -3625,11 +3655,46 @@ mod tests {
         fs::remove_dir_all(d).unwrap()
     }
     #[test]
+    fn accepts_endpoint_specific_openai_function_tool_shapes() {
+        let responses: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hello",
+            "tools": [{
+                "type": "function",
+                "name": "get_current_timestamp",
+                "description": "Get the current Unix timestamp.",
+                "parameters": {"type": "object", "properties": {}}
+            }]
+        }))
+        .unwrap();
+        assert!(responses.tools[0].valid_function());
+        assert!(matches!(
+            validate_controls(None, None, &responses.tools, None, None),
+            Err(Error::BadRequest(message)) if message.contains("does not advertise tool calling")
+        ));
+
+        let chat: ChatRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_current_timestamp",
+                    "description": "Get the current Unix timestamp.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        }))
+        .unwrap();
+        assert!(chat.tools[0].valid_function());
+    }
+    #[test]
     fn scheduler_uses_transition_cost_priority_and_wait() {
         let c = vec![
             SlotCandidate {
                 slot: 1,
                 valid_prefix: 1,
+
                 transfer_bytes: 5000,
                 rollback_tokens: 0,
                 quiesce_cost: 0,
