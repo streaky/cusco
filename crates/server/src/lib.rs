@@ -1205,7 +1205,18 @@ impl Server {
             .ok_or(Error::ContextNotFound)?;
         self.persist()
     }
-    pub fn register_model(&self, mut model: ModelRecord) -> Result<ModelRecord, Error> {
+    pub fn register_model(&self, model: ModelRecord) -> Result<ModelRecord, Error> {
+        self.register_model_with(|_| Ok(()), model)
+    }
+
+    pub fn register_model_with<F>(
+        &self,
+        finalize: F,
+        mut model: ModelRecord,
+    ) -> Result<ModelRecord, Error>
+    where
+        F: FnOnce(&ModelRecord) -> Result<(), Error>,
+    {
         let _lifecycle = self.model_lifecycle.lock();
         model.aliases.sort();
         model.aliases.dedup();
@@ -1239,11 +1250,8 @@ impl Server {
             guard.durable.next_model_epoch = epoch
                 .checked_add(1)
                 .ok_or_else(|| Error::State("model epoch space exhausted".into()))?;
-            (
-                epoch,
-                guard.durable.models.get(&model.id).cloned(),
-                guard.durable.models.clone(),
-            )
+            let previous = guard.durable.models.get(&model.id).cloned();
+            (epoch, previous, guard.durable.models.clone())
         };
         model.epoch = epoch;
         if let Err(error) = self.engine.prepare_model(&model) {
@@ -1267,10 +1275,20 @@ impl Server {
             self.engine.retire_model(&model.id, model.epoch);
             return Err(error);
         }
+        if let Err(error) = finalize(&model) {
+            let mut guard = self.inner.lock();
+            guard.durable.models = previous_models;
+            guard.durable.next_model_epoch = epoch;
+            drop(guard);
+            self.engine.retire_model(&model.id, model.epoch);
+            return Err(error);
+        }
         self.engine
             .commit_model(&model, previous.as_ref().map(|record| record.epoch));
         Ok(model)
     }
+
+
     pub fn models(&self) -> Vec<ModelRecord> {
         self.inner.lock().durable.models.values().cloned().collect()
     }
@@ -2780,7 +2798,7 @@ async fn perform_ollama_pull(
             catalog
                 .finish_operation(&operation, "failed", Some(&error.to_string()))
                 .map_err(state_err)?;
-            return Err(error);
+            return Err(state_err(error));
         }
     };
     if let Some(sender) = &progress {
@@ -2798,17 +2816,19 @@ async fn perform_ollama_pull(
     if let Some(sender) = &progress {
         let _ = sender.send(json!({"status":"writing manifest"})).await;
     }
-    let model = s.register_model(ModelRecord {
-        id: name,
-        revision: fetched.identity.clone(),
-        path: fetched.path,
-        sha256: fetched.sha256,
-        aliases: vec![],
-        family: metadata.architecture,
-        size_bytes: fetched.size,
-        epoch: 0,
-    })?;
-    catalog.publish(&model).map_err(state_err)?;
+    let model = s.register_model_with(
+        |model| catalog.publish(model).map_err(state_err),
+        ModelRecord {
+            id: name,
+            revision: fetched.identity.clone(),
+            path: fetched.path,
+            sha256: fetched.sha256,
+            aliases: vec![],
+            family: metadata.architecture,
+            size_bytes: fetched.size,
+            epoch: 0,
+        },
+    )?;
     catalog
         .finish_operation(&operation, "complete", None)
         .map_err(state_err)?;
