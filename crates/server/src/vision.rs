@@ -1,4 +1,4 @@
-use crate::VisionConfig;
+use crate::config::VisionConfig;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{AnimationDecoder, ImageDecoder, ImageFormat};
 use parking_lot::Mutex;
@@ -231,6 +231,7 @@ impl ImageAdmission {
 
 mod tests {
     use super::*;
+    use crate::config::{ByteSize, VisionConfig};
     fn admission() -> ImageAdmission {
         ImageAdmission::new(VisionConfig::default())
     }
@@ -336,7 +337,7 @@ mod tests {
             "total_pixels"
         );
         let mut config = VisionConfig::default();
-        config.retention_capacity = crate::ByteSize(1);
+        config.retention_capacity = ByteSize(1);
         assert_eq!(
             ImageAdmission::new(config)
                 .admit_base64("image/png", &png)
