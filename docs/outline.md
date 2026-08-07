@@ -1823,9 +1823,9 @@ The out-of-box compaction surface is intentionally conservative and deterministi
 - `window_tail`
   - Keeps required anchors (system/developer policy and active tool declarations).
   - Trims conversational content by selecting a contiguous retained window under the target token/window budget (favoring continuity around the latest active exchange and preserving required anchors), rather than always dropping strict chronological prefix order.
+  - Trims at logical turn/message boundaries only: v1 never retains a partial message, so role and envelope integrity are preserved.
   - Aligns truncation to compaction block geometry where possible to avoid immediately invalidating reusable block boundaries.
   - Records explicit runtime metadata: budget, anchor policy, and rejection reason.
-
 Selection policy:
 
 - default strategy is `window_tail`;
