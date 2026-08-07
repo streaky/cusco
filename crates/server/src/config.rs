@@ -1,6 +1,11 @@
 use crate::{HttpDebugLevel, SchedulerPolicyConfig, ServerConfig};
 use serde::{Deserialize, Serialize};
-use std::{fs, net::SocketAddr, path::{Path, PathBuf}, str::FromStr};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 use thiserror::Error;
 
 const CONFIG_VERSION: u32 = 1;
@@ -35,16 +40,36 @@ impl FromStr for ByteSize {
     type Err = String;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let value = value.trim();
-        let split = value.find(char::is_whitespace).ok_or_else(|| "size must contain a unit (for example `8 GiB`)".to_string())?;
-        let amount: f64 = value[..split].trim().parse().map_err(|_| "size amount must be numeric".to_string())?;
-        if !amount.is_finite() || amount < 0.0 { return Err("size amount must be finite and non-negative".into()); }
+        let split = value
+            .find(char::is_whitespace)
+            .ok_or_else(|| "size must contain a unit (for example `8 GiB`)".to_string())?;
+        let amount: f64 = value[..split]
+            .trim()
+            .parse()
+            .map_err(|_| "size amount must be numeric".to_string())?;
+        if !amount.is_finite() || amount < 0.0 {
+            return Err("size amount must be finite and non-negative".into());
+        }
         let multiplier = match value[split..].trim().to_ascii_lowercase().as_str() {
-            "b" => 1.0, "kib" => 1024.0, "mib" => 1024.0_f64.powi(2), "gib" => 1024.0_f64.powi(3), "tib" => 1024.0_f64.powi(4),
-            "kb" => 1000.0, "mb" => 1000.0_f64.powi(2), "gb" => 1000.0_f64.powi(3), "tb" => 1000.0_f64.powi(4),
-            _ => return Err("unsupported size unit; use B, KiB, MiB, GiB, TiB, KB, MB, GB, or TB".into()),
+            "b" => 1.0,
+            "kib" => 1024.0,
+            "mib" => 1024.0_f64.powi(2),
+            "gib" => 1024.0_f64.powi(3),
+            "tib" => 1024.0_f64.powi(4),
+            "kb" => 1000.0,
+            "mb" => 1000.0_f64.powi(2),
+            "gb" => 1000.0_f64.powi(3),
+            "tb" => 1000.0_f64.powi(4),
+            _ => {
+                return Err(
+                    "unsupported size unit; use B, KiB, MiB, GiB, TiB, KB, MB, GB, or TB".into(),
+                );
+            }
         };
         let bytes = amount * multiplier;
-        if bytes > u64::MAX as f64 { return Err("size exceeds u64 byte accounting".into()); }
+        if bytes > u64::MAX as f64 {
+            return Err("size exceeds u64 byte accounting".into());
+        }
         Ok(Self(bytes.round() as u64))
     }
 }
@@ -116,17 +141,45 @@ pub struct VisionConfig {
 }
 
 impl Default for VisionConfig {
-    fn default() -> Self { Self { max_images: default_image_count(), max_encoded_bytes: default_encoded_bytes(), max_decoded_bytes: default_decoded_bytes(), max_dimension: default_dimension(), max_total_pixels: default_pixels(), retention_capacity: default_retention(), metadata_allowlist: vec![] } }
+    fn default() -> Self {
+        Self {
+            max_images: default_image_count(),
+            max_encoded_bytes: default_encoded_bytes(),
+            max_decoded_bytes: default_decoded_bytes(),
+            max_dimension: default_dimension(),
+            max_total_pixels: default_pixels(),
+            retention_capacity: default_retention(),
+            metadata_allowlist: vec![],
+        }
+    }
 }
-fn default_listen() -> SocketAddr { "127.0.0.1:8080".parse().expect("static address") }
-fn default_context() -> u32 { 4096 }
-fn default_gpu_layers() -> i32 { 99 }
-fn default_image_count() -> usize { 8 }
-fn default_encoded_bytes() -> usize { 16 << 20 }
-fn default_decoded_bytes() -> usize { 12 << 20 }
-fn default_dimension() -> u32 { 8192 }
-fn default_pixels() -> u64 { 32_000_000 }
-fn default_retention() -> ByteSize { ByteSize(256 << 20) }
+fn default_listen() -> SocketAddr {
+    "127.0.0.1:8080".parse().expect("static address")
+}
+fn default_context() -> u32 {
+    4096
+}
+fn default_gpu_layers() -> i32 {
+    99
+}
+fn default_image_count() -> usize {
+    8
+}
+fn default_encoded_bytes() -> usize {
+    16 << 20
+}
+fn default_decoded_bytes() -> usize {
+    12 << 20
+}
+fn default_dimension() -> u32 {
+    8192
+}
+fn default_pixels() -> u64 {
+    32_000_000
+}
+fn default_retention() -> ByteSize {
+    ByteSize(256 << 20)
+}
 
 impl DaemonConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -134,12 +187,40 @@ impl DaemonConfig {
         config.validate()
     }
     pub fn validate(self) -> Result<Self, ConfigError> {
-        if self.version != CONFIG_VERSION { return Err(ConfigError::Version(self.version)); }
-        if self.execution.device_capacity.0 == 0 || self.execution.host_capacity.0 == 0 || self.execution.storage_capacity.0 == 0 { return Err(ConfigError::Invalid("execution capacities must be nonzero".into())); }
-        if self.execution.context_reserve.0 > self.execution.storage_capacity.0 { return Err(ConfigError::Invalid("context reserve exceeds storage capacity".into())); }
-        if self.execution.context_tokens == 0 { return Err(ConfigError::Invalid("context_tokens must be nonzero".into())); }
-        if self.vision.max_images == 0 || self.vision.max_encoded_bytes == 0 || self.vision.max_decoded_bytes == 0 || self.vision.max_dimension == 0 || self.vision.max_total_pixels == 0 { return Err(ConfigError::Invalid("vision limits must be nonzero".into())); }
-        if self.vision.retention_capacity.0 < self.vision.max_decoded_bytes as u64 { return Err(ConfigError::Invalid("vision retention capacity is smaller than one decoded image limit".into())); }
+        if self.version != CONFIG_VERSION {
+            return Err(ConfigError::Version(self.version));
+        }
+        if self.execution.device_capacity.0 == 0
+            || self.execution.host_capacity.0 == 0
+            || self.execution.storage_capacity.0 == 0
+        {
+            return Err(ConfigError::Invalid(
+                "execution capacities must be nonzero".into(),
+            ));
+        }
+        if self.execution.context_reserve.0 > self.execution.storage_capacity.0 {
+            return Err(ConfigError::Invalid(
+                "context reserve exceeds storage capacity".into(),
+            ));
+        }
+        if self.execution.context_tokens == 0 {
+            return Err(ConfigError::Invalid(
+                "context_tokens must be nonzero".into(),
+            ));
+        }
+        if self.vision.max_images == 0
+            || self.vision.max_encoded_bytes == 0
+            || self.vision.max_decoded_bytes == 0
+            || self.vision.max_dimension == 0
+            || self.vision.max_total_pixels == 0
+        {
+            return Err(ConfigError::Invalid("vision limits must be nonzero".into()));
+        }
+        if self.vision.retention_capacity.0 < self.vision.max_decoded_bytes as u64 {
+            return Err(ConfigError::Invalid(
+                "vision retention capacity is smaller than one decoded image limit".into(),
+            ));
+        }
         Ok(self)
     }
 }
@@ -149,7 +230,10 @@ mod tests {
     use super::*;
     #[test]
     fn byte_sizes_require_units_and_allow_fractions() {
-        assert_eq!("1.5 GiB".parse::<ByteSize>().unwrap(), ByteSize(1_610_612_736));
+        assert_eq!(
+            "1.5 GiB".parse::<ByteSize>().unwrap(),
+            ByteSize(1_610_612_736)
+        );
         assert!("1024".parse::<ByteSize>().is_err());
     }
     #[test]

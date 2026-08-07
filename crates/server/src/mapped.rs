@@ -1129,15 +1129,9 @@ mod tests {
 
     #[test]
     fn mapped_state_is_reused_without_activation_copying() {
-        let engine = MappedEngine::open(
-            "gemma3",
-            "mock://deterministic",
-            4096,
-            0,
-            1 << 30,
-            1 << 30,
-        )
-        .unwrap();
+        let engine =
+            MappedEngine::open("gemma3", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+                .unwrap();
         let model = model();
         let first = engine
             .generate_collected(test_request(&model, &"a".repeat(40), 2, &[]))
@@ -1204,15 +1198,9 @@ mod tests {
         engine
             .generate_collected(test_request(&model, &"b".repeat(40), 1, &[]))
             .unwrap();
-        let control = MappedEngine::open(
-            "gemma3",
-            "mock://deterministic",
-            4096,
-            0,
-            1 << 30,
-            1 << 30,
-        )
-        .unwrap();
+        let control =
+            MappedEngine::open("gemma3", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+                .unwrap();
         let control_first = control
             .generate_collected(test_request(&model, &"a".repeat(40), 2, &[]))
             .unwrap();
@@ -1239,15 +1227,8 @@ mod tests {
 
     #[test]
     fn capacity_rejection_precedes_decode_and_preserves_metrics() {
-        let engine = MappedEngine::open(
-            "gemma3",
-            "mock://deterministic",
-            64,
-            0,
-            1 << 20,
-            1 << 20,
-        )
-        .unwrap();
+        let engine =
+            MappedEngine::open("gemma3", "mock://deterministic", 64, 0, 1 << 20, 1 << 20).unwrap();
         let model = model();
         let error = engine
             .generate_collected(test_request(&model, &"x".repeat(65), 1, &[]))
@@ -1258,15 +1239,9 @@ mod tests {
 
     #[test]
     fn publication_failure_keeps_the_prior_mapping_reusable() {
-        let engine = MappedEngine::open(
-            "gemma3",
-            "mock://deterministic",
-            4096,
-            0,
-            250_000,
-            1 << 20,
-        )
-        .unwrap();
+        let engine =
+            MappedEngine::open("gemma3", "mock://deterministic", 4096, 0, 250_000, 1 << 20)
+                .unwrap();
         let model = model();
         let first = engine
             .generate_collected(test_request(&model, &"a".repeat(40), 1, &[]))
@@ -1288,15 +1263,9 @@ mod tests {
 
     #[test]
     fn exact_cached_prefix_resumes_from_its_saved_logits() {
-        let engine = MappedEngine::open(
-            "gemma3",
-            "mock://deterministic",
-            4096,
-            0,
-            1 << 30,
-            1 << 30,
-        )
-        .unwrap();
+        let engine =
+            MappedEngine::open("gemma3", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+                .unwrap();
         let model = model();
         let primed = engine
             .generate_collected(test_request(&model, &"p".repeat(32), 0, &[]))
@@ -1315,15 +1284,9 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("cusco-mapped-server-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
-        let engine = MappedEngine::open(
-            "gemma3",
-            "mock://deterministic",
-            4096,
-            0,
-            1 << 30,
-            1 << 30,
-        )
-        .unwrap();
+        let engine =
+            MappedEngine::open("gemma3", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+                .unwrap();
         let server = Server::open(
             directory.join("state.json"),
             Arc::new(AnonymousAdmin),

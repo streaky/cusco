@@ -47,14 +47,47 @@ fn read_u64(reader: &mut impl Read) -> Result<u64, Error> {
     Ok(u64::from_le_bytes(bytes))
 }
 fn read_string(reader: &mut impl Read) -> Result<String, Error> {
-    let length = usize::try_from(read_u64(reader)?).map_err(|_| Error::InvalidMetadata("string length exceeds address space".into()))?;
-    if length > 16 << 20 { return Err(Error::InvalidMetadata("metadata string exceeds 16 MiB".into())); }
+    let length = usize::try_from(read_u64(reader)?)
+        .map_err(|_| Error::InvalidMetadata("string length exceeds address space".into()))?;
+    if length > 16 << 20 {
+        return Err(Error::InvalidMetadata(
+            "metadata string exceeds 16 MiB".into(),
+        ));
+    }
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes)?;
-    String::from_utf8(bytes).map_err(|_| Error::InvalidMetadata("metadata string is not UTF-8".into()))
+    String::from_utf8(bytes)
+        .map_err(|_| Error::InvalidMetadata("metadata string is not UTF-8".into()))
 }
 fn skip_value(reader: &mut impl Read, kind: u32) -> Result<(), Error> {
-    let bytes = match kind { 0 | 1 | 7 => 1, 2 | 3 => 2, 4 | 5 | 6 => 4, 10 | 11 | 12 => 8, 8 => { let _ = read_string(reader)?; return Ok(()); }, 9 => { let element = read_u32(reader)?; let count = read_u64(reader)?; if count > 1_000_000 { return Err(Error::InvalidMetadata("metadata array is unreasonably large".into())); } for _ in 0..count { skip_value(reader, element)?; } return Ok(()); }, _ => return Err(Error::InvalidMetadata(format!("unknown metadata type {kind}"))) };
+    let bytes = match kind {
+        0 | 1 | 7 => 1,
+        2 | 3 => 2,
+        4 | 5 | 6 => 4,
+        10 | 11 | 12 => 8,
+        8 => {
+            let _ = read_string(reader)?;
+            return Ok(());
+        }
+        9 => {
+            let element = read_u32(reader)?;
+            let count = read_u64(reader)?;
+            if count > 1_000_000 {
+                return Err(Error::InvalidMetadata(
+                    "metadata array is unreasonably large".into(),
+                ));
+            }
+            for _ in 0..count {
+                skip_value(reader, element)?;
+            }
+            return Ok(());
+        }
+        _ => {
+            return Err(Error::InvalidMetadata(format!(
+                "unknown metadata type {kind}"
+            )));
+        }
+    };
     let mut buffer = [0; 8];
     reader.read_exact(&mut buffer[..bytes])?;
     Ok(())
@@ -64,12 +97,22 @@ pub fn probe_gguf(path: impl AsRef<Path>) -> Result<ModelMetadata, Error> {
     let mut reader = File::open(path)?;
     let mut magic = [0; 4];
     reader.read_exact(&mut magic)?;
-    if &magic != b"GGUF" { return Err(Error::InvalidMetadata("missing GGUF magic".into())); }
+    if &magic != b"GGUF" {
+        return Err(Error::InvalidMetadata("missing GGUF magic".into()));
+    }
     let version = read_u32(&mut reader)?;
-    if !(2..=3).contains(&version) { return Err(Error::InvalidMetadata(format!("unsupported GGUF version {version}"))); }
+    if !(2..=3).contains(&version) {
+        return Err(Error::InvalidMetadata(format!(
+            "unsupported GGUF version {version}"
+        )));
+    }
     let _tensor_count = read_u64(&mut reader)?;
     let metadata_count = read_u64(&mut reader)?;
-    if metadata_count > 1_000_000 { return Err(Error::InvalidMetadata("metadata entry count is unreasonably large".into())); }
+    if metadata_count > 1_000_000 {
+        return Err(Error::InvalidMetadata(
+            "metadata entry count is unreasonably large".into(),
+        ));
+    }
     let mut architecture = None;
     let mut name = None;
     for _ in 0..metadata_count {
@@ -77,12 +120,20 @@ pub fn probe_gguf(path: impl AsRef<Path>) -> Result<ModelMetadata, Error> {
         let kind = read_u32(&mut reader)?;
         if (key == "general.architecture" || key == "general.name") && kind == 8 {
             let value = read_string(&mut reader)?;
-            if key == "general.architecture" { architecture = Some(value); } else { name = Some(value); }
+            if key == "general.architecture" {
+                architecture = Some(value);
+            } else {
+                name = Some(value);
+            }
         } else {
             skip_value(&mut reader, kind)?;
         }
     }
-    Ok(ModelMetadata { architecture: architecture.ok_or_else(|| Error::InvalidMetadata("general.architecture is absent".into()))?, name })
+    Ok(ModelMetadata {
+        architecture: architecture
+            .ok_or_else(|| Error::InvalidMetadata("general.architecture is absent".into()))?,
+        name,
+    })
 }
 fn digest(path: &Path) -> Result<(String, u64), Error> {
     let mut f = File::open(path)?;
@@ -128,7 +179,12 @@ fn parse_hf(uri: &str) -> Result<(String, String, String), Error> {
         .components()
         .all(|component| matches!(component, std::path::Component::Normal(_)))
         && Path::new(file).components().count() == 1;
-    if org.is_empty() || model.is_empty() || revision.is_empty() || revision.contains('/') || file.is_empty() || !simple_file
+    if org.is_empty()
+        || model.is_empty()
+        || revision.is_empty()
+        || revision.contains('/')
+        || file.is_empty()
+        || !simple_file
     {
         return Err(Error::InvalidUri);
     }
@@ -145,14 +201,22 @@ fn resolve_revision(repo: &str, revision: &str) -> Result<String, Error> {
     let url = format!("https://huggingface.co/api/models/{repo}/revision/{revision}");
     let mut response = ureq::get(url).call()?;
     let value: serde_json::Value = serde_json::from_reader(response.body_mut().as_reader())?;
-    let sha = value.get("sha").and_then(serde_json::Value::as_str).ok_or(Error::InvalidUri)?;
-    if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err(Error::InvalidUri); }
+    let sha = value
+        .get("sha")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(Error::InvalidUri)?;
+    if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::InvalidUri);
+    }
     Ok(sha.to_ascii_lowercase())
 }
 pub fn fetch_hf(uri: &str, cache: &Path, expected: Option<&str>) -> Result<ModelRecord, Error> {
     let (repo, requested_revision, file) = parse_hf(uri)?;
     let revision = resolve_revision(&repo, &requested_revision)?;
-    let dir = cache.join("models").join(repo.replace('/', "--")).join(&revision);
+    let dir = cache
+        .join("models")
+        .join(repo.replace('/', "--"))
+        .join(&revision);
     fs::create_dir_all(&dir)?;
     let destination = dir.join(&file);
     if destination.exists() && register_local(&destination, uri, expected).is_err() {

@@ -156,7 +156,9 @@ fn run(command: Command) -> Result<()> {
                 WorkloadScheduler, load_user_models,
             };
             let config = DaemonConfig::load(config)?;
-            let bearer_token = std::env::var("CUSCO_BEARER_TOKEN").ok().or_else(|| config.bearer_token.clone());
+            let bearer_token = std::env::var("CUSCO_BEARER_TOKEN")
+                .ok()
+                .or_else(|| config.bearer_token.clone());
             let anonymous = bearer_token.is_none();
             let auth: Arc<dyn AuthProvider> = match bearer_token {
                 Some(token) => Arc::new(BearerAuth::new(token)),
@@ -177,8 +179,9 @@ fn run(command: Command) -> Result<()> {
             let engine = WorkloadScheduler::new(engine, config.scheduler)?;
             let transient_state = config.paths.database.with_extension("runtime.json");
             if transient_state.exists() {
-                fs::remove_file(&transient_state)
-                    .with_context(|| format!("discard transient state {}", transient_state.display()))?;
+                fs::remove_file(&transient_state).with_context(|| {
+                    format!("discard transient state {}", transient_state.display())
+                })?;
             }
             let server = Server::open(&transient_state, auth, engine)?;
             server.configure(config.server)?;
@@ -860,8 +863,15 @@ mod tests {
         };
         assert_eq!(config, PathBuf::from("/data/config.yaml"));
         let command = Args::command();
-        let serve = command.get_subcommands().find(|command| command.get_name() == "serve").unwrap();
-        assert!(serve.get_arguments().all(|argument| argument.get_id() == "config" || argument.get_id() == "help"));
+        let serve = command
+            .get_subcommands()
+            .find(|command| command.get_name() == "serve")
+            .unwrap();
+        assert!(
+            serve
+                .get_arguments()
+                .all(|argument| argument.get_id() == "config" || argument.get_id() == "help")
+        );
     }
 
     #[test]

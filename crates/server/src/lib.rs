@@ -37,8 +37,8 @@ mod mapped;
 mod scheduler;
 mod vision;
 
-pub use config::{ByteSize, ConfigError, DaemonConfig, DataPaths, ExecutionConfig, VisionConfig};
 pub use catalog::{CatalogError, ModelCatalog, UserModelConfig, UserModels, load_user_models};
+pub use config::{ByteSize, ConfigError, DaemonConfig, DataPaths, ExecutionConfig, VisionConfig};
 pub use generation::{
     FinishReason, FrontierControl, GenerationFrontier, MAX_STOP_BYTES, MAX_STOP_SEQUENCES,
     StopAlignment,
@@ -1082,8 +1082,12 @@ impl Server {
         *self.catalog.lock() = Some(catalog);
         *self.model_directory.lock() = model_directory.into();
     }
-    fn catalog(&self) -> Option<ModelCatalog> { self.catalog.lock().clone() }
-    fn model_directory(&self) -> PathBuf { self.model_directory.lock().clone() }
+    fn catalog(&self) -> Option<ModelCatalog> {
+        self.catalog.lock().clone()
+    }
+    fn model_directory(&self) -> PathBuf {
+        self.model_directory.lock().clone()
+    }
     fn persist(&self) -> Result<(), Error> {
         let guard = self.inner.lock();
         let bytes = serde_json::to_vec_pretty(&guard.durable).map_err(state_err)?;
@@ -1845,19 +1849,37 @@ struct CompletionRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StreamOptions { #[serde(default)] include_usage: bool }
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum ReasoningEffort { None, Low, Medium, High, Max }
+enum ReasoningEffort {
+    None,
+    Low,
+    Medium,
+    High,
+    Max,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResponseFormat { r#type: String }
+struct ResponseFormat {
+    r#type: String,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FunctionTool { name: String, description: Option<String>, parameters: Value }
+struct FunctionTool {
+    name: String,
+    description: Option<String>,
+    parameters: Value,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ToolDefinition { r#type: String, function: FunctionTool }
+struct ToolDefinition {
+    r#type: String,
+    function: FunctionTool,
+}
 
 fn validate_controls(
     temperature: Option<f32>,
@@ -1867,25 +1889,38 @@ fn validate_controls(
     reasoning: Option<&ReasoningEffort>,
 ) -> Result<(), Error> {
     if temperature.is_some_and(|value| value != 0.0) {
-        return Err(Error::BadRequest("unsupported_capability: this executor supports greedy temperature=0 only".into()));
+        return Err(Error::BadRequest(
+            "unsupported_capability: this executor supports greedy temperature=0 only".into(),
+        ));
     }
     if top_p.is_some_and(|value| value != 1.0) {
-        return Err(Error::BadRequest("unsupported_capability: top_p sampling is unavailable for this executor".into()));
+        return Err(Error::BadRequest(
+            "unsupported_capability: top_p sampling is unavailable for this executor".into(),
+        ));
     }
     if !tools.is_empty() {
         for tool in tools {
-            if tool.r#type != "function" || tool.function.name.is_empty() || !tool.function.parameters.is_object() {
+            if tool.r#type != "function"
+                || tool.function.name.is_empty()
+                || !tool.function.parameters.is_object()
+            {
                 return Err(Error::BadRequest("invalid function tool definition".into()));
             }
             let _ = &tool.function.description;
         }
-        return Err(Error::BadRequest("unsupported_capability: selected model profile does not advertise tool calling".into()));
+        return Err(Error::BadRequest(
+            "unsupported_capability: selected model profile does not advertise tool calling".into(),
+        ));
     }
     if response_format.is_some_and(|format| format.r#type != "text") {
-        return Err(Error::BadRequest("unsupported_capability: structured output requires grammar support".into()));
+        return Err(Error::BadRequest(
+            "unsupported_capability: structured output requires grammar support".into(),
+        ));
     }
     if reasoning.is_some_and(|effort| !matches!(effort, ReasoningEffort::None)) {
-        return Err(Error::BadRequest("unsupported_capability: selected model does not advertise reasoning levels".into()));
+        return Err(Error::BadRequest(
+            "unsupported_capability: selected model does not advertise reasoning levels".into(),
+        ));
     }
     Ok(())
 }
@@ -1926,7 +1961,9 @@ struct ChatMessage {
     role: String,
     content: ChatContent,
 }
-fn default_user_role() -> String { "user".into() }
+fn default_user_role() -> String {
+    "user".into()
+}
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ChatContent {
@@ -1941,14 +1978,22 @@ enum ContentPart {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ImageUrlPart { url: String }
+struct ImageUrlPart {
+    url: String,
+}
 
 fn lower_messages(messages: Vec<ChatMessage>) -> Result<String, Error> {
     let admission = ImageAdmission::new(VisionConfig::default());
     let mut lines = Vec::with_capacity(messages.len());
     for message in messages {
-        if !matches!(message.role.as_str(), "system" | "user" | "assistant" | "tool") {
-            return Err(Error::BadRequest(format!("unsupported message role {}", message.role)));
+        if !matches!(
+            message.role.as_str(),
+            "system" | "user" | "assistant" | "tool"
+        ) {
+            return Err(Error::BadRequest(format!(
+                "unsupported message role {}",
+                message.role
+            )));
         }
         let text = match message.content {
             ChatContent::Text(text) => text,
@@ -1958,8 +2003,14 @@ fn lower_messages(messages: Vec<ChatMessage>) -> Result<String, Error> {
                     match part {
                         ContentPart::Text { text: part } => text.push_str(&part),
                         ContentPart::ImageUrl { image_url } => {
-                            if message.role != "user" { return Err(Error::BadRequest("images are accepted only in user messages".into())); }
-                            admission.admit_data_uri(&image_url.url).map_err(|error| Error::BadRequest(error.to_string()))?;
+                            if message.role != "user" {
+                                return Err(Error::BadRequest(
+                                    "images are accepted only in user messages".into(),
+                                ));
+                            }
+                            admission
+                                .admit_data_uri(&image_url.url)
+                                .map_err(|error| Error::BadRequest(error.to_string()))?;
                             return Err(Error::BadRequest("image_unsupported: selected model has no compatible vision projector".into()));
                         }
                     }
@@ -2000,7 +2051,10 @@ fn routes(server: Server) -> Router {
         .route("/ollama/api/pull", post(ollama_pull))
         .route("/ollama/api/copy", post(ollama_copy))
         .route("/ollama/api/delete", post(ollama_delete))
-        .route("/cusco/v1/contexts", get(list_contexts).post(create_context))
+        .route(
+            "/cusco/v1/contexts",
+            get(list_contexts).post(create_context),
+        )
         .route("/cusco/v1/contexts/import", post(import_context))
         .route(
             "/cusco/v1/contexts/{id}",
@@ -2130,7 +2184,10 @@ async fn completion(
     let request_context = auth(&s, &headers, Scope::Inference)?;
     validate_controls(r.temperature, r.top_p, &[], None, None)?;
     let _seed = r.seed;
-    let _include_usage = r.stream_options.as_ref().is_some_and(|options| options.include_usage);
+    let _include_usage = r
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage);
     s.model(&r.model)?;
     drop(permit);
     infer_response(
@@ -2159,9 +2216,18 @@ async fn chat(
     }: PrequeueJson<ChatRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
-    validate_controls(r.temperature, r.top_p, &r.tools, r.response_format.as_ref(), r.reasoning_effort.as_ref())?;
+    validate_controls(
+        r.temperature,
+        r.top_p,
+        &r.tools,
+        r.response_format.as_ref(),
+        r.reasoning_effort.as_ref(),
+    )?;
     let _seed = r.seed;
-    let _include_usage = r.stream_options.as_ref().is_some_and(|options| options.include_usage);
+    let _include_usage = r
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage);
     s.model(&r.model)?;
     let prompt = lower_messages(r.messages)?;
     drop(permit);
@@ -2207,17 +2273,44 @@ struct ResponsesRequest {
 
 async fn responses(
     State(s): State<Server>,
-    PrequeueJson { headers, value: r, retained_bytes, _permit: permit }: PrequeueJson<ResponsesRequest>,
+    PrequeueJson {
+        headers,
+        value: r,
+        retained_bytes,
+        _permit: permit,
+    }: PrequeueJson<ResponsesRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
-    validate_controls(r.temperature, r.top_p, &r.tools, r.response_format.as_ref(), r.reasoning_effort.as_ref())?;
+    validate_controls(
+        r.temperature,
+        r.top_p,
+        &r.tools,
+        r.response_format.as_ref(),
+        r.reasoning_effort.as_ref(),
+    )?;
     let _seed = r.seed;
     s.model(&r.model)?;
     drop(permit);
-    infer_response(s, r.model, r.input, r.max_output_tokens, r.stream, None, vec![], false, None, retained_bytes, request_context.principal, WireProtocol::OpenAiResponses).await
+    infer_response(
+        s,
+        r.model,
+        r.input,
+        r.max_output_tokens,
+        r.stream,
+        None,
+        vec![],
+        false,
+        None,
+        retained_bytes,
+        request_context.principal,
+        WireProtocol::OpenAiResponses,
+    )
+    .await
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2229,12 +2322,31 @@ struct OllamaGenerateRequest {
 }
 async fn ollama_generate(
     State(s): State<Server>,
-    PrequeueJson { headers, value: r, retained_bytes, _permit: permit }: PrequeueJson<OllamaGenerateRequest>,
+    PrequeueJson {
+        headers,
+        value: r,
+        retained_bytes,
+        _permit: permit,
+    }: PrequeueJson<OllamaGenerateRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
     s.model(&r.model)?;
     drop(permit);
-    infer_response(s, r.model, r.prompt, None, r.stream, None, vec![], false, None, retained_bytes, request_context.principal, WireProtocol::OllamaGenerate).await
+    infer_response(
+        s,
+        r.model,
+        r.prompt,
+        None,
+        r.stream,
+        None,
+        vec![],
+        false,
+        None,
+        retained_bytes,
+        request_context.principal,
+        WireProtocol::OllamaGenerate,
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -2247,13 +2359,32 @@ struct OllamaChatRequest {
 }
 async fn ollama_chat(
     State(s): State<Server>,
-    PrequeueJson { headers, value: r, retained_bytes, _permit: permit }: PrequeueJson<OllamaChatRequest>,
+    PrequeueJson {
+        headers,
+        value: r,
+        retained_bytes,
+        _permit: permit,
+    }: PrequeueJson<OllamaChatRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
     s.model(&r.model)?;
     let prompt = lower_messages(r.messages)?;
     drop(permit);
-    infer_response(s, r.model, prompt, None, r.stream, None, vec![], false, None, retained_bytes, request_context.principal, WireProtocol::OllamaChat).await
+    infer_response(
+        s,
+        r.model,
+        prompt,
+        None,
+        r.stream,
+        None,
+        vec![],
+        false,
+        None,
+        retained_bytes,
+        request_context.principal,
+        WireProtocol::OllamaChat,
+    )
+    .await
 }
 
 async fn ollama_tags(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
@@ -2263,25 +2394,46 @@ async fn ollama_tags(State(s): State<Server>, headers: HeaderMap) -> Result<Json
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OllamaNameRequest { name: String }
-async fn ollama_show(State(s): State<Server>, headers: HeaderMap, Json(r): Json<OllamaNameRequest>) -> Result<Json<ModelRecord>, Error> {
+struct OllamaNameRequest {
+    name: String,
+}
+async fn ollama_show(
+    State(s): State<Server>,
+    headers: HeaderMap,
+    Json(r): Json<OllamaNameRequest>,
+) -> Result<Json<ModelRecord>, Error> {
     auth(&s, &headers, Scope::Inference)?;
     Ok(Json(s.model(&r.name)?))
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OllamaCopyRequest { source: String, destination: String }
-async fn ollama_copy(State(s): State<Server>, headers: HeaderMap, Json(r): Json<OllamaCopyRequest>) -> Result<StatusCode, Error> {
+struct OllamaCopyRequest {
+    source: String,
+    destination: String,
+}
+async fn ollama_copy(
+    State(s): State<Server>,
+    headers: HeaderMap,
+    Json(r): Json<OllamaCopyRequest>,
+) -> Result<StatusCode, Error> {
     auth(&s, &headers, Scope::Admin)?;
     let model = s.alias_model(&r.source, r.destination)?;
-    if let Some(catalog) = s.catalog() { catalog.publish(&model).map_err(state_err)?; }
+    if let Some(catalog) = s.catalog() {
+        catalog.publish(&model).map_err(state_err)?;
+    }
     Ok(StatusCode::OK)
 }
-async fn ollama_delete(State(s): State<Server>, headers: HeaderMap, Json(r): Json<OllamaNameRequest>) -> Result<StatusCode, Error> {
+async fn ollama_delete(
+    State(s): State<Server>,
+    headers: HeaderMap,
+    Json(r): Json<OllamaNameRequest>,
+) -> Result<StatusCode, Error> {
     auth(&s, &headers, Scope::Admin)?;
     s.remove_model(&r.name)?;
-    if let Some(catalog) = s.catalog() { catalog.remove(&r.name).map_err(state_err)?; }
+    if let Some(catalog) = s.catalog() {
+        catalog.remove(&r.name).map_err(state_err)?;
+    }
     Ok(StatusCode::OK)
 }
 
@@ -2292,36 +2444,64 @@ struct OllamaPullRequest {
     #[serde(default)]
     sha256: Option<String>,
 }
-async fn ollama_pull(State(s): State<Server>, headers: HeaderMap, Json(r): Json<OllamaPullRequest>) -> Result<Json<Value>, Error> {
+async fn ollama_pull(
+    State(s): State<Server>,
+    headers: HeaderMap,
+    Json(r): Json<OllamaPullRequest>,
+) -> Result<Json<Value>, Error> {
     auth(&s, &headers, Scope::Admin)?;
-    let catalog = s.catalog().ok_or_else(|| Error::State("model catalog is not configured".into()))?;
+    let catalog = s
+        .catalog()
+        .ok_or_else(|| Error::State("model catalog is not configured".into()))?;
     let operation = Uuid::new_v4().to_string();
-    catalog.begin_operation(&operation, &r.name, "pull").map_err(state_err)?;
+    catalog
+        .begin_operation(&operation, &r.name, "pull")
+        .map_err(state_err)?;
     let name = r.name;
     let expected = r.sha256;
     let cache = s.model_directory();
     let fetched = tokio::task::spawn_blocking({
         let name = name.clone();
         move || cusco_model_registry::fetch_hf(&name, &cache, expected.as_deref())
-    }).await.map_err(state_err);
+    })
+    .await
+    .map_err(state_err);
     let fetched = match fetched {
         Ok(Ok(fetched)) => fetched,
         Ok(Err(error)) => {
-            catalog.finish_operation(&operation, "failed", Some(&error.to_string())).map_err(state_err)?;
+            catalog
+                .finish_operation(&operation, "failed", Some(&error.to_string()))
+                .map_err(state_err)?;
             return Err(state_err(error));
         }
         Err(error) => {
-            catalog.finish_operation(&operation, "failed", Some(&error.to_string())).map_err(state_err)?;
+            catalog
+                .finish_operation(&operation, "failed", Some(&error.to_string()))
+                .map_err(state_err)?;
             return Err(error);
         }
     };
     let metadata = tokio::task::spawn_blocking({
         let path = fetched.path.clone();
         move || cusco_model_registry::probe_gguf(path)
-    }).await.map_err(state_err)?.map_err(state_err)?;
-    let model = s.register_model(ModelRecord { id: name, revision: fetched.identity.clone(), path: fetched.path, sha256: fetched.sha256, aliases: vec![], family: metadata.architecture, size_bytes: fetched.size, epoch: 0 })?;
+    })
+    .await
+    .map_err(state_err)?
+    .map_err(state_err)?;
+    let model = s.register_model(ModelRecord {
+        id: name,
+        revision: fetched.identity.clone(),
+        path: fetched.path,
+        sha256: fetched.sha256,
+        aliases: vec![],
+        family: metadata.architecture,
+        size_bytes: fetched.size,
+        epoch: 0,
+    })?;
     catalog.publish(&model).map_err(state_err)?;
-    catalog.finish_operation(&operation, "complete", None).map_err(state_err)?;
+    catalog
+        .finish_operation(&operation, "complete", None)
+        .map_err(state_err)?;
     Ok(Json(json!({"status":"success","model":model})))
 }
 struct DisconnectGuard {
@@ -2367,23 +2547,55 @@ fn start_deadline_watchdogs(
 }
 
 #[derive(Clone, Copy)]
-enum WireProtocol { OpenAiCompletion, OpenAiChat, OpenAiResponses, OllamaGenerate, OllamaChat }
+enum WireProtocol {
+    OpenAiCompletion,
+    OpenAiChat,
+    OpenAiResponses,
+    OllamaGenerate,
+    OllamaChat,
+}
 
 fn stream_row(protocol: WireProtocol, event: StreamEvent) -> String {
     let value = match (protocol, event) {
-        (WireProtocol::OpenAiCompletion, StreamEvent::Token { token, .. }) => json!({"object":"text_completion","choices":[{"text":token,"index":0,"finish_reason":null}]}),
-        (WireProtocol::OpenAiChat, StreamEvent::Token { token, .. }) => json!({"object":"chat.completion.chunk","choices":[{"delta":{"content":token},"index":0,"finish_reason":null}]}),
-        (WireProtocol::OpenAiResponses, StreamEvent::Token { token, .. }) => json!({"type":"response.output_text.delta","delta":token}),
-        (WireProtocol::OllamaGenerate, StreamEvent::Token { token, .. }) => json!({"response":token,"done":false}),
-        (WireProtocol::OllamaChat, StreamEvent::Token { token, .. }) => json!({"message":{"role":"assistant","content":token},"done":false}),
-        (WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat, StreamEvent::Finished { reason, usage }) => json!({"choices":[{"index":0,"finish_reason":reason}],"usage":{"prompt_tokens":usage.input_tokens,"completion_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}),
-        (WireProtocol::OpenAiResponses, StreamEvent::Finished { reason, usage }) => json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}}),
-        (WireProtocol::OllamaGenerate | WireProtocol::OllamaChat, StreamEvent::Finished { reason, usage }) => json!({"done":true,"done_reason":reason,"prompt_eval_count":usage.input_tokens,"eval_count":usage.generated_tokens}),
-        (_, StreamEvent::Error { message }) => json!({"error":{"message":message,"type":"server_error"}}),
+        (WireProtocol::OpenAiCompletion, StreamEvent::Token { token, .. }) => {
+            json!({"object":"text_completion","choices":[{"text":token,"index":0,"finish_reason":null}]})
+        }
+        (WireProtocol::OpenAiChat, StreamEvent::Token { token, .. }) => {
+            json!({"object":"chat.completion.chunk","choices":[{"delta":{"content":token},"index":0,"finish_reason":null}]})
+        }
+        (WireProtocol::OpenAiResponses, StreamEvent::Token { token, .. }) => {
+            json!({"type":"response.output_text.delta","delta":token})
+        }
+        (WireProtocol::OllamaGenerate, StreamEvent::Token { token, .. }) => {
+            json!({"response":token,"done":false})
+        }
+        (WireProtocol::OllamaChat, StreamEvent::Token { token, .. }) => {
+            json!({"message":{"role":"assistant","content":token},"done":false})
+        }
+        (
+            WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat,
+            StreamEvent::Finished { reason, usage },
+        ) => {
+            json!({"choices":[{"index":0,"finish_reason":reason}],"usage":{"prompt_tokens":usage.input_tokens,"completion_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}})
+        }
+        (WireProtocol::OpenAiResponses, StreamEvent::Finished { reason, usage }) => {
+            json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}})
+        }
+        (
+            WireProtocol::OllamaGenerate | WireProtocol::OllamaChat,
+            StreamEvent::Finished { reason, usage },
+        ) => {
+            json!({"done":true,"done_reason":reason,"prompt_eval_count":usage.input_tokens,"eval_count":usage.generated_tokens})
+        }
+        (_, StreamEvent::Error { message }) => {
+            json!({"error":{"message":message,"type":"server_error"}})
+        }
         (_, StreamEvent::Started { request_id, .. }) => json!({"id":request_id}),
     };
     match protocol {
-        WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat | WireProtocol::OpenAiResponses => format!("data: {value}\n\n"),
+        WireProtocol::OpenAiCompletion
+        | WireProtocol::OpenAiChat
+        | WireProtocol::OpenAiResponses => format!("data: {value}\n\n"),
         WireProtocol::OllamaGenerate | WireProtocol::OllamaChat => format!("{value}\n"),
     }
 }
@@ -2391,11 +2603,21 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent) -> String {
 fn completed_response(protocol: WireProtocol, response: InferResponse) -> Value {
     let usage = json!({"prompt_tokens":response.usage.input_tokens,"completion_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens});
     match protocol {
-        WireProtocol::OpenAiCompletion => json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text,"index":0,"finish_reason":"stop"}],"usage":usage}),
-        WireProtocol::OpenAiChat => json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":"stop"}],"usage":usage}),
-        WireProtocol::OpenAiResponses => json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens}}),
-        WireProtocol::OllamaGenerate => json!({"model":response.usage.model,"response":response.text,"done":true,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens}),
-        WireProtocol::OllamaChat => json!({"model":response.usage.model,"message":{"role":"assistant","content":response.text},"done":true,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens}),
+        WireProtocol::OpenAiCompletion => {
+            json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text,"index":0,"finish_reason":"stop"}],"usage":usage})
+        }
+        WireProtocol::OpenAiChat => {
+            json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":"stop"}],"usage":usage})
+        }
+        WireProtocol::OpenAiResponses => {
+            json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens}})
+        }
+        WireProtocol::OllamaGenerate => {
+            json!({"model":response.usage.model,"response":response.text,"done":true,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens})
+        }
+        WireProtocol::OllamaChat => {
+            json!({"model":response.usage.model,"message":{"role":"assistant","content":response.text},"done":true,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens})
+        }
     }
 }
 
@@ -2471,13 +2693,20 @@ async fn infer_response(
                 }
             },
         );
-        let rows = first.chain(rest).map(move |event| Ok::<_, Infallible>(stream_row(protocol, event)));
+        let rows = first
+            .chain(rest)
+            .map(move |event| Ok::<_, Infallible>(stream_row(protocol, event)));
         let content_type = match protocol {
-            WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat | WireProtocol::OpenAiResponses => "text/event-stream",
+            WireProtocol::OpenAiCompletion
+            | WireProtocol::OpenAiChat
+            | WireProtocol::OpenAiResponses => "text/event-stream",
             WireProtocol::OllamaGenerate | WireProtocol::OllamaChat => "application/x-ndjson",
         };
         let mut response = Response::new(Body::from_stream(rows));
-        response.headers_mut().insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static(content_type),
+        );
         response.headers_mut().insert(
             "x-request-id",
             HeaderValue::from_str(&correlation_id).expect("UUID is a valid header value"),
@@ -3027,31 +3256,6 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["choices"][0]["text"], "world hello");
-        let context_id = body["usage"]["context_id"].as_str().unwrap();
-        let continuation = Request::builder()
-            .method("POST")
-            .uri("/openai/v1/completions")
-            .header("authorization", "Bearer secret")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({
-                    "model": "m",
-                    "prompt": "again",
-                    "max_tokens": 1,
-                    "context_id": context_id
-                })
-                .to_string(),
-            ))
-            .unwrap();
-        let continuation = app.clone().oneshot(continuation).await.unwrap();
-        assert_eq!(continuation.status(), StatusCode::OK);
-        let continuation: Value = serde_json::from_slice(
-            &to_bytes(continuation.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(continuation["usage"]["context_id"], context_id);
         let spec = openapi_document();
         assert_eq!(spec["openapi"], "3.1.0");
         assert!(spec["paths"]["/openai/v1/chat/completions"].is_object());
@@ -3069,51 +3273,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_lifecycle_chat_streaming_and_context_routes() {
+    async fn namespaced_chat_streaming_and_context_routes() {
         let (s, d) = setup(Arc::new(AnonymousAdmin));
         let app = router(s);
-        let second = d.join("second.gguf");
-        fs::write(&second, b"second").unwrap();
-        let register = json!({
-            "id":"second",
-            "revision":"r2",
-            "path":second,
-            "sha256":hex_digest(b"second")
-        });
-        for (method, uri, body, expected) in [
-            ("POST", "/native/models", register, StatusCode::OK),
-            ("GET", "/native/models", json!(null), StatusCode::OK),
-            ("GET", "/native/models/second", json!(null), StatusCode::OK),
-            ("GET", "/cusco/v1/status", json!(null), StatusCode::OK),
-            (
-                "POST",
-                "/native/models/second/aliases",
-                json!({"alias":"stable"}),
-                StatusCode::OK,
-            ),
-            (
-                "GET",
-                "/native/models/second/check-update/r1",
-                json!(null),
-                StatusCode::OK,
-            ),
-            (
-                "POST",
-                "/native/models/second/verify",
-                json!(null),
-                StatusCode::OK,
-            ),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(request(method, uri, body))
+        assert_eq!(
+            app.clone()
+                .oneshot(request("GET", "/cusco/v1/status", json!(null)))
                 .await
-                .unwrap();
-            if response.status() != expected {
-                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-                panic!("{method} {uri}: {}", String::from_utf8_lossy(&bytes));
-            }
-        }
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
         assert_eq!(
             app.clone()
                 .oneshot(request("GET", "/cusco/v1/contexts", json!(null)))
@@ -3143,7 +3313,7 @@ mod tests {
         let created: ContextRecord =
             serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        let context_uri = format!("/native/contexts/{}", created.id.0);
+        let context_uri = format!("/cusco/v1/contexts/{}", created.id.0);
         assert_eq!(
             app.clone()
                 .oneshot(request("GET", &context_uri, json!(null)))
@@ -3171,7 +3341,7 @@ mod tests {
         );
         assert_eq!(
             app.clone()
-                .oneshot(request("DELETE", "/native/requests/pending", json!(null)))
+                .oneshot(request("DELETE", "/cusco/v1/requests/pending", json!(null)))
                 .await
                 .unwrap()
                 .status(),
@@ -3192,12 +3362,11 @@ mod tests {
         );
         to_bytes(streamed.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
-            app.clone()
-                .oneshot(request("DELETE", "/native/models/second", json!(null)))
+            app.oneshot(request("GET", "/native/models", json!(null)))
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::NO_CONTENT
+            StatusCode::NOT_FOUND
         );
         fs::remove_dir_all(d).unwrap();
     }
@@ -3821,7 +3990,7 @@ mod tests {
                     .header("authorization", "Bearer header-secret")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"model":"m","prompt":"private prompt","max_tokens":2,"api_key":"body-secret"}"#,
+                        r#"{"model":"m","prompt":"private prompt","max_tokens":2}"#,
                     ))
                     .unwrap(),
             )
@@ -3846,7 +4015,6 @@ mod tests {
         assert_eq!(records[0]["path"], "/openai/v1/completions");
         assert_eq!(records[0]["body"]["json"]["model"], "[REDACTED]");
         assert_eq!(records[0]["body"]["json"]["prompt"], "[REDACTED]");
-        assert_eq!(records[0]["body"]["json"]["api_key"], "[REDACTED]");
         assert_eq!(records[0]["body"]["json"]["max_tokens"], 2);
         assert_eq!(records[1]["direction"], "out");
         assert_eq!(records[1]["status"], 200);
@@ -3876,7 +4044,7 @@ mod tests {
         );
         let response = app
             .oneshot(
-                Request::post("/v1/completions?trace_token=query-secret")
+                Request::post("/openai/v1/completions?trace_token=query-secret")
                     .header("authorization", "Bearer header-secret")
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -3897,7 +4065,7 @@ mod tests {
         assert_eq!(records[0]["level"], "full");
         assert_eq!(
             records[0]["uri"],
-            "/v1/completions?trace_token=query-secret"
+            "/openai/v1/completions?trace_token=query-secret"
         );
         assert!(
             records[0]["headers"]
@@ -3934,7 +4102,11 @@ mod tests {
             }),
         );
         let response = app
-            .oneshot(Request::get("/openai/v1/openapi.json").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/openai/v1/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -4043,7 +4215,7 @@ mod tests {
                 .expect("HTTP server became ready");
             std::io::Write::write_all(
                 &mut socket,
-                b"GET /openapi.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                b"GET /openai/v1/openapi.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
             )
             .unwrap();
             let mut response = String::new();
