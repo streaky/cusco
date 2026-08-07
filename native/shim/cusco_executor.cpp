@@ -318,11 +318,30 @@ cusco_status cusco_sampler_create(
             raw = llama_sampler_init_greedy();
         } else {
             raw = llama_sampler_chain_init(llama_sampler_chain_default_params());
-            if (raw) {
-                llama_sampler_chain_add(raw, llama_sampler_init_top_p(config->top_p, 1));
-                llama_sampler_chain_add(raw, llama_sampler_init_temp(config->temperature));
-                llama_sampler_chain_add(raw, llama_sampler_init_dist(config->seed));
+            if (!raw) {
+                return CUSCO_NOMEM;
             }
+            auto * top_p = llama_sampler_init_top_p(config->top_p, 1);
+            if (!top_p) {
+                llama_sampler_free(raw);
+                return CUSCO_NOMEM;
+            }
+            auto * temp = llama_sampler_init_temp(config->temperature);
+            if (!temp) {
+                llama_sampler_free(top_p);
+                llama_sampler_free(raw);
+                return CUSCO_NOMEM;
+            }
+            auto * dist = llama_sampler_init_dist(config->seed);
+            if (!dist) {
+                llama_sampler_free(temp);
+                llama_sampler_free(top_p);
+                llama_sampler_free(raw);
+                return CUSCO_NOMEM;
+            }
+            llama_sampler_chain_add(raw, top_p);
+            llama_sampler_chain_add(raw, temp);
+            llama_sampler_chain_add(raw, dist);
         }
     }
     if (!is_mock(executor) && !raw) {
