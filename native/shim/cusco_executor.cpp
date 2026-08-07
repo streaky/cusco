@@ -304,14 +304,27 @@ cusco_status cusco_executor_render_token(
     return CUSCO_BACKEND;
 }
 
-cusco_status cusco_sampler_greedy(
+cusco_status cusco_sampler_create(
     cusco_executor * executor,
+    const cusco_sampler_config * config,
     cusco_sampler ** out) try {
-    if (!executor || !out) {
+    if (!executor || !config || !out || config->top_p <= 0.0F || config->top_p > 1.0F) {
         return CUSCO_INVALID;
     }
     *out = nullptr;
-    llama_sampler * raw = is_mock(executor) ? nullptr : llama_sampler_init_greedy();
+    llama_sampler * raw = nullptr;
+    if (!is_mock(executor)) {
+        if (config->temperature <= 0.0F) {
+            raw = llama_sampler_init_greedy();
+        } else {
+            raw = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            if (raw) {
+                llama_sampler_chain_add(raw, llama_sampler_init_top_p(config->top_p, 1));
+                llama_sampler_chain_add(raw, llama_sampler_init_temp(config->temperature));
+                llama_sampler_chain_add(raw, llama_sampler_init_dist(config->seed));
+            }
+        }
+    }
     if (!is_mock(executor) && !raw) {
         return CUSCO_NOMEM;
     }

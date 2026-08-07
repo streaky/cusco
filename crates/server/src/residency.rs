@@ -738,6 +738,7 @@ mod tests {
             prompt: prompt.into(),
             max_tokens,
             prior_tokens: vec![],
+            sampling: Default::default(),
             control,
             scheduling: SchedulingMetadata::default(),
             prefill_chunk_tokens: 32,

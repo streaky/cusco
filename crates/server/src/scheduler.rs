@@ -902,6 +902,7 @@ mod tests {
                 .join(" "),
             max_tokens: 2,
             prior_tokens: vec![],
+            sampling: Default::default(),
             control: Arc::new(RequestControl::new()),
             scheduling: crate::SchedulingMetadata {
                 class,

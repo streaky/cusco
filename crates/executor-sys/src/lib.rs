@@ -43,6 +43,14 @@ pub struct OperatingPoint {
     pub competent: c_uint,
 }
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SamplerConfig {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub seed: c_uint,
+}
+
+#[repr(C)]
 pub struct DecodeResult {
     pub logits: *const f32,
     pub logits_len: usize,
@@ -78,8 +86,11 @@ unsafe extern "C" {
         capacity: usize,
         size: *mut usize,
     ) -> c_int;
-    pub fn cusco_sampler_greedy(executor: *mut CuscoExecutor, out: *mut *mut CuscoSampler)
-    -> c_int;
+    pub fn cusco_sampler_create(
+        executor: *mut CuscoExecutor,
+        config: *const SamplerConfig,
+        out: *mut *mut CuscoSampler,
+    ) -> c_int;
     pub fn cusco_sampler_free(sampler: *mut CuscoSampler);
     pub fn cusco_sampler_sample(
         sampler: *mut CuscoSampler,

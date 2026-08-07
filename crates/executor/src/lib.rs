@@ -133,14 +133,31 @@ pub struct PreparedMapping {
 }
 
 /// A request-owned native sampler. Sampling requires the executor that created it.
-pub struct GreedySampler {
+pub struct Sampler {
     raw: NonNull<sys::CuscoSampler>,
 }
 
 // SAFETY: a sampler is request-owned and all access still requires an exclusive
 // borrow of the executor that created it. Moving a suspended request between
 // scheduler threads does not permit concurrent native sampler access.
-unsafe impl Send for GreedySampler {}
+unsafe impl Send for Sampler {}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SamplingConfig {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub seed: u32,
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: 0,
+        }
+    }
+}
 
 impl Executor {
     pub fn open(path: &str, n_ctx: u32, gpu_layers: i32) -> Result<Self, Error> {
@@ -205,9 +222,9 @@ impl Executor {
         Ok(String::from_utf8_lossy(&buffer).into_owned())
     }
 
-    pub fn greedy_sampler(&mut self) -> Result<GreedySampler, Error> {
-        Ok(GreedySampler {
-            raw: ffi::greedy_sampler(self.raw)?,
+    pub fn sampler(&mut self, config: SamplingConfig) -> Result<Sampler, Error> {
+        Ok(Sampler {
+            raw: ffi::sampler(self.raw, config)?,
         })
     }
 
@@ -293,7 +310,7 @@ impl Executor {
     }
 }
 
-impl GreedySampler {
+impl Sampler {
     pub fn sample(&mut self, executor: &mut Executor) -> Result<i32, Error> {
         ffi::sample(self.raw, executor.raw)
     }
@@ -314,7 +331,7 @@ impl Drop for PreparedMapping {
         ffi::free_prepared_mapping(self.raw)
     }
 }
-impl Drop for GreedySampler {
+impl Drop for Sampler {
     fn drop(&mut self) {
         ffi::free_sampler(self.raw)
     }
@@ -415,12 +432,19 @@ mod ffi {
         Ok(())
     }
 
-    pub(super) fn greedy_sampler(
+    pub(super) fn sampler(
         raw: NonNull<sys::CuscoExecutor>,
+        config: crate::SamplingConfig,
     ) -> Result<NonNull<sys::CuscoSampler>, Error> {
         let mut sampler = std::ptr::null_mut();
-        // SAFETY: raw is live and the output points to writable storage.
-        status(unsafe { sys::cusco_sampler_greedy(raw.as_ptr(), &mut sampler) })?;
+        let config = sys::SamplerConfig {
+            temperature: config.temperature,
+            top_p: config.top_p,
+            seed: config.seed,
+        };
+        // SAFETY: raw is live, config is borrowed for the call, and the output
+        // points to writable storage.
+        status(unsafe { sys::cusco_sampler_create(raw.as_ptr(), &config, &mut sampler) })?;
         NonNull::new(sampler).ok_or(Error::Backend(3))
     }
 
@@ -726,7 +750,7 @@ mod tests {
     fn native_sampler_and_renderer_are_request_owned() {
         let mut executor = Executor::open("mock://deterministic", 128, 0).unwrap();
         let decoded = executor.decode(&[11]).unwrap();
-        let mut sampler = executor.greedy_sampler().unwrap();
+        let mut sampler = executor.sampler(SamplingConfig::default()).unwrap();
         assert_eq!(sampler.sample(&mut executor).unwrap(), decoded.token);
 
         let mut piece = Vec::with_capacity(32);

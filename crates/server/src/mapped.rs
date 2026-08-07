@@ -6,7 +6,7 @@ use cusco_context_store::{
     AdapterEpoch, ComponentMask, ContextStore, EvaluatedPrefixId, LogicalContextId, ModelEpoch,
     PersistentTokenSequence,
 };
-use cusco_executor::{Decode, Executor, GreedySampler, MappingId, MappingState, OperatingPoint};
+use cusco_executor::{Decode, Executor, MappingId, MappingState, OperatingPoint, Sampler};
 use cusco_physical_manager::{
     Capacity, Component, PhysicalManager, PhysicalRepresentationId, Tier,
 };
@@ -380,7 +380,7 @@ struct MappedSession {
     active_mapping: Option<MappingId>,
     parent: Option<EvaluatedPrefixId>,
     next: Option<Decode>,
-    sampler: Option<GreedySampler>,
+    sampler: Option<Sampler>,
     input_tokens: usize,
     cached: usize,
     evaluated_tokens: usize,
@@ -479,7 +479,12 @@ impl MappedSession {
                 ));
             }
             let mut state = self.state.lock();
-            self.sampler = Some(state.executor.greedy_sampler().map_err(state_error)?);
+            self.sampler = Some(
+                state
+                    .executor
+                    .sampler(self.request.sampling)
+                    .map_err(state_error)?,
+            );
             self.stage = MappedStage::Decode;
             return Ok(SessionStep::Progress(QuantumObservation::model_free(
                 QuantumKind::Prefill,
@@ -1064,6 +1069,7 @@ mod tests {
             prompt: prompt.into(),
             max_tokens,
             prior_tokens: prior_tokens.to_vec(),
+            sampling: Default::default(),
             control: Arc::new(RequestControl::new()),
             scheduling: SchedulingMetadata::default(),
             prefill_chunk_tokens: 32,
@@ -1306,6 +1312,7 @@ mod tests {
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: Default::default(),
                 },
             )
             .unwrap()
@@ -1324,6 +1331,7 @@ mod tests {
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: Default::default(),
                 },
             )
             .unwrap()

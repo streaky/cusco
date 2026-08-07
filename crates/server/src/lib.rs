@@ -30,6 +30,7 @@ use std::{
 mod catalog;
 mod config;
 mod residency;
+use cusco_executor::SamplingConfig;
 use thiserror::Error;
 use uuid::Uuid;
 mod generation;
@@ -170,6 +171,8 @@ pub struct InferRequest {
     pub stop: Vec<String>,
     #[serde(default)]
     pub raw_continuation: bool,
+    #[serde(skip, default)]
+    pub sampling: SamplingConfig,
     #[serde(skip, default)]
     pub scheduling: SchedulingMetadata,
 }
@@ -700,6 +703,7 @@ pub struct EngineRequest {
     pub prompt: String,
     pub max_tokens: usize,
     pub prior_tokens: Vec<i32>,
+    pub sampling: SamplingConfig,
     pub control: Arc<RequestControl>,
     pub scheduling: SchedulingMetadata,
     pub prefill_chunk_tokens: usize,
@@ -1656,6 +1660,7 @@ impl Server {
                 prompt: req.prompt.clone(),
                 max_tokens: req.max_tokens,
                 prior_tokens: prior_tokens.to_vec(),
+                sampling: req.sampling,
                 control: control.clone(),
                 scheduling: req.scheduling.clone(),
                 prefill_chunk_tokens: 32,
@@ -1896,14 +1901,14 @@ fn validate_controls(
     response_format: Option<&ResponseFormat>,
     reasoning: Option<&ReasoningEffort>,
 ) -> Result<(), Error> {
-    if temperature.is_some_and(|value| value != 0.0) {
+    if temperature.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
         return Err(Error::BadRequest(
-            "unsupported_capability: this executor supports greedy temperature=0 only".into(),
+            "temperature must be finite and between 0 and 2".into(),
         ));
     }
-    if top_p.is_some_and(|value| value != 1.0) {
+    if top_p.is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1.0) {
         return Err(Error::BadRequest(
-            "unsupported_capability: top_p sampling is unavailable for this executor".into(),
+            "top_p must be finite, greater than 0, and at most 1".into(),
         ));
     }
     if !tools.is_empty() {
@@ -1931,6 +1936,22 @@ fn validate_controls(
         ));
     }
     Ok(())
+}
+fn sampling_config(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
+) -> Result<SamplingConfig, Error> {
+    let seed = seed
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| Error::BadRequest("seed must be at most 4294967295".into()))?
+        .unwrap_or(u32::MAX);
+    Ok(SamplingConfig {
+        temperature: temperature.unwrap_or(1.0),
+        top_p: top_p.unwrap_or(1.0),
+        seed,
+    })
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2191,7 +2212,7 @@ async fn completion(
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
     validate_controls(r.temperature, r.top_p, &[], None, None)?;
-    let _seed = r.seed;
+    let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
     let _include_usage = r
         .stream_options
         .as_ref()
@@ -2203,6 +2224,7 @@ async fn completion(
         r.model,
         r.prompt,
         r.max_tokens,
+        sampling,
         r.stream,
         r.context_id,
         r.stop.map(StopInput::into_vec).unwrap_or_default(),
@@ -2231,7 +2253,7 @@ async fn chat(
         r.response_format.as_ref(),
         r.reasoning_effort.as_ref(),
     )?;
-    let _seed = r.seed;
+    let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
     let _include_usage = r
         .stream_options
         .as_ref()
@@ -2244,6 +2266,7 @@ async fn chat(
         r.model,
         prompt,
         r.max_tokens,
+        sampling,
         r.stream,
         r.context_id,
         r.stop.map(StopInput::into_vec).unwrap_or_default(),
@@ -2296,7 +2319,7 @@ async fn responses(
         r.response_format.as_ref(),
         r.reasoning_effort.as_ref(),
     )?;
-    let _seed = r.seed;
+    let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
     s.model(&r.model)?;
     drop(permit);
     infer_response(
@@ -2304,6 +2327,7 @@ async fn responses(
         r.model,
         r.input,
         r.max_output_tokens,
+        sampling,
         r.stream,
         None,
         vec![],
@@ -2345,6 +2369,7 @@ async fn ollama_generate(
         r.model,
         r.prompt,
         None,
+        SamplingConfig::default(),
         r.stream,
         None,
         vec![],
@@ -2383,6 +2408,7 @@ async fn ollama_chat(
         r.model,
         prompt,
         None,
+        SamplingConfig::default(),
         r.stream,
         None,
         vec![],
@@ -2634,6 +2660,7 @@ async fn infer_response(
     model: String,
     prompt: String,
     max_tokens: Option<usize>,
+    sampling: SamplingConfig,
     streaming: bool,
     context_id: Option<ContextId>,
     stop: Vec<String>,
@@ -2669,6 +2696,7 @@ async fn infer_response(
         model,
         prompt,
         max_tokens: max_tokens.unwrap_or_else(default_tokens),
+        sampling,
         context_id,
         deadline_ms: Some(
             u64::try_from(wall_remaining.as_millis())
@@ -3069,6 +3097,7 @@ mod tests {
             scheduling: SchedulingMetadata::default(),
             stop: vec![],
             raw_continuation: false,
+            sampling: SamplingConfig::default(),
         };
         let (out, events) = s.infer("r", req).unwrap();
         assert_eq!(out.text, "two one");
@@ -3088,6 +3117,7 @@ mod tests {
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                 },
             )
             .unwrap_err();
@@ -3105,6 +3135,7 @@ mod tests {
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                 }
             ),
             Err(Error::Deadline)
@@ -3122,6 +3153,7 @@ mod tests {
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                 },
             ),
             Err(Error::Busy)
@@ -3146,6 +3178,7 @@ mod tests {
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                 }
             ),
             Err(Error::State(_))
@@ -3587,6 +3620,7 @@ mod tests {
                     deadline_ms: None,
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                     scheduling: SchedulingMetadata::default(),
                 },
                 admission,
@@ -3634,6 +3668,7 @@ mod tests {
                     deadline_ms: None,
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                     scheduling: SchedulingMetadata::default(),
                 },
                 admission,
@@ -3693,6 +3728,7 @@ mod tests {
                         deadline_ms: None,
                         stop: vec![],
                         raw_continuation: false,
+                        sampling: SamplingConfig::default(),
                         scheduling: SchedulingMetadata::default(),
                     },
                 )
@@ -3713,6 +3749,7 @@ mod tests {
                     deadline_ms: Some(5),
                     stop: vec![],
                     raw_continuation: false,
+                    sampling: SamplingConfig::default(),
                     scheduling: SchedulingMetadata::default(),
                 },
             ),
