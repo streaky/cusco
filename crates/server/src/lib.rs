@@ -1739,28 +1739,6 @@ fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-#[derive(Clone, Deserialize)]
-struct AliasRequest {
-    alias: String,
-}
-#[derive(Clone, Deserialize)]
-struct RegisterRequest {
-    id: String,
-    revision: String,
-    path: PathBuf,
-    sha256: String,
-    #[serde(default = "default_model_family")]
-    family: String,
-    #[serde(default)]
-    aliases: Vec<String>,
-}
-#[derive(Clone, Deserialize)]
-struct FetchRequest {
-    uri: String,
-    cache: PathBuf,
-    #[serde(default)]
-    sha256: Option<String>,
-}
 struct PrequeueJson<T> {
     headers: HeaderMap,
     value: T,
@@ -1827,6 +1805,7 @@ impl StopInput {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CompletionRequest {
     model: String,
     prompt: String,
@@ -1844,6 +1823,7 @@ struct CompletionRequest {
     deadline_ms: Option<u64>,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
@@ -1859,6 +1839,7 @@ struct ChatRequest {
     deadline_ms: Option<u64>,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChatMessage {
     content: String,
 }
@@ -1877,34 +1858,29 @@ pub fn router_with_http_debug(server: Server, debug: HttpDebug) -> Router {
 
 fn routes(server: Server) -> Router {
     Router::new()
-        .route("/openapi.json", get(openapi))
-        .route("/v1/completions", post(completion))
-        .route("/v1/chat/completions", post(chat))
-        .route("/v1/models", get(list_models))
+        .route("/openai/v1/openapi.json", get(openapi))
+        .route("/ollama/api/openapi.json", get(openapi))
+        .route("/cusco/v1/openapi.json", get(openapi))
+        .route("/openai/v1/completions", post(completion))
+        .route("/openai/v1/chat/completions", post(chat))
+        .route("/openai/v1/models", get(list_models))
+        .route("/openai/v1/responses", post(responses))
+        .route("/ollama/api/generate", post(ollama_generate))
+        .route("/ollama/api/chat", post(ollama_chat))
+        .route("/ollama/api/tags", get(ollama_tags))
+        .route("/ollama/api/show", post(ollama_show))
+        .route("/ollama/api/pull", post(ollama_pull))
+        .route("/ollama/api/copy", post(ollama_copy))
+        .route("/ollama/api/delete", post(ollama_delete))
+        .route("/cusco/v1/contexts", get(list_contexts).post(create_context))
+        .route("/cusco/v1/contexts/import", post(import_context))
         .route(
-            "/native/models",
-            get(list_native_models).post(register_model),
-        )
-        .route("/native/models/fetch", post(fetch_model))
-        .route(
-            "/native/models/{id}",
-            get(inspect_model).delete(remove_model),
-        )
-        .route("/native/models/{id}/verify", post(verify_model))
-        .route(
-            "/native/models/{id}/check-update/{revision}",
-            get(check_update),
-        )
-        .route("/native/models/{id}/aliases", post(alias_model))
-        .route("/native/contexts", get(list_contexts).post(create_context))
-        .route("/native/contexts/import", post(import_context))
-        .route(
-            "/native/contexts/{id}",
+            "/cusco/v1/contexts/{id}",
             get(get_context).delete(delete_context),
         )
-        .route("/native/status", get(native_status))
-        .route("/native/contexts/{id}/branches", post(branch_context))
-        .route("/native/requests/{id}", delete(cancel_request))
+        .route("/cusco/v1/status", get(native_status))
+        .route("/cusco/v1/contexts/{id}/branches", post(branch_context))
+        .route("/cusco/v1/requests/{id}", delete(cancel_request))
         .with_state(server)
 }
 
@@ -2072,6 +2048,110 @@ async fn chat(
     )
     .await
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesRequest {
+    model: String,
+    input: String,
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
+    #[serde(default)]
+    stream: bool,
+}
+
+async fn responses(
+    State(s): State<Server>,
+    PrequeueJson { headers, value: r, retained_bytes, _permit: permit }: PrequeueJson<ResponsesRequest>,
+) -> Result<Response, Error> {
+    let request_context = auth(&s, &headers, Scope::Inference)?;
+    s.model(&r.model)?;
+    drop(permit);
+    infer_response(s, r.model, r.input, r.max_output_tokens, r.stream, None, vec![], false, None, retained_bytes, request_context.principal).await
+}
+
+fn default_true() -> bool { true }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaGenerateRequest {
+    model: String,
+    prompt: String,
+    #[serde(default = "default_true")]
+    stream: bool,
+}
+async fn ollama_generate(
+    State(s): State<Server>,
+    PrequeueJson { headers, value: r, retained_bytes, _permit: permit }: PrequeueJson<OllamaGenerateRequest>,
+) -> Result<Response, Error> {
+    let request_context = auth(&s, &headers, Scope::Inference)?;
+    s.model(&r.model)?;
+    drop(permit);
+    infer_response(s, r.model, r.prompt, None, r.stream, None, vec![], false, None, retained_bytes, request_context.principal).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaChatRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    #[serde(default = "default_true")]
+    stream: bool,
+}
+async fn ollama_chat(
+    State(s): State<Server>,
+    PrequeueJson { headers, value: r, retained_bytes, _permit: permit }: PrequeueJson<OllamaChatRequest>,
+) -> Result<Response, Error> {
+    let request_context = auth(&s, &headers, Scope::Inference)?;
+    s.model(&r.model)?;
+    let prompt = r.messages.into_iter().map(|message| message.content).collect::<Vec<_>>().join("\n");
+    drop(permit);
+    infer_response(s, r.model, prompt, None, r.stream, None, vec![], false, None, retained_bytes, request_context.principal).await
+}
+
+async fn ollama_tags(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
+    auth(&s, &headers, Scope::Inference)?;
+    Ok(Json(json!({"models": s.models()})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaNameRequest { name: String }
+async fn ollama_show(State(s): State<Server>, headers: HeaderMap, Json(r): Json<OllamaNameRequest>) -> Result<Json<ModelRecord>, Error> {
+    auth(&s, &headers, Scope::Inference)?;
+    Ok(Json(s.model(&r.name)?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaCopyRequest { source: String, destination: String }
+async fn ollama_copy(State(s): State<Server>, headers: HeaderMap, Json(r): Json<OllamaCopyRequest>) -> Result<StatusCode, Error> {
+    auth(&s, &headers, Scope::Admin)?;
+    s.alias_model(&r.source, r.destination)?;
+    Ok(StatusCode::OK)
+}
+async fn ollama_delete(State(s): State<Server>, headers: HeaderMap, Json(r): Json<OllamaNameRequest>) -> Result<StatusCode, Error> {
+    auth(&s, &headers, Scope::Admin)?;
+    s.remove_model(&r.name)?;
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaPullRequest {
+    name: String,
+    #[serde(default)]
+    sha256: Option<String>,
+}
+async fn ollama_pull(State(s): State<Server>, headers: HeaderMap, Json(r): Json<OllamaPullRequest>) -> Result<Json<Value>, Error> {
+    auth(&s, &headers, Scope::Admin)?;
+    let name = r.name;
+    let expected = r.sha256;
+    let fetched = tokio::task::spawn_blocking(move || cusco_model_registry::fetch_hf(&name, Path::new("./data/models"), expected.as_deref()))
+        .await.map_err(state_err)?.map_err(state_err)?;
+    let model = s.register_model(ModelRecord { id: fetched.identity.clone(), revision: fetched.sha256.clone(), path: fetched.path, sha256: fetched.sha256, aliases: vec![], family: default_model_family(), size_bytes: fetched.size, epoch: 0 })?;
+    Ok(Json(json!({"status":"success","model":model})))
+}
 struct DisconnectGuard {
     control: Arc<RequestControl>,
     armed: bool,
@@ -2216,64 +2296,6 @@ async fn list_models(State(s): State<Server>, headers: HeaderMap) -> Result<Json
     auth(&s, &headers, Scope::Inference)?;
     Ok(Json(json!({"data":s.models()})))
 }
-async fn list_native_models(
-    State(s): State<Server>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    Ok(Json(json!({"data":s.models()})))
-}
-async fn register_model(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    Json(r): Json<RegisterRequest>,
-) -> Result<Json<ModelRecord>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    Ok(Json(s.register_model(ModelRecord {
-        id: r.id,
-        revision: r.revision,
-        path: r.path,
-        sha256: r.sha256,
-        aliases: r.aliases,
-        family: r.family,
-        size_bytes: 0,
-        epoch: 0,
-    })?))
-}
-async fn fetch_model(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    Json(r): Json<FetchRequest>,
-) -> Result<Json<ModelRecord>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    let fetched =
-        cusco_model_registry::fetch_hf(&r.uri, &r.cache, r.sha256.as_deref()).map_err(state_err)?;
-    let revision = r
-        .uri
-        .split_once('@')
-        .and_then(|(_, value)| value.split_once('/'))
-        .map(|(value, _)| value)
-        .unwrap_or("unknown")
-        .to_owned();
-    Ok(Json(s.register_model(ModelRecord {
-        id: fetched.identity,
-        revision,
-        path: fetched.path,
-        sha256: fetched.sha256,
-        aliases: vec![],
-        family: "gemma-phase6".into(),
-        size_bytes: fetched.size,
-        epoch: 0,
-    })?))
-}
-async fn inspect_model(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Json<ModelRecord>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    Ok(Json(s.model(&id)?))
-}
 async fn native_status(
     State(server): State<Server>,
     headers: HeaderMap,
@@ -2284,42 +2306,6 @@ async fn native_status(
         "admission": server.admission_metrics(),
         "residency": server.engine.residency_status(),
     })))
-}
-async fn verify_model(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Json<Value>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    Ok(Json(json!({"valid":s.verify_model(&id)?})))
-}
-async fn check_update(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    AxumPath((id, revision)): AxumPath<(String, String)>,
-) -> Result<Json<Value>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    Ok(Json(
-        json!({"update_available":s.check_update(&id,&revision)?}),
-    ))
-}
-async fn alias_model(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-    Json(r): Json<AliasRequest>,
-) -> Result<Json<ModelRecord>, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    Ok(Json(s.alias_model(&id, r.alias)?))
-}
-async fn remove_model(
-    State(s): State<Server>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> Result<StatusCode, Error> {
-    auth(&s, &headers, Scope::Admin)?;
-    s.remove_model(&id)?;
-    Ok(StatusCode::NO_CONTENT)
 }
 async fn create_context(
     State(s): State<Server>,
