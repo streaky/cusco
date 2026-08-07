@@ -1746,8 +1746,26 @@ The initial Phase 9 release deliberately favors a useful, bounded compatibility 
 
   When compaction changes the client-supplied conversation state for replay, OpenAI message-based endpoints should include a `cusco_compaction_result` object in response metadata so simpler clients can persist the compacted history and continue deterministically. This response-side payload is not required for the OpenAI Responses API path, which uses protocol-native continuation state.
 
+  Response schema for `cusco_compaction_result` (OpenAI message-based responses):
+
+  - `compact_mode`: `Applied | PolicyBudgetExceeded | NotRequested | NoMatchFallback | AppliedAnchorsOnly`
+  - `compact_reason`: `Applied | PolicyBudgetExceeded | NoMatchFallback | NoActionableBudget | NotRequested`
+  - `requested_strategy_preferences`: array of strategy IDs sent by the client
+  - `selected_strategy_id`: resolved strategy ID, or `null` if none selected
+  - `target_budget_tokens`: requested target token/window budget
+  - `anchor_policy`: concrete anchor policy identifier
+  - `retained_turns`: number of turns kept in the selected predecessor context
+  - `retained_window_tokens`: approximate token count of retained conversational tail
+  - `removed_turns`: number of turns removed
+  - `removed_messages`: number of messages removed
+  - `retained_message_ids`: message IDs retained for deterministic replay
+  - `resulting_context_epoch`: opaque identity for the new context branch/lineage
+  - `strategy_parameters`: resolved strategy parameters
+  - `succeeded`: boolean for whether compaction planning and proposal publication succeeded
+  - `fallback_used`: boolean
+  - `applied`: boolean for whether history was actually shortened for replay
+
 - Ollama compatibility covers the equivalent generation and chat operations, streaming, vision, model lifecycle, and the other Ollama controls supported by the same canonical services. In request options, `cusco_compaction` is the same ordered preference list mechanism, and `fallback_when_no_match` is the same fallback selector (`NoCompact|Reject`). Empty/unsupported lists use the selected fallback; unknown ids remain validation errors. It must be one of the registered strategy IDs (currently `window_tail`) in this release. Cusco-specific context, scheduling, cancellation, usage, and lifecycle capabilities remain available through `/cusco/v1/*`, rather than creating a second execution path.
- 
 - Embeddings and direct tokenizer access are deferred. Unsupported protocol fields and capabilities must be rejected explicitly rather than silently discarded.
 - Vision input is inline base64/data-URI content only in v1. Remote URLs and local filesystem references are rejected. Accept static JPEG, PNG, WebP, and GIF inputs where the selected model/projector supports them; reject animated images, SVG-as-image input, BMP, TIFF, and other unsupported formats rather than silently choosing a frame or transforming the content. SVG remains ordinary text content unless a future capability explicitly renders it. Validate the declared MIME type against decoded content. Rust decodes base64 in the adapter/admission boundary before enforcing decoded-byte and image-dimension limits, while separately enforcing encoded transport limits; this prevents base64 expansion from masking actual memory usage. Reasonable default limits for image count, encoded and decoded bytes, pixel dimensions, total pixels, and supported MIME types are validated before model admission; administrators may tune those limits in `config.yaml` within implementation-defined hard safety bounds. Admission limits must account for the selected native projector's patch/grid multipliers and model-specific image-token expansion, not only raw pixel dimensions, so apparently safe images cannot overflow downstream tensor or context budgets. Encoded size is a transport and memory-safety guard, not a billing unit: compressed and uncompressed images with the same dimensions may have very different byte sizes, while model-facing image usage is accounted in the model's applicable input-token or equivalent processing units where measurable. Invalid or over-limit images produce explicit request errors rather than being dropped or transparently resized. Tool use does not grant implicit filesystem, URL, shell, or network access. Cusco v1 supports client-declared function tools that produce calls for external execution and client-supplied results; remote code agents are a supported use case because an agent runner can connect to Cusco, execute code-agent actions in its own environment, and return results without granting Cusco host access. Cusco-native tool execution is not part of v1. The model-facing orchestration, streaming, cancellation, deadlines, repeated tool-call/result turns, bounded argument/result sizes, explicit truncation markers, and usage metering are defined for external function tools, while unsupported native capabilities are rejected explicitly. Tool definitions are validated against the supported intersection of the declared OpenAI- and Ollama-compatible function-tool contracts: unsupported schema features, duplicate names, malformed definitions, and stale or mismatched continuation results are rejected explicitly rather than silently coerced.
 - Model registration and capability probing determine whether a model/projector supports vision. Requests containing image content are rejected at the HTTP/CLI admission boundary when the selected model lacks that capability; images are never silently discarded, converted to text, or routed to another model in v1. Model metadata exposes the supported modalities for client discovery.
@@ -1864,6 +1882,7 @@ For each baseline check above, define a nameable fixture-backed test so implemen
 | `compaction_success_successor_commit` | `cargo test -p cusco-server compaction_success_successor_commit -- --nocapture` | `phase10/fixtures/integration/compaction_success_matrix.yaml` |
 | `compaction_failure_rolls_back_source_context` | `cargo test -p cusco-server compaction_failure_rolls_back_source_context -- --nocapture` | `phase10/fixtures/integration/compaction_rollback_cases.yaml` |
 | `compaction_cancel_disconnect_race` | `cargo test -p cusco-server compaction_cancel_disconnect_race -- --nocapture` | `phase10/fixtures/races/cancel_disconnect_race.yaml` |
+| `compaction_result_payload_for_openai_replay` | `cargo test -p cusco-server compaction_result_payload_for_openai_replay -- --nocapture` | `phase10/fixtures/integration/openai_compaction_result.yaml` |
 | `semantic_regression_pronoun_continuity` | `cargo test -p cusco-server semantic_regression_pronoun_continuity -- --nocapture` | `phase10/fixtures/semantic/pronoun_continuity.jsonl` |
 | `semantic_regression_instruction_retention` | `cargo test -p cusco-server semantic_regression_instruction_retention -- --nocapture` | `phase10/fixtures/semantic/instruction_retention.yaml` |
 | `semantic_regression_tool_call_consistency` | `cargo test -p cusco-server semantic_regression_tool_call_consistency -- --nocapture` | `phase10/fixtures/semantic/tool_call_consistency.yaml` |
