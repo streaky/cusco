@@ -2088,7 +2088,8 @@ fn routes(server: Server) -> Router {
         .route("/ollama/api/show", post(ollama_show))
         .route("/ollama/api/pull", post(ollama_pull))
         .route("/ollama/api/copy", post(ollama_copy))
-        .route("/ollama/api/delete", post(ollama_delete))
+        .route("/ollama/api/delete", delete(ollama_delete))
+        .route("/ollama/api/ps", get(ollama_ps))
         .route(
             "/cusco/v1/contexts",
             get(list_contexts).post(create_context),
@@ -2499,16 +2500,34 @@ async fn ollama_tags(State(s): State<Server>, headers: HeaderMap) -> Result<Json
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OllamaNameRequest {
-    name: String,
+struct OllamaModelRequest {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
+
+impl OllamaModelRequest {
+    fn model_name(&self) -> Result<&str, Error> {
+        match (self.model.as_deref(), self.name.as_deref()) {
+            (Some(model), Some(name)) if model != name => Err(Error::BadRequest(
+                "`model` and `name` must identify the same model".into(),
+            )),
+            (Some(model), _) | (_, Some(model)) if !model.is_empty() => Ok(model),
+            _ => Err(Error::BadRequest(
+                "one of `model` or `name` is required".into(),
+            )),
+        }
+    }
+}
+
 async fn ollama_show(
     State(s): State<Server>,
     headers: HeaderMap,
-    Json(r): Json<OllamaNameRequest>,
+    Json(r): Json<OllamaModelRequest>,
 ) -> Result<Json<ModelRecord>, Error> {
     auth(&s, &headers, Scope::Inference)?;
-    Ok(Json(s.model(&r.name)?))
+    Ok(Json(s.model(r.model_name()?)?))
 }
 
 #[derive(Deserialize)]
@@ -2532,14 +2551,45 @@ async fn ollama_copy(
 async fn ollama_delete(
     State(s): State<Server>,
     headers: HeaderMap,
-    Json(r): Json<OllamaNameRequest>,
+    Json(r): Json<OllamaModelRequest>,
 ) -> Result<StatusCode, Error> {
     auth(&s, &headers, Scope::Admin)?;
-    s.remove_model(&r.name)?;
+    let model = r.model_name()?.to_owned();
+    s.remove_model(&model)?;
     if let Some(catalog) = s.catalog() {
-        catalog.remove(&r.name).map_err(state_err)?;
+        catalog.remove(&model).map_err(state_err)?;
     }
     Ok(StatusCode::OK)
+}
+
+async fn ollama_ps(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
+    auth(&s, &headers, Scope::Inference)?;
+    let models = s
+        .engine
+        .residency_status()
+        .and_then(|status| status.get("models").cloned())
+        .and_then(|models| models.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|status| !status["retiring"].as_bool().unwrap_or(false))
+        .filter_map(|status| {
+            let id = status["id"].as_str()?;
+            let model = s.model(id).ok()?;
+            Some(json!({
+                "name": model.id,
+                "model": model.id,
+                "size": model.size_bytes,
+                "digest": model.sha256,
+                "details": {
+                    "format": "gguf",
+                    "family": model.family,
+                    "families": [model.family],
+                },
+                "size_vram": status["operating_point"]["device_bytes"],
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"models": models})))
 }
 
 #[derive(Deserialize)]
@@ -3100,7 +3150,7 @@ pub fn openapi_document() -> Value {
             "/ollama/api/show",
             "post",
             "ollamaShow",
-            Some("OllamaNameRequest"),
+            Some("OllamaModelRequest"),
         ),
         (
             "/ollama/api/pull",
@@ -3116,10 +3166,11 @@ pub fn openapi_document() -> Value {
         ),
         (
             "/ollama/api/delete",
-            "post",
+            "delete",
             "ollamaDelete",
-            Some("OllamaNameRequest"),
+            Some("OllamaModelRequest"),
         ),
+        ("/ollama/api/ps", "get", "ollamaPs", None),
         ("/cusco/v1/contexts", "get", "cuscoContexts", None),
         ("/cusco/v1/contexts", "post", "cuscoCreateContext", None),
         (
@@ -3172,7 +3223,7 @@ pub fn openapi_document() -> Value {
             "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"type": "string"}, "stream": {"type": "boolean"}}},
             "OllamaGenerateRequest": {"type": "object", "additionalProperties": false, "required": ["model", "prompt"], "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
             "OllamaChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
-            "OllamaNameRequest": {"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string"}}},
+            "OllamaModelRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["model"]}, {"required": ["name"]}], "properties": {"model": {"type": "string"}, "name": {"type": "string"}}},
             "OllamaPullRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["name"]}, {"required": ["model"]}], "properties": {"name": {"type": "string"}, "model": {"type": "string"}, "sha256": {"type": "string"}, "insecure": {"type": "boolean"}, "stream": {"type": "boolean"}}},
             "OllamaPullProgress": {
                 "type": "object",
@@ -3321,6 +3372,27 @@ mod tests {
     impl InferenceEngine for FailingEngine {
         fn start_session(&self, _: EngineRequest) -> Result<Box<dyn ExecutionSession>, Error> {
             Err(Error::State("generation failed".into()))
+        }
+    }
+
+    struct ResidentStatusEngine;
+
+    impl InferenceEngine for ResidentStatusEngine {
+        fn start_session(
+            &self,
+            request: EngineRequest,
+        ) -> Result<Box<dyn ExecutionSession>, Error> {
+            DeterministicEngine.start_session(request)
+        }
+
+        fn residency_status(&self) -> Option<Value> {
+            Some(json!({
+                "models": [{
+                    "id": "m",
+                    "retiring": false,
+                    "operating_point": {"device_bytes": 3}
+                }]
+            }))
         }
     }
 
@@ -4404,6 +4476,78 @@ mod tests {
         assert_eq!(server.pre_queue.semaphore.available_permits(), 2);
         drop(third);
         assert_eq!(server.pre_queue.semaphore.available_permits(), 3);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn ollama_delete_uses_delete_and_accepts_canonical_model_field() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let app = router_with_http_debug(
+            server.clone(),
+            HttpDebug::new(HttpDebugLevel::Full, move |line| {
+                captured.lock().push(line.to_owned())
+            }),
+        );
+        let response = app
+            .oneshot(
+                Request::delete("/ollama/api/delete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"m"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(server.model("m"), Err(Error::ModelNotFound(_))));
+        let records = records
+            .lock()
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["method"], "DELETE");
+        assert_eq!(records[0]["body"]["utf8"], r#"{"model":"m"}"#);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ollama_ps_reports_resident_models() {
+        let dir = dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.gguf");
+        fs::write(&path, b"model").unwrap();
+        let server = Server::open(
+            dir.join("state.json"),
+            Arc::new(AnonymousAdmin),
+            Arc::new(ResidentStatusEngine),
+        )
+        .unwrap();
+        server
+            .register_model(ModelRecord {
+                id: "m".into(),
+                revision: "r1".into(),
+                path,
+                sha256: hex_digest(b"model"),
+                aliases: vec![],
+                family: "gemma4".into(),
+                size_bytes: 5,
+                epoch: 0,
+            })
+            .unwrap();
+        let response = router(server)
+            .oneshot(Request::get("/ollama/api/ps").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["models"][0]["name"], "m");
+        assert_eq!(body["models"][0]["model"], "m");
+        assert_eq!(body["models"][0]["size"], 5);
+        assert_eq!(body["models"][0]["size_vram"], 3);
+        assert_eq!(body["models"][0]["details"]["format"], "gguf");
+        assert_eq!(body["models"][0]["details"]["family"], "gemma4");
         fs::remove_dir_all(dir).unwrap();
     }
 
