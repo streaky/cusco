@@ -296,11 +296,12 @@ Protocol adapters may map their own extension fields onto this canonical object 
 
 `ContextLifecycleService::list_strategies` should include current strategy catalog version and supported ids so clients can negotiate capabilities before sending preference lists.
 
-A separate context-lifecycle service should still accept advisory client-presence signals and expose strategy discovery without making any external protocol adapter responsible for compaction policy:
+A dedicated context-lifecycle service should still accept advisory client-presence signals and expose strategy discovery without making any external protocol adapter responsible for compaction policy. For v1, `/cusco/v1/*` compaction policy operations, strategy capability endpoints, and registration paths use the same authorization seam and principal-scope model as generation endpoints (no separate role lattice yet), with operator-driven expansion deferred.
+
+Protocol adapters may map native fields or extension objects onto these canonical operations. A selected strategy is part of request and context policy, not model identity, and authorization policy must govern strategy enumeration, selection, registration, and execution.
 
 Capabilities that neither compatibility protocol models—including durable logical contexts, branch selection and import, cache and compaction policy, activity hints, extended usage, and explicit request cancellation—belong to the versioned `/cusco/v1/*` API. They must remain visible in the generated OpenAPI document and must not be smuggled into unrelated OpenAI or Ollama fields. The final Phase 9 surface contains no `/native/*` routes.
 
-Protocol adapters may map native fields or extension objects onto these canonical operations. A selected strategy is part of request and context policy, not model identity, and authorization policy must govern strategy enumeration, selection, registration, and execution.
 
 Canonical request types must preserve information needed by the implemented OpenAI profile and by plausible future protocol families without embedding any protocol's JSON schema into `server-core`. The adapter owns field names, defaults, error envelopes, streaming framing, and protocol-specific model-name syntax. The core owns validation, scheduling, context semantics, execution, and usage facts.
 
