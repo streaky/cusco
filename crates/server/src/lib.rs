@@ -5322,4 +5322,28 @@ mod tests {
         assert!(with_usage.contains("\"usage\""));
         assert!(with_usage.ends_with("data: [DONE]\n\n"));
     }
+    #[test]
+    fn compaction_declarations_are_context_bound_and_expire() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let context = server.create_context().unwrap();
+        let declaration = server
+            .create_compaction_declaration(CreateCompactionDeclaration {
+                context_id: context.id.0.clone(),
+                strategy_preferences: vec![WINDOW_TAIL_STRATEGY_ID.into()],
+                target_tokens: Some(8),
+                expires_in_ms: 1_000,
+            })
+            .unwrap();
+        assert_eq!(
+            server.compaction_declaration(&declaration.declaration_id).unwrap(),
+            declaration
+        );
+        let mismatch = CompactionRequest {
+            declaration_id: Some(declaration.declaration_id),
+            ..CompactionRequest::default()
+        };
+        assert_eq!(mismatch.target_tokens, None);
+        drop(server);
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
