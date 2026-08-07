@@ -1850,8 +1850,8 @@ Baseline completion requires all checks below to pass before external workers ar
 | Semantic quality | `semantic_regression_tool_call_consistency` | Tool-call state is coherent and does not create malformed or context-inconsistent calls in the next-turn request path. |
 | Semantic quality | `semantic_regression_followup_fidelity` | Follow-up prompts against compacted successors maintain expected structured behavior against a control fixture set. |
 | Integration | `openai_responses_stream_correlates_ids` | End-to-end stream metadata preserves distinct transport request/correlation IDs and inferred inference-operation / execution-session IDs. |
-| Documentation | `swagger_combined_spec_and_ui` | A single combined OpenAPI JSON is the source of truth for `/openai/v1/*`, `/ollama/api/*`, and `/cusco/v1/*`, and Phase 10 includes a lightweight Swagger UI route over that combined contract. |
-Opt-in external workers (Python/Rust) remain disabled until all Phase 10 baseline checks above pass and platform isolation work is implemented under Open Question 7.
+| Documentation | `swagger_combined_spec_and_ui` | A single combined OpenAPI JSON is the source of truth for `/openai/v1/*`, `/ollama/api/*`, and `/cusco/v1/*`; the Swagger UI route is opt-in and **disabled by default** through `config.yaml` (e.g., `openapi.ui.enabled: false`) and must require explicit operator enablement in all other environments. |
+- Opt-in external workers (Python/Rust) remain disabled until all Phase 10 baseline checks above pass and platform isolation work is implemented under Open Question 7.
 
 
 #### Phase 10 test matrix (window_tail baseline)
@@ -1872,6 +1872,7 @@ For each baseline check above, define a nameable fixture-backed test so implemen
 | `semantic_regression_followup_fidelity` | `cargo test -p cusco-server semantic_regression_followup_fidelity -- --nocapture` | `phase10/fixtures/semantic/followup_fidelity.jsonl` |
 | `openai_responses_stream_correlates_ids` | `cargo test -p cusco-server openai_responses_stream_correlates_ids -- --nocapture` | `phase10/fixtures/integration/stream_correlation.yaml` |
 | `swagger_combined_spec_and_ui_smoke` | `cargo test -p cusco-server swagger_combined_spec_and_ui_smoke -- --nocapture` | `phase10/fixtures/openapi/swagger_smoke.yaml` |
+| `swagger_ui_default_off` | `cargo test -p cusco-server swagger_ui_default_off -- --nocapture` | `phase10/fixtures/openapi/swagger_smoke.yaml` |
 Execution rule: no `phase10` baseline artifact is complete until all listed command filters execute green for the target branch.
 
 ---
