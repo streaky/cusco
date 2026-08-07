@@ -254,7 +254,33 @@ trait ModelService {
 }
 ```
 
-Context lifecycle extensions should use the same application boundary. `CanonicalGenerationRequest` should reserve optional fields for a registered context-strategy identifier and versioned strategy parameters. A separate context-lifecycle service should accept advisory client-presence signals and expose strategy discovery without making any external protocol adapter responsible for compaction policy:
+Context lifecycle extensions should use the same application boundary. `CanonicalGenerationRequest` should reserve optional fields for compaction strategy selection and versioned strategy parameters; when omitted, compaction is explicitly disabled and no predictive path is started.
+
+```rust
+struct CanonicalGenerationRequest {
+    ...
+    compaction: Option<CompactionRequest>,
+}
+
+struct CompactionRequest {
+    strategy: StrategyId,           // required if `compaction` is present
+    trigger: CompactionTrigger,     // explicit (request-only, no background guessing)
+    strategy_config: JsonValue,     // strategy-specific policy overrides
+}
+
+enum CompactionTrigger {
+    // request-only predictive declaration from an active request
+    Predictive,
+    // no automatic compaction on ordinary generation completion
+    None,
+}
+```
+
+All external APIs that can influence generation must accept an explicit `compaction` request parameter with the same type requirement. If present, `compaction.strategy` must name a concrete built-in strategy (currently `window_tail`); if absent, no compaction work is triggered on that request.
+
+Protocol adapters may map their own extension fields onto this canonical object (for example, an OpenAI extension field `cusco_compaction` and an Ollama options field `cusco_compaction`). Inference adapters must validate and reject unknown enum values instead of treating the request as a boolean toggle.
+
+A separate context-lifecycle service should still accept advisory client-presence signals and expose strategy discovery without making any external protocol adapter responsible for compaction policy:
 
 ```rust
 trait ContextLifecycleService {
@@ -271,9 +297,9 @@ trait ContextLifecycleService {
 }
 ```
 
-Protocol adapters may map native fields or extension objects onto these canonical operations. A selected strategy is part of request and context policy, not model identity, and authorization policy must govern strategy enumeration, selection, registration, and execution.
-
 Capabilities that neither compatibility protocol models—including durable logical contexts, branch selection and import, cache and compaction policy, activity hints, extended usage, and explicit request cancellation—belong to the versioned `/cusco/v1/*` API. They must remain visible in the generated OpenAPI document and must not be smuggled into unrelated OpenAI or Ollama fields. The final Phase 9 surface contains no `/native/*` routes.
+
+Protocol adapters may map native fields or extension objects onto these canonical operations. A selected strategy is part of request and context policy, not model identity, and authorization policy must govern strategy enumeration, selection, registration, and execution.
 
 Canonical request types must preserve information needed by the implemented OpenAI profile and by plausible future protocol families without embedding any protocol's JSON schema into `server-core`. The adapter owns field names, defaults, error envelopes, streaming framing, and protocol-specific model-name syntax. The core owns validation, scheduling, context semantics, execution, and usage facts.
 
@@ -549,17 +575,20 @@ struct CompactionProposal {
 }
 ```
 
+The server should not guess that another turn is imminent from traffic heuristics. Request intent must drive compaction work:
+
+- if `trigger = Predictive`, run explicit request-driven prefetch scheduling after the current reply;  
+- if omitted, no predictive compaction request is inferred.
+
+A separate declaration endpoint remains useful for long-lived sessions where clients want to predeclare intent before their next request, but this endpoint never replaces an explicit request field when one is available.
+
 The exact wire schema can evolve, but `StrategyId`, opaque validated strategy configuration, trigger policy, and successor selection must be carried by the canonical API rather than hidden in an OpenAI- or Ollama-specific field. Protocol adapters may map their own extension fields onto these types. The native administrative API should expose context policy and activity updates explicitly. In the initial implementation these fields may be accepted, validated, persisted, and reported as unsupported for execution; reserving them early prevents later API and context-record migrations.
 
 Strategy execution should use a request/response protocol with version negotiation, bounded payloads, cancellation, deadlines, and structured error categories. A strategy receives a logical conversation view and declared limits, not an executor binding. It returns a proposal, not permission to mutate a context. A Rust trait and an out-of-process worker protocol should implement the same semantic contract so that built-in Rust, user-authored Rust, Python, and future language implementations differ only in deployment and trust policy.
 
 ### Explicit predictive compaction intent
 
-The server should not guess that another turn is imminent from recent traffic, HTTP keepalive, typing cadence, or historical revisit probability. It already knows the deterministic capacity facts—the model limit, current token count, reserved response and next-turn headroom, chat-template overhead, canonical cache-block geometry, and evaluated boundary—but only the client knows whether a user is still engaged and expects to continue.
-
-A later, dedicated native API should therefore let an authorized client explicitly declare that a connected logical context is expected to need another turn and that predictive compaction should begin. The exact wire schema is intentionally deferred. Once the server accepts that declaration, it should start the eligible compaction path as capacity permits rather than waiting for the next inference request or second-guessing the client's intent. This is a specific scheduling operation, not an inference field, an HTTP-connection heuristic, or a weak signal to feed into a predictor.
-
-The declaration must be scoped to the principal, logical context, source head, policy version, and client connection or another explicit bounded lifetime. It is never a lease on device memory and cannot weaken admission, authorization, or correctness rules. If the anticipated request never arrives, the prepared compacted successor remains semantically valid but loses speculative priority and is demoted or evicted under ordinary cache policy. The original logical context remains intact throughout.
+A dedicated declaration path is still supported for long-lived sessions where inference requests are not continuous. It accepts the same strategy enum semantics (`None` or registered strategy ID) and scope/lifetime constraints, but it does not replace explicit inference-request compaction fields when those are present.
 
 ### Cache-aware compaction boundaries
 
@@ -1680,10 +1709,13 @@ relative latency thresholds before running the sustained mixed workload.
 Starvation is gated primarily by a maximum number of scheduler rounds while
 wall-clock queue and first-event latency are reported separately. The mixed
 artifact records class/principal/request mix, prompt and generation sizes,
-arrival pattern, duration, cancellation and deadline injection, capacity
-recovery, diagnostic loss, and all thresholds. Tuning those policy parameters
-after observing a working system requires a new versioned fixture and evidence;
-it does not require changing the resumable execution contract.
+arrival pattern, duration, cancellation and deadline injection, and recovery,
+diagnostic loss, and all thresholds. Tuning those policy parameters after
+observing a working system requires a new versioned fixture and evidence; it
+does not require changing the resumable execution contract.
+
+- OpenAI compatibility covers completions, chat completions, the Responses API, streaming, text and bounded image input, tools/tool calls, response formats, temperature, `top_p`, output-token limits, and reasoning effort. The canonical internal reasoning-effort enum is `none`, `low`, `medium`, `high`, or `max`, and the OpenAI `reasoning_effort` request parameter maps onto it. Cusco adds an explicit extension field `cusco_compaction` for request-scoped compaction opt-in; the value is a strategy enum (currently only `window_tail`) and omission means no compaction speculation. Cusco maps the canonical value onto the selected strategy gate and rejects unknown values. Ollama's `think` behavior is the reasonable compatibility model: a selected model may support on/off, may support levels, or may ignore levels according to its template and capabilities. Cusco maps the canonical value onto the closest supported model behavior, applies capability checks, and does not claim universal token budgets or quality guarantees.
+- Ollama compatibility covers the equivalent generation and chat operations, streaming, vision, model lifecycle, and the other Ollama controls supported by the same canonical services. In its request options object, an explicit strategy enum field `cusco_compaction` enables request-scoped predictive compaction and must be one of the registered strategy IDs (currently `window_tail`); absence is treated as disabled. Cusco-specific context, scheduling, cancellation, usage, and lifecycle capabilities remain available through `/cusco/v1/*`, rather than creating a second execution path.
 
 The implemented Phase 8 contract uses a protocol-neutral `ExecutionSession`
 boundary and a replaceable priority-aware deficit-round-robin scheduler with
