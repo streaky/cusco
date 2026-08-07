@@ -1808,13 +1808,12 @@ Implement only after the live executor, residency, context-placement, request sc
 - close the observed Phase 9 compatibility and observability defects before semantic-compaction work begins: suppress model-declared textual terminal/control sequences such as Gemma `<end_of_turn>` before any constituent bytes are published to buffered or streaming clients, including when the sequence spans multiple tokens; propagate the transport request/correlation ID unchanged through canonical inference requests, scheduler decisions, execution diagnostics, and response metadata while retaining distinct inference-operation and execution-session IDs; and emit OpenAI Responses streaming lifecycle events with the protocol-native response, output-item, content-part, and index fields required to reconstruct the same complete response represented by the terminal event.
 - a versioned strategy registry and a single deterministic built-in trimming strategy:
   - `window_tail`: preserve required anchors (system/dev and policy scope), then trim by selecting a contiguous retained window under the target token/window budget with block-aware safety.
-- the shared Rust trait and sandboxed out-of-process worker protocol, with Python as the first reference worker;
-- explicit predictive-compaction declarations and preemptible speculative scheduling;
+- in-process deterministic built-in strategy implementations in the `context-strategy` service;
 - compacted-successor creation through the ordinary tokenize, evaluate, validate, and atomic publication path;
 - a dedicated authorized declaration API with bounded lifetime, disconnect handling, expiry, and rate limits;
 - cache-block-aware target planning without weakening semantic constraints;
 - cancellation, obsolescence, resource accounting, provenance, and operator controls;
-- execute compaction planning and worker coordination without blocking the async runtime: declarations, expiry, cancellation, and event delivery remain async and bounded, while tokenization, context inspection, strategy execution, validation, and native publication use bounded blocking workers or the sandbox process; worker limits, queueing, disconnects, shutdown, and backpressure must not delay admitted interactive inference;
+- execute compaction planning and strategy execution without blocking the async runtime: declarations, expiry, cancellation, and event delivery remain async and bounded, while context-inspection, strategy proposals, validation, and native publication use bounded blocking workers with explicit completion limits; worker queue limits, disconnects, shutdown behavior, and backpressure must not delay admitted interactive inference;
 
 #### Built-in compaction method (out-of-box)
 
@@ -1831,11 +1830,11 @@ Selection policy:
 - default strategy is `window_tail`;
 - strategy execution requires explicit per-context policy opt-in and declared remaining budget constraints.
 
-No in-process model-based or user-authored strategies are in the out-of-box phase until worker hardening is implemented.
+- No in-process model-based or user-authored strategies are in the out-of-box phase. Custom strategy workers (including user-authored Python/Rust implementations) are explicitly deferred to post-v1.
 
 #### Phase 10 baseline exit checklist (window_tail only)
 
-Baseline completion requires all checks below to pass before external workers are enabled:
+Baseline completion for v1 requires all checks below to pass:
 
 | Domain | Test | Acceptance |
 |---|---|---|
@@ -1912,11 +1911,11 @@ Each phase must end in a usable artifact and a decision, not merely merged infra
 | 7. Residency and lifecycle scheduling | capacity-aware model residency, context tiering, transactional load/reload/unload, and immutable model-epoch ownership | measured device and host admission remains within capacity; load, movement, revision, removal, eviction, reload, and unload races preserve active references and prior usable bindings without leaks |
 | 8. Workload and operational hardening | distinct request-ordering policy, starvation protection, lifecycle-aware cancellation and deadlines, scheduler observability, and sustained-load validation | mixed workloads satisfy bounded fairness, capacity, cancellation, deadline, latency, and reclamation gates; every residency and scheduling decision is attributable; correlated transport and inference timings remain unambiguous without diagnostic backpressure silently changing execution |
 | 9. Compatibility, persistence, and packaging | supported OpenAI, Ollama, and Cusco profiles, local and managed model lifecycle, bounded image input, durable recovery, async-runtime blocking boundary, and production/test container contracts | declared protocol and model-lifecycle conformance fixtures pass, including strict unsupported-input errors, request defaults, templates, tools, and native streaming framing; blocking fetch, hashing, persistence, residency, spill/restore, and native lifecycle work cannot occupy Tokio workers outside bounded worker capacity; cancellation, shutdown, ownership fences, restarts, crashes, migrations, backup/restore, and corrupt state preserve transactional guarantees; production deployment exercises the live scheduled path |
-| 10. Semantic compaction | Phase 9 compatibility and correlation closure, strategy registry, built-in strategy, worker protocol, speculative scheduler, explicit client declaration API, and bounded async/blocking worker coordination | real-model buffered and streaming fixtures prove that textual terminal/control sequences never escape; transport, inference-operation, and execution-session IDs remain distinct and correctly correlated end to end; OpenAI Responses streams are protocol-conformant and reconstruct the terminal response exactly; original contexts survive every failure and race; accepted declarations start eligible work without predictive guessing; abandoned successors demote normally; committed successors execute correctly; compaction workers and sandbox coordination remain bounded and cancellable without delaying admitted interactive inference; interactive latency and guarded capacity are not regressed; strategy sandboxes and authorization pass their gates |
+| 10. Semantic compaction | Phase 9 compatibility and correlation closure, strategy registry, built-in deterministic strategy, explicit client declaration API, and bounded async/blocking coordination | real-model buffered and streaming fixtures prove that textual terminal/control sequences never escape; transport, inference-operation, and execution-session IDs remain distinct and correctly correlated end to end; OpenAI Responses streams are protocol-conformant and reconstruct the terminal response exactly; original contexts survive every failure and race; accepted declarations start eligible work without predictive guessing; abandoned successors demote normally; committed successors execute correctly without blocking interactive inference |
 
 Phase 1 has an explicit go/no-go boundary. If complete recurrent capture and restoration cannot be expressed without exposing unstable model internals, the project pauses for an executor-boundary redesign before server work begins. Phase 5 is optional unless staged measurements show that physical assembly is a material bottleneck.
 
-Phase 4 reserves and persists the extension contract but does not execute it. Phase 10 turns it on only after fault injection proves that strategy crashes, malformed output, cancellation, expired or disconnected declarations, late results, and next-turn races cannot mutate the source context or delay admitted interactive work. Third-party workers require explicit operator enablement; the first release should support allowlisted local executables rather than arbitrary uploaded code.
+Phase 4 reserves and persists the extension contract but does not execute it. The first release should support allowlisted local executables for admin-only runtime tasks; third-party compaction workers remain post-v1 only, with explicit operator enablement and hardened isolation.
 
 ## Definition of a cache hit
 
@@ -2092,8 +2091,8 @@ The executor-proof, logical-store, mapped-execution, and Phase 6 design question
 6. **Semantic compaction (Phase 10):** resolved for baseline as **`window_tail` only**.
    - Window-tail is conservative and deterministic: contiguous retention under budget with anchor preservation.
    - Non-baseline strategies (`role_preserving_window`, `block_aligned_keep_tail_overlap`, model-assisted variants) remain future work in the roadmap.
-   - External workers remain opt-in only after worker hardening (Open Question 7) and post-v1 quality gates are implemented.
-7. **Worker hardening (Phase 10):** which isolation mechanisms are required on each supported deployment platform, especially for user-authored Python and Rust strategies?
+   - Third-party/custom workers are deferred to post-v1.
+7. **Worker hardening (post-v1):** which isolation mechanisms are required on each supported deployment platform, especially for user-authored Python and Rust strategies?
 8. **Output-blocked displacement (Phases 7 and 8):** once multiple slots or runnable requests exist, how long may a blocked request retain mapped state and what disconnect and displacement policy preserves fairness without unsafe reclamation?
 9. **Partial-tail retention (post-Phase 6 measurement):** is durable retention of incomplete generated tails worth its storage and recovery complexity after complete-block publication has been measured?
 10. **Competent operating points (Phase 7):** should operators select an explicit placement preset, a measured latency objective, or both, and under what transactional policy may the residency scheduler change it?
