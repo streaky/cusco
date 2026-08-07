@@ -19,28 +19,6 @@ Model identity, immutable revision, aliases, and lifecycle operation records
 survive restart. Logical contexts, active requests, queues, native execution
 state, and spill state are intentionally disposable in the v1 restart model.
 
-## Run the real-model inference integration test
-
-The workflow uses
-`hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf`.
-It keeps the immutable Hugging Face artifact under `models/cache` and
-materializes the stable `models/gemma-4-e2b-it.gguf` test path. The cache is
-reused across runs; the model is downloaded only when it is absent or invalid.
-With Docker's NVIDIA runtime configured and an available NVIDIA GPU, run:
-
-```sh
-tools/inference-integration-test.sh
-```
-
-Set `CUSCO_GPU_DEVICE_ID`, `CUSCO_MODEL_DIR`, or `CUSCO_RESULT_DIR` to override
-those defaults. The command evaluates four prompts with the real Gemma model,
-captures each complete execution checkpoint, displaces the active slot,
-restores through host memory, and verifies both the inferred token and every
-logit bit against uninterrupted execution. It also verifies that cancellation
-and a deliberately failed restore preserve the prior binding. The command
-exits nonzero on any failed assertion and prints a short Markdown report with
-the prompts, inferred token IDs, checkpoint sizes, and exactness results.
-
 ## Run the mapped-execution proof
 
 With the validation GGUF and NVIDIA runtime available, run:
@@ -55,54 +33,6 @@ activation, and writes staged-versus-mapped timing, bytes, and prompt work
 avoided to `results/phase5.json`. The proof does not claim graph/cache reuse:
 llama.cpp's public API does not expose whether its backend rebuilt a graph.
 
-## Run the Phase 6C acceptance report
-
-With the validation GGUF and NVIDIA runtime available, run:
-
-```sh
-CUSCO_GPU_DEVICE_ID=0 tools/phase6c-report.sh
-```
-
-Choose an available GPU index. `CUSCO_MODEL_DIR`, `CUSCO_RESULT_DIR`, and
-`CUSCO_PHASE6C_REPORT_PORT` override the remaining defaults. The workflow runs
-the GPU-less 80%-per-file coverage gate, exact executor and mapped-execution
-proofs, and an authenticated live-server matrix. It injects cancellation,
-deadline, and queue overload, verifies mapped continuation and accounting,
-performs a graceful stop and restart, and confirms that durable contexts—but
-not ephemeral queue state—recover. Machine-readable evidence, including
-configuration, provenance, selected GPU UUID, exactness results, prompt phase
-timings, cache work, transfers, and device/host accounting, is written to
-`results/phase6c-server.json`.
-
-## Run the Phase 7 residency report
-
-With the validation GGUF and NVIDIA runtime available, run:
-
-```sh
-CUSCO_GPU_DEVICE_ID=0 tools/phase7-report.sh
-```
-
-The workflow runs the GPU-less per-file coverage gate, then exercises the live
-resident server with two immutable model identities, a transactional epoch
-reload, model removal, accounting checks, graceful restart, and post-restart
-inference. Machine-readable GPU, epoch, resident-set, capacity, lifecycle, and
-latency evidence is written to `results/phase7-server.json`.
-
-
-## Run the Phase 8 scheduler report
-
-With the validation GGUF and NVIDIA runtime available, run:
-
-```sh
-CUSCO_GPU_DEVICE_ID=0 tools/phase8-report.sh
-```
-
-The workflow runs the GPU-less 80%-per-file coverage gate and the versioned
-real-GPU workload in `config/phase8-workload.json`. It records the isolated
-baseline, mixed interactive/standard/batch results, cancellation and deadline
-injections, post-workload capacity recovery, scheduler policy and counters,
-fully drained attributed decision records, latency/starvation thresholds, build
-and workload provenance, and selected GPU in `results/phase8-server.json`.
 
 ## Run the unified API smoke report
 
@@ -113,9 +43,9 @@ CUSCO_GPU_DEVICE_ID=0 docker compose -f compose.test.yaml run --rm api-smoke
 This deterministic, model-backed smoke suite exercises the primary OpenAI,
 Cusco context/compaction, and status APIs against the standard Gemma test model.
 It writes `results/smoke-report.json` with per-scenario status and latency,
-request/token totals, and aggregate min/median/max latency. The report is the
-common high-level API gate; the phase-specific reports remain available for
-focused scheduler, residency, and executor evidence.
+request/token totals, and aggregate min/median/max latency. Focused executor,
+mapped-execution, and scheduler proofs remain available as lower-level
+engineering diagnostics.
 
 ## Run the production Compose service
 

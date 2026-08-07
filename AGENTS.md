@@ -49,10 +49,10 @@ Select the proof GPU with `CUSCO_GPU_DEVICE_ID`; do not assume a particular host
 ## Testing and verification
 
 - Write behavioral tests alongside permanent changes.
-- Every measured Rust source file must maintain at least 80% line coverage. `tools/coverage.sh` runs the tests and enforces the per-file threshold.
-- Run the GPU-less coverage path with `docker compose -f compose.test.yaml run --rm test`.
-- Phase 6 lifecycle or live-executor changes require `CUSCO_GPU_DEVICE_ID=<index> tools/phase6c-report.sh`; it runs coverage plus the executor, mapped, cancellation/deadline/overload, graceful-shutdown, and restart gates and writes `results/phase6c-server.json`.
-- Phase 7 residency or model-lifecycle changes require `CUSCO_GPU_DEVICE_ID=<index> tools/phase7-report.sh`; it runs coverage plus the multi-model load/reuse/reload/remove/restart matrix and writes `results/phase7-server.json`.
+ - Every measured Rust source file must maintain at least 80% line coverage. `tools/coverage.sh` runs the tests and enforces the per-file threshold.
+ - Run the GPU-less coverage path with `docker compose -f compose.test.yaml run --rm test`.
+ - The unified real-model API smoke gate is `docker compose -f compose.test.yaml run --rm api-smoke`; it exercises the primary OpenAI, Cusco context/compaction, and status APIs and writes `results/smoke-report.json` with request, token, and latency statistics.
+ - Focused executor, mapped-execution, and scheduler proofs remain available through their Compose services when changing those subsystems.
 - Real-model tests and proofs use `hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf`. Run the Compose `model-fetch` service before them; it reuses the persistent host cache under `${CUSCO_MODEL_DIR:-./models}/cache`, validates the cached artifact, and only downloads when it is absent or invalid. The stable test path is `models/gemma-4-e2b-it.gguf`. Executor-boundary changes require the real model proof, not only deterministic model-free tests, and must write machine-readable evidence under `results/`.
 - Mapped-executor changes require `docker compose -f compose.test.yaml run --rm mapped-proof`; it writes staged-versus-mapped evidence to `results/phase5.json`.
 - Verify failure behavior transactionally: cancellation, preparation failure, transfer failure, validation failure, and commit failure must leave the prior binding usable.
