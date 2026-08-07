@@ -21,6 +21,8 @@ pub enum CompactionTrigger {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CompactionRequest {
     #[serde(default)]
+    pub declaration_id: Option<String>,
+    #[serde(default)]
     pub strategy_preferences: Vec<String>,
     #[serde(default)]
     pub fallback_when_no_match: CompactionNoMatchFallback,
@@ -52,6 +54,7 @@ pub struct CreateCompactionDeclaration {
 impl Default for CompactionRequest {
     fn default() -> Self {
         Self {
+            declaration_id: None,
             strategy_preferences: Vec::new(),
             fallback_when_no_match: CompactionNoMatchFallback::NoCompact,
             trigger: CompactionTrigger::Request,

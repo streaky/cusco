@@ -1715,11 +1715,27 @@ impl Server {
     fn infer_admitted(
         &self,
         request_id: &str,
-        req: InferRequest,
+        mut req: InferRequest,
         successor_id: ContextId,
         mut frontier: GenerationFrontier,
         mut emit: impl FnMut(StreamEvent) -> Result<(), Error>,
     ) -> Result<(InferResponse, StreamEvent), Error> {
+        if let Some(compaction) = req.compaction.as_mut() {
+            if let Some(declaration_id) = compaction.declaration_id.clone() {
+                let declaration = self.compaction_declaration(&declaration_id)?;
+                let context_id = req
+                    .context_id
+                    .as_ref()
+                    .ok_or_else(|| Error::BadRequest("compaction declaration requires context".into()))?;
+                if context_id.0 != declaration.context_id {
+                    return Err(Error::BadRequest("compaction declaration context mismatch".into()));
+                }
+                compaction.strategy_preferences = declaration.strategy_preferences;
+                if compaction.target_tokens.is_none() {
+                    compaction.target_tokens = declaration.target_tokens;
+                }
+            }
+        }
         let started = Instant::now();
         let deadline = req
             .deadline_ms
