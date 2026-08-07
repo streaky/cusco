@@ -258,4 +258,72 @@ mod tests {
             "image_unsupported"
         );
     }
+    #[test]
+    fn enforces_encoded_decoded_geometry_and_retention_limits() {
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 1, image::Rgb([1, 2, 3])))
+            .write_to(&mut encoded, ImageFormat::Png)
+            .unwrap();
+        let png = STANDARD.encode(encoded.into_inner());
+        assert_eq!(
+            admission()
+                .admit_data_uri("not-a-data-uri")
+                .unwrap_err()
+                .code,
+            "image_malformed"
+        );
+        assert_eq!(
+            admission()
+                .admit_base64("image/png", "!!!")
+                .unwrap_err()
+                .code,
+            "image_malformed"
+        );
+
+        let mut config = VisionConfig::default();
+        config.max_encoded_bytes = 1;
+        assert_eq!(
+            ImageAdmission::new(config)
+                .admit_base64("image/png", &png)
+                .unwrap_err()
+                .field,
+            "encoded_bytes"
+        );
+        let mut config = VisionConfig::default();
+        config.max_decoded_bytes = 1;
+        assert_eq!(
+            ImageAdmission::new(config)
+                .admit_base64("image/png", &png)
+                .unwrap_err()
+                .field,
+            "decoded_bytes"
+        );
+        let mut config = VisionConfig::default();
+        config.max_dimension = 1;
+        assert_eq!(
+            ImageAdmission::new(config)
+                .admit_base64("image/png", &png)
+                .unwrap_err()
+                .field,
+            "width"
+        );
+        let mut config = VisionConfig::default();
+        config.max_total_pixels = 1;
+        assert_eq!(
+            ImageAdmission::new(config)
+                .admit_base64("image/png", &png)
+                .unwrap_err()
+                .field,
+            "total_pixels"
+        );
+        let mut config = VisionConfig::default();
+        config.retention_capacity = crate::ByteSize(1);
+        assert_eq!(
+            ImageAdmission::new(config)
+                .admit_base64("image/png", &png)
+                .unwrap_err()
+                .field,
+            "retention_bytes"
+        );
+    }
 }

@@ -1011,6 +1011,7 @@ pub struct Server {
     engine: Arc<dyn InferenceEngine>,
     catalog: Arc<Mutex<Option<ModelCatalog>>>,
     model_directory: Arc<Mutex<PathBuf>>,
+    vision: Arc<Mutex<VisionConfig>>,
 }
 struct AdmissionGuard {
     server: Server,
@@ -1074,6 +1075,7 @@ impl Server {
             engine,
             catalog: Arc::new(Mutex::new(None)),
             model_directory: Arc::new(Mutex::new(PathBuf::from("./data/models"))),
+            vision: Arc::new(Mutex::new(VisionConfig::default())),
         };
         server.persist()?;
         Ok(server)
@@ -1084,6 +1086,12 @@ impl Server {
     }
     fn catalog(&self) -> Option<ModelCatalog> {
         self.catalog.lock().clone()
+    }
+    pub fn configure_vision(&self, config: VisionConfig) {
+        *self.vision.lock() = config;
+    }
+    fn vision_config(&self) -> VisionConfig {
+        self.vision.lock().clone()
     }
     fn model_directory(&self) -> PathBuf {
         self.model_directory.lock().clone()
@@ -1982,8 +1990,8 @@ struct ImageUrlPart {
     url: String,
 }
 
-fn lower_messages(messages: Vec<ChatMessage>) -> Result<String, Error> {
-    let admission = ImageAdmission::new(VisionConfig::default());
+fn lower_messages(messages: Vec<ChatMessage>, vision: VisionConfig) -> Result<String, Error> {
+    let admission = ImageAdmission::new(vision);
     let mut lines = Vec::with_capacity(messages.len());
     for message in messages {
         if !matches!(
@@ -2229,7 +2237,7 @@ async fn chat(
         .as_ref()
         .is_some_and(|options| options.include_usage);
     s.model(&r.model)?;
-    let prompt = lower_messages(r.messages)?;
+    let prompt = lower_messages(r.messages, s.vision_config())?;
     drop(permit);
     infer_response(
         s,
@@ -2368,7 +2376,7 @@ async fn ollama_chat(
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
     s.model(&r.model)?;
-    let prompt = lower_messages(r.messages)?;
+    let prompt = lower_messages(r.messages, s.vision_config())?;
     drop(permit);
     infer_response(
         s,

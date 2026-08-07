@@ -185,6 +185,7 @@ fn run(command: Command) -> Result<()> {
             }
             let server = Server::open(&transient_state, auth, engine)?;
             server.configure(config.server)?;
+            server.configure_vision(config.vision);
             let catalog = ModelCatalog::open(&config.paths.database)?;
             server.attach_catalog(catalog.clone(), config.paths.models.clone());
             for model in catalog.models()? {

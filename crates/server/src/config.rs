@@ -241,4 +241,86 @@ mod tests {
         let yaml = "version: 1\nlisten: 127.0.0.1:8080\npaths: {database: db, models: models, spill: spill, user_models: local, user_config: user.yaml}\nexecution: {device_capacity: '1 GiB', host_capacity: '1 GiB', storage_capacity: '2 GiB', context_reserve: '1 GiB', surprise: true}\n";
         assert!(serde_yaml::from_str::<DaemonConfig>(yaml).is_err());
     }
+    fn valid() -> DaemonConfig {
+        DaemonConfig {
+            version: 1,
+            listen: default_listen(),
+            unsafe_public_unauthenticated: false,
+            bearer_token: None,
+            http_debug: HttpDebugLevel::Off,
+            paths: DataPaths {
+                database: "db".into(),
+                models: "models".into(),
+                spill: "spill".into(),
+                user_models: "local".into(),
+                user_config: "user.yaml".into(),
+            },
+            execution: ExecutionConfig {
+                device_capacity: ByteSize(1),
+                host_capacity: ByteSize(1),
+                storage_capacity: ByteSize(2),
+                context_reserve: ByteSize(1),
+                context_tokens: 1,
+                gpu_layers: 0,
+                require_competent: false,
+            },
+            server: ServerConfig::default(),
+            scheduler: SchedulerPolicyConfig::default(),
+            vision: VisionConfig::default(),
+        }
+    }
+    #[test]
+    fn validates_versions_capacities_and_vision_limits() {
+        assert!(valid().validate().is_ok());
+        let mut config = valid();
+        config.version = 2;
+        assert!(matches!(config.validate(), Err(ConfigError::Version(2))));
+        for mutate in [
+            (|c: &mut DaemonConfig| c.execution.device_capacity = ByteSize(0))
+                as fn(&mut DaemonConfig),
+            |c: &mut DaemonConfig| c.execution.host_capacity = ByteSize(0),
+            |c: &mut DaemonConfig| c.execution.storage_capacity = ByteSize(0),
+        ] {
+            let mut config = valid();
+            mutate(&mut config);
+            assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        }
+        let mut config = valid();
+        config.execution.context_reserve = ByteSize(3);
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        let mut config = valid();
+        config.execution.context_tokens = 0;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        let mut config = valid();
+        config.vision.max_images = 0;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        let mut config = valid();
+        config.vision.retention_capacity = ByteSize(1);
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+    #[test]
+    fn loads_round_tripped_configuration_and_rejects_bad_sizes() {
+        for (text, bytes) in [
+            ("1 B", 1),
+            ("1 KiB", 1024),
+            ("1 MB", 1_000_000),
+            ("1 TB", 1_000_000_000_000),
+        ] {
+            assert_eq!(text.parse::<ByteSize>().unwrap(), ByteSize(bytes));
+        }
+        for text in [
+            "bad B",
+            "-1 B",
+            "NaN B",
+            "1 XB",
+            "999999999999999999999999999999999 TiB",
+        ] {
+            assert!(text.parse::<ByteSize>().is_err(), "{text}");
+        }
+        let path = std::env::temp_dir().join(format!("cusco-config-{}.yaml", uuid::Uuid::new_v4()));
+        fs::write(&path, serde_yaml::to_string(&valid()).unwrap()).unwrap();
+        assert_eq!(DaemonConfig::load(&path).unwrap().version, 1);
+        fs::remove_file(path).unwrap();
+        assert_eq!(serde_yaml::to_string(&ByteSize(3)).unwrap().trim(), "3 B");
+    }
 }

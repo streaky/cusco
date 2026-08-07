@@ -285,4 +285,35 @@ mod tests {
         assert_eq!(probe_gguf(&path).unwrap().architecture, "gemma3");
         fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn rejects_invalid_gguf_headers_and_metadata_values() {
+        let mut scalar = std::io::Cursor::new(vec![0_u8; 8]);
+        for kind in [0, 2, 4, 7, 10, 12] {
+            scalar.set_position(0);
+            skip_value(&mut scalar, kind).unwrap();
+        }
+        let mut string = Vec::new();
+        string.extend_from_slice(&3_u64.to_le_bytes());
+        string.extend_from_slice(b"abc");
+        skip_value(&mut std::io::Cursor::new(string), 8).unwrap();
+        assert!(matches!(
+            skip_value(&mut std::io::Cursor::new(Vec::<u8>::new()), 99),
+            Err(Error::InvalidMetadata(_))
+        ));
+
+        let path = std::env::temp_dir().join(format!("cusco-invalid-{}.gguf", std::process::id()));
+        fs::write(&path, b"nope").unwrap();
+        assert!(matches!(probe_gguf(&path), Err(Error::InvalidMetadata(_))));
+        let mut header = Vec::new();
+        header.extend_from_slice(b"GGUF");
+        header.extend_from_slice(&1_u32.to_le_bytes());
+        fs::write(&path, &header).unwrap();
+        assert!(matches!(probe_gguf(&path), Err(Error::InvalidMetadata(_))));
+        header[4..8].copy_from_slice(&3_u32.to_le_bytes());
+        header.extend_from_slice(&0_u64.to_le_bytes());
+        header.extend_from_slice(&0_u64.to_le_bytes());
+        fs::write(&path, &header).unwrap();
+        assert!(matches!(probe_gguf(&path), Err(Error::InvalidMetadata(_))));
+        fs::remove_file(path).unwrap();
+    }
 }

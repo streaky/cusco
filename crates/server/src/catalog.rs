@@ -235,4 +235,81 @@ mod tests {
         );
         let _ = fs::remove_file(path);
     }
+    #[test]
+    fn validates_catalog_mutations_and_user_model_roots() {
+        let (path, catalog) = database();
+        let mut model = ModelRecord {
+            id: "m".into(),
+            revision: "r".into(),
+            path: "/m.gguf".into(),
+            sha256: "abc".into(),
+            aliases: vec!["latest".into()],
+            family: "gemma3".into(),
+            size_bytes: 7,
+            epoch: 0,
+        };
+        assert!(matches!(
+            catalog.publish(&model),
+            Err(CatalogError::Data(_))
+        ));
+        model.epoch = 1;
+        catalog.publish(&model).unwrap();
+        assert_eq!(catalog.models().unwrap(), vec![model.clone()]);
+        assert!(!catalog.remove("absent").unwrap());
+        catalog.begin_operation("done", "m", "pull").unwrap();
+        catalog.finish_operation("done", "complete", None).unwrap();
+        assert_eq!(
+            catalog.operation_status("done").unwrap().as_deref(),
+            Some("complete")
+        );
+        assert!(matches!(
+            catalog.finish_operation("done", "failed", None),
+            Err(CatalogError::Data(_))
+        ));
+        assert!(catalog.remove("m").unwrap());
+
+        let root = std::env::temp_dir().join(format!("cusco-user-models-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("m.gguf"), b"model").unwrap();
+        let config = root.join("models.yaml");
+        fs::write(
+            &config,
+            "models:\n  - {name: local, path: m.gguf, aliases: [latest]}\n",
+        )
+        .unwrap();
+        let loaded = load_user_models(&config, &root).unwrap();
+        assert_eq!(
+            loaded.models[0].path,
+            fs::canonicalize(root.join("m.gguf")).unwrap()
+        );
+        fs::write(
+            &config,
+            "models:\n  - {name: same, path: m.gguf}\n  - {name: same, path: m.gguf}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            load_user_models(&config, &root),
+            Err(CatalogError::Data(_))
+        ));
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("outside-{}.gguf", Uuid::new_v4()));
+        fs::write(&outside, b"outside").unwrap();
+        fs::write(
+            &config,
+            format!(
+                "models:\n  - {{name: escape, path: {}}}\n",
+                outside.display()
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_user_models(&config, &root),
+            Err(CatalogError::Data(_))
+        ));
+        let _ = fs::remove_file(outside);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(path);
+    }
 }
