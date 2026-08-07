@@ -1855,6 +1855,7 @@ The out-of-box compaction surface is intentionally conservative and deterministi
   - Periodic recompression is expected: later turns may compact the newly adopted head again if it again risks fitting pressure, preserving tail semantics across time.
   - Records explicit runtime metadata: budget, anchor policy, compact mode, and compact-reason.
 #### Phase 10 baseline exit checklist (window_tail only)
+**Repository status (2026-08-07):** The implementation currently provides the deterministic `window_tail` strategy, declaration lifecycle, request/response plumbing, correlation/session metadata, and Responses lifecycle events. The rebuilt Compose coverage gate passes (`81 passed`, all measured Rust files above the 80% threshold), but the complete Phase 10 baseline exit checklist has not yet been demonstrated end to end; Phase 10 remains in progress.
 
 This checklist is scoped to v1 request-tied execution only: Phase 10 baseline implementations must not spawn tick-based background speculation or preemptive compaction workers.
 
