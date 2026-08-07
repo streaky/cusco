@@ -8,38 +8,14 @@ services:
     command:
       - /work/target/release/cusco
       - serve
-      - "/data/models/${CUSCO_MODEL_FILE:-gemma-4-e2b-it.gguf}"
-      - --model-id
-      - "${CUSCO_MODEL_ID:-gemma-4-e2b-it}"
-      - --model-family
-      - "${CUSCO_MODEL_FAMILY:-gemma-4-e2b-it}"
-      - --listen
-      - 0.0.0.0:8080
-      - --state
-      - /data/state/cusco-state.json
-      - --spill-directory
-      - /data/spill
-      - --device-bytes
-      - "${CUSCO_DEVICE_BYTES:-8589934592}"
-      - --host-bytes
-      - "${CUSCO_HOST_BYTES:-17179869184}"
-      - --storage-bytes
-      - "${CUSCO_STORAGE_BYTES:-68719476736}"
-      - --context-reserve-bytes
-      - "${CUSCO_CONTEXT_RESERVE_BYTES:-1073741824}"
-      - --context
-      - "${CUSCO_CONTEXT_SIZE:-4096}"
-      - --gpu-layers
-      - "${CUSCO_GPU_LAYERS:-99}"
-      - --require-competent
-      - --bearer-token
-      - "${CUSCO_BEARER_TOKEN:?set CUSCO_BEARER_TOKEN}"
+      - --config
+      - /data/config.yaml
     environment:
-      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
+      CUSCO_BEARER_TOKEN: "${CUSCO_BEARER_TOKEN:?set CUSCO_BEARER_TOKEN}"
+      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-0}"
       LD_LIBRARY_PATH: /opt/llama-build/bin
-#      CUSCO_HTTP_DEBUG: full
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/openapi.json"]
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "-H", "Authorization: Bearer ${CUSCO_BEARER_TOKEN}", "http://127.0.0.1:8080/openai/v1/models"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -50,8 +26,11 @@ services:
     ports:
       - "${CUSCO_LISTEN_ADDRESS:-127.0.0.1}:${CUSCO_PORT:-11443}:8080"
     volumes:
+      - ./config/config.yaml:/data/config.yaml:ro
+      - ./config/user.yaml:/data/user.yaml:ro
+      - ./data/user-models:/data/user-models:ro
       - ./data/models:/data/models
-      - ./data/state:/data/state
+      - ./data/db:/data/db
       - ./data/spill:/data/spill
     deploy:
       resources:
