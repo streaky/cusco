@@ -181,10 +181,37 @@ fn default_retention() -> ByteSize {
     ByteSize(256 << 20)
 }
 
+impl FromStr for HttpDebugLevel {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "safe" => Ok(Self::Safe),
+            "full" => Ok(Self::Full),
+            _ => Err("HTTP debug level must be one of: off, safe, full".into()),
+        }
+    }
+}
+
 impl DaemonConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let config: Self = serde_yaml::from_slice(&fs::read(path)?)?;
         config.validate()
+    }
+    pub fn resolve_http_debug(
+        &self,
+        cli: Option<HttpDebugLevel>,
+        environment: Option<&str>,
+    ) -> Result<HttpDebugLevel, ConfigError> {
+        if let Some(cli) = cli {
+            return Ok(cli);
+        }
+        environment
+            .map(str::parse)
+            .transpose()
+            .map_err(ConfigError::Invalid)
+            .map(|environment| environment.unwrap_or(self.http_debug))
     }
     pub fn validate(self) -> Result<Self, ConfigError> {
         if self.version != CONFIG_VERSION {
@@ -269,6 +296,27 @@ mod tests {
             vision: VisionConfig::default(),
         }
     }
+    #[test]
+    fn http_debug_overrides_follow_cli_environment_configuration_precedence() {
+        let mut config = valid();
+        config.http_debug = HttpDebugLevel::Off;
+        assert_eq!(
+            config.resolve_http_debug(None, Some("full")).unwrap(),
+            HttpDebugLevel::Full
+        );
+        assert_eq!(
+            config
+                .resolve_http_debug(Some(HttpDebugLevel::Safe), Some("full"))
+                .unwrap(),
+            HttpDebugLevel::Safe
+        );
+        assert!(config.resolve_http_debug(None, Some("verbose")).is_err());
+        assert_eq!(
+            config.resolve_http_debug(None, None).unwrap(),
+            HttpDebugLevel::Off
+        );
+    }
+
     #[test]
     fn validates_versions_capacities_and_vision_limits() {
         assert!(valid().validate().is_ok());

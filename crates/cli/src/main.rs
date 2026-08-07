@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use cusco_executor::{Executor, logits_identical};
 use cusco_model_registry::{GEMMA_URI, ModelRecord, fetch_hf, register_local};
 use serde::{Deserialize, Serialize};
@@ -16,13 +16,6 @@ use std::{
 struct Args {
     #[command(subcommand)]
     command: Command,
-}
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
-enum HttpDebugLevelArg {
-    #[default]
-    Off,
-    Safe,
-    Full,
 }
 
 #[derive(Subcommand)]
@@ -93,6 +86,9 @@ enum Command {
         /// Versioned daemon configuration.
         #[arg(long, default_value = "/data/config.yaml")]
         config: PathBuf,
+        /// Override HTTP transport diagnostics (`CUSCO_HTTP_DEBUG` is also supported).
+        #[arg(long)]
+        http_debug: Option<cusco_server::HttpDebugLevel>,
     },
 }
 fn main() -> Result<()> {
@@ -184,13 +180,17 @@ fn run(command: Command) -> Result<()> {
             device_bytes,
             host_bytes,
         )?,
-        Command::Serve { config } => {
+        Command::Serve { config, http_debug } => {
             use cusco_server::{
                 AnonymousAdmin, AuthProvider, BearerAuth, DaemonConfig, HttpDebugLevel,
                 ModelCatalog, ModelRecord, ResidencyConfig, ResidentEngine, Server,
                 WorkloadScheduler, load_user_models,
             };
             let config = DaemonConfig::load(config)?;
+            let http_debug = config.resolve_http_debug(
+                http_debug,
+                std::env::var("CUSCO_HTTP_DEBUG").ok().as_deref(),
+            )?;
             let bearer_token = std::env::var("CUSCO_BEARER_TOKEN")
                 .ok()
                 .or_else(|| config.bearer_token.clone());
@@ -247,7 +247,7 @@ fn run(command: Command) -> Result<()> {
                 catalog.publish(&model)?;
             }
             let runtime = tokio::runtime::Runtime::new()?;
-            match config.http_debug {
+            match http_debug {
                 HttpDebugLevel::Off => runtime.block_on(cusco_server::serve(
                     server,
                     config.listen,
@@ -850,13 +850,15 @@ fn proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     #[test]
     fn serve_cli_accepts_only_versioned_configuration_path() {
         let args = Args::try_parse_from(["cusco", "serve", "--config", "operator.yaml"]).unwrap();
-        let Command::Serve { config } = args.command else {
+        let Command::Serve { config, http_debug } = args.command else {
             panic!("serve command expected")
         };
         assert_eq!(config, PathBuf::from("operator.yaml"));
+        assert_eq!(http_debug, None);
         assert!(Args::try_parse_from(["cusco", "serve", "model.gguf"]).is_err());
     }
 
@@ -893,22 +895,32 @@ mod tests {
 
     #[test]
     fn serve_config_path_has_production_default() {
-        use clap::CommandFactory;
+        // The default config path remains production-oriented.
         let args = Args::try_parse_from(["cusco", "serve"]).unwrap();
-        let Command::Serve { config } = args.command else {
+        let Command::Serve { config, http_debug } = args.command else {
             panic!("serve command expected")
         };
         assert_eq!(config, PathBuf::from("/data/config.yaml"));
+        assert_eq!(http_debug, None);
+    }
+
+    #[test]
+    fn http_debug_cli_override_is_parsed() {
+        use cusco_server::HttpDebugLevel;
+
+        let args = Args::try_parse_from(["cusco", "serve", "--http-debug", "full"]).unwrap();
+        let Command::Serve { http_debug, .. } = args.command else {
+            panic!("serve command expected")
+        };
+        assert_eq!(http_debug, Some(HttpDebugLevel::Full));
         let command = Args::command();
         let serve = command
             .get_subcommands()
             .find(|command| command.get_name() == "serve")
             .unwrap();
-        assert!(
-            serve
-                .get_arguments()
-                .all(|argument| argument.get_id() == "config" || argument.get_id() == "help")
-        );
+        assert!(serve.get_arguments().all(|argument| {
+            matches!(argument.get_id().as_str(), "config" | "http_debug" | "help")
+        }));
     }
 
     #[test]
