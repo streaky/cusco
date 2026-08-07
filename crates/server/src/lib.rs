@@ -35,6 +35,7 @@ use uuid::Uuid;
 mod generation;
 mod mapped;
 mod scheduler;
+mod vision;
 
 pub use config::{ByteSize, ConfigError, DaemonConfig, DataPaths, ExecutionConfig, VisionConfig};
 pub use catalog::{CatalogError, ModelCatalog, UserModelConfig, UserModels, load_user_models};
@@ -45,6 +46,7 @@ pub use generation::{
 pub use mapped::{ExecutionProfile, MappedEngine, MappedMetrics};
 pub use residency::{ResidencyConfig, ResidencyMetrics, ResidentEngine, ResidentModelStatus};
 pub use scheduler::{SchedulerMetrics, SchedulerStatus, WorkloadScheduler};
+pub use vision::{AdmittedImage, ImageAdmission, VisionError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -1841,7 +1843,54 @@ struct ChatRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChatMessage {
-    content: String,
+    #[serde(default = "default_user_role")]
+    role: String,
+    content: ChatContent,
+}
+fn default_user_role() -> String { "user".into() }
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ChatContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrlPart },
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageUrlPart { url: String }
+
+fn lower_messages(messages: Vec<ChatMessage>) -> Result<String, Error> {
+    let admission = ImageAdmission::new(VisionConfig::default());
+    let mut lines = Vec::with_capacity(messages.len());
+    for message in messages {
+        if !matches!(message.role.as_str(), "system" | "user" | "assistant" | "tool") {
+            return Err(Error::BadRequest(format!("unsupported message role {}", message.role)));
+        }
+        let text = match message.content {
+            ChatContent::Text(text) => text,
+            ChatContent::Parts(parts) => {
+                let mut text = String::new();
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text: part } => text.push_str(&part),
+                        ContentPart::ImageUrl { image_url } => {
+                            if message.role != "user" { return Err(Error::BadRequest("images are accepted only in user messages".into())); }
+                            admission.admit_data_uri(&image_url.url).map_err(|error| Error::BadRequest(error.to_string()))?;
+                            return Err(Error::BadRequest("image_unsupported: selected model has no compatible vision projector".into()));
+                        }
+                    }
+                }
+                text
+            }
+        };
+        lines.push(format!("{}: {}", message.role, text));
+    }
+    Ok(lines.join("\n"))
 }
 
 pub fn router(server: Server) -> Router {
@@ -2028,15 +2077,12 @@ async fn chat(
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
     s.model(&r.model)?;
+    let prompt = lower_messages(r.messages)?;
     drop(permit);
     infer_response(
         s,
         r.model,
-        r.messages
-            .into_iter()
-            .map(|m| m.content)
-            .collect::<Vec<_>>()
-            .join("\n"),
+        prompt,
         r.max_tokens,
         r.stream,
         r.context_id,
@@ -2104,7 +2150,7 @@ async fn ollama_chat(
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
     s.model(&r.model)?;
-    let prompt = r.messages.into_iter().map(|message| message.content).collect::<Vec<_>>().join("\n");
+    let prompt = lower_messages(r.messages)?;
     drop(permit);
     infer_response(s, r.model, prompt, None, r.stream, None, vec![], false, None, retained_bytes, request_context.principal).await
 }
