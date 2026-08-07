@@ -1884,6 +1884,9 @@ impl Server {
                 .contexts
                 .get_mut(&context.id)
                 .ok_or(Error::ContextNotFound)?;
+            if stored.revision != context.revision {
+                return Err(Error::State("context changed during compaction".into()));
+            }
             stored.tokens = raw_context_tokens;
             stored.native_tokens = successor_tokens;
             stored.revision += 1;
