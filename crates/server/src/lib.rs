@@ -2355,6 +2355,21 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaOptions {
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    num_predict: Option<usize>,
+    #[serde(default)]
+    stop: Option<StopInput>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OllamaGenerateRequest {
@@ -2362,6 +2377,8 @@ struct OllamaGenerateRequest {
     prompt: String,
     #[serde(default = "default_true")]
     stream: bool,
+    #[serde(default)]
+    options: OllamaOptions,
 }
 async fn ollama_generate(
     State(s): State<Server>,
@@ -2373,18 +2390,20 @@ async fn ollama_generate(
     }: PrequeueJson<OllamaGenerateRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
+    validate_controls(r.options.temperature, r.options.top_p, &[], None, None)?;
+    let sampling = sampling_config(r.options.temperature, r.options.top_p, r.options.seed)?;
     s.model(&r.model)?;
     drop(permit);
     infer_response(
         s,
         r.model,
         r.prompt,
-        None,
-        SamplingConfig::default(),
+        r.options.num_predict,
+        sampling,
         true,
         r.stream,
         None,
-        vec![],
+        r.options.stop.map(StopInput::into_vec).unwrap_or_default(),
         false,
         None,
         retained_bytes,
@@ -2401,6 +2420,8 @@ struct OllamaChatRequest {
     messages: Vec<ChatMessage>,
     #[serde(default = "default_true")]
     stream: bool,
+    #[serde(default)]
+    options: OllamaOptions,
 }
 async fn ollama_chat(
     State(s): State<Server>,
@@ -2412,6 +2433,8 @@ async fn ollama_chat(
     }: PrequeueJson<OllamaChatRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
+    validate_controls(r.options.temperature, r.options.top_p, &[], None, None)?;
+    let sampling = sampling_config(r.options.temperature, r.options.top_p, r.options.seed)?;
     let model = s.model(&r.model)?;
     let prompt = lower_messages(&model.family, r.messages, s.vision_config())?;
     drop(permit);
@@ -2419,12 +2442,12 @@ async fn ollama_chat(
         s,
         r.model,
         prompt,
-        None,
-        SamplingConfig::default(),
+        r.options.num_predict,
+        sampling,
         true,
         r.stream,
         None,
-        vec![],
+        r.options.stop.map(StopInput::into_vec).unwrap_or_default(),
         false,
         None,
         retained_bytes,
