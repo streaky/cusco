@@ -1776,8 +1776,9 @@ The Phase 9 release profile supports the proven Gemma family and any other archi
 
 Implement only after the live executor, residency, context-placement, request schedulers, persistence, and public lifecycle contracts pass their semantic and capacity gates:
 
-- close the observed Phase 9 compatibility and observability defects before semantic-compaction work begins: suppress model-declared textual terminal/control sequences such as Gemma `<end_of_turn>` before any constituent bytes are published to buffered or streaming clients, including when the sequence spans multiple tokens; propagate the transport request/correlation ID unchanged through canonical inference requests, scheduler decisions, execution diagnostics, and response metadata while retaining distinct inference-operation and execution-session IDs; and emit OpenAI Responses streaming lifecycle events with the protocol-native response, output-item, content-part, and index fields required to reconstruct the same complete response represented by the terminal event;
-- a versioned strategy registry and one deterministic built-in trimming strategy;
+- close the observed Phase 9 compatibility and observability defects before semantic-compaction work begins: suppress model-declared textual terminal/control sequences such as Gemma `<end_of_turn>` before any constituent bytes are published to buffered or streaming clients, including when the sequence spans multiple tokens; propagate the transport request/correlation ID unchanged through canonical inference requests, scheduler decisions, execution diagnostics, and response metadata while retaining distinct inference-operation and execution-session IDs; and emit OpenAI Responses streaming lifecycle events with the protocol-native response, output-item, content-part, and index fields required to reconstruct the same complete response represented by the terminal event.
+- a versioned strategy registry and a single deterministic built-in trimming strategy:
+  - `window_tail`: preserve required anchors (system/dev and policy scope), then trim by selecting a contiguous retained window under the target token/window budget with block-aware safety.
 - the shared Rust trait and sandboxed out-of-process worker protocol, with Python as the first reference worker;
 - explicit predictive-compaction declarations and preemptible speculative scheduling;
 - compacted-successor creation through the ordinary tokenize, evaluate, validate, and atomic publication path;
@@ -1785,9 +1786,72 @@ Implement only after the live executor, residency, context-placement, request sc
 - cache-block-aware target planning without weakening semantic constraints;
 - cancellation, obsolescence, resource accounting, provenance, and operator controls;
 - execute compaction planning and worker coordination without blocking the async runtime: declarations, expiry, cancellation, and event delivery remain async and bounded, while tokenization, context inspection, strategy execution, validation, and native publication use bounded blocking workers or the sandbox process; worker limits, queueing, disconnects, shutdown, and backpressure must not delay admitted interactive inference;
-- opt-in per-context policy; no automatic semantic rewriting by default.
+
+#### Built-in compaction method (out-of-box)
+
+The out-of-box compaction surface is intentionally conservative and deterministic:
+
+- `window_tail`
+  - Keeps required anchors (system/developer policy and active tool declarations).
+  - Trims conversational content by selecting a contiguous retained window under the target token/window budget (favoring continuity around the latest active exchange and preserving required anchors), rather than always dropping strict chronological prefix order.
+  - Aligns truncation to compaction block geometry where possible to avoid immediately invalidating reusable block boundaries.
+  - Records explicit runtime metadata: budget, anchor policy, and rejection reason.
+
+Selection policy:
+
+- default strategy is `window_tail`;
+- strategy execution requires explicit per-context policy opt-in and declared remaining budget constraints.
+
+No in-process model-based or user-authored strategies are in the out-of-box phase until worker hardening is implemented.
+
+#### Phase 10 baseline exit checklist (window_tail only)
+
+Baseline completion requires all checks below to pass before external workers are enabled:
+
+| Domain | Test | Acceptance |
+|---|---|---|
+| Registry bootstrap | `strategy_registry_registers_deterministic_ids` | Built-ins are discoverable, versioned, and cannot collide with external strategy IDs. |
+| Strategy behavior | `window_tail_preserves_required_anchors` | System/dev policy anchors are preserved under all configured budget trims; windowing never drops required role scope. |
+| Determinism | `strategy_output_is_idempotent_for_same_context` | Re-running a strategy on the same committed source context and config yields an identical candidate successor lineage. |
+| Publication safety | `compaction_success_successor_commit` | Successful strategies publish successor context through the normal tokenize/evaluate/validate/commit path, including usage and scheduling correlation metadata. |
+| Publication safety | `compaction_failure_rolls_back_source_context` | Failed strategy execution, validation failure, cancellation, or race conditions cannot mutate the source context or active binding. |
+| Concurrency | `compaction_cancel_disconnect_race` | Cancel/disconnect/race preempts speculative compaction and demotes stale successors without leaking reservations or orphaning derived state. |
+| Semantic quality | `semantic_regression_pronoun_continuity` | Pronoun reference and role continuity remain valid after compaction in deterministic follow-up prompts. |
+| Semantic quality | `semantic_regression_instruction_retention` | System/user policy/instruction constraints are preserved and dominant over trimmed history. |
+| Semantic quality | `semantic_regression_tool_call_consistency` | Tool-call state is coherent and does not create malformed or context-inconsistent calls in the next-turn request path. |
+| Semantic quality | `semantic_regression_followup_fidelity` | Follow-up prompts against compacted successors maintain expected structured behavior against a control fixture set. |
+| Integration | `openai_responses_stream_correlates_ids` | End-to-end stream metadata preserves distinct transport request/correlation IDs and inferred inference-operation / execution-session IDs. |
+
+Opt-in external workers (Python/Rust) remain disabled until all Phase 10 baseline checks above pass and platform isolation work is implemented under Open Question 7.
+
+
+#### Phase 10 test matrix (window_tail baseline)
+
+For each baseline check above, define a nameable fixture-backed test so implementation can be scheduled and gated independently:
+
+| Test name | Suggested command | Primary fixture set |
+|---|---|---|
+| `strategy_registry_registers_deterministic_ids` | `cargo test -p cusco-server strategy_registry_registers_deterministic_ids -- --nocapture` | `phase10/fixtures/strategy/registry/` |
+| `window_tail_preserves_required_anchors` | `cargo test -p cusco-server window_tail_preserves_required_anchors -- --nocapture` | `phase10/fixtures/strategy/window_tail/anchors.yaml` |
+| `strategy_output_is_idempotent_for_same_context` | `cargo test -p cusco-server strategy_output_is_idempotent_for_same_context -- --nocapture` | `phase10/fixtures/strategy/idempotence/*.yaml` |
+| `compaction_success_successor_commit` | `cargo test -p cusco-server compaction_success_successor_commit -- --nocapture` | `phase10/fixtures/integration/compaction_success_matrix.yaml` |
+| `compaction_failure_rolls_back_source_context` | `cargo test -p cusco-server compaction_failure_rolls_back_source_context -- --nocapture` | `phase10/fixtures/integration/compaction_rollback_cases.yaml` |
+| `compaction_cancel_disconnect_race` | `cargo test -p cusco-server compaction_cancel_disconnect_race -- --nocapture` | `phase10/fixtures/races/cancel_disconnect_race.yaml` |
+| `semantic_regression_pronoun_continuity` | `cargo test -p cusco-server semantic_regression_pronoun_continuity -- --nocapture` | `phase10/fixtures/semantic/pronoun_continuity.jsonl` |
+| `semantic_regression_instruction_retention` | `cargo test -p cusco-server semantic_regression_instruction_retention -- --nocapture` | `phase10/fixtures/semantic/instruction_retention.yaml` |
+| `semantic_regression_tool_call_consistency` | `cargo test -p cusco-server semantic_regression_tool_call_consistency -- --nocapture` | `phase10/fixtures/semantic/tool_call_consistency.yaml` |
+| `semantic_regression_followup_fidelity` | `cargo test -p cusco-server semantic_regression_followup_fidelity -- --nocapture` | `phase10/fixtures/semantic/followup_fidelity.jsonl` |
+| `openai_responses_stream_correlates_ids` | `cargo test -p cusco-server openai_responses_stream_correlates_ids -- --nocapture` | `phase10/fixtures/integration/stream_correlation.yaml` |
+
+Execution rule: no `phase10` baseline artifact is complete until all listed command filters execute green for the target branch.
+
+---
 
 ## Post-completion roadmap
+
+
+
+
 
 After Phases 1 through 10 satisfy their exit gates, prioritize additional work from measured deployment demand:
 
@@ -1797,9 +1861,9 @@ After Phases 1 through 10 satisfy their exit gates, prioritize additional work f
 - speculative decoding, draft-model lifecycle, model adapters, and transactional adapter reloads;
 - additional model architectures selected from demonstrated demand rather than compatibility speculation;
 - remote image retrieval with explicit SSRF controls, audio and video inputs, realtime media, and other multimodal surfaces;
-- broader hosted-service compatibility, additional model sources, grammars, reranking, and multi-model routing.
-- locality-aware queue planning after the FIFO and fairness baselines are proven: within a bounded planning window, estimate model-residency, mapped-context, reusable-prefix, uncached-prefill, and transition costs, then reorder only where priority, deadlines, tenant isolation, age, and starvation bounds permit. The planner may adapt its estimates from observed phase timings for each bounded model/executor/device compatibility class, including model load or switch cost and prefill cost by uncached token and context geometry, but must expose uncertainty, use a deterministic fallback when evidence is sparse or stale, and invalidate learned data across relevant model, executor, configuration, or hardware changes. Planning must not mutate context state or reserve physical resources, and transactional admission must revalidate every estimate.
-- concurrent prefix coalescing only after multi-request execution is correct and measurable: detect requests whose dependency-valid immutable prefixes coincide, share referenced physical blocks without coupling their samplers or successor branches, and evaluate identical missing prefill at most once when cancellation, deadlines, copy-on-write publication, native fences, and tenant isolation can all remain independent. Treat this as a measured optimization rather than a prerequisite for execution concurrency.
+- additional deterministic compaction strategy families: `role_preserving_window`, `block_aligned_keep_tail_overlap`, and deterministic role-aware variants with stronger retention heuristics;
+- external worker execution strategies (Python/Rust workers via the sandbox protocol) with explicit operator allowlists;
+- richer compaction quality suites for multi-domain semantic stability before enabling any non-default strategy families.
 
 These additions must continue to use the protocol-neutral services, transactional state transitions, and canonical usage/event records established by the completed phases.
 
@@ -1995,7 +2059,10 @@ The executor-proof, logical-store, mapped-execution, and Phase 6 design question
 3. **Reconstruction policy (Phase 7):** which evaluated-state components are cheap enough to reconstruct that retaining their physical representations is not worthwhile?
 4. **Multi-GPU representation (post-Phase 9):** how should tensor placement be represented in a physical block descriptor?
 5. **Cross-upgrade persistence (resolved for v1):** v1 discards context-related and native execution state on restart or upgrade. A durable native checkpoint format may be reconsidered only for a later version with an explicit compatibility contract.
-6. **Semantic compaction (Phase 10):** which built-in strategies and semantic-quality suites are sufficient before enabling external workers?
+6. **Semantic compaction (Phase 10):** resolved for baseline as **`window_tail` only**.
+   - Window-tail is conservative and deterministic: contiguous retention under budget with anchor preservation.
+   - Non-baseline strategies (`role_preserving_window`, `block_aligned_keep_tail_overlap`, model-assisted variants) remain future work in the roadmap.
+   - External workers remain opt-in only after worker hardening (Open Question 7) and post-v1 quality gates are implemented.
 7. **Worker hardening (Phase 10):** which isolation mechanisms are required on each supported deployment platform, especially for user-authored Python and Rust strategies?
 8. **Output-blocked displacement (Phases 7 and 8):** once multiple slots or runnable requests exist, how long may a blocked request retain mapped state and what disconnect and displacement policy preserves fairness without unsafe reclamation?
 9. **Partial-tail retention (post-Phase 6 measurement):** is durable retention of incomplete generated tails worth its storage and recovery complexity after complete-block publication has been measured?
@@ -2003,16 +2070,13 @@ The executor-proof, logical-store, mapped-execution, and Phase 6 design question
 
 ## Recommendation
 
-Phase 6 live execution integration is complete through its three milestones:
-persistent mapped execution, the incremental generation frontier, and bounded
-lifecycle integration with the combined acceptance workflow.
-
-The original recommendation to begin with a minimal Rust-controlled executor proof is now historical rationale. That proof succeeded, as did the logical-store, physical-manager, minimal-server, and mapped-execution gates in Phases 2 through 5. Their result is the implemented foundation, not a remaining prerequisite.
+For v1 and the immediate Phase 10 exit path, compaction is limited to `window_tail` only.
+The baseline remains deterministic, contiguous, anchor-aware retention with no model-owned or user-defined strategy surface by default.
+Future compaction options (`role_preserving_window`, `block_aligned_keep_tail_overlap`, external workers) stay in the post-v1/post-completion roadmap with explicit hardening and evidence gates.
 
 The next decisive gate is Phase 7: generalize the proven single-model,
 single-slot ownership contract into transactional residency and lifecycle
-scheduling without weakening Phase 6's bounded admission or exact-state
-guarantees.
+scheduling without weakening earlier bounded admission or exact-state guarantees.
 
 Phase 7 can now generalize resource ownership and residency from the completed
 live coordinator, generation frontier, and native execution boundary before
