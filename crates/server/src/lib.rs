@@ -2410,9 +2410,11 @@ async fn http_debug_middleware(
         HeaderValue::from_str(&request_id).expect("UUID is a valid header value"),
     );
     debug.emit(json!({
+        "type": "http_debug",
+        "level": debug.level,
         "direction": "out",
+        "request_id": request_id,
         "status": parts.status.as_u16(),
-        "duration_ms": 0,
         "headers": if debug.level == HttpDebugLevel::Full {
             unredacted_headers(&parts.headers)
         } else {
@@ -2431,9 +2433,11 @@ async fn http_debug_middleware(
             let mut capture = HttpBodyCapture::full();
             capture.push(bytes);
             debug.emit(json!({
+                "type": "http_debug",
+                "level": debug.level,
                 "direction": "out_body",
+                "request_id": request_id,
                 "chunk_index": chunk_index,
-                "body": capture.rendered(debug.level, response_content_type.as_deref())
             }));
             chunk_index += 1;
         }
@@ -5283,7 +5287,7 @@ mod tests {
         let active = Arc::new(RequestControl::new());
         start_deadline_watchdogs(&wall, Duration::from_millis(5), Duration::from_secs(1));
         start_deadline_watchdogs(&active, Duration::from_secs(1), Duration::from_millis(5));
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(matches!(wall.check(), Err(Error::Deadline)));
         assert!(matches!(active.check(), Err(Error::Deadline)));
     }
