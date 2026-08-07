@@ -17,7 +17,7 @@ services:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-0}"
       LD_LIBRARY_PATH: /opt/llama-build/bin
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "-H", "Authorization: Bearer ${CUSCO_BEARER_TOKEN}", "http://127.0.0.1:8080/openai/v1/models"]
+      test: ["CMD-SHELL", "curl --fail --silent --show-error -H \"Authorization: Bearer $$CUSCO_BEARER_TOKEN\" \"http://127.0.0.1:8080/openai/v1/models\""]
       interval: 30s
       timeout: 5s
       retries: 3
