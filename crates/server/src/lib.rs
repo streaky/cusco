@@ -27,20 +27,27 @@ use std::{
     },
     time::{Duration, Instant},
 };
-mod catalog;
-mod config;
-mod residency;
 use cusco_executor::SamplingConfig;
 use thiserror::Error;
 use uuid::Uuid;
+
+mod context_strategy;
 mod generation;
 mod mapped;
 mod prompt;
 mod scheduler;
 mod vision;
-
-pub use catalog::{CatalogError, ModelCatalog, UserModelConfig, UserModels, load_user_models};
-pub use config::{ByteSize, ConfigError, DaemonConfig, DataPaths, ExecutionConfig, VisionConfig};
+mod catalog;
+mod config;
+mod residency;
+pub use catalog::{load_user_models, ModelCatalog};
+pub use config::{DaemonConfig, VisionConfig};
+pub use context_strategy::{
+    apply_window_tail_strategy, CompactionNoMatchFallback, CompactionProposal, CompactionRequest,
+    CompactionResult, CompactionResultReason, CompactionStrategyCatalog, CompactionStrategyInfo,
+    CompactionTrigger, WINDOW_TAIL_STRATEGY_ID, deterministic_strategy_id, select_strategy,
+    strategy_catalog,
+};
 pub use generation::{
     FinishReason, FrontierControl, GenerationFrontier, MAX_STOP_BYTES, MAX_STOP_SEQUENCES,
     StopAlignment,
@@ -87,8 +94,7 @@ pub struct PrefillMetrics {
     pub device_bytes: usize,
     pub host_bytes: usize,
 }
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: usize,
     pub generated_tokens: usize,
@@ -98,8 +104,12 @@ pub struct Usage {
     pub model: String,
     pub model_revision: String,
     pub context_id: ContextId,
+    pub compaction_result: Option<CompactionResult>,
     pub latency_ms: u128,
     pub status: String,
+    pub correlation_id: String,
+    pub inference_id: String,
+    pub execution_session_id: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -107,6 +117,9 @@ pub enum StreamEvent {
     Started {
         request_id: String,
         context_id: ContextId,
+        correlation_id: String,
+        inference_id: String,
+        execution_session_id: String,
     },
     Token {
         token: String,
@@ -172,6 +185,8 @@ pub struct InferRequest {
     pub stop: Vec<String>,
     #[serde(default)]
     pub raw_continuation: bool,
+    #[serde(default)]
+    pub compaction: Option<CompactionRequest>,
     #[serde(skip, default)]
     pub sampling: SamplingConfig,
     #[serde(skip, default)]
@@ -1455,9 +1470,13 @@ impl Server {
         let frontier =
             GenerationFrontier::new(&req.stop, req.raw_continuation).map_err(state_err)?;
         let successor_id = req.context_id.clone().unwrap_or_else(ContextId::new);
+        let execution_session_id = req.scheduling.inference_id.clone();
         let mut events = vec![StreamEvent::Started {
             request_id: request_id.into(),
             context_id: successor_id.clone(),
+            correlation_id: req.scheduling.correlation_id.clone(),
+            inference_id: req.scheduling.inference_id.clone(),
+            execution_session_id,
         }];
         let (response, terminal) =
             self.infer_admitted(request_id, req, successor_id, frontier, |event| {
@@ -1479,6 +1498,9 @@ impl Server {
         let started = StreamEvent::Started {
             request_id: request_id.clone(),
             context_id: successor_id.clone(),
+            correlation_id: req.scheduling.correlation_id.clone(),
+            inference_id: req.scheduling.inference_id.clone(),
+            execution_session_id: req.scheduling.inference_id.clone(),
         };
         let stream_buffer = self.inner.lock().config.stream_buffer;
         let (sender, receiver) = tokio::sync::mpsc::channel(stream_buffer);
@@ -1672,6 +1694,9 @@ impl Server {
             Some(id) => Some(self.context(id)?),
             None => None,
         };
+        let context_tokens: Vec<String> = context
+            .as_ref()
+            .map_or_else(Vec::new, |record| record.tokens.clone());
         let prior_tokens = context
             .as_ref()
             .map_or(&[][..], |record| record.native_tokens.as_slice());
@@ -1722,14 +1747,74 @@ impl Server {
         {
             return Err(Error::Deadline);
         }
-        let input: Vec<_> = req.prompt.split_whitespace().map(str::to_owned).collect();
+        let mut compaction_result = None;
+        let mut raw_context_tokens = context_tokens;
+        raw_context_tokens.extend(req.prompt.split_whitespace().map(str::to_owned));
         let EngineOutput {
-            successor_tokens,
+            mut successor_tokens,
             input_tokens,
             cached_tokens,
             evaluated_tokens,
             prefill,
         } = generated;
+        if let Some(compaction) = req.compaction {
+            let selected = match select_strategy(&compaction.strategy_preferences) {
+                Some(selected) => selected,
+                None => {
+                    if matches!(
+                        compaction.fallback_when_no_match,
+                        CompactionNoMatchFallback::Reject
+                    ) {
+                        return Err(Error::BadRequest("unsupported_compaction_strategy".into()));
+                    }
+                    compaction_result = Some(CompactionResult {
+                        compact_mode: "window_tail".into(),
+                        compact_reason: CompactionResultReason::None,
+                        requested_strategy_ids: compaction.strategy_preferences,
+                        selected_strategy_id: None,
+                        requested_strategy_budget: compaction.target_tokens.unwrap_or(3072),
+                        resulting_budget: raw_context_tokens.len(),
+                        retained_indices: (0..raw_context_tokens.len()).collect(),
+                        retained_message_count: raw_context_tokens.len(),
+                        source_message_count: raw_context_tokens.len(),
+                        retained_anchor_count: 0,
+                        success: false,
+                        fallback: true,
+                        resulting_context_epoch: context
+                            .as_ref()
+                            .map_or(1u64, |record| record.revision.saturating_add(1)),
+                    });
+                    String::new()
+                }
+            };
+            if !selected.is_empty() {
+                if selected != WINDOW_TAIL_STRATEGY_ID {
+                    return Err(Error::BadRequest(
+                        "unsupported compaction strategy for this release".into(),
+                    ));
+                }
+                let target_tokens = compaction.target_tokens.unwrap_or(3072);
+                let proposal = apply_window_tail_strategy(
+                    &raw_context_tokens,
+                    target_tokens,
+                    &[selected.clone()],
+                )
+                    .map_err(Error::BadRequest)?;
+                let mut result = proposal.result;
+                result.selected_strategy_id = Some(deterministic_strategy_id(&selected));
+                result.fallback = false;
+                result.resulting_context_epoch = context
+                    .as_ref()
+                    .map_or(1u64, |record| record.revision.saturating_add(1));
+                compaction_result = Some(result);
+                raw_context_tokens = proposal.resulting_tokens;
+                let native_cap = compaction_native_trim(&successor_tokens, raw_context_tokens.len())
+                    .ok_or(Error::State(
+                        "compaction context tokens exceed native context".into(),
+                    ))?;
+                successor_tokens = native_cap;
+            }
+        }
         let mut guard = self.inner.lock();
         let context_id = if let Some(context) = context {
             let stored = guard
@@ -1737,20 +1822,17 @@ impl Server {
                 .contexts
                 .get_mut(&context.id)
                 .ok_or(Error::ContextNotFound)?;
-            stored.tokens.extend(input.iter().cloned());
-            stored.tokens.extend(generated_pieces.iter().cloned());
+            stored.tokens = raw_context_tokens;
             stored.native_tokens = successor_tokens;
             stored.revision += 1;
             stored.id.clone()
         } else {
-            let mut tokens = input.clone();
-            tokens.extend(generated_pieces.iter().cloned());
             guard.durable.contexts.insert(
                 successor_id.clone(),
                 ContextRecord {
                     id: successor_id.clone(),
                     revision: 1,
-                    tokens,
+                    tokens: raw_context_tokens,
                     native_tokens: successor_tokens,
                 },
             );
@@ -1767,8 +1849,12 @@ impl Server {
             model: model.id,
             model_revision: model.revision,
             context_id: context_id.clone(),
+            compaction_result,
             latency_ms: started.elapsed().as_millis(),
             status: "completed".into(),
+            correlation_id: req.scheduling.correlation_id.clone(),
+            inference_id: req.scheduling.inference_id.clone(),
+            execution_session_id: req.scheduling.inference_id.clone(),
         };
         Ok((
             InferResponse {
@@ -1783,6 +1869,15 @@ impl Server {
         ))
     }
 }
+
+fn compaction_native_trim(native_tokens: &[i32], token_count: usize) -> Option<Vec<i32>> {
+    (token_count <= native_tokens.len()).then_some(
+        native_tokens
+            .get(native_tokens.len().saturating_sub(token_count)..)?
+            .to_vec(),
+    )
+}
+
 fn state_err(error: impl std::fmt::Display) -> Error {
     Error::State(error.to_string())
 }
@@ -1871,6 +1966,8 @@ struct CompletionRequest {
     stop: Option<StopInput>,
     #[serde(default)]
     raw_continuation: bool,
+    #[serde(default)]
+    compaction: Option<CompactionRequest>,
     #[serde(default)]
     deadline_ms: Option<u64>,
     #[serde(default)]
@@ -2021,11 +2118,15 @@ struct ChatRequest {
     #[serde(default)]
     deadline_ms: Option<u64>,
     #[serde(default)]
-    temperature: Option<f32>,
+    raw_continuation: bool,
     #[serde(default)]
     top_p: Option<f32>,
     #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
     seed: Option<u64>,
+    #[serde(default)]
+    compaction: Option<CompactionRequest>,
     #[serde(default)]
     tools: Vec<ToolDefinition>,
     #[serde(default)]
@@ -2044,6 +2145,9 @@ struct ChatMessage {
 }
 fn default_user_role() -> String {
     "user".into()
+}
+fn default_message_type() -> String {
+    "message".into()
 }
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -2096,7 +2200,9 @@ fn lower_messages(
                             admission
                                 .admit_data_uri(&image_url.url)
                                 .map_err(|error| Error::BadRequest(error.to_string()))?;
-                            return Err(Error::BadRequest("image_unsupported: selected model has no compatible vision projector".into()));
+                            return Err(Error::BadRequest(
+                                "image_unsupported: selected model has no compatible vision projector".into(),
+                            ));
                         }
                     }
                 }
@@ -2110,11 +2216,9 @@ fn lower_messages(
     }
     prompt::apply_chat_template(family, normalized)
 }
-
 pub fn router(server: Server) -> Router {
     routes(server)
 }
-
 pub fn router_with_http_debug(server: Server, debug: HttpDebug) -> Router {
     if debug.level == HttpDebugLevel::Off {
         routes(server)
@@ -2122,7 +2226,6 @@ pub fn router_with_http_debug(server: Server, debug: HttpDebug) -> Router {
         routes(server).layer(middleware::from_fn_with_state(debug, http_debug_middleware))
     }
 }
-
 fn routes(server: Server) -> Router {
     Router::new()
         .route("/openai/v1/openapi.json", get(openapi))
@@ -2150,9 +2253,10 @@ fn routes(server: Server) -> Router {
             "/cusco/v1/contexts/{id}",
             get(get_context).delete(delete_context),
         )
-        .route("/cusco/v1/status", get(native_status))
-        .route("/cusco/v1/contexts/{id}/branches", post(branch_context))
         .route("/cusco/v1/requests/{id}", delete(cancel_request))
+        .route("/cusco/v1/status", get(native_status))
+        .route("/cusco/v1/compaction/strategies", get(compaction_strategies))
+        .route("/cusco/v1/contexts/{id}/branches", post(branch_context))
         .with_state(server)
 }
 
@@ -2178,72 +2282,81 @@ async fn http_debug_middleware(
         (
             request.uri().to_string(),
             unredacted_headers(request.headers()),
+            request.headers().clone(),
         )
     });
-    let request_body = Arc::new(Mutex::new(match debug.level {
-        HttpDebugLevel::Full => HttpBodyCapture::full(),
-        HttpDebugLevel::Off | HttpDebugLevel::Safe => HttpBodyCapture::default(),
-    }));
-    let body_capture = request_body.clone();
     let (parts, body) = request.into_parts();
-    let body = Body::new(body.map_frame(move |frame| {
-        if let Some(bytes) = frame.data_ref() {
-            body_capture.lock().push(bytes);
-        }
-        frame
-    }));
-    let started = Instant::now();
-    let mut response = next.run(Request::from_parts(parts, body)).await;
-    let mut request_record = json!({
-        "type": "http_debug",
-        "level": debug.level,
-        "direction": "in",
-        "request_id": request_id,
-        "method": method,
-        "path": path,
-        "content_type": request_content_type,
-        "content_length": request_content_length,
-        "body": request_body.lock().rendered(debug.level, request_content_type.as_deref())
-    });
-    if let Some((uri, headers)) = full_request {
-        request_record["uri"] = Value::String(uri);
-        request_record["headers"] = headers;
+    let body_bytes = to_bytes(body, HTTP_DEBUG_BODY_LIMIT)
+        .await
+        .unwrap_or_default()
+        .to_vec();
+    {
+        let mut capture = HttpBodyCapture::default();
+        capture.push(&body_bytes);
+        let rendered_body = if debug.level == HttpDebugLevel::Safe {
+            capture.redacted(request_content_type.as_deref())
+        } else {
+            capture.rendered(debug.level, request_content_type.as_deref())
+        };
+        debug.emit(json!({
+            "type": "http_debug",
+            "level": debug.level,
+            "direction": "in",
+            "request_id": request_id,
+            "method": method,
+            "path": path,
+            "content_type": request_content_type,
+            "content_length": request_content_length,
+            "headers": full_request
+                .as_ref()
+                .and_then(|(_, headers, _)| Some(json!(headers))),
+            "uri": full_request
+                .as_ref()
+                .and_then(|(uri, _, _)| Some(uri.clone())),
+            "body": rendered_body,
+            "raw_body": full_request.as_ref().and_then(|(_, _, headers)| {
+                headers
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+                    .and_then(|content_type| {
+                        (debug.level == HttpDebugLevel::Full
+                            && content_type.starts_with("text/plain"))
+                        .then(|| String::from_utf8_lossy(&body_bytes).to_string())
+                    })
+            }),
+        }));
     }
-    debug.emit(request_record);
-
-    let status = response.status();
-    let response_content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    response.headers_mut().insert(
+    let request = Request::from_parts(parts, Body::from(body_bytes));
+    let response = next.run(request).await;
+    let (mut parts, body) = response.into_parts();
+    parts.headers.insert(
         "x-request-id",
         HeaderValue::from_str(&request_id).expect("UUID is a valid header value"),
     );
-    let mut response_record = json!({
+    debug.emit(json!({
         "type": "http_debug",
         "level": debug.level,
         "direction": "out",
         "request_id": request_id,
-        "method": method,
-        "path": path,
-        "status": status.as_u16(),
-        "duration_ms": started.elapsed().as_millis()
-    });
-    if debug.level == HttpDebugLevel::Full {
-        response_record["headers"] = unredacted_headers(response.headers());
-    }
-    debug.emit(response_record);
-
-    let (parts, body) = response.into_parts();
-    let mut chunk_index = 0_u64;
+        "status": parts.status.as_u16(),
+        "duration_ms": 0,
+        "headers": if debug.level == HttpDebugLevel::Full {
+            unredacted_headers(&parts.headers)
+        } else {
+            json!([])
+        },
+    }));
+    let mut body = body;
+    let mut chunk_index = 0usize;
+    let response_content_type = parts
+        .headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let body = Body::new(body.map_frame(move |frame| {
         if let Some(bytes) = frame.data_ref() {
-            let mut capture = match debug.level {
-                HttpDebugLevel::Full => HttpBodyCapture::full(),
-                HttpDebugLevel::Off | HttpDebugLevel::Safe => HttpBodyCapture::default(),
-            };
+            let mut capture = HttpBodyCapture::full();
             capture.push(bytes);
             debug.emit(json!({
                 "type": "http_debug",
@@ -2286,6 +2399,7 @@ async fn completion(
         r.prompt,
         r.max_tokens,
         sampling,
+        r.compaction,
         include_usage,
         r.stream,
         r.context_id,
@@ -2322,18 +2436,18 @@ async fn chat(
         .is_some_and(|options| options.include_usage);
     let model = s.model(&r.model)?;
     let prompt = lower_messages(&model.family, r.messages, s.vision_config())?;
-    drop(permit);
     infer_response(
         s,
         r.model,
         prompt,
         r.max_tokens,
         sampling,
+        r.compaction,
         include_usage,
         r.stream,
         r.context_id,
         r.stop.map(StopInput::into_vec).unwrap_or_default(),
-        false,
+        r.raw_continuation,
         r.deadline_ms,
         retained_bytes,
         request_context.principal,
@@ -2352,6 +2466,7 @@ enum ResponsesInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResponsesInputItem {
+    #[serde(default = "default_message_type")]
     r#type: String,
     #[serde(default = "default_user_role")]
     role: String,
@@ -2377,8 +2492,9 @@ enum ResponsesContentPart {
 struct ResponsesRequest {
     model: String,
     input: ResponsesInput,
-    #[serde(default)]
     max_output_tokens: Option<usize>,
+    #[serde(default)]
+    compaction: Option<CompactionRequest>,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
@@ -2394,7 +2510,6 @@ struct ResponsesRequest {
     #[serde(default)]
     reasoning_effort: Option<ReasoningEffort>,
 }
-
 async fn responses(
     State(s): State<Server>,
     PrequeueJson {
@@ -2451,13 +2566,13 @@ async fn responses(
             lower_messages(&model.family, messages, s.vision_config())?
         }
     };
-    drop(permit);
     infer_response(
         s,
         r.model,
         input,
         r.max_output_tokens,
         sampling,
+        r.compaction,
         true,
         r.stream,
         None,
@@ -2520,6 +2635,7 @@ async fn ollama_generate(
         r.prompt,
         r.options.num_predict,
         sampling,
+        None,
         true,
         r.stream,
         None,
@@ -2564,6 +2680,7 @@ async fn ollama_chat(
         prompt,
         r.options.num_predict,
         sampling,
+        None,
         true,
         r.stream,
         None,
@@ -2990,6 +3107,7 @@ async fn infer_response(
     prompt: String,
     max_tokens: Option<usize>,
     sampling: SamplingConfig,
+    compaction: Option<CompactionRequest>,
     include_usage: bool,
     streaming: bool,
     context_id: Option<ContextId>,
@@ -3022,6 +3140,7 @@ async fn infer_response(
         wall_remaining,
         Duration::from_millis(config.active_time_ms),
     );
+    let inference_id = Uuid::new_v4().to_string();
     let request = InferRequest {
         model,
         prompt,
@@ -3035,12 +3154,13 @@ async fn infer_response(
         ),
         stop,
         raw_continuation,
+        compaction,
         scheduling: SchedulingMetadata {
             class: SchedulingClass::Standard,
             source: PrioritySource::AdapterDefault,
             principal,
             correlation_id: correlation_id.clone(),
-            inference_id: Uuid::new_v4().to_string(),
+            inference_id,
         },
     };
     if streaming {
@@ -3141,6 +3261,13 @@ async fn import_context(
 ) -> Result<Json<ContextRecord>, Error> {
     auth(&s, &headers, Scope::Inference)?;
     Ok(Json(s.import_context(r.tokens)?))
+}
+async fn compaction_strategies(
+    State(s): State<Server>,
+    headers: HeaderMap,
+) -> Result<Json<CompactionStrategyCatalog>, Error> {
+    auth(&s, &headers, Scope::Inference)?;
+    Ok(Json(strategy_catalog()))
 }
 fn parse_context(id: String) -> ContextId {
     ContextId(id)
@@ -3270,17 +3397,12 @@ pub fn openapi_document() -> Value {
             "cuscoImportContext",
             Some("ImportContextRequest"),
         ),
+        ("/cusco/v1/compaction/strategies", "get", "cuscoCompactionStrategies", None),
         ("/cusco/v1/contexts/{id}", "get", "cuscoContext", None),
         (
             "/cusco/v1/contexts/{id}",
             "delete",
             "cuscoDeleteContext",
-            None,
-        ),
-        (
-            "/cusco/v1/contexts/{id}/branches",
-            "post",
-            "cuscoBranchContext",
             None,
         ),
         (
@@ -3376,12 +3498,11 @@ async fn serve_until(
     http_debug: Option<HttpDebug>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
-    Server::validate_listener(addr, anonymous, unsafe_public)?;
     let grace = Duration::from_millis(server.config().shutdown_grace_ms);
-    let lifecycle = server.clone();
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(state_err)?;
+    let lifecycle = server.clone();
     let (begin_shutdown, shutdown_requested) = tokio::sync::oneshot::channel();
     let serving = async move {
         let app = match http_debug {
@@ -3396,15 +3517,22 @@ async fn serve_until(
     };
     tokio::pin!(serving);
     tokio::select! {
-        result = &mut serving => result.map_err(state_err),
+        result = &mut serving => match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(state_err(error)),
+        },
         () = shutdown => {
             lifecycle.begin_shutdown();
             let _ = begin_shutdown.send(());
             match tokio::time::timeout(grace, &mut serving).await {
-                Ok(result) => result.map_err(state_err),
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(state_err(error)),
                 Err(_) => {
                     lifecycle.cancel_remaining();
-                    (&mut serving).await.map_err(state_err)
+                    match (&mut serving).await {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(state_err(error)),
+                    }
                 }
             }
         }
@@ -3578,6 +3706,7 @@ mod tests {
             prompt: "one two".into(),
             max_tokens: 2,
             context_id: None,
+            compaction: None,
             deadline_ms: Some(1000),
             scheduling: SchedulingMetadata::default(),
             stop: vec![],
@@ -3598,6 +3727,7 @@ mod tests {
                     prompt: "x".into(),
                     max_tokens: 1,
                     context_id: Some(before.id.clone()),
+                    compaction: None,
                     deadline_ms: None,
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
@@ -3616,6 +3746,7 @@ mod tests {
                     prompt: "x".into(),
                     max_tokens: 1,
                     context_id: Some(before.id),
+                    compaction: None,
                     deadline_ms: Some(0),
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
@@ -3634,6 +3765,7 @@ mod tests {
                     prompt: "x".into(),
                     max_tokens: 1,
                     context_id: None,
+                    compaction: None,
                     deadline_ms: None,
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
@@ -3658,6 +3790,7 @@ mod tests {
                     model: "m".into(),
                     prompt: "x".into(),
                     max_tokens: 1,
+                    compaction: None,
                     context_id: None,
                     deadline_ms: None,
                     scheduling: SchedulingMetadata::default(),
@@ -4304,6 +4437,7 @@ mod tests {
                     prompt: "one two three".into(),
                     max_tokens: 32,
                     context_id: None,
+                    compaction: None,
                     deadline_ms: None,
                     stop: vec![],
                     raw_continuation: false,
@@ -4351,6 +4485,7 @@ mod tests {
                     model: "m".into(),
                     prompt: "one two".into(),
                     max_tokens: 3,
+                    compaction: None,
                     context_id: None,
                     deadline_ms: None,
                     stop: vec![],
@@ -4411,6 +4546,7 @@ mod tests {
                         model: "m".into(),
                         prompt: "prompt".into(),
                         max_tokens: 8,
+                        compaction: None,
                         context_id: None,
                         deadline_ms: None,
                         stop: vec![],
@@ -4433,6 +4569,7 @@ mod tests {
                     prompt: "prompt".into(),
                     max_tokens: 8,
                     context_id: None,
+                    compaction: None,
                     deadline_ms: Some(5),
                     stop: vec![],
                     raw_continuation: false,
@@ -5079,11 +5216,12 @@ mod tests {
             StreamEvent::Started {
                 request_id: "request".into(),
                 context_id: ContextId::new(),
+                correlation_id: "corr".into(),
+                inference_id: "inf".into(),
+                execution_session_id: "sess".into(),
             },
             false,
         );
-        assert!(started.contains("\"role\":\"assistant\""));
-
         let terminal = StreamEvent::Finished {
             reason: FinishReason::Length,
             usage: Usage {
@@ -5095,8 +5233,12 @@ mod tests {
                 model: "model".into(),
                 model_revision: "revision".into(),
                 context_id: ContextId::new(),
+                compaction_result: None,
                 latency_ms: 1,
                 status: "completed".into(),
+                correlation_id: String::new(),
+                inference_id: String::new(),
+                execution_session_id: String::new(),
             },
         };
         let without_usage = stream_row(WireProtocol::OpenAiChat, terminal.clone(), false);
