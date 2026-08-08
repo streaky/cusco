@@ -244,26 +244,37 @@ impl FairPolicy {
         i64::from(weight.saturating_mul(self.config.deficit_refill))
     }
 
-    fn select(&mut self) -> Option<Selection> {
+    fn select<F>(&mut self, mut available: F) -> Option<Selection>
+    where
+        F: FnMut(u64) -> bool,
+    {
         if self.runnable.is_empty() {
             return None;
         }
-        self.round = self.round.saturating_add(1);
         let mut heads = Vec::<(usize, FlowKey, SchedulingClass, u8, i64)>::new();
         for (index, entry) in self.runnable.iter().enumerate() {
             if heads.iter().any(|(_, flow, _, _, _)| flow == &entry.flow) {
                 continue;
             }
+            if !available(entry.id) {
+                continue;
+            }
             let (class, promotions) = self.effective_class(entry);
             let credit = self.weight(class);
-            *self.deficits.entry(entry.flow.clone()).or_default() = self
+            heads.push((index, entry.flow.clone(), class, promotions, credit));
+        }
+        if heads.is_empty() {
+            return None;
+        }
+        self.round = self.round.saturating_add(1);
+        for (_, flow, _, _, credit) in &heads {
+            *self.deficits.entry(flow.clone()).or_default() = self
                 .deficits
-                .get(&entry.flow)
+                .get(flow)
                 .copied()
                 .unwrap_or_default()
-                .saturating_add(credit)
+                .saturating_add(*credit)
                 .min(credit.saturating_mul(8));
-            heads.push((index, entry.flow.clone(), class, promotions, credit));
         }
         let total_weight = heads
             .iter()
@@ -326,6 +337,12 @@ enum ClientMessage {
     Failed(Error),
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ModelSlotKey {
+    model_id: String,
+    model_epoch: u64,
+}
+
 enum Command {
     Submit {
         id: u64,
@@ -338,6 +355,36 @@ enum Command {
     Shutdown,
 }
 
+enum SchedulerEvent {
+    Client(Command),
+    SlotCompleted(SlotCompletion),
+}
+
+enum SlotAction {
+    Start(EngineRequest),
+    Step(Box<dyn ExecutionSession>),
+    Finish(Box<dyn ExecutionSession>),
+    Shutdown,
+}
+
+struct SlotTask {
+    id: u64,
+    action: SlotAction,
+    selection: Option<Selection>,
+}
+struct SlotCompletion {
+    id: u64,
+    result: Result<SessionStep, Error>,
+    session: Option<Box<dyn ExecutionSession>>,
+    selection: Option<Selection>,
+    quantum_duration_ns: u128,
+}
+struct SlotWorker {
+    sender: Sender<SlotTask>,
+    handle: thread::JoinHandle<()>,
+    busy: bool,
+}
+
 struct Job {
     request: Option<EngineRequest>,
     session: Option<Box<dyn ExecutionSession>>,
@@ -345,11 +392,12 @@ struct Job {
     response: Sender<ClientMessage>,
     flow: FlowKey,
     scheduling: crate::SchedulingMetadata,
-    model_id: String,
-    model_epoch: u64,
+    slot: ModelSlotKey,
     execution_session_id: String,
     admitted_round: u64,
     admitted_at: Instant,
+    in_flight: bool,
+    cancel_requested: bool,
 }
 
 struct SchedulerCounters {
@@ -380,7 +428,7 @@ impl Default for SchedulerCounters {
 
 pub struct WorkloadScheduler {
     inner: Arc<dyn InferenceEngine>,
-    commands: Sender<Command>,
+    commands: Sender<SchedulerEvent>,
     next_id: AtomicU64,
     policy: SchedulerPolicyConfig,
     counters: Arc<SchedulerCounters>,
@@ -409,16 +457,18 @@ impl WorkloadScheduler {
             None => SchedulerDiagnostics::stderr(policy.diagnostic_capacity),
         };
         let counters = Arc::new(SchedulerCounters::default());
-        let (commands, receiver) = mpsc::channel();
+        let (events, receiver) = mpsc::channel();
         let worker_inner = inner.clone();
         let worker_counters = counters.clone();
         let worker_diagnostics = diagnostics.clone();
+        let worker_events = events.clone();
         let worker = thread::Builder::new()
             .name("cusco-workload-scheduler".into())
             .spawn(move || {
                 run_scheduler(
                     worker_inner,
                     policy,
+                    worker_events,
                     receiver,
                     worker_counters,
                     worker_diagnostics,
@@ -427,7 +477,7 @@ impl WorkloadScheduler {
             .map_err(|error| Error::State(error.to_string()))?;
         Ok(Arc::new(Self {
             inner,
-            commands,
+            commands: events,
             next_id: AtomicU64::new(0),
             policy,
             counters,
@@ -471,7 +521,7 @@ impl WorkloadScheduler {
 
 impl Drop for WorkloadScheduler {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Shutdown);
+        let _ = self.commands.send(SchedulerEvent::Client(Command::Shutdown));
         if let Some(worker) = self.worker.lock().take() {
             let _ = worker.join();
         }
@@ -481,7 +531,7 @@ impl Drop for WorkloadScheduler {
 struct SchedulerClientSession {
     id: u64,
     control: Arc<crate::RequestControl>,
-    commands: Sender<Command>,
+    commands: Sender<SchedulerEvent>,
     receiver: Receiver<ClientMessage>,
     waiting_ack: bool,
     finished: Option<EngineOutput>,
@@ -519,7 +569,7 @@ impl ExecutionSession for SchedulerClientSession {
         }
         if self.waiting_ack {
             self.commands
-                .send(Command::Continue(self.id))
+                .send(SchedulerEvent::Client(Command::Continue(self.id)))
                 .map_err(|_| Error::Cancelled)?;
             self.waiting_ack = false;
         }
@@ -532,12 +582,12 @@ impl ExecutionSession for SchedulerClientSession {
         }
         if self.waiting_ack {
             self.commands
-                .send(Command::Stop(self.id))
+                .send(SchedulerEvent::Client(Command::Stop(self.id)))
                 .map_err(|_| Error::Cancelled)?;
             self.waiting_ack = false;
         } else {
             self.commands
-                .send(Command::Cancel(self.id))
+                .send(SchedulerEvent::Client(Command::Cancel(self.id)))
                 .map_err(|_| Error::Cancelled)?;
         }
         match self.receive()? {
@@ -551,7 +601,9 @@ impl Drop for SchedulerClientSession {
     fn drop(&mut self) {
         if self.finished.is_none() {
             self.control.cancel();
-            let _ = self.commands.send(Command::Cancel(self.id));
+            let _ = self
+                .commands
+                .send(SchedulerEvent::Client(Command::Cancel(self.id)));
         }
     }
 }
@@ -576,11 +628,11 @@ impl InferenceEngine for WorkloadScheduler {
             .map_err(|_| Error::State("scheduler session id space exhausted".into()))?;
         let (response, receiver) = mpsc::channel();
         self.commands
-            .send(Command::Submit {
+            .send(SchedulerEvent::Client(Command::Submit {
                 id,
                 request,
                 response,
-            })
+            }))
             .map_err(|_| Error::ShuttingDown)?;
         Ok(Box::new(SchedulerClientSession {
             id,
@@ -622,64 +674,186 @@ impl InferenceEngine for WorkloadScheduler {
 fn run_scheduler(
     inner: Arc<dyn InferenceEngine>,
     config: SchedulerPolicyConfig,
-    commands: Receiver<Command>,
+    events: Sender<SchedulerEvent>,
+    receiver: Receiver<SchedulerEvent>,
     counters: Arc<SchedulerCounters>,
     diagnostics: Arc<SchedulerDiagnostics>,
 ) {
     let mut policy = FairPolicy::new(config);
     let mut jobs = HashMap::<u64, Job>::new();
+    let mut slots = HashMap::<ModelSlotKey, SlotWorker>::new();
+    let mut shutting_down = false;
     loop {
-        while let Ok(command) = commands.try_recv() {
-            if matches!(command, Command::Shutdown) {
-                cancel_all_jobs(&mut jobs);
-                return;
-            }
-            handle_command(command, &mut jobs, &mut policy, &counters);
-        }
+        while dispatch_one(&inner, &events, &mut slots, &mut jobs, &mut policy, &counters) {}
         counters
             .runnable
             .store(policy.runnable.len(), Ordering::Release);
-        if let Some(selection) = policy.select() {
-            counters.rounds.store(policy.round, Ordering::Release);
-            execute_quantum(
-                selection,
-                &inner,
+        if shutting_down && slots.values().all(|slot| !slot.busy) {
+            cancel_all_jobs(&mut jobs);
+            shutdown_slots(&mut slots);
+            return;
+        }
+        let Ok(event) = receiver.recv() else {
+            cancel_all_jobs(&mut jobs);
+            shutdown_slots(&mut slots);
+            return;
+        };
+        match event {
+            SchedulerEvent::Client(Command::Shutdown) => {
+                shutting_down = true;
+                policy.runnable.clear();
+                for job in jobs.values_mut() {
+                    job.control.cancel();
+                    job.cancel_requested = true;
+                }
+            }
+            SchedulerEvent::Client(command) if !shutting_down => {
+                handle_command(command, &inner, &events, &mut slots, &mut jobs, &mut policy, &counters)
+            }
+            SchedulerEvent::Client(Command::Submit { response, .. }) => {
+                let _ = response.send(ClientMessage::Failed(Error::ShuttingDown));
+            }
+            SchedulerEvent::Client(_) => {}
+            SchedulerEvent::SlotCompleted(completion) => handle_completion(
+                completion,
+                &mut slots,
                 &mut jobs,
                 &mut policy,
                 &counters,
                 &diagnostics,
-            );
-            continue;
-        }
-        match commands.recv() {
-            Ok(Command::Shutdown) | Err(_) => {
-                cancel_all_jobs(&mut jobs);
-                break;
-            }
-            Ok(command) => handle_command(command, &mut jobs, &mut policy, &counters),
+            ),
         }
     }
 }
 
-fn cancel_all_jobs(jobs: &mut HashMap<u64, Job>) {
-    for (_, job) in jobs.drain() {
-        job.control.cancel();
-        let _ = job.response.send(ClientMessage::Failed(Error::Cancelled));
+fn spawn_slot(
+    key: &ModelSlotKey,
+    inner: Arc<dyn InferenceEngine>,
+    events: Sender<SchedulerEvent>,
+) -> Result<SlotWorker, Error> {
+    let (sender, receiver) = mpsc::channel::<SlotTask>();
+    let name = format!("cusco-model-slot-{}-{}", key.model_id, key.model_epoch);
+    let handle = thread::Builder::new()
+        .name(name)
+        .spawn(move || {
+            while let Ok(task) = receiver.recv() {
+                if matches!(task.action, SlotAction::Shutdown) {
+                    return;
+                }
+                let started = Instant::now();
+                let (result, session) = match task.action {
+                    SlotAction::Start(request) => match inner.start_session(request) {
+                        Ok(session) => (
+                            Ok(SessionStep::Progress(QuantumObservation::model_free(
+                                QuantumKind::Preparation,
+                                1,
+                            ))),
+                            Some(session),
+                        ),
+                        Err(error) => (Err(error), None),
+                    },
+                    SlotAction::Step(mut session) => {
+                        let result = session.step();
+                        (result, Some(session))
+                    }
+                    SlotAction::Finish(mut session) => {
+                        let result = session.finish().map(SessionStep::Finished);
+                        (result, None)
+                    }
+                    SlotAction::Shutdown => unreachable!(),
+                };
+                if events
+                    .send(SchedulerEvent::SlotCompleted(SlotCompletion {
+                        id: task.id,
+                        result,
+                        session,
+                        selection: task.selection,
+                        quantum_duration_ns: started.elapsed().as_nanos(),
+                    }))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .map_err(|error| Error::State(error.to_string()))?;
+    Ok(SlotWorker {
+        sender,
+        handle,
+        busy: false,
+    })
+}
+
+fn ensure_slot<'a>(
+    key: &ModelSlotKey,
+    inner: &Arc<dyn InferenceEngine>,
+    events: &Sender<SchedulerEvent>,
+    slots: &'a mut HashMap<ModelSlotKey, SlotWorker>,
+) -> Result<&'a mut SlotWorker, Error> {
+    if !slots.contains_key(key) {
+        let worker = spawn_slot(key, inner.clone(), events.clone())?;
+        slots.insert(key.clone(), worker);
+    }
+    Ok(slots.get_mut(key).expect("slot was inserted"))
+}
+
+fn dispatch_one(
+    inner: &Arc<dyn InferenceEngine>,
+    events: &Sender<SchedulerEvent>,
+    slots: &mut HashMap<ModelSlotKey, SlotWorker>,
+    jobs: &mut HashMap<u64, Job>,
+    policy: &mut FairPolicy,
+    counters: &SchedulerCounters,
+) -> bool {
+    let selection = policy.select(|id| {
+        jobs.get(&id).is_some_and(|job| {
+            !job.in_flight && !slots.get(&job.slot).is_some_and(|slot| slot.busy)
+        })
+    });
+    let Some(selection) = selection else {
+        return false;
+    };
+    let id = selection.id;
+    let job = jobs
+        .get_mut(&id)
+        .expect("policy only selects retained jobs");
+    let action = if let Some(request) = job.request.take() {
+        SlotAction::Start(request)
+    } else {
+        SlotAction::Step(job.session.take().expect("started job retains session"))
+    };
+    job.in_flight = true;
+    match ensure_slot(&job.slot, inner, events, slots).and_then(|slot| {
+        slot.busy = true;
+        slot.sender
+            .send(SlotTask {
+                id,
+                action,
+                selection: Some(selection),
+            })
+            .map_err(|_| Error::State("model slot worker stopped".into()))
+    }) {
+        Ok(()) => true,
+        Err(error) => {
+            let job = jobs.remove(&id).expect("failed job exists");
+            send_terminal(job, Err(error), counters);
+            true
+        }
     }
 }
+
 
 fn handle_command(
     command: Command,
+    inner: &Arc<dyn InferenceEngine>,
+    events: &Sender<SchedulerEvent>,
+    slots: &mut HashMap<ModelSlotKey, SlotWorker>,
     jobs: &mut HashMap<u64, Job>,
     policy: &mut FairPolicy,
     counters: &SchedulerCounters,
 ) {
     match command {
-        Command::Submit {
-            id,
-            request,
-            response,
-        } => {
+        Command::Submit { id, request, response } => {
             let flow = FlowKey {
                 principal: request.scheduling.principal.clone(),
                 class: request.scheduling.class,
@@ -687,25 +861,26 @@ fn handle_command(
             let admitted_at = Instant::now();
             let admitted_round = policy.round;
             let scheduling = request.scheduling.clone();
-            let model_id = request.model.id.clone();
-            let model_epoch = request.model.epoch;
+            let slot = ModelSlotKey {
+                model_id: request.model.id.clone(),
+                model_epoch: request.model.epoch,
+            };
             let control = request.control.clone();
-            jobs.insert(
-                id,
-                Job {
-                    request: Some(request),
-                    session: None,
-                    control,
-                    response,
-                    flow: flow.clone(),
-                    scheduling,
-                    model_id,
-                    model_epoch,
-                    execution_session_id: Uuid::new_v4().to_string(),
-                    admitted_round,
-                    admitted_at,
-                },
-            );
+            jobs.insert(id, Job {
+                request: Some(request),
+                session: None,
+                control,
+                response,
+                flow: flow.clone(),
+                scheduling,
+                slot,
+                execution_session_id: Uuid::new_v4().to_string(),
+                admitted_round,
+                admitted_at,
+                in_flight: false,
+                cancel_requested: false,
+            });
+            counters.admitted.fetch_add(1, Ordering::Relaxed);
             policy.enqueue(id, flow, admitted_round, admitted_at);
         }
         Command::Continue(id) => {
@@ -716,99 +891,96 @@ fn handle_command(
         }
         Command::Stop(id) => {
             counters.waiting.fetch_sub(1, Ordering::AcqRel);
-            if let Some(mut job) = jobs.remove(&id) {
-                let flow = job.flow.clone();
-                let result = job
-                    .session
-                    .as_mut()
-                    .ok_or_else(|| Error::State("scheduler session was not started".into()))
-                    .and_then(|session| session.finish());
-                send_terminal(job, result, counters);
-                policy.clear_if_idle(&flow, jobs);
+            policy.remove(id);
+            let Some(job) = jobs.get_mut(&id) else { return };
+            let Some(session) = job.session.take() else {
+                job.control.cancel();
+                job.cancel_requested = true;
+                return;
+            };
+            job.in_flight = true;
+            match ensure_slot(&job.slot, inner, events, slots) {
+                Ok(slot) => {
+                    slot.busy = true;
+                    if slot.sender.send(SlotTask {
+                        id,
+                        action: SlotAction::Finish(session),
+                        selection: None,
+                    }).is_err() {
+                        let job = jobs.remove(&id).expect("stopped job exists");
+                        send_terminal(job, Err(Error::State("model slot worker stopped".into())), counters);
+                    }
+                }
+                Err(error) => {
+                    let job = jobs.remove(&id).expect("stopped job exists");
+                    send_terminal(job, Err(error), counters);
+                }
             }
         }
         Command::Cancel(id) => {
             let was_runnable = policy.remove(id);
-            if let Some(job) = jobs.remove(&id) {
-                let flow = job.flow.clone();
+            let Some(job) = jobs.get_mut(&id) else { return };
+            job.control.cancel();
+            if job.in_flight {
+                job.cancel_requested = true;
+            } else {
+                let job = jobs.remove(&id).expect("cancelled job exists");
                 if job.session.is_some() && !was_runnable {
                     counters.waiting.fetch_sub(1, Ordering::AcqRel);
                 }
-                job.control.cancel();
-                let _ = job.response.send(ClientMessage::Failed(Error::Cancelled));
-                counters.cancelled.fetch_add(1, Ordering::Relaxed);
+                let flow = job.flow.clone();
+                send_terminal(job, Err(Error::Cancelled), counters);
                 policy.clear_if_idle(&flow, jobs);
             }
         }
-        Command::Shutdown => unreachable!("shutdown is handled by the scheduler loop"),
+        Command::Shutdown => unreachable!(),
     }
 }
 
-fn execute_quantum(
-    selection: Selection,
-    inner: &Arc<dyn InferenceEngine>,
+fn handle_completion(
+    completion: SlotCompletion,
+    slots: &mut HashMap<ModelSlotKey, SlotWorker>,
     jobs: &mut HashMap<u64, Job>,
     policy: &mut FairPolicy,
     counters: &SchedulerCounters,
     diagnostics: &SchedulerDiagnostics,
 ) {
-    let Some(job) = jobs.get_mut(&selection.id) else {
-        return;
-    };
-    let quantum_started = Instant::now();
-    let result = if job.session.is_none() {
-        let request = job.request.take().expect("unstarted job retains request");
-        inner.start_session(request).map(|session| {
-            job.session = Some(session);
-            SessionStep::Progress(QuantumObservation::model_free(QuantumKind::Preparation, 1))
-        })
-    } else {
-        job.session.as_mut().expect("session exists").step()
-    };
-
-    let (observation, wait_for_consumer, terminal) = match result {
-        Ok(SessionStep::Progress(observation)) => (observation, false, None),
-        Ok(SessionStep::Token {
-            id,
-            piece,
-            terminal_or_control,
-            observation,
-        }) => {
-            if job
-                .response
-                .send(ClientMessage::Token {
-                    id,
-                    piece,
-                    terminal_or_control,
-                })
-                .is_err()
-            {
-                (observation, false, Some(Err(Error::Cancelled)))
+    let Some(job) = jobs.get_mut(&completion.id) else { return };
+    if let Some(slot) = slots.get_mut(&job.slot) {
+        slot.busy = false;
+    }
+    job.in_flight = false;
+    job.session = completion.session;
+    let mut terminal = None;
+    let mut wait_for_consumer = false;
+    let observation = match completion.result {
+        Ok(SessionStep::Progress(observation)) => observation,
+        Ok(SessionStep::Token { id, piece, terminal_or_control, observation }) => {
+            if job.cancel_requested || job.response.send(ClientMessage::Token {
+                id, piece, terminal_or_control,
+            }).is_err() {
+                terminal = Some(Err(Error::Cancelled));
             } else {
                 counters.waiting.fetch_add(1, Ordering::AcqRel);
-                (observation, true, None)
+                wait_for_consumer = true;
             }
+            observation
         }
-        Ok(SessionStep::Finished(output)) => (
-            QuantumObservation::model_free(QuantumKind::Publication, 1),
-            false,
-            Some(Ok(output)),
-        ),
-        Err(error) => (
-            QuantumObservation::model_free(QuantumKind::Preparation, 1),
-            false,
-            Some(Err(error)),
-        ),
+        Ok(SessionStep::Finished(output)) => {
+            terminal = Some(if job.cancel_requested { Err(Error::Cancelled) } else { Ok(output) });
+            QuantumObservation::model_free(QuantumKind::Publication, 1)
+        }
+        Err(error) => {
+            terminal = Some(if job.cancel_requested { Err(Error::Cancelled) } else { Err(error) });
+            QuantumObservation::model_free(QuantumKind::Preparation, 1)
+        }
     };
-    let quantum_duration_ns = quantum_started.elapsed().as_nanos();
-    policy.charge(
-        &job.flow,
-        observation.charged_tokens,
-        selection.charge_scale,
-    );
-    diagnostics.emit(
-        "scheduler_decision",
-        &SchedulerDecision {
+    if job.cancel_requested && terminal.is_none() {
+        terminal = Some(Err(Error::Cancelled));
+    }
+    if let Some(selection) = completion.selection {
+        policy.charge(&job.flow, observation.charged_tokens, selection.charge_scale);
+        diagnostics.emit("scheduler_decision", &SchedulerDecision {
             record_type: "scheduler_decision",
             transport_correlation_id: job.scheduling.correlation_id.clone(),
             inference_operation_id: job.scheduling.inference_id.clone(),
@@ -816,44 +988,60 @@ fn execute_quantum(
             principal: job.scheduling.principal.clone(),
             class: job.scheduling.class,
             priority_source: job.scheduling.source,
-            model_id: job.model_id.clone(),
-            model_epoch: job.model_epoch,
+            model_id: job.slot.model_id.clone(),
+            model_epoch: job.slot.model_epoch,
             queue_age_ms: selection.queue_age_ms,
             queue_age_rounds: selection.queue_age_rounds,
             age_promotions: selection.promotions,
             quantum_kind: observation.kind,
             charged_tokens: observation.charged_tokens,
-            quantum_duration_ns,
+            quantum_duration_ns: completion.quantum_duration_ns,
             context_placement: observation.context_placement,
             executor_slot_occupied: observation.executor_slot_occupied,
             transition_cost_bytes: observation.transition_cost_bytes,
             capacity_reserved_bytes: observation.capacity_reserved_bytes,
-            cancelled: terminal
-                .as_ref()
-                .is_some_and(|result| matches!(result, Err(Error::Cancelled))),
-            deadline_expired: terminal
-                .as_ref()
-                .is_some_and(|result| matches!(result, Err(Error::Deadline))),
-            reason: if selection.promotions > 0 {
-                "age_promoted"
-            } else {
-                "class_ready"
-            },
-        },
-    );
+            cancelled: matches!(terminal, Some(Err(Error::Cancelled))),
+            deadline_expired: matches!(terminal, Some(Err(Error::Deadline))),
+            reason: if selection.promotions > 0 { "age_promoted" } else { "class_ready" },
+        });
+    }
     if let Some(result) = terminal {
-        let job = jobs.remove(&selection.id).expect("terminal job exists");
+        let job = jobs.remove(&completion.id).expect("terminal job exists");
         let flow = job.flow.clone();
+        let slot = job.slot.clone();
         send_terminal(job, result, counters);
         policy.clear_if_idle(&flow, jobs);
+        retire_slot_if_idle(&slot, slots, jobs);
     } else if !wait_for_consumer {
-        let job = jobs.get(&selection.id).expect("runnable job exists");
-        policy.enqueue(
-            selection.id,
-            job.flow.clone(),
-            job.admitted_round,
-            job.admitted_at,
-        );
+        policy.enqueue(completion.id, job.flow.clone(), job.admitted_round, job.admitted_at);
+    }
+}
+
+fn retire_slot_if_idle(
+    key: &ModelSlotKey,
+    slots: &mut HashMap<ModelSlotKey, SlotWorker>,
+    jobs: &HashMap<u64, Job>,
+) {
+    if jobs.values().any(|job| &job.slot == key) {
+        return;
+    }
+    if let Some(slot) = slots.remove(key) {
+        let _ = slot.sender.send(SlotTask { id: 0, action: SlotAction::Shutdown, selection: None });
+        let _ = slot.handle.join();
+    }
+}
+
+fn cancel_all_jobs(jobs: &mut HashMap<u64, Job>) {
+    for (_, job) in jobs.drain() {
+        job.control.cancel();
+        let _ = job.response.send(ClientMessage::Failed(Error::Cancelled));
+    }
+}
+
+fn shutdown_slots(slots: &mut HashMap<ModelSlotKey, SlotWorker>) {
+    for (_, slot) in slots.drain() {
+        let _ = slot.sender.send(SlotTask { id: 0, action: SlotAction::Shutdown, selection: None });
+        let _ = slot.handle.join();
     }
 }
 
@@ -882,6 +1070,58 @@ fn send_terminal(job: Job, result: Result<EngineOutput, Error>, counters: &Sched
 mod tests {
     use super::*;
     use crate::{DeterministicEngine, ModelRecord, RequestControl};
+
+    #[derive(Default)]
+    struct BlockingEngine {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        active_by_model: Mutex<HashMap<String, usize>>,
+        max_by_model: Mutex<HashMap<String, usize>>,
+    }
+
+    impl InferenceEngine for BlockingEngine {
+        fn start_session(
+            &self,
+            request: EngineRequest,
+        ) -> Result<Box<dyn ExecutionSession>, Error> {
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_active.fetch_max(active, Ordering::AcqRel);
+            {
+                let mut by_model = self.active_by_model.lock();
+                let current = by_model.entry(request.model.id.clone()).or_default();
+                *current += 1;
+                let mut maxima = self.max_by_model.lock();
+                maxima
+                    .entry(request.model.id.clone())
+                    .and_modify(|maximum| *maximum = (*maximum).max(*current))
+                    .or_insert(*current);
+            }
+            thread::sleep(Duration::from_millis(50));
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            *self
+                .active_by_model
+                .lock()
+                .get_mut(&request.model.id)
+                .expect("model activity exists") -= 1;
+            Ok(Box::new(ImmediateSession {
+                output: EngineOutput::default(),
+            }))
+        }
+    }
+
+    struct ImmediateSession {
+        output: EngineOutput,
+    }
+
+    impl ExecutionSession for ImmediateSession {
+        fn step(&mut self) -> Result<SessionStep, Error> {
+            Ok(SessionStep::Finished(self.output.clone()))
+        }
+
+        fn finish(&mut self) -> Result<EngineOutput, Error> {
+            Ok(self.output.clone())
+        }
+    }
     use parking_lot::Mutex;
     use std::{path::PathBuf, time::Duration};
 
@@ -953,7 +1193,7 @@ mod tests {
             );
         }
         let selected = (0..6)
-            .filter_map(|_| policy.select().map(|s| s.id))
+            .filter_map(|_| policy.select(|_| true).map(|s| s.id))
             .collect::<Vec<_>>();
         assert!(selected.contains(&1));
         if selected.contains(&2) {
@@ -993,7 +1233,7 @@ mod tests {
         }
         let mut counts = [0usize; 3];
         for _ in 0..70 {
-            let selected = policy.select().unwrap();
+            let selected = policy.select(|_| true).unwrap();
             let index = selected.id as usize;
             counts[index] += 1;
             policy.charge(&flows[index], 1, selected.charge_scale);
@@ -1104,5 +1344,38 @@ mod tests {
                 .diagnostic_loss_by_kind
                 .contains_key("scheduler_decision")
         );
+    }
+
+    #[test]
+    fn distinct_model_slots_overlap_while_each_model_remains_serialized() {
+        let engine = Arc::new(BlockingEngine::default());
+        let scheduler =
+            WorkloadScheduler::new(engine.clone(), SchedulerPolicyConfig::default()).unwrap();
+        let mut sessions = [
+            ("a", 1_u64, "a-one"),
+            ("a", 1_u64, "a-two"),
+            ("b", 2_u64, "b-one"),
+        ]
+        .into_iter()
+        .map(|(model, epoch, principal)| {
+            let mut request = request(SchedulingClass::Standard, principal, 1);
+            request.model.id = model.into();
+            request.model.epoch = epoch;
+            scheduler.start_session(request).unwrap()
+        })
+        .collect::<Vec<_>>();
+        let handles = sessions
+            .drain(..)
+            .map(|mut session| thread::spawn(move || session.step().unwrap()))
+            .collect::<Vec<_>>();
+        for handle in handles {
+            assert!(matches!(
+                handle.join().expect("client thread completes"),
+                SessionStep::Finished(_)
+            ));
+        }
+        assert_eq!(engine.max_active.load(Ordering::Acquire), 2);
+        assert_eq!(engine.max_by_model.lock().get("a"), Some(&1));
+        assert_eq!(engine.max_by_model.lock().get("b"), Some(&1));
     }
 }

@@ -112,20 +112,27 @@ This means capacity rejection, promotion metrics, and Phase 5 copy claims are no
 
 Expose authoritative native per-mapping/per-block allocation and transfer telemetry through the ABI, including allocator class, bytes, tier/device, and fences. Account for incremental blocks, not cumulative logical prefix length. If llama sequence mappings share one arena and cannot expose independent block ownership, model that truth explicitly rather than projecting a block-store abstraction onto them.
 
-### C5. One scheduler worker serializes every resident model
+### C5. Independent resident-model execution — remediated
 
-**Evidence**
+`WorkloadScheduler` now retains one central fairness/admission actor but dispatches
+native quanta to lazily created workers keyed by `(model_id, model_epoch)`.
+Each key permits one in-flight quantum, preserving serialization within a native
+slot, while distinct resident model epochs can prepare, prefill, and decode
+concurrently. Worker completions return quantum observations to the central actor
+for charging and diagnostics, so concurrency does not create a second fairness
+policy.
 
-- `WorkloadScheduler` owns one command channel and one worker join handle (`crates/server/src/scheduler.rs:381-389`).
-- Construction starts exactly one `cusco-workload-scheduler` OS thread (`scheduler.rs:411-436`).
-- The loop chooses one job and directly calls `execute_quantum` (`scheduler.rs:622-660`).
-- `execute_quantum` synchronously calls either `inner.start_session(request)` or `session.step()` on that same thread (`scheduler.rs:747-767`). These operations include model preparation/load and native prefill/decode.
+Cancellation, deadlines, and shutdown remain responsive while native calls are in
+flight: controls are shared with workers, shutdown cancels all requests, and the
+scheduler drains and joins every slot worker before returning. Suspended sessions
+remain owned by their model-key worker until resumed or retired, and idle workers
+are retired only after their model epoch has no queued or in-flight work.
 
-Fair interleaving within a native slot is sound, but a process-wide synchronous executor contradicts Phase 7's “one independently locked native slot per resident model epoch” design and the project guide's statement that distinct resident models can execute independently. A slow load or long native quantum for model A stalls model B and scheduler command handling.
-
-**Recommended direction**
-
-Keep a central policy actor if useful, but dispatch selected work to a bounded per-resident-model executor/slot actor. Track each slot's in-flight fence and return completion observations to the policy actor. This preserves global fairness/accounting while allowing one native quantum per independent model slot concurrently. Model loading and spill/restore should use a separate bounded lifecycle pool so they cannot block scheduling decisions.
+Behavioral coverage proves both halves of the contract: distinct model keys overlap
+execution, while two requests for one key never overlap. Authoritative allocator
+accounting remains separate remediation C6/Step 5; this concurrency cutover uses
+the existing residency admission boundary rather than adding another capacity
+estimate.
 
 ### C6. Residency decisions rely on untrusted operating-point estimates
 
@@ -329,17 +336,27 @@ coarse sequence-level metadata traversal and eviction behavior; measured
 pressure there is the explicit trigger for the B1 native-block evolution, not a
 reason to restore KV-copying publication.
 
-### 5. Make capacity and operating points authoritative
+### 5. Make capacity and operating points authoritative — deferred
 
-Once real allocations and bindings exist, add native prepare/probe reservations that report planned tensor placement, context pools, scratch requirements, transfer headroom, and elastic ranges. Reconcile reservations with post-load allocator telemetry. Then replace proportional layer-count and serialized-state estimates in residency admission.
+Add native prepare/probe reservations that report planned tensor placement,
+context pools, scratch requirements, transfer headroom, and elastic ranges.
+Reconcile reservations with post-load allocator telemetry. Then replace
+proportional layer-count and serialized-state estimates in residency admission.
 
-Capacity work belongs here rather than earlier because estimates cannot be made authoritative over placeholder physical representations. It must precede scheduler concurrency: allowing multiple model workers to load and execute concurrently while admission remains approximate would multiply the current oversubscription and rollback risks.
+This remains required before capacity claims can be considered authoritative, but
+it no longer blocks the independent-slot scheduler cutover. Until Step 5 is
+implemented, concurrent model epochs remain subject to the existing conservative
+residency admission estimates rather than allocator-reconciled measurements.
 
-### 6. Introduce independent model-slot execution
+### 6. Introduce independent model-slot execution — implemented
 
-Keep the global fairness scheduler as an admission and dispatch policy, but move native preparation/prefill/decode work to independently runnable per-model or per-slot executors. Define slot occupancy, suspension, cancellation, shutdown, and model-epoch draining using the ownership fences and capacity reservations established above.
-
-This ordering lets concurrency reuse trustworthy state transitions rather than adding locks around the current single-threaded path and later replacing them. Re-run mixed-model fairness and capacity-recovery workloads as soon as the first concurrent implementation exists.
+The global fairness actor now dispatches at most one native quantum at a time to
+each `(model_id, model_epoch)` worker. Distinct eligible model epochs execute
+concurrently; requests sharing an epoch remain serialized. Completion events
+return charging and diagnostic observations to the actor, and cancellation,
+deadline, shutdown, suspension, and idle epoch retirement retain explicit
+lifecycle fences. Focused coverage exercises same-model serialization and
+different-model overlap.
 
 ### 7. Complete lifecycle persistence and extract its service boundary together
 
