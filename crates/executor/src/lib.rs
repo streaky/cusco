@@ -69,7 +69,11 @@ pub struct MappingMetrics {
     pub active: MappingId,
     pub resident_mappings: usize,
     pub reference_switches: u64,
-    pub activation_bytes_copied: u64,
+    pub fork_bytes_copied: u64,
+    pub export_bytes_copied: u64,
+    pub import_bytes_copied: u64,
+    pub total_bytes_copied: u64,
+    pub graph_recaptures: Option<u64>,
 }
 
 /// Uniquely owns one native execution slot. The slot is mutated only through `&mut self`.
@@ -616,11 +620,22 @@ mod ffi {
     pub(super) fn mapping_metrics(executor: NonNull<sys::CuscoExecutor>) -> super::MappingMetrics {
         // SAFETY: executor is live for all read-only metric calls.
         unsafe {
+            let graph_recaptures =
+                (sys::cusco_executor_graph_recaptures_supported(executor.as_ptr()) != 0)
+                    .then(|| sys::cusco_executor_graph_recaptures(executor.as_ptr()));
             super::MappingMetrics {
                 active: super::MappingId(sys::cusco_executor_active_mapping(executor.as_ptr())),
                 resident_mappings: sys::cusco_executor_mapping_count(executor.as_ptr()),
                 reference_switches: sys::cusco_executor_reference_switches(executor.as_ptr()),
-                activation_bytes_copied: sys::cusco_executor_mapped_bytes_copied(executor.as_ptr()),
+                fork_bytes_copied: sys::cusco_executor_mapping_fork_bytes_copied(executor.as_ptr()),
+                export_bytes_copied: sys::cusco_executor_mapping_export_bytes_copied(
+                    executor.as_ptr(),
+                ),
+                import_bytes_copied: sys::cusco_executor_mapping_import_bytes_copied(
+                    executor.as_ptr(),
+                ),
+                total_bytes_copied: sys::cusco_executor_mapping_bytes_copied(executor.as_ptr()),
+                graph_recaptures,
             }
         }
     }
@@ -795,7 +810,17 @@ mod tests {
 
         let metrics = executor.mapping_metrics();
         assert_eq!(metrics.reference_switches, 1);
-        assert_eq!(metrics.activation_bytes_copied, 0);
+        assert_eq!(
+            metrics.fork_bytes_copied,
+            (2 * prefix.len() * std::mem::size_of::<i32>()) as u64
+        );
+        assert_eq!(metrics.export_bytes_copied, spilled.bytes.len() as u64);
+        assert_eq!(metrics.import_bytes_copied, spilled.bytes.len() as u64);
+        assert_eq!(
+            metrics.total_bytes_copied,
+            metrics.fork_bytes_copied + metrics.export_bytes_copied + metrics.import_bytes_copied
+        );
+        assert_eq!(metrics.graph_recaptures, None);
         executor.activate_mapping(MappingId(0)).unwrap();
         executor.remove_mapping(restored).unwrap();
         assert_eq!(executor.mapping_metrics().resident_mappings, 1);

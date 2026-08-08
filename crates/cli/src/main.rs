@@ -64,6 +64,18 @@ enum Command {
         #[arg(long, default_value = "/results/phase5.json")]
         output: PathBuf,
     },
+    /// Measure representation publication scaling and exact continuation.
+    RepresentationProof {
+        model: PathBuf,
+        #[arg(long, default_value = "/work/config/representation-workload.json")]
+        workload: PathBuf,
+        #[arg(long, default_value = "/results/representation-proof.json")]
+        output: PathBuf,
+        #[arg(long, default_value_t = 4096)]
+        context: u32,
+        #[arg(long, default_value_t = 99)]
+        gpu_layers: i32,
+    },
     /// Run the versioned real-model Phase 8 scheduler acceptance workload.
     SchedulerProof {
         model: PathBuf,
@@ -128,6 +140,13 @@ fn run(command: Command) -> Result<()> {
             prefix,
             output,
         } => mapped_proof(model, context, gpu_layers, &prefix, output)?,
+        Command::RepresentationProof {
+            model,
+            workload,
+            output,
+            context,
+            gpu_layers,
+        } => representation_proof(model, workload, output, context, gpu_layers)?,
         Command::SchedulerProof {
             model,
             workload,
@@ -250,6 +269,17 @@ fn resolve_model(model: &Path, expected_sha256: Option<&str>) -> Result<Registry
         return fetch_hf(model_ref, &cache, expected_sha256).map_err(Into::into);
     }
     register_local(model, GEMMA_URI, expected_sha256).map_err(Into::into)
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RepresentationProofWorkload {
+    version: u32,
+    name: String,
+    trace_text: String,
+    trace_repetitions: usize,
+    represented_prefix_tokens: Vec<usize>,
+    require_reference_only_forks: bool,
+    require_graph_reuse_signal: bool,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -645,6 +675,179 @@ fn percentile(values: &[u128], percentile: usize) -> u128 {
     sorted[index]
 }
 
+fn representation_proof(
+    model: PathBuf,
+    workload_path: PathBuf,
+    output: PathBuf,
+    n_ctx: u32,
+    gpu_layers: i32,
+) -> Result<()> {
+    let proof_started = Instant::now();
+    let workload_bytes = fs::read(&workload_path)
+        .with_context(|| format!("read workload {}", workload_path.display()))?;
+    let workload: RepresentationProofWorkload =
+        serde_json::from_slice(&workload_bytes).context("parse representation workload")?;
+    ensure!(workload.version == 1, "unsupported representation workload version");
+    ensure!(!workload.trace_text.is_empty(), "representation trace text is empty");
+    ensure!(workload.trace_repetitions > 0, "trace repetitions must be positive");
+    ensure!(
+        !workload.represented_prefix_tokens.is_empty(),
+        "represented-prefix boundary list is empty"
+    );
+    ensure!(
+        workload
+            .represented_prefix_tokens
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "represented-prefix boundaries must be strictly increasing"
+    );
+
+    let record = resolve_model(&model, None)?;
+    let model_path = record.path.to_str().context("resolved model path is not UTF-8")?;
+    let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
+    ensure!(
+        executor.capabilities().mapped_execution,
+        "executor does not support mapped execution"
+    );
+    let trace = workload.trace_text.repeat(workload.trace_repetitions);
+    let tokens = executor.tokenize(&trace)?;
+    let final_boundary = *workload.represented_prefix_tokens.last().unwrap();
+    ensure!(
+        tokens.len() > final_boundary + 1,
+        "trace has {} tokens but needs more than {}",
+        tokens.len(),
+        final_boundary + 1
+    );
+
+    let mut active = cusco_executor::MappingId(0);
+    let mut cursor = 0usize;
+    let mut boundaries = Vec::with_capacity(workload.represented_prefix_tokens.len());
+    for &represented_prefix_tokens in &workload.represented_prefix_tokens {
+        executor.decode(&tokens[cursor..represented_prefix_tokens])?;
+        let before = executor.mapping_metrics();
+        let publication_started = Instant::now();
+        let prepared = executor.prepare_mapping_fork(active)?;
+        let successor = executor.commit_mapping(prepared)?;
+        let publication_ns = publication_started.elapsed().as_nanos();
+        let after = executor.mapping_metrics();
+        let fork_bytes_copied = after.fork_bytes_copied - before.fork_bytes_copied;
+
+        let continuation_input_token = tokens[represented_prefix_tokens];
+        executor.activate_mapping(active)?;
+        let source = executor.decode(&[continuation_input_token])?;
+        executor.activate_mapping(successor)?;
+        let successor_decode = executor.decode(&[continuation_input_token])?;
+        let token_equal = source.token == successor_decode.token;
+        let logits_equal = logits_identical(&source.logits, &successor_decode.logits);
+        ensure!(
+            token_equal && logits_equal,
+            "fork diverged at represented prefix {represented_prefix_tokens}"
+        );
+        if workload.require_reference_only_forks {
+            ensure!(
+                fork_bytes_copied == 0,
+                "fork at represented prefix {represented_prefix_tokens} copied {fork_bytes_copied} payload bytes"
+            );
+        }
+        boundaries.push(json!({
+            "represented_prefix_tokens": represented_prefix_tokens,
+            "publication_ns": publication_ns,
+            "fork_bytes_copied": fork_bytes_copied,
+            "source_mapping": active.0,
+            "successor_mapping": successor.0,
+            "continuation_input_token": continuation_input_token,
+            "next_token": successor_decode.token,
+            "token_equal": token_equal,
+            "logits_equal": logits_equal
+        }));
+        active = successor;
+        cursor = represented_prefix_tokens + 1;
+    }
+
+    let movement_before = executor.mapping_metrics();
+    let export_started = Instant::now();
+    let exported = executor.export_mapping(active)?;
+    let export_ns = export_started.elapsed().as_nanos();
+    let after_export = executor.mapping_metrics();
+    let import_started = Instant::now();
+    let imported = executor.import_mapping(&exported)?;
+    let import_ns = import_started.elapsed().as_nanos();
+    let after_import = executor.mapping_metrics();
+    let movement_token = tokens[cursor];
+    executor.activate_mapping(active)?;
+    let resident = executor.decode(&[movement_token])?;
+    executor.activate_mapping(imported)?;
+    let restored = executor.decode(&[movement_token])?;
+    let movement_token_equal = resident.token == restored.token;
+    let movement_logits_equal = logits_identical(&resident.logits, &restored.logits);
+    ensure!(
+        movement_token_equal && movement_logits_equal,
+        "exported and imported mapping diverged"
+    );
+    let metrics = executor.mapping_metrics();
+    if workload.require_graph_reuse_signal {
+        ensure!(
+            metrics.graph_recaptures.is_some(),
+            "workload requires graph telemetry but the backend does not expose it"
+        );
+    }
+
+    let publication_ns: Vec<u128> = boundaries
+        .iter()
+        .map(|row| row["publication_ns"].as_u64().unwrap() as u128)
+        .collect();
+    let artifact = json!({
+        "schema_version": 1,
+        "test_set": {
+            "version": workload.version,
+            "name": workload.name,
+            "workload": workload,
+            "trace_manifest": {
+                "token_count": tokens.len(),
+                "tokens": tokens,
+                "represented_prefix_tokens": workload.represented_prefix_tokens
+            }
+        },
+        "target": {
+            "model": record.identity,
+            "resolved_path": record.path,
+            "context_tokens": n_ctx,
+            "gpu_layers": gpu_layers
+        },
+        "correctness": {
+            "passed": true,
+            "boundaries": boundaries,
+            "state_movement": {
+                "payload_bytes": exported.bytes.len(),
+                "continuation_input_token": movement_token,
+                "next_token": restored.token,
+                "token_equal": movement_token_equal,
+                "logits_equal": movement_logits_equal
+            }
+        },
+        "performance": {
+            "publication_ns": publication_ns,
+            "publication_min_ns": publication_ns.iter().min(),
+            "publication_max_ns": publication_ns.iter().max(),
+            "export_ns": export_ns,
+            "import_ns": import_ns,
+            "fork_bytes_copied": metrics.fork_bytes_copied,
+            "export_bytes_copied_delta": after_export.export_bytes_copied - movement_before.export_bytes_copied,
+            "import_bytes_copied_delta": after_import.import_bytes_copied - after_export.import_bytes_copied,
+            "total_bytes_copied": metrics.total_bytes_copied,
+            "graph_recaptures_supported": metrics.graph_recaptures.is_some(),
+            "graph_recaptures": metrics.graph_recaptures
+        },
+        "elapsed_ms": proof_started.elapsed().as_millis()
+    });
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&output, serde_json::to_vec_pretty(&artifact)?)?;
+    println!("{}", serde_json::to_string_pretty(&artifact)?);
+    Ok(())
+}
+
 fn mapped_proof(
     model: PathBuf,
     n_ctx: u32,
@@ -698,10 +901,6 @@ fn mapped_proof(
         results.push(json!({"mapping": mapping.0, "next_token": decoded.token}));
     }
     let metrics = executor.mapping_metrics();
-    ensure!(
-        metrics.activation_bytes_copied == 0,
-        "mapping activation copied device bytes"
-    );
     let artifact = json!({
         "model": record.identity,
         "resolved_path": record.path,
@@ -711,7 +910,8 @@ fn mapped_proof(
             "staged_restore_ns": staged_restore_ns,
             "mapped_activation_ns": activation_ns,
             "staged_bytes_read": checkpoint.bytes * 4,
-            "mapped_activation_bytes_copied": metrics.activation_bytes_copied,
+            "mapped_fork_bytes_copied": metrics.fork_bytes_copied,
+            "mapped_total_bytes_copied": metrics.total_bytes_copied,
             "prompt_tokens_avoided": tokens.len() * 4
         },
         "elapsed_ms": started.elapsed().as_millis()
@@ -969,15 +1169,65 @@ mod tests {
         let mapped: serde_json::Value =
             serde_json::from_slice(&fs::read(mapped_output).unwrap()).unwrap();
         assert_eq!(mapped["branches"].as_array().unwrap().len(), 4);
-        assert_eq!(mapped["metrics"]["activation_bytes_copied"], 0);
+        assert_eq!(mapped["metrics"]["reference_switches"], 4);
         assert!(mapped["comparison"]["staged_bytes_read"].as_u64().unwrap() > 0);
-        assert_eq!(mapped["comparison"]["mapped_activation_bytes_copied"], 0);
+        assert!(
+            mapped["comparison"]["mapped_fork_bytes_copied"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
         assert!(
             mapped["comparison"]["prompt_tokens_avoided"]
                 .as_u64()
                 .unwrap()
                 > 0
         );
+        let representation_workload = root.join("representation-workload.json");
+        fs::write(
+            &representation_workload,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "name": "model-free-representation",
+                "trace_text": "deterministic representation trace ",
+                "trace_repetitions": 4,
+                "represented_prefix_tokens": [2, 4, 8],
+                "require_reference_only_forks": false,
+                "require_graph_reuse_signal": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let representation_output = root.join("representation.json");
+        run(Command::RepresentationProof {
+            model: PathBuf::from("mock://deterministic"),
+            workload: representation_workload,
+            output: representation_output.clone(),
+            context: 128,
+            gpu_layers: 0,
+        })
+        .unwrap();
+        let representation: Value =
+            serde_json::from_slice(&fs::read(representation_output).unwrap()).unwrap();
+        assert_eq!(representation["correctness"]["passed"], true);
+        assert_eq!(
+            representation["correctness"]["boundaries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(
+            representation["performance"]["fork_bytes_copied"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            representation["performance"]["graph_recaptures_supported"],
+            false
+        );
+
         let workload = root.join("scheduler-workload.json");
         fs::write(
             &workload,

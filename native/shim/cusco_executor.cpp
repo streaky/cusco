@@ -48,7 +48,9 @@ struct cusco_executor {
     int32_t next_sequence;
     uint64_t mapping_epoch;
     uint64_t reference_switches;
-    uint64_t mapped_bytes_copied;
+    uint64_t mapping_fork_bytes_copied;
+    uint64_t mapping_export_bytes_copied;
+    uint64_t mapping_import_bytes_copied;
     std::atomic_bool cancel;
     int32_t gpu_layers;
 };
@@ -615,6 +617,7 @@ cusco_status cusco_executor_prepare_mapping_fork(
             ? executor->mock_state
             : executor->mock_mappings.at(source_mapping);
         executor->mock_mappings.emplace(mapping, state);
+        executor->mapping_fork_bytes_copied += state.size() * sizeof(int32_t);
     } else {
         llama_memory_seq_cp(
             llama_get_memory(executor->ctx), source_sequence, sequence, -1, -1);
@@ -726,6 +729,7 @@ cusco_status cusco_executor_export_mapping(
         if (required != 0) {
             memcpy(buffer, state.data(), required);
         }
+        executor->mapping_export_bytes_copied += required;
         return CUSCO_OK;
     }
     const size_t copied = llama_state_seq_get_data(
@@ -733,7 +737,11 @@ cusco_status cusco_executor_export_mapping(
         buffer,
         capacity,
         executor->block_table.at(mapping));
-    return copied == required ? CUSCO_OK : CUSCO_BACKEND;
+    if (copied == required) {
+        executor->mapping_export_bytes_copied += copied;
+        return CUSCO_OK;
+    }
+    return CUSCO_BACKEND;
 } catch (...) {
     return CUSCO_BACKEND;
 }
@@ -787,6 +795,7 @@ cusco_status cusco_executor_import_mapping(
         throw;
     }
     *out = mapping;
+    executor->mapping_import_bytes_copied += size;
     return CUSCO_OK;
 } catch (const std::bad_alloc &) {
     return CUSCO_NOMEM;
@@ -803,8 +812,27 @@ size_t cusco_executor_mapping_count(const cusco_executor * executor) {
 uint64_t cusco_executor_reference_switches(const cusco_executor * executor) {
     return executor ? executor->reference_switches : 0;
 }
-uint64_t cusco_executor_mapped_bytes_copied(const cusco_executor * executor) {
-    return executor ? executor->mapped_bytes_copied : 0;
+uint64_t cusco_executor_mapping_fork_bytes_copied(const cusco_executor * executor) {
+    return executor ? executor->mapping_fork_bytes_copied : 0;
+}
+uint64_t cusco_executor_mapping_export_bytes_copied(const cusco_executor * executor) {
+    return executor ? executor->mapping_export_bytes_copied : 0;
+}
+uint64_t cusco_executor_mapping_import_bytes_copied(const cusco_executor * executor) {
+    return executor ? executor->mapping_import_bytes_copied : 0;
+}
+uint64_t cusco_executor_mapping_bytes_copied(const cusco_executor * executor) {
+    return executor
+        ? executor->mapping_fork_bytes_copied
+            + executor->mapping_export_bytes_copied
+            + executor->mapping_import_bytes_copied
+        : 0;
+}
+uint32_t cusco_executor_graph_recaptures_supported(const cusco_executor *) {
+    return 0;
+}
+uint64_t cusco_executor_graph_recaptures(const cusco_executor *) {
+    return 0;
 }
 
 cusco_status cusco_executor_replace_state_for_proof(

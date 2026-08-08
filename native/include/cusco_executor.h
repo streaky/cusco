@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define CUSCO_EXECUTOR_ABI_VERSION 7u
+#define CUSCO_EXECUTOR_ABI_VERSION 8u
 
 /* Opaque, uniquely owned handles. Only the cancellation signal is thread-safe. */
 typedef struct cusco_executor cusco_executor;
@@ -106,8 +106,8 @@ cusco_status cusco_executor_commit_restore(cusco_executor *, cusco_prepared_rest
  * the executor context. Preparing a fork allocates and copies sequence
  * references, but it is invisible to activation until commit publishes it.
  * Activation changes only the block-table reference used by subsequent decode
- * calls; it does not serialize or restore checkpoint bytes. Graph/cache reuse
- * is not reported because llama.cpp's public API exposes no rebuild signal. */
+ * calls; it does not serialize or restore checkpoint bytes. Fork, export, and
+ * import byte counters report payload bytes actually copied by this shim. */
 cusco_status cusco_executor_prepare_mapping_fork(
     cusco_executor *, uint32_t source_mapping, cusco_prepared_mapping ** out);
 void cusco_prepared_mapping_free(cusco_prepared_mapping *);
@@ -128,7 +128,14 @@ cusco_status cusco_executor_import_mapping(
 uint32_t cusco_executor_active_mapping(const cusco_executor *);
 size_t cusco_executor_mapping_count(const cusco_executor *);
 uint64_t cusco_executor_reference_switches(const cusco_executor *);
-uint64_t cusco_executor_mapped_bytes_copied(const cusco_executor *);
+uint64_t cusco_executor_mapping_fork_bytes_copied(const cusco_executor *);
+uint64_t cusco_executor_mapping_export_bytes_copied(const cusco_executor *);
+uint64_t cusco_executor_mapping_import_bytes_copied(const cusco_executor *);
+uint64_t cusco_executor_mapping_bytes_copied(const cusco_executor *);
+/* The pinned llama.cpp public API exposes no graph-recapture signal. These
+ * calls make that absence explicit instead of reporting a fabricated zero. */
+uint32_t cusco_executor_graph_recaptures_supported(const cusco_executor *);
+uint64_t cusco_executor_graph_recaptures(const cusco_executor *);
 /* Thread-safe request abort signal. The next active or subsequent decode
  * observes cancellation at llama.cpp's abort callback without mutating the
  * last completed sequence state. */

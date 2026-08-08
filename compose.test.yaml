@@ -53,6 +53,20 @@ services:
       - cargo-git:/root/.cargo/git
       - cargo-target:/work/target
     deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
+  representation-proof:
+    build: *test-build
+    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader > /results/representation-proof-gpu.csv && cargo run -p cusco -- representation-proof 'hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf'"]
+    environment:
+      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
+      LD_LIBRARY_PATH: "/opt/llama-build/bin"
+    volumes:
+      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_RESULT_DIR:-./results}:/results"
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
+
 
   api-smoke:
     depends_on:

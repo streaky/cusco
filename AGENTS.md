@@ -35,7 +35,7 @@ The server dynamically admits and reuses multiple model epochs within configured
 - Local builds must support CUDA architectures `sm_61` and `sm_70`. Use `CUSCO_CUDA_ARCHITECTURES="61;70"` for normal local builds.
 - Reserve the broad, full CUDA architecture build for production releases. Do not spend local development time compiling every supported CUDA target unless release validation specifically requires it.
 - `llama.cpp-version.txt` is the sole source of truth for the llama.cpp version. It contains a release tag only. Build and fetch tooling must read it; never duplicate the tag or record the corresponding commit hash.
-- Keep llama.cpp changes behind the versioned C ABI in `native/include/cusco_executor.h` (currently ABI version 7). Rust should not depend directly on unstable llama.cpp internals.
+- Keep llama.cpp changes behind the versioned C ABI in `native/include/cusco_executor.h` (currently ABI version 8). Rust should not depend directly on unstable llama.cpp internals.
 - Model files and generated proof results are local artifacts and must not be committed.
 
 A normal local image build is:
@@ -52,9 +52,9 @@ Select the proof GPU with `CUSCO_GPU_DEVICE_ID`; do not assume a particular host
  - Every measured Rust source file must maintain at least 80% line coverage. `tools/coverage.sh` runs the tests and enforces the per-file threshold.
  - Run the GPU-less coverage path with `docker compose -f compose.test.yaml run --rm test`.
  - The unified real-model API smoke gate is `docker compose -f compose.test.yaml run --rm api-smoke`; it exercises the primary OpenAI, Cusco context/compaction, and status APIs and writes `results/smoke-report.json` with request, token, and latency statistics.
- - Focused executor, mapped-execution, and scheduler proofs remain available through their Compose services when changing those subsystems.
+ - Focused executor, mapped-execution, representation-measurement, and scheduler proofs remain available through their Compose services when changing those subsystems.
 - Real-model tests and proofs use the single canonical artifact `hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf`. Pass that URI directly to proof and smoke interfaces; the model registry resolves its immutable revision, validates or populates the persistent cache under `${CUSCO_MODEL_DIR:-./models}/cache`, and supplies the resolved local path only at the executor boundary. Tests must not inspect the cache layout, copy, hard-link, symlink, or independently redownload the artifact. This Gemma model supports vision and tool use, so their real-model acceptance coverage should use the same artifact. Executor-boundary changes require the real model proof, not only deterministic model-free tests, and must write machine-readable evidence under `results/`.
-- Mapped-executor changes require `docker compose -f compose.test.yaml run --rm mapped-proof`; it writes staged-versus-mapped evidence to `results/phase5.json`.
+- Mapped-executor changes require `docker compose -f compose.test.yaml run --rm mapped-proof`; it writes staged-versus-mapped evidence to `results/phase5.json`. Representation changes additionally require `docker compose -f compose.test.yaml run --rm representation-proof`; it replays `config/representation-workload.json` and writes exact-continuation, publication-scaling, copy, state-movement, and graph-telemetry evidence to `results/representation-proof.json`.
 - Verify failure behavior transactionally: cancellation, preparation failure, transfer failure, validation failure, and commit failure must leave the prior binding usable.
 - For behavioral work, exercise the changed path end to end. A successful compile alone is not sufficient.
 

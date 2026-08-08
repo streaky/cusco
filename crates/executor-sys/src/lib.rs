@@ -156,7 +156,18 @@ unsafe extern "C" {
     pub fn cusco_executor_active_mapping(executor: *const CuscoExecutor) -> c_uint;
     pub fn cusco_executor_mapping_count(executor: *const CuscoExecutor) -> usize;
     pub fn cusco_executor_reference_switches(executor: *const CuscoExecutor) -> c_ulonglong;
-    pub fn cusco_executor_mapped_bytes_copied(executor: *const CuscoExecutor) -> c_ulonglong;
+    pub fn cusco_executor_mapping_fork_bytes_copied(
+        executor: *const CuscoExecutor,
+    ) -> c_ulonglong;
+    pub fn cusco_executor_mapping_export_bytes_copied(
+        executor: *const CuscoExecutor,
+    ) -> c_ulonglong;
+    pub fn cusco_executor_mapping_import_bytes_copied(
+        executor: *const CuscoExecutor,
+    ) -> c_ulonglong;
+    pub fn cusco_executor_mapping_bytes_copied(executor: *const CuscoExecutor) -> c_ulonglong;
+    pub fn cusco_executor_graph_recaptures_supported(executor: *const CuscoExecutor) -> c_uint;
+    pub fn cusco_executor_graph_recaptures(executor: *const CuscoExecutor) -> c_ulonglong;
     pub fn cusco_executor_cancel(executor: *mut CuscoExecutor);
     pub fn cusco_executor_reset_cancel(executor: *mut CuscoExecutor);
 

@@ -1226,6 +1226,20 @@ The server should expose native metrics for:
 - output-equivalence failures in validation mode;
 - cache benefit by explicit predictive-declaration class, observed revisit class, and cache hit rate.
 
+The canonical representation baseline is the versioned deterministic workload
+in `config/representation-workload.json`, executed with:
+
+```text
+docker compose -f compose.test.yaml run --rm representation-proof
+```
+
+Its reusable artifact separates correctness from performance: exact token and
+logit continuation is established at every represented-prefix boundary and
+after export/import before publication latency or copy deltas are interpreted.
+Fork, export, and import counters report bytes actually copied by the native
+shim. Graph recaptures are an optional capability and are reported as
+unsupported, not zero, when the pinned backend exposes no truthful signal.
+
 Compaction observability should additionally include:
 
 - eligibility checks, starts, completions, cancellations, obsolete results, failures, and timeouts by strategy;
@@ -1359,6 +1373,7 @@ Canonical commands should remain short and explicit about which Compose contract
 docker compose -f compose.test.yaml build
 docker compose -f compose.test.yaml run --rm test
 docker compose -f compose.test.yaml run --rm mapped-proof
+docker compose -f compose.test.yaml run --rm representation-proof
 docker compose -f compose.test.yaml run --rm executor-proof
 docker compose up -d server
 ```

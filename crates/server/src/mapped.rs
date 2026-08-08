@@ -148,7 +148,11 @@ pub struct MappedMetrics {
     pub decoded_tokens: u64,
     pub published_blocks: u64,
     pub reference_switches: u64,
-    pub activation_bytes_copied: u64,
+    pub fork_bytes_copied: u64,
+    pub export_bytes_copied: u64,
+    pub import_bytes_copied: u64,
+    pub total_bytes_copied: u64,
+    pub graph_recaptures: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -652,7 +656,11 @@ impl MappedSession {
         state.metrics.cached_tokens += self.cached as u64;
         state.metrics.cache_hits += u64::from(self.cached != 0);
         state.metrics.reference_switches = native_metrics.reference_switches;
-        state.metrics.activation_bytes_copied = native_metrics.activation_bytes_copied;
+        state.metrics.fork_bytes_copied = native_metrics.fork_bytes_copied;
+        state.metrics.export_bytes_copied = native_metrics.export_bytes_copied;
+        state.metrics.import_bytes_copied = native_metrics.import_bytes_copied;
+        state.metrics.total_bytes_copied = native_metrics.total_bytes_copied;
+        state.metrics.graph_recaptures = native_metrics.graph_recaptures;
         let physical_metrics = state.physical.metrics();
         self.prefill.transfer_bytes = physical_metrics.transfer_bytes;
         self.prefill.device_bytes = physical_metrics.device_total;
@@ -1150,7 +1158,8 @@ mod tests {
         assert_eq!(metrics.requests, 2);
         assert_eq!(metrics.cache_hits, 1);
         assert!(metrics.cached_tokens >= 32);
-        assert_eq!(metrics.activation_bytes_copied, 0);
+        assert_eq!(metrics.fork_bytes_copied, 0);
+        assert_eq!(metrics.graph_recaptures, None);
         assert!(metrics.reference_switches >= 2);
     }
 
