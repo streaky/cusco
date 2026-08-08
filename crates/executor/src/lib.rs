@@ -78,11 +78,15 @@ impl Clone for RepresentationHandle {
 
 impl std::fmt::Debug for RepresentationHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("RepresentationHandle").field(&self.identity).finish()
+        f.debug_tuple("RepresentationHandle")
+            .field(&self.identity)
+            .finish()
     }
 }
 impl PartialEq for RepresentationHandle {
-    fn eq(&self, other: &Self) -> bool { self.identity == other.identity && self.raw == other.raw }
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.raw == other.raw
+    }
 }
 impl Eq for RepresentationHandle {}
 impl std::hash::Hash for RepresentationHandle {
@@ -92,7 +96,9 @@ impl std::hash::Hash for RepresentationHandle {
     }
 }
 impl Drop for RepresentationHandle {
-    fn drop(&mut self) { ffi::release_representation(self.raw); }
+    fn drop(&mut self) {
+        ffi::release_representation(self.raw);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -105,7 +111,9 @@ pub struct RepresentationDescriptor {
     pub completion_fence: u64,
 }
 impl RepresentationHandle {
-    pub fn identity(&self) -> u64 { self.identity }
+    pub fn identity(&self) -> u64 {
+        self.identity
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -643,8 +651,12 @@ mod ffi {
         raw: NonNull<sys::CuscoRepresentation>,
     ) -> Result<super::RepresentationDescriptor, Error> {
         let mut descriptor = sys::RepresentationDescriptor {
-            identity: 0, component_mask: 0, tier: 0, represented_position: 0,
-            serialized_bytes: 0, completion_fence: 0,
+            identity: 0,
+            component_mask: 0,
+            tier: 0,
+            represented_position: 0,
+            serialized_bytes: 0,
+            completion_fence: 0,
         };
         status(unsafe { sys::cusco_representation_describe(raw.as_ptr(), &mut descriptor) })?;
         Ok(super::RepresentationDescriptor {
@@ -664,7 +676,10 @@ mod ffi {
         let mut prepared = std::ptr::null_mut();
         status(unsafe {
             sys::cusco_executor_prepare_mapping_fork(
-                executor.as_ptr(), source.as_ptr(), &mut prepared)
+                executor.as_ptr(),
+                source.as_ptr(),
+                &mut prepared,
+            )
         })?;
         NonNull::new(prepared).ok_or(Error::Backend(3))
     }
@@ -676,7 +691,10 @@ mod ffi {
         let mut representation = std::ptr::null_mut();
         status(unsafe {
             sys::cusco_executor_commit_mapping(
-                executor.as_ptr(), prepared.as_ptr(), &mut representation)
+                executor.as_ptr(),
+                prepared.as_ptr(),
+                &mut representation,
+            )
         })?;
         NonNull::new(representation).ok_or(Error::Backend(3))
     }
@@ -702,8 +720,13 @@ mod ffi {
         let mut position = 0;
         status(unsafe {
             sys::cusco_executor_export_mapping(
-                executor.as_ptr(), representation.as_ptr(), bytes.as_mut_ptr(),
-                bytes.len(), &mut written, &mut position)
+                executor.as_ptr(),
+                representation.as_ptr(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &mut written,
+                &mut position,
+            )
         })?;
         bytes.truncate(written);
         Ok(super::MappingState { bytes, position })
@@ -716,8 +739,12 @@ mod ffi {
         let mut representation = std::ptr::null_mut();
         status(unsafe {
             sys::cusco_executor_import_mapping(
-                executor.as_ptr(), state.bytes.as_ptr(), state.bytes.len(),
-                state.position, &mut representation)
+                executor.as_ptr(),
+                state.bytes.as_ptr(),
+                state.bytes.len(),
+                state.position,
+                &mut representation,
+            )
         })?;
         NonNull::new(representation).ok_or(Error::Backend(3))
     }

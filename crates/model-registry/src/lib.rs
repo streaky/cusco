@@ -75,8 +75,8 @@ fn skip_value(reader: &mut impl Read, kind: u32) -> Result<(), Error> {
     let bytes = match kind {
         0 | 1 | 7 => 1,
         2 | 3 => 2,
-        4 | 5 | 6 => 4,
-        10 | 11 | 12 => 8,
+        4..=6 => 4,
+        10..=12 => 8,
         8 => {
             let _ = read_string(reader)?;
             return Ok(());

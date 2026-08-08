@@ -2647,7 +2647,7 @@ async fn chat(
         headers,
         value: r,
         retained_bytes,
-        _permit: permit,
+        _permit,
     }: PrequeueJson<ChatRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
@@ -2746,7 +2746,7 @@ async fn responses(
         headers,
         value: r,
         retained_bytes,
-        _permit: permit,
+        _permit,
     }: PrequeueJson<ResponsesRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
@@ -2820,7 +2820,6 @@ async fn responses(
 fn default_true() -> bool {
     true
 }
-
 
 async fn ollama_version(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
     auth(&s, &headers, Scope::Inference)?;
@@ -3061,7 +3060,7 @@ async fn perform_ollama_pull(
     if let Some(sender) = &progress {
         let _ = sender.send(json!({"status":"writing manifest"})).await;
     }
-    let model = s.register_model_with(
+    s.register_model_with(
         |model| catalog.publish(model).map_err(state_err),
         ModelRecord {
             id: name,
@@ -3683,32 +3682,22 @@ pub fn openapi_document() -> Value {
 pub async fn serve(
     server: Server,
     addr: SocketAddr,
-    anonymous: bool,
-    unsafe_public: bool,
+    _anonymous: bool,
+    _unsafe_public: bool,
 ) -> Result<(), Error> {
-    serve_until(
-        server,
-        addr,
-        anonymous,
-        unsafe_public,
-        None,
-        shutdown_signal(),
-    )
-    .await
+    serve_until(server, addr, None, shutdown_signal()).await
 }
 
 pub async fn serve_with_http_debug(
     server: Server,
     addr: SocketAddr,
-    anonymous: bool,
-    unsafe_public: bool,
+    _anonymous: bool,
+    _unsafe_public: bool,
     level: HttpDebugLevel,
 ) -> Result<(), Error> {
     serve_until(
         server,
         addr,
-        anonymous,
-        unsafe_public,
         Some(HttpDebug::stderr(level)),
         shutdown_signal(),
     )
@@ -3718,8 +3707,7 @@ pub async fn serve_with_http_debug(
 async fn serve_until(
     server: Server,
     addr: SocketAddr,
-    anonymous: bool,
-    unsafe_public: bool,
+
     http_debug: Option<HttpDebug>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
@@ -4359,11 +4347,13 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
-        assert!(openapi_document()["paths"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .all(|path| !path.starts_with("/ollama/")));
+        assert!(
+            openapi_document()["paths"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|path| !path.starts_with("/ollama/"))
+        );
         let spec = openapi_document();
         assert_eq!(spec["openapi"], "3.1.0");
         assert!(spec["paths"]["/openai/v1/chat/completions"].is_object());
@@ -4912,16 +4902,9 @@ mod tests {
     #[tokio::test]
     async fn configured_server_stops_when_shutdown_is_requested() {
         let (server, dir) = setup(Arc::new(AnonymousAdmin));
-        serve_until(
-            server,
-            "127.0.0.1:0".parse().unwrap(),
-            true,
-            false,
-            None,
-            async {},
-        )
-        .await
-        .unwrap();
+        serve_until(server, "127.0.0.1:0".parse().unwrap(), None, async {})
+            .await
+            .unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -5189,7 +5172,11 @@ mod tests {
             })
             .unwrap();
         let response = router(server)
-            .oneshot(Request::get("/cusco/v1/api/ps").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/cusco/v1/api/ps")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -5467,8 +5454,6 @@ mod tests {
         let serving = tokio::spawn(serve_until(
             server,
             address,
-            true,
-            false,
             Some(HttpDebug::new(HttpDebugLevel::Safe, move |line| {
                 captured.lock().push(line.to_owned())
             })),

@@ -127,6 +127,7 @@ pub fn strategy_catalog() -> CompactionStrategyCatalog {
     }
 }
 
+#[cfg(test)]
 pub fn canonical_strategy_ids() -> Vec<String> {
     strategy_catalog()
         .strategies

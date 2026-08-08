@@ -141,9 +141,8 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn cusco_representation_retain(representation: *mut CuscoRepresentation);
     pub fn cusco_representation_release(representation: *mut CuscoRepresentation);
-    pub fn cusco_representation_identity(
-        representation: *const CuscoRepresentation,
-    ) -> c_ulonglong;
+    pub fn cusco_representation_identity(representation: *const CuscoRepresentation)
+    -> c_ulonglong;
     pub fn cusco_representation_describe(
         representation: *const CuscoRepresentation,
         out: *mut RepresentationDescriptor,
@@ -182,14 +181,10 @@ unsafe extern "C" {
         position: usize,
         out: *mut *mut CuscoRepresentation,
     ) -> c_int;
-    pub fn cusco_executor_active_mapping_identity(
-        executor: *const CuscoExecutor,
-    ) -> c_ulonglong;
+    pub fn cusco_executor_active_mapping_identity(executor: *const CuscoExecutor) -> c_ulonglong;
     pub fn cusco_executor_mapping_count(executor: *const CuscoExecutor) -> usize;
     pub fn cusco_executor_reference_switches(executor: *const CuscoExecutor) -> c_ulonglong;
-    pub fn cusco_executor_mapping_fork_bytes_copied(
-        executor: *const CuscoExecutor,
-    ) -> c_ulonglong;
+    pub fn cusco_executor_mapping_fork_bytes_copied(executor: *const CuscoExecutor) -> c_ulonglong;
     pub fn cusco_executor_mapping_export_bytes_copied(
         executor: *const CuscoExecutor,
     ) -> c_ulonglong;

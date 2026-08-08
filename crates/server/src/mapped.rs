@@ -325,7 +325,10 @@ impl MappedEngine {
         let _ = state.physical.release_binding(EXECUTION_SLOT);
         let mut spilled = 0;
         for (id, native) in candidates {
-            let mapping = state.executor.export_mapping(&native).map_err(state_error)?;
+            let mapping = state
+                .executor
+                .export_mapping(&native)
+                .map_err(state_error)?;
             if state.spill_bytes.saturating_add(mapping.bytes.len()) > self.spill_capacity {
                 continue;
             }
@@ -459,7 +462,10 @@ impl MappedSession {
         let activation_started = Instant::now();
         let transfer_before = state.physical.metrics().transfer_bytes;
         activate_prefix(&mut state, logical_context, prefix.as_deref())?;
-        let source = state.executor.active_representation().map_err(state_error)?;
+        let source = state
+            .executor
+            .active_representation()
+            .map_err(state_error)?;
         self.active_mapping = Some(fork_and_activate(&mut state.executor, &source)?);
         self.prefill.mapping_activation_ns = elapsed_ns(activation_started);
         let transfer_after = state.physical.metrics().transfer_bytes;
@@ -538,7 +544,11 @@ impl MappedSession {
                     .clone(),
                 self.next.as_ref().expect("decode result exists"),
             )?);
-            let source = self.active_mapping.as_ref().expect("published mapping exists").clone();
+            let source = self
+                .active_mapping
+                .as_ref()
+                .expect("published mapping exists")
+                .clone();
             self.active_mapping = Some(fork_and_activate(&mut state.executor, &source)?);
         }
         self.prefill.uncached_prefill_ns = self
@@ -613,7 +623,11 @@ impl MappedSession {
                         .clone(),
                     self.next.as_ref().expect("decode result exists"),
                 )?);
-                let source = self.active_mapping.as_ref().expect("published mapping exists").clone();
+                let source = self
+                    .active_mapping
+                    .as_ref()
+                    .expect("published mapping exists")
+                    .clone();
                 self.active_mapping = Some(fork_and_activate(&mut state.executor, &source)?);
             }
         }
@@ -635,7 +649,11 @@ impl MappedSession {
     fn activate_owned(&self, state: &mut MappedState) -> Result<(), Error> {
         state
             .executor
-            .activate_mapping(self.active_mapping.as_ref().expect("prepared mapping exists"))
+            .activate_mapping(
+                self.active_mapping
+                    .as_ref()
+                    .expect("prepared mapping exists"),
+            )
             .map_err(state_error)
     }
 
@@ -651,9 +669,17 @@ impl MappedSession {
                 .parent
                 .and_then(|id| state.resident.get(&id))
                 .and_then(|resident| resident.native.clone())
-                .unwrap_or(state.executor.active_representation().map_err(state_error)?);
+                .unwrap_or(
+                    state
+                        .executor
+                        .active_representation()
+                        .map_err(state_error)?,
+                );
             if active != fallback {
-                state.executor.activate_mapping(&fallback).map_err(state_error)?;
+                state
+                    .executor
+                    .activate_mapping(&fallback)
+                    .map_err(state_error)?;
             }
         }
         let native_metrics = state.executor.mapping_metrics();
@@ -788,7 +814,10 @@ fn activate_prefix(
         }
         state
             .executor
-            .import_mapping(&MappingState { bytes, position: spilled.position })
+            .import_mapping(&MappingState {
+                bytes,
+                position: spilled.position,
+            })
             .map_err(state_error)?
     };
     let revision = state
@@ -796,7 +825,10 @@ fn activate_prefix(
         .context(context)
         .ok_or_else(|| Error::State("logical context disappeared".into()))?
         .revision;
-    let previous = state.executor.active_representation().map_err(state_error)?;
+    let previous = state
+        .executor
+        .active_representation()
+        .map_err(state_error)?;
     let (prepared, _, transfers) = state
         .physical
         .prepare_transition(
@@ -888,7 +920,12 @@ fn publish_block(
     let rollback = parent
         .and_then(|id| state.resident.get(&id))
         .and_then(|resident| resident.native.clone())
-        .unwrap_or(state.executor.active_representation().map_err(state_error)?);
+        .unwrap_or(
+            state
+                .executor
+                .active_representation()
+                .map_err(state_error)?,
+        );
     let prepared_publication = state
         .logical
         .prepare_publication(

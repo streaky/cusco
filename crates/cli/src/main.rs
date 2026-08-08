@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cusco_executor::{Executor, logits_identical};
-use cusco_model_registry::{GEMMA_URI, ModelRecord as RegistryModelRecord, fetch_hf, register_local};
+use cusco_model_registry::{
+    GEMMA_URI, ModelRecord as RegistryModelRecord, fetch_hf, register_local,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -687,9 +689,18 @@ fn representation_proof(
         .with_context(|| format!("read workload {}", workload_path.display()))?;
     let workload: RepresentationProofWorkload =
         serde_json::from_slice(&workload_bytes).context("parse representation workload")?;
-    ensure!(workload.version == 1, "unsupported representation workload version");
-    ensure!(!workload.trace_text.is_empty(), "representation trace text is empty");
-    ensure!(workload.trace_repetitions > 0, "trace repetitions must be positive");
+    ensure!(
+        workload.version == 1,
+        "unsupported representation workload version"
+    );
+    ensure!(
+        !workload.trace_text.is_empty(),
+        "representation trace text is empty"
+    );
+    ensure!(
+        workload.trace_repetitions > 0,
+        "trace repetitions must be positive"
+    );
     ensure!(
         !workload.represented_prefix_tokens.is_empty(),
         "represented-prefix boundary list is empty"
@@ -703,7 +714,10 @@ fn representation_proof(
     );
 
     let record = resolve_model(&model, None)?;
-    let model_path = record.path.to_str().context("resolved model path is not UTF-8")?;
+    let model_path = record
+        .path
+        .to_str()
+        .context("resolved model path is not UTF-8")?;
     let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
     ensure!(
         executor.capabilities().mapped_execution,
@@ -857,7 +871,10 @@ fn mapped_proof(
 ) -> Result<()> {
     let started = Instant::now();
     let record = resolve_model(&model, None)?;
-    let model_path = record.path.to_str().context("resolved model path is not UTF-8")?;
+    let model_path = record
+        .path
+        .to_str()
+        .context("resolved model path is not UTF-8")?;
     let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
     ensure!(
         executor.capabilities().mapped_execution,
