@@ -4,7 +4,7 @@ use axum::{
     extract::{FromRequest, Path as AxumPath, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header::RETRY_AFTER},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
 };
 use futures_util::{StreamExt, stream};
@@ -41,7 +41,7 @@ mod catalog;
 mod config;
 mod residency;
 pub use catalog::{load_user_models, ModelCatalog};
-pub use config::{DaemonConfig, VisionConfig};
+pub use config::{DaemonConfig, OpenApiConfig, VisionConfig};
 pub use context_strategy::{
     apply_window_tail_strategy, CompactionDeclaration, CompactionNoMatchFallback,
     CompactionProposal, CompactionRequest, CompactionResult, CompactionResultReason,
@@ -1037,6 +1037,7 @@ pub struct Server {
     catalog: Arc<Mutex<Option<ModelCatalog>>>,
     model_directory: Arc<Mutex<PathBuf>>,
     vision: Arc<Mutex<VisionConfig>>,
+    openapi: Arc<Mutex<OpenApiConfig>>,
 }
 struct AdmissionGuard {
     server: Server,
@@ -1102,6 +1103,7 @@ impl Server {
             catalog: Arc::new(Mutex::new(None)),
             model_directory: Arc::new(Mutex::new(PathBuf::from("./data/models"))),
             vision: Arc::new(Mutex::new(VisionConfig::default())),
+            openapi: Arc::new(Mutex::new(OpenApiConfig::default())),
         };
         server.persist()?;
         Ok(server)
@@ -1115,6 +1117,12 @@ impl Server {
     }
     pub fn configure_vision(&self, config: VisionConfig) {
         *self.vision.lock() = config;
+    }
+    pub fn configure_openapi(&self, config: OpenApiConfig) {
+        *self.openapi.lock() = config;
+    }
+    fn openapi_ui_enabled(&self) -> bool {
+        self.openapi.lock().ui.enabled
     }
     fn vision_config(&self) -> VisionConfig {
         self.vision.lock().clone()
@@ -2305,7 +2313,7 @@ pub fn router_with_http_debug(server: Server, debug: HttpDebug) -> Router {
     }
 }
 fn routes(server: Server) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/openai/v1/openapi.json", get(openapi))
         .route("/ollama/api/openapi.json", get(openapi))
         .route("/cusco/v1/openapi.json", get(openapi))
@@ -2335,8 +2343,13 @@ fn routes(server: Server) -> Router {
         .route("/cusco/v1/status", get(native_status))
         .route("/cusco/v1/compaction/strategies", get(compaction_strategies))
         .route("/cusco/v1/compaction/declarations", post(create_compaction_declaration))
-        .route("/cusco/v1/contexts/{id}/branches", post(branch_context))
-        .with_state(server)
+        .route("/cusco/v1/contexts/{id}/branches", post(branch_context));
+    let app = if server.openapi_ui_enabled() {
+        app.route("/openapi/ui", get(swagger_ui))
+    } else {
+        app
+    };
+    app.with_state(server)
 }
 
 async fn http_debug_middleware(
@@ -3207,15 +3220,21 @@ fn completed_response(
     finish_reason: FinishReason,
 ) -> Value {
     let usage = json!({"prompt_tokens":response.usage.input_tokens,"completion_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens});
+    let cusco = json!({
+        "compaction_result": response.usage.compaction_result,
+        "correlation_id": response.usage.correlation_id,
+        "inference_id": response.usage.inference_id,
+        "execution_session_id": response.usage.execution_session_id,
+    });
     match protocol {
         WireProtocol::OpenAiCompletion => {
-            json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text,"index":0,"finish_reason":finish_reason}],"usage":usage})
+            json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text,"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
         WireProtocol::OpenAiChat => {
-            json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":finish_reason}],"usage":usage})
+            json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
         WireProtocol::OpenAiResponses => {
-            json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"finish_reason":finish_reason,"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens}})
+            json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"finish_reason":finish_reason,"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens},"cusco":cusco})
         }
         WireProtocol::OllamaGenerate => {
             json!({"model":response.usage.model,"response":response.text,"done":true,"done_reason":finish_reason,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens})
@@ -3460,6 +3479,25 @@ fn openapi_operation(operation_id: &str, request_schema: Option<&str>) -> Value 
         });
     }
     operation
+}
+
+async fn swagger_ui() -> Html<&'static str> {
+    Html(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cusco API</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>SwaggerUIBundle({url:"/openai/v1/openapi.json",dom_id:"#swagger-ui"});</script>
+</body>
+</html>"##,
+    )
 }
 
 pub fn openapi_document() -> Value {
@@ -4232,6 +4270,53 @@ mod tests {
             "#/components/schemas/CompletionRequest"
         );
         fs::remove_dir_all(d).unwrap()
+    }
+
+    #[tokio::test]
+    async fn swagger_ui_default_off() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let response = router(server)
+            .oneshot(
+                Request::get("/openapi/ui")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn swagger_combined_spec_and_ui_smoke() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        server.configure_openapi(OpenApiConfig {
+            ui: crate::config::OpenApiUiConfig { enabled: true },
+        });
+        let app = router(server);
+        let response = app
+            .oneshot(
+                Request::get("/openapi/ui")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/html; charset=utf-8");
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("SwaggerUIBundle"));
+        let spec = openapi_document();
+        assert!(spec["paths"]["/openai/v1/completions"].is_object());
+        assert!(spec["paths"]["/ollama/api/generate"].is_object());
+        assert!(spec["paths"]["/cusco/v1/contexts"].is_object());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -5450,6 +5535,33 @@ mod tests {
         assert_eq!(result.selected_strategy_id.as_deref(), Some("window_tail:v1"));
         assert_eq!(successor.revision, source.revision + 1);
         assert!(successor.tokens.iter().any(|token| token.contains("system")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compaction_result_payload_for_openai_replay() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let source = server
+            .import_context(vec![
+                "<start_of_turn>system".into(),
+                "policy".into(),
+                "<start_of_turn>user".into(),
+                "older question".into(),
+            ])
+            .unwrap();
+        let (response, _) = server
+            .infer("compact-replay", compacting_request(source.id))
+            .unwrap();
+        let payload = completed_response(
+            WireProtocol::OpenAiCompletion,
+            response,
+            FinishReason::Length,
+        );
+        assert_eq!(
+            payload["cusco"]["compaction_result"]["selected_strategy_id"],
+            "window_tail:v1"
+        );
+        assert_eq!(payload["cusco"]["compaction_result"]["success"], true);
         fs::remove_dir_all(directory).unwrap();
     }
 

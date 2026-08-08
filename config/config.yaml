@@ -2,6 +2,9 @@ version: 1
 listen: 0.0.0.0:8080
 unsafe_public_unauthenticated: false
 http_debug: off
+openapi:
+  ui:
+    enabled: false
 paths:
   database: /data/db/catalog.sqlite
   models: /data/models
