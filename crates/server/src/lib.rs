@@ -13,13 +13,10 @@ use http_body_util::BodyExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
-    fs,
     future::Future,
-    io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -36,6 +33,7 @@ mod catalog;
 mod config;
 mod context_strategy;
 mod generation;
+mod lifecycle;
 mod mapped;
 mod prompt;
 mod residency;
@@ -237,19 +235,10 @@ pub struct ModelRecord {
     #[serde(default)]
     pub epoch: u64,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct DurableState {
-    installation: Uuid,
+#[derive(Clone, Debug)]
+struct RuntimeState {
     contexts: HashMap<ContextId, ContextRecord>,
-    models: HashMap<String, ModelRecord>,
-    #[serde(default = "initial_model_epoch")]
-    next_model_epoch: u64,
 }
-
-fn initial_model_epoch() -> u64 {
-    1
-}
-
 fn default_model_family() -> String {
     "gemma4".into()
 }
@@ -978,7 +967,7 @@ struct QueueEntry {
     ready: tokio::sync::oneshot::Sender<()>,
 }
 struct Inner {
-    durable: DurableState,
+    durable: RuntimeState,
     controls: HashMap<String, Arc<RequestControl>>,
     pending_cancelled: HashSet<String>,
     active: usize,
@@ -1082,16 +1071,13 @@ struct DeclarationState {
 
 #[derive(Clone)]
 pub struct Server {
-    state_path: PathBuf,
     inner: Arc<Mutex<Inner>>,
     pre_queue: Arc<PrequeueGate>,
     compaction_workers: Arc<PrequeueGate>,
-    model_lifecycle: Arc<Mutex<()>>,
     auth: Arc<dyn AuthProvider>,
     declarations: Arc<Mutex<DeclarationState>>,
     engine: Arc<dyn InferenceEngine>,
-    catalog: Arc<Mutex<Option<ModelCatalog>>>,
-    model_directory: Arc<Mutex<PathBuf>>,
+    lifecycle: lifecycle::ModelLifecycleService,
     vision: Arc<Mutex<VisionConfig>>,
     openapi: Arc<Mutex<OpenApiConfig>>,
 }
@@ -1113,34 +1099,16 @@ impl Drop for AdmissionGuard {
 }
 impl Server {
     pub fn open(
-        path: impl AsRef<Path>,
+        _path: impl AsRef<Path>,
         auth: Arc<dyn AuthProvider>,
         engine: Arc<dyn InferenceEngine>,
     ) -> Result<Self, Error> {
-        let path = path.as_ref().to_owned();
-        let mut durable: DurableState = if path.exists() {
-            serde_json::from_slice(&fs::read(&path).map_err(state_err)?).map_err(state_err)?
-        } else {
-            DurableState {
-                installation: Uuid::new_v4(),
-                contexts: HashMap::new(),
-                models: HashMap::new(),
-                next_model_epoch: initial_model_epoch(),
-            }
-        };
-        durable.next_model_epoch = durable
-            .models
-            .values()
-            .map(|model| model.epoch)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1)
-            .max(durable.next_model_epoch);
         let config = ServerConfig::default();
-        let server = Self {
-            state_path: path,
+        Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
-                durable,
+                durable: RuntimeState {
+                    contexts: HashMap::new(),
+                },
                 controls: HashMap::new(),
                 pending_cancelled: HashSet::new(),
                 active: 0,
@@ -1153,27 +1121,23 @@ impl Server {
             })),
             pre_queue: PrequeueGate::new(config.pre_queue_concurrency),
             compaction_workers: PrequeueGate::new(config.compaction_workers),
-            model_lifecycle: Arc::new(Mutex::new(())),
             auth,
             declarations: Arc::new(Mutex::new(DeclarationState {
                 records: HashMap::new(),
                 creation_times: HashMap::new(),
             })),
+            lifecycle: lifecycle::ModelLifecycleService::new(engine.clone()),
             engine,
-            catalog: Arc::new(Mutex::new(None)),
-            model_directory: Arc::new(Mutex::new(PathBuf::from("./data/models"))),
             vision: Arc::new(Mutex::new(VisionConfig::default())),
             openapi: Arc::new(Mutex::new(OpenApiConfig::default())),
-        };
-        server.persist()?;
-        Ok(server)
+        })
     }
     pub fn attach_catalog(&self, catalog: ModelCatalog, model_directory: impl Into<PathBuf>) {
-        *self.catalog.lock() = Some(catalog);
-        *self.model_directory.lock() = model_directory.into();
+        self.lifecycle
+            .attach_catalog(catalog, model_directory.into());
     }
     fn catalog(&self) -> Option<ModelCatalog> {
-        self.catalog.lock().clone()
+        self.lifecycle.catalog()
     }
     pub fn configure_vision(&self, config: VisionConfig) {
         *self.vision.lock() = config;
@@ -1188,19 +1152,7 @@ impl Server {
         self.vision.lock().clone()
     }
     fn model_directory(&self) -> PathBuf {
-        self.model_directory.lock().clone()
-    }
-    fn persist(&self) -> Result<(), Error> {
-        let guard = self.inner.lock();
-        let bytes = serde_json::to_vec_pretty(&guard.durable).map_err(state_err)?;
-        if let Some(parent) = self.state_path.parent() {
-            fs::create_dir_all(parent).map_err(state_err)?;
-        }
-        let tmp = self
-            .state_path
-            .with_extension(format!("tmp-{}", Uuid::new_v4()));
-        fs::write(&tmp, bytes).map_err(state_err)?;
-        fs::rename(tmp, &self.state_path).map_err(state_err)
+        self.lifecycle.model_directory()
     }
     fn authorize(&self, headers: &HeaderMap, scope: Scope) -> Result<RequestContext, Error> {
         self.auth.authenticate(headers, scope)
@@ -1227,7 +1179,6 @@ impl Server {
         };
         guard.durable.contexts.insert(id, record.clone());
         drop(guard);
-        self.persist()?;
         Ok(record)
     }
     pub fn branch_context(&self, source: &ContextId) -> Result<ContextRecord, Error> {
@@ -1246,7 +1197,6 @@ impl Server {
             .durable
             .contexts
             .insert(record.id.clone(), record.clone());
-        self.persist()?;
         Ok(record)
     }
     pub fn context(&self, id: &ContextId) -> Result<ContextRecord, Error> {
@@ -1279,7 +1229,6 @@ impl Server {
             .durable
             .contexts
             .insert(record.id.clone(), record.clone());
-        self.persist()?;
         Ok(record)
     }
     pub fn delete_context(&self, id: &ContextId) -> Result<(), Error> {
@@ -1289,7 +1238,7 @@ impl Server {
             .contexts
             .remove(id)
             .ok_or(Error::ContextNotFound)?;
-        self.persist()
+        Ok(())
     }
     pub fn create_compaction_declaration(
         &self,
@@ -1409,86 +1358,22 @@ impl Server {
         Ok(())
     }
     pub fn register_model(&self, model: ModelRecord) -> Result<ModelRecord, Error> {
-        self.register_model_with(|_| Ok(()), model)
+        self.lifecycle.register(model, |_| Ok(()))
+    }
+
+    pub fn register_catalog_model(&self, model: ModelRecord) -> Result<ModelRecord, Error> {
+        self.lifecycle.register_from_catalog(model)
     }
 
     pub fn register_model_with<F>(
         &self,
         finalize: F,
-        mut model: ModelRecord,
+        model: ModelRecord,
     ) -> Result<ModelRecord, Error>
     where
         F: FnOnce(&ModelRecord) -> Result<(), Error>,
     {
-        let _lifecycle = self.model_lifecycle.lock();
-        model.aliases.sort();
-        model.aliases.dedup();
-        if model.family.is_empty() {
-            model.family = default_model_family();
-        }
-        if model.size_bytes == 0 {
-            model.size_bytes = fs::metadata(&model.path).map_err(state_err)?.len();
-        }
-        let existing = self
-            .inner
-            .lock()
-            .durable
-            .models
-            .get(&model.id)
-            .cloned()
-            .filter(|existing| {
-                existing.revision == model.revision
-                    && existing.path == model.path
-                    && existing.sha256 == model.sha256
-                    && existing.family == model.family
-                    && existing.size_bytes == model.size_bytes
-            });
-        if let Some(existing) = existing {
-            self.engine.prepare_model(&existing)?;
-            return Ok(existing);
-        }
-        let (epoch, previous, previous_models) = {
-            let mut guard = self.inner.lock();
-            let epoch = guard.durable.next_model_epoch;
-            guard.durable.next_model_epoch = epoch
-                .checked_add(1)
-                .ok_or_else(|| Error::State("model epoch space exhausted".into()))?;
-            let previous = guard.durable.models.get(&model.id).cloned();
-            (epoch, previous, guard.durable.models.clone())
-        };
-        model.epoch = epoch;
-        if let Err(error) = self.engine.prepare_model(&model) {
-            self.inner.lock().durable.next_model_epoch = epoch;
-            return Err(error);
-        }
-        {
-            let mut guard = self.inner.lock();
-            for existing in guard.durable.models.values_mut() {
-                existing
-                    .aliases
-                    .retain(|alias| !model.aliases.contains(alias));
-            }
-            guard.durable.models.insert(model.id.clone(), model.clone());
-        }
-        if let Err(error) = self.persist() {
-            let mut guard = self.inner.lock();
-            guard.durable.models = previous_models;
-            guard.durable.next_model_epoch = epoch;
-            drop(guard);
-            self.engine.retire_model(&model.id, model.epoch);
-            return Err(error);
-        }
-        if let Err(error) = finalize(&model) {
-            let mut guard = self.inner.lock();
-            guard.durable.models = previous_models;
-            guard.durable.next_model_epoch = epoch;
-            drop(guard);
-            self.engine.retire_model(&model.id, model.epoch);
-            return Err(error);
-        }
-        self.engine
-            .commit_model(&model, previous.as_ref().map(|record| record.epoch));
-        Ok(model)
+        self.lifecycle.register(model, finalize)
     }
     fn effective_stop_sequences(&self, req: &InferRequest) -> Result<Vec<String>, Error> {
         let mut stops = req.stop.clone();
@@ -1500,78 +1385,19 @@ impl Server {
     }
 
     pub fn models(&self) -> Vec<ModelRecord> {
-        self.inner.lock().durable.models.values().cloned().collect()
+        self.lifecycle.models()
     }
     pub fn model(&self, id: &str) -> Result<ModelRecord, Error> {
-        let guard = self.inner.lock();
-        guard
-            .durable
-            .models
-            .get(id)
-            .or_else(|| {
-                guard
-                    .durable
-                    .models
-                    .values()
-                    .find(|m| m.aliases.iter().any(|a| a == id))
-            })
-            .cloned()
-            .ok_or_else(|| Error::ModelNotFound(id.into()))
+        self.lifecycle.model(id)
     }
     pub fn alias_model(&self, id: &str, alias: String) -> Result<ModelRecord, Error> {
-        let _lifecycle = self.model_lifecycle.lock();
-        let mut guard = self.inner.lock();
-        if !guard.durable.models.contains_key(id) {
-            return Err(Error::ModelNotFound(id.into()));
-        }
-        let previous = guard.durable.models.clone();
-        for model in guard.durable.models.values_mut() {
-            model.aliases.retain(|existing| existing != &alias);
-        }
-        let model = guard.durable.models.get_mut(id).unwrap();
-        model.aliases.push(alias);
-        model.aliases.sort();
-        let out = model.clone();
-        drop(guard);
-        if let Err(error) = self.persist() {
-            self.inner.lock().durable.models = previous;
-            return Err(error);
-        }
-        Ok(out)
+        self.lifecycle.alias(id, alias)
     }
     pub fn remove_model(&self, id: &str) -> Result<(), Error> {
-        let _lifecycle = self.model_lifecycle.lock();
-        let model = self
-            .inner
-            .lock()
-            .durable
-            .models
-            .remove(id)
-            .ok_or_else(|| Error::ModelNotFound(id.into()))?;
-        if let Err(error) = self.persist() {
-            self.inner
-                .lock()
-                .durable
-                .models
-                .insert(model.id.clone(), model);
-            return Err(error);
-        }
-        self.engine.retire_model(&model.id, model.epoch);
-        Ok(())
+        self.lifecycle.remove(id)
     }
     pub fn verify_model(&self, id: &str) -> Result<bool, Error> {
-        let model = self.model(id)?;
-        let mut file = fs::File::open(model.path).map_err(state_err)?;
-        let mut digest = Sha256::new();
-        let mut buffer = [0; 1024 * 1024];
-        loop {
-            let count = file.read(&mut buffer).map_err(state_err)?;
-            if count == 0 {
-                break;
-            }
-            digest.update(&buffer[..count]);
-        }
-        Ok(format!("{:x}", digest.finalize()) == model.sha256)
+        self.lifecycle.verify(id)
     }
     pub fn check_update(&self, id: &str, revision: &str) -> Result<bool, Error> {
         Ok(self.model(id)?.revision != revision)
@@ -2067,7 +1893,6 @@ impl Server {
             successor_id
         };
         drop(guard);
-        self.persist()?;
         let usage = Usage {
             input_tokens,
             generated_tokens: frontier.generated_tokens,
@@ -2103,6 +1928,7 @@ fn state_err(error: impl std::fmt::Display) -> Error {
 }
 #[cfg(test)]
 fn hex_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -2882,10 +2708,7 @@ async fn ollama_copy(
     Json(r): Json<OllamaCopyRequest>,
 ) -> Result<StatusCode, Error> {
     auth(&s, &headers, Scope::Admin)?;
-    let model = s.alias_model(&r.source, r.destination)?;
-    if let Some(catalog) = s.catalog() {
-        catalog.publish(&model).map_err(state_err)?;
-    }
+    s.alias_model(&r.source, r.destination)?;
     Ok(StatusCode::OK)
 }
 async fn ollama_delete(
@@ -2894,11 +2717,7 @@ async fn ollama_delete(
     Json(r): Json<OllamaModelRequest>,
 ) -> Result<StatusCode, Error> {
     auth(&s, &headers, Scope::Admin)?;
-    let model = r.model_name()?.to_owned();
-    s.remove_model(&model)?;
-    if let Some(catalog) = s.catalog() {
-        catalog.remove(&model).map_err(state_err)?;
-    }
+    s.remove_model(r.model_name()?)?;
     Ok(StatusCode::OK)
 }
 
@@ -3057,32 +2876,42 @@ async fn perform_ollama_pull(
             .send(json!({"status":"verifying sha256 digest","digest":fetched.sha256}))
             .await;
     }
-    let metadata = tokio::task::spawn_blocking({
-        let path = fetched.path.clone();
-        move || cusco_model_registry::probe_gguf(path)
-    })
-    .await
-    .map_err(state_err)?
-    .map_err(state_err)?;
     if let Some(sender) = &progress {
         let _ = sender.send(json!({"status":"writing manifest"})).await;
     }
-    s.register_model_with(
-        |model| catalog.publish(model).map_err(state_err),
-        ModelRecord {
-            id: name,
-            revision: fetched.identity.clone(),
-            path: fetched.path,
-            sha256: fetched.sha256,
-            aliases: vec![],
-            family: metadata.architecture,
-            size_bytes: fetched.size,
-            epoch: 0,
-        },
-    )?;
-    catalog
-        .finish_operation(&operation, "complete", None)
-        .map_err(state_err)?;
+    let completion = tokio::task::spawn_blocking({
+        let server = s.clone();
+        let catalog = catalog.clone();
+        let operation = operation.clone();
+        move || {
+            let metadata = cusco_model_registry::probe_gguf(&fetched.path).map_err(state_err)?;
+            server.register_model_with(
+                |model| {
+                    catalog
+                        .publish_and_finish_operation(model, &operation)
+                        .map_err(state_err)
+                },
+                ModelRecord {
+                    id: name,
+                    revision: fetched.identity,
+                    path: fetched.path,
+                    sha256: fetched.sha256,
+                    aliases: vec![],
+                    family: metadata.architecture,
+                    size_bytes: fetched.size,
+                    epoch: 0,
+                },
+            )
+        }
+    })
+    .await
+    .map_err(state_err)?;
+    if let Err(error) = completion {
+        catalog
+            .finish_operation(&operation, "failed", Some(&error.to_string()))
+            .map_err(state_err)?;
+        return Err(error);
+    }
     let result = json!({"status":"success"});
     if let Some(sender) = progress {
         let _ = sender.send(result.clone()).await;
@@ -3805,6 +3634,7 @@ mod tests {
         body::{Body, Bytes, to_bytes},
         http::Request,
     };
+    use std::fs;
     use std::net::IpAddr;
     use tower::ServiceExt;
     fn dir() -> PathBuf {
@@ -3965,23 +3795,23 @@ mod tests {
         }
     }
     #[test]
-    fn persistence_branching_and_ids_survive_restart() {
-        let (s, d) = setup(Arc::new(AnonymousAdmin));
-        let a = s.create_context().unwrap();
-        let b = s.branch_context(&a.id).unwrap();
-        assert_ne!(a.id, b.id);
-        drop(s);
-        let s = Server::open(
-            d.join("state.json"),
+    fn contexts_are_disposable_across_restart() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let context = server.create_context().unwrap();
+        server.branch_context(&context.id).unwrap();
+        drop(server);
+        let restarted = Server::open(
+            directory.join("state.json"),
             Arc::new(AnonymousAdmin),
             Arc::new(DeterministicEngine),
         )
         .unwrap();
-        assert_eq!(s.context(&a.id).unwrap(), a);
-        let c = s.create_context().unwrap();
-        assert_ne!(a.id, c.id);
-        assert_ne!(b.id, c.id);
-        fs::remove_dir_all(d).unwrap()
+        assert!(restarted.contexts().is_empty());
+        assert!(matches!(
+            restarted.context(&context.id),
+            Err(Error::ContextNotFound)
+        ));
+        fs::remove_dir_all(directory).unwrap()
     }
     #[test]
     fn inference_usage_events_deadline_and_cancel_are_transactional() {
@@ -5222,7 +5052,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_rejects_new_work_and_restart_recovers_only_durable_state() {
+    async fn shutdown_rejects_new_work_and_restart_discards_runtime_state() {
         let (server, dir) = setup(Arc::new(AnonymousAdmin));
         let context = server.create_context().unwrap();
         let active = server
@@ -5256,7 +5086,11 @@ mod tests {
             Arc::new(DeterministicEngine),
         )
         .unwrap();
-        assert_eq!(restarted.context(&context.id).unwrap(), context);
+        assert!(restarted.contexts().is_empty());
+        assert!(matches!(
+            restarted.context(&context.id),
+            Err(Error::ContextNotFound)
+        ));
         assert_eq!(restarted.admission_metrics(), AdmissionMetrics::default());
         assert!(!restarted.inner.lock().shutting_down);
         fs::remove_dir_all(dir).unwrap();

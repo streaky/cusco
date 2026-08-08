@@ -21,10 +21,10 @@ The repository contains a great deal of real implementation, not scaffolding: th
 It is not accurate, however, to say that Phases 1–10 are complete **as fully as the outline intended**. The largest gaps are below.
 
 1. **The physical-state architecture is not yet real or atomic.** `PhysicalManager` mostly accounts for metadata; its transfers mutate tier flags and counters but move no executor bytes. The mapped server registers invented cumulative byte sizes unrelated to the actual native mapping. Logical publication can commit before physical publication and has no rollback.
-2. **All model execution is globally serialized by one scheduler thread.** This defeats the Phase 7 requirement that distinct resident models execute independently and makes the Phase 8 scheduler a process-wide execution bottleneck.
-3. **The logical context representation will scale poorly.** It allocates and hashes once per token, copies every full evaluated prefix, and repeatedly walks token ancestry. Successive publications of growing prefixes trend toward quadratic copied/hashed work and retained memory.
+2. **Independent resident-model execution is now implemented.** A central fairness actor dispatches native quanta to per-`(model_id, model_epoch)` workers, preserving same-model serialization while allowing distinct models to overlap.
+3. **Logical context scaling has been remediated.** Token storage uses immutable chunks and evaluated mappings retain shared sequence boundaries instead of full-prefix token copies.
 4. **Residency admission is based on estimates rather than trustworthy native capacity.** The native operating point proportionally assigns model bytes by layer count and treats serialized state size as context memory. The pre-load estimator is coarser still. The scheduler therefore cannot prove the capacity guarantees the outline requires.
-5. **Phase 9 persistence is both broader and less transactional than its final contract.** Contexts are still reloaded from a JSON state file; every context mutation rewrites that whole file synchronously. Models are duplicated between JSON and SQLite, and a catalog-finalization failure can restore memory without restoring the already-written JSON file.
+5. **Phase 9 persistence and lifecycle boundaries are now remediated.** Runtime contexts are discarded on restart; SQLite is the sole model/lifecycle authority; model publication and pull completion share one SQLite transaction; and fetch/probe/prepare/publication runs off Tokio in a protocol-neutral lifecycle service.
 6. **The checked-in acceptance story has regressed.** The Phase 6/7/8 report scripts and Compose gates named by the outline no longer exist. The unified real-model smoke gate is useful but does not replace their mixed-load, streaming, management-lifecycle-fault, correlation, or transactional checks.
 7. **Phase 10's mechanism is present, but its declared semantic and end-to-end acceptance matrix is not.** The fixture tree named by the outline is absent, semantic tests are structural token-retention checks rather than model-output regression checks, and the unified smoke does not exercise streaming ID correlation.
 
@@ -40,9 +40,9 @@ These are architecture issues worth resolving before adding multi-GPU placement,
 | **4. Minimal server and scheduler** | **Broadly superseded; two goals remain incomplete** | Later APIs supersede the minimal routes and Phase 9 supersedes durable contexts. The current server has authentication, admission, streaming, context APIs, model management, usage, cancellation, deadlines, and OpenAPI. The intended protocol-neutral service boundary has collapsed into a large `lib.rs`, and independent benchmark-harness integration is not present as a runnable first-class gate. |
 | **5. Mapped execution** | **Exact native-mapping proof complete; historical block-table claim not implemented** | `mapped-proof` and `results/phase5.json` compare staged and mapped paths. Native mappings use llama sequence IDs and can switch references, but the historical physical-block-table/kernel-resolution design is not present and current publication performs sequence copies. The selected Approach A remediation no longer treats a Rust-owned block table as the immediate completion criterion: it requires truthful opaque native ownership, copy-free linear publication, stable graph reuse, and meaningful copy telemetry. Native-allocated shared blocks remain the conditional B1 evolution. |
 | **6. Live execution integration** | **Functional path present; capacity and transaction gates incomplete** | One-model mapped execution, bounded admission, incremental output, request-owned sampling/frontier state, stops, cancellation, deadlines, and shutdown machinery exist. The prior Phase 6 artifacts remain under `results/`. The current physical publication sequence can leave logical and physical state divergent, and capacity is based on fictitious representation sizes. The documented `tools/phase6c-report.sh` gate no longer exists. |
-| **7. Residency and lifecycle scheduling** | **Dynamic lifecycle present; core independence/capacity goals incomplete** | Dynamic epochs, load/reuse/reload/remove/retire behavior, spill paths, status, and lifecycle tests exist in `residency.rs` and the catalog. Admission does not choose among executor-reported operating points, accounting is estimated, and all resident models ultimately execute through one scheduler worker. The documented Phase 7 report gate no longer exists. |
-| **8. Workload scheduling and hardening** | **Fairness policy implemented; execution architecture and acceptance incomplete** | Priority-aware deficit round robin, FIFO equivalence, monotonic promotion, bounded prefill/decode quanta, IDs, diagnostics, and model-free tests exist in `scheduler.rs`. `WorkloadScheduler` synchronously invokes every session on one OS thread, so the policy also globally serializes unrelated model slots. Historical Phase 8 artifacts exist, but the report script/service named in the outline is gone and the unified smoke has no sustained mixed-load or fault workload. |
-| **9. Compatibility, persistence, packaging** | **Broad but incomplete** | The clean surface now consists of OpenAI-compatible inference under `/openai/v1/*` and the Cusco control plane under `/cusco/v1/*`, including a bounded Ollama-compatible model-management profile under `/cusco/v1/api/*`. Standalone `/ollama/*` routes and Ollama inference operations have been removed. Strict controls, native streaming, model catalog, model resolution, config, and production/test Compose exist. Persistence violates the final disposable-context contract and is split across JSON and SQLite. Some blocking lifecycle work still runs on Tokio. Images are bounded and decoded but always rejected because no projector execution path exists. Compatibility breadth therefore falls short of the declared text-plus-image contract. |
+| **7. Residency and lifecycle scheduling** | **Dynamic lifecycle and independent execution implemented; capacity incomplete** | Dynamic epochs, load/reuse/reload/remove/retire behavior, spill paths, status, transactional SQLite lifecycle publication, and restart behavior exist. Per-model-epoch workers allow distinct resident models to overlap while preserving same-model serialization. Admission still does not use authoritative allocator operating points, and the documented Phase 7 report gate no longer exists. |
+| **8. Workload scheduling and hardening** | **Fairness and independent execution implemented; acceptance incomplete** | Priority-aware deficit round robin, FIFO equivalence, monotonic promotion, bounded prefill/decode quanta, IDs, diagnostics, per-model-epoch workers, and focused overlap/serialization tests exist. Historical Phase 8 artifacts remain, but the report script/service named in the outline is gone and unified smoke has no sustained mixed-load or fault workload. |
+| **9. Compatibility, persistence, packaging** | **Broadly implemented; vision remains incomplete** | The clean surface consists of OpenAI-compatible inference under `/openai/v1/*` and the Cusco control plane under `/cusco/v1/*`, including bounded Ollama-compatible model management under `/cusco/v1/api/*`. SQLite is the sole durable model/lifecycle authority, contexts are disposable on restart, publication is transactional, and blocking pull lifecycle work runs outside Tokio through `ModelLifecycleService`. Images are bounded and decoded but rejected because no projector execution path exists. |
 | **10. Semantic context compaction** | **Baseline mechanism implemented; acceptance overclaimed** | The registry, deterministic `window_tail`, declarations, bounded workers, successor preparation/publication, replay metadata, terminal-sequence suppression, and compaction smoke scenarios exist. The named semantic-quality and end-to-end stream-correlation fixtures/tests in the outline do not. Current evidence proves deterministic trimming and continuation, not the full semantic quality/correlation matrix. |
 
 ## Critical structural and performance findings
@@ -150,35 +150,29 @@ Add native prepare/probe APIs that report actual planned tensor placement, conte
 
 ## High-severity completeness and consistency findings
 
-### H1. Phase 9 persistence contradicts the superseding restart contract
+### H1. Phase 9 persistence and lifecycle transaction — remediated
 
-Phase 9 explicitly says contexts, branches, evaluated prefixes, native mappings, caches, and in-flight state may be discarded on restart (`docs/outline.md:1795`) and calls for SQLite-backed model/lifecycle persistence (`outline.md:1824-1825`). Current behavior retains the earlier Phase 4 JSON design:
+The v1 restart contract is now explicit in implementation: `Server::open` starts
+with an empty runtime context store, context mutations perform no filesystem
+writes, and model records are hydrated only from SQLite by startup code.
 
-- `Server::open` deserializes the complete `DurableState` when the JSON path exists (`crates/server/src/lib.rs:1108-1136`). `DurableState` includes contexts and models.
-- `persist()` serializes the whole state with `serde_json::to_vec_pretty` and synchronously writes/renames a temporary file (`lib.rs:1186-1196`).
-- Context creation, branching, mutation, deletion, model operations, and inference completion call this full rewrite (`lib.rs:1221-1285`, `1408-1549`, `2061-2064`).
+`ModelLifecycleService` owns protocol-neutral prepare/publish/commit ordering.
+Registration prepares the native model before durable publication, retires the
+prepared epoch if publication fails, and only then swaps the in-memory epoch.
+Ollama pull executes GGUF probe, native preparation, and catalog publication in
+`spawn_blocking`; its `publish_and_finish_operation` repository operation writes
+the model and marks the lifecycle operation complete in one SQLite transaction.
+Failed operation completion rolls back model publication.
 
-This creates synchronous $O(\text{all durable state})$ filesystem work on the inference path and restores state the final v1 contract deliberately made disposable.
+Configured startup models use the same prepare-before-publication service path,
+while catalog hydration preserves durable epochs without republishing them.
+Alias and delete handlers delegate once to the lifecycle service rather than
+performing duplicate catalog writes.
 
-**Recommended direction**
-
-Make SQLite the sole durable model/lifecycle/configuration authority. Stop serializing contexts in the v1 profile; initialize a fresh installation-scoped context namespace on process start. If durable contexts return later, give them a purpose-built append/transaction schema and explicit compatibility version rather than reviving the whole-state JSON snapshot.
-
-### H2. Model registration can split memory, JSON, SQLite, and native state
-
-`register_model_with` clones the complete model map, prepares the native model, updates the in-memory map, persists JSON, and then invokes the catalog finalizer (`lib.rs:1408-1484`). If finalization fails, it restores the in-memory map and retires the native model, but it does **not** rewrite the JSON file that was already successfully persisted. A restart can therefore resurrect the model that the SQLite catalog rejected. The whole-map clone is also avoidable $O(\text{model count})$ work.
-
-**Recommended direction**
-
-Use one SQLite transaction for operation state and model publication. Prepare/probe native state before it, publish durable metadata once, then atomically swap the in-memory epoch. On post-publication native failure, record a failed/unavailable lifecycle state transactionally rather than attempting cross-store rollback. Eliminate the duplicate JSON model registry.
-
-### H3. The async-runtime blocking boundary is incomplete
-
-Phase 9 requires fetch, hashing, filesystem persistence, residency load/reload/unload, spill/restore, and native lifecycle work to execute in bounded blocking workers (`docs/outline.md:1798`, `1817`). The Ollama-compatible management pull implementation, exposed at `/cusco/v1/api/pull`, correctly uses `spawn_blocking` for model fetch and GGUF probing, but it calls synchronous SQLite methods before and after those blocks and calls `register_model_with` directly on the Tokio task. Registration can perform filesystem metadata, native model preparation/load, full JSON persistence, and SQLite publication. The API namespace cutover did not change this execution boundary.
-
-**Recommended direction**
-
-Move the entire lifecycle transaction behind a bounded lifecycle executor, not only the obvious download/probe calls. Keep progress delivery and cancellation orchestration on Tokio. Measure queue occupancy and lifecycle-worker time separately from inference scheduling.
+Behavioral coverage verifies disposable restart state, shutdown restart
+semantics, atomic publication/operation completion, catalog recovery, and
+lifecycle rollback. A future durable-context profile still requires a
+purpose-built versioned persistence contract rather than reviving JSON snapshots.
 
 ### H4. Historical acceptance gates are no longer runnable as documented
 
@@ -241,12 +235,10 @@ preferable.
 Recommended order:
 
 1. **Define one truthful physical-state and transaction model.** Resolve C2–C4 together; isolated patches will otherwise add more metadata around a non-atomic boundary.
-2. **Replace global synchronous execution with per-model slot workers.** Preserve the current fairness policy as the global dispatcher, but make independent residency actually concurrent.
-3. **Make native capacity reservation authoritative.** Then update residency admission and performance evidence to use real bytes and operating points.
-4. **Complete the Phase 9 clean persistence cutover.** Remove JSON contexts/models, use SQLite transactions, and move lifecycle work entirely behind the blocking boundary.
-5. **Restore reproducible acceptance gates.** Reuse stable scenario sets across local and future cluster harnesses; preserve correctness, fault, and performance layers separately.
-6. **Close Phase 10 semantic and stream-correlation evidence.** Only then mark its baseline checklist complete.
-7. **Extract application-service and repository boundaries from `server::lib`.** Do this alongside the persistence/lifecycle work, not as a cosmetic module shuffle.
+2. **Make native capacity reservation authoritative.** Then update residency admission and performance evidence to use real bytes and operating points.
+3. **Restore reproducible acceptance gates.** Reuse stable scenario sets across local and future cluster harnesses; preserve correctness, fault, and performance layers separately.
+4. **Close Phase 10 semantic and stream-correlation evidence.** Only then mark its baseline checklist complete.
+5. **Continue extracting application-service boundaries from `server::lib`.** Model lifecycle now has a protocol-neutral service and repository transaction boundary; inference and context lifecycle remain mixed with transport code.
 
 ## Settled remediation decisions
 
@@ -358,11 +350,15 @@ deadline, shutdown, suspension, and idle epoch retirement retain explicit
 lifecycle fences. Focused coverage exercises same-model serialization and
 different-model overlap.
 
-### 7. Complete lifecycle persistence and extract its service boundary together
+### 7. Complete lifecycle persistence and extract its service boundary — implemented
 
-Make SQLite the sole durable authority for model identity, aliases, revisions, and lifecycle operations; delete whole-state JSON persistence for disposable contexts and native state. Move the complete fetch/probe/prepare/catalog-publication transaction behind a bounded lifecycle executor. Extract a protocol-neutral lifecycle service and repository transaction boundary while doing this, then keep `/cusco/v1/*` and its Ollama-compatible management profile as thin projections.
-
-Persistence and service extraction should be one change sequence because the useful service interface is the transaction boundary. Extracting HTTP-shaped methods first would merely preserve the current split transaction behind another layer. This work can be prototyped alongside Steps 3–4, but final registration/load semantics should be based on the authoritative capacity and ownership contracts from Step 5.
+SQLite is now the sole durable authority for model identity, aliases, revisions,
+and lifecycle operations; contexts and native runtime state are discarded on
+restart. `ModelLifecycleService` owns prepare/publish/commit ordering and the
+catalog repository provides atomic model-publication plus operation completion.
+Pull performs fetch, probe, native preparation, and publication off Tokio, while
+HTTP adapters remain thin lifecycle projections. Focused tests cover restart
+disposal, transaction rollback, catalog recovery, and lifecycle behavior.
 
 ### 8. Rebuild the full acceptance stack against the settled architecture
 

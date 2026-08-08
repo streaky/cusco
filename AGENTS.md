@@ -71,7 +71,7 @@ Select the proof GPU with `CUSCO_GPU_DEVICE_ID`; do not assume a particular host
 
 - Preserve the ownership boundary: Rust owns policy and logical state; llama.cpp owns model-specific tensors, graphs, and kernels.
 - Prefer transactional prepare/commit operations. Never invalidate a working binding before replacement state is fully prepared and validated.
-- Keep slots disposable and logical contexts durable.
+- Keep slots disposable. Logical contexts survive requests and slot changes but are disposable on daemon restart in the v1 profile.
 - Use exact comparisons in deterministic checkpoint validation; do not weaken bitwise-logit or token equality into approximate checks.
 - Reuse existing repository patterns and keep changes scoped to the active implementation phase.
 - Update tests, high-level documentation, and this guide when a change makes them inaccurate.

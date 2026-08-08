@@ -126,6 +126,38 @@ impl ModelCatalog {
         self.connection.lock().execute("INSERT INTO models(id,revision,path,sha256,family,size_bytes,epoch,aliases_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,path=excluded.path,sha256=excluded.sha256,family=excluded.family,size_bytes=excluded.size_bytes,epoch=excluded.epoch,aliases_json=excluded.aliases_json", params![model.id, model.revision, model.path.to_string_lossy(), model.sha256, model.family, size, epoch, aliases])?;
         Ok(())
     }
+    pub fn publish_and_finish_operation(
+        &self,
+        model: &ModelRecord,
+        operation: &str,
+    ) -> Result<(), CatalogError> {
+        if model.epoch == 0 {
+            return Err(CatalogError::Data("model epoch must be nonzero".into()));
+        }
+        let aliases = serde_json::to_string(&model.aliases)
+            .map_err(|error| CatalogError::Data(error.to_string()))?;
+        let size = i64::try_from(model.size_bytes)
+            .map_err(|_| CatalogError::Data("model size exceeds SQLite integer".into()))?;
+        let epoch = i64::try_from(model.epoch)
+            .map_err(|_| CatalogError::Data("model epoch exceeds SQLite integer".into()))?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO models(id,revision,path,sha256,family,size_bytes,epoch,aliases_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,path=excluded.path,sha256=excluded.sha256,family=excluded.family,size_bytes=excluded.size_bytes,epoch=excluded.epoch,aliases_json=excluded.aliases_json",
+            params![model.id, model.revision, model.path.to_string_lossy(), model.sha256, model.family, size, epoch, aliases],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE lifecycle_operations SET status='complete', detail=NULL, finished_at=unixepoch() WHERE id=?1 AND status='running'",
+            [operation],
+        )?;
+        if changed != 1 {
+            return Err(CatalogError::Data(format!(
+                "operation {operation} is absent or terminal"
+            )));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
 
     pub fn remove(&self, id: &str) -> Result<bool, CatalogError> {
         Ok(self
@@ -232,6 +264,33 @@ mod tests {
         assert_eq!(
             reopened.operation_status("op").unwrap().as_deref(),
             Some("failed")
+        );
+        let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn model_publication_and_operation_completion_are_atomic() {
+        let (path, catalog) = database();
+        let model = ModelRecord {
+            id: "m".into(),
+            revision: "r".into(),
+            path: "/model.gguf".into(),
+            sha256: "abc".into(),
+            aliases: vec![],
+            family: "gemma".into(),
+            size_bytes: 7,
+            epoch: 1,
+        };
+        assert!(matches!(
+            catalog.publish_and_finish_operation(&model, "absent"),
+            Err(CatalogError::Data(_))
+        ));
+        assert_eq!(catalog.model("m").unwrap(), None);
+        catalog.begin_operation("op", "m", "pull").unwrap();
+        catalog.publish_and_finish_operation(&model, "op").unwrap();
+        assert_eq!(catalog.model("m").unwrap(), Some(model));
+        assert_eq!(
+            catalog.operation_status("op").unwrap().as_deref(),
+            Some("complete")
         );
         let _ = fs::remove_file(path);
     }

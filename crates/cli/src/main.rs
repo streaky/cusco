@@ -211,7 +211,7 @@ fn run(command: Command) -> Result<()> {
             let catalog = ModelCatalog::open(&config.paths.database)?;
             server.attach_catalog(catalog.clone(), config.paths.models.clone());
             for model in catalog.models()? {
-                server.register_model(model)?;
+                server.register_catalog_model(model)?;
             }
             let declared = load_user_models(&config.paths.user_config, &config.paths.user_models)?;
             for declaration in declared.models {
@@ -221,17 +221,23 @@ fn run(command: Command) -> Result<()> {
                     declaration.sha256.as_deref(),
                 )?;
                 let metadata = cusco_model_registry::probe_gguf(&registered.path)?;
-                let model = server.register_model(ModelRecord {
-                    id: declaration.name,
-                    revision: registered.sha256.clone(),
-                    path: registered.path,
-                    sha256: registered.sha256,
-                    aliases: declaration.aliases,
-                    family: metadata.architecture,
-                    size_bytes: registered.size,
-                    epoch: 0,
-                })?;
-                catalog.publish(&model)?;
+                server.register_model_with(
+                    |model| {
+                        catalog
+                            .publish(model)
+                            .map_err(|error| cusco_server::Error::State(error.to_string()))
+                    },
+                    ModelRecord {
+                        id: declaration.name,
+                        revision: registered.sha256.clone(),
+                        path: registered.path,
+                        sha256: registered.sha256,
+                        aliases: declaration.aliases,
+                        family: metadata.architecture,
+                        size_bytes: registered.size,
+                        epoch: 0,
+                    },
+                )?;
             }
             let runtime = tokio::runtime::Runtime::new()?;
             match http_debug {
