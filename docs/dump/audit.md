@@ -360,18 +360,25 @@ Pull performs fetch, probe, native preparation, and publication off Tokio, while
 HTTP adapters remain thin lifecycle projections. Focused tests cover restart
 disposal, transaction rollback, catalog recovery, and lifecycle behavior.
 
-### 8. Rebuild the full acceptance stack against the settled architecture
+### 8. Rebuild the full acceptance stack against the settled architecture — implemented
 
-Promote the reusable workloads introduced in Step 1 into maintained gates:
+`config/acceptance.json` now defines one versioned reusable test set. The
+`acceptance-model-free` gate executes named logical publication, transfer-fence,
+failure rollback, exact continuation, fairness, deadline, cancellation,
+backpressure, diagnostic-overflow, mixed-model overlap, catalog atomicity,
+restart, streaming, and compaction rollback contracts. The `acceptance` gate
+then runs the real executor, mapped-publication, representation-scaling, and
+sustained scheduler proofs before exercising the unified API smoke runner.
 
-- deterministic logical, publication, rollback, and exact-continuation checks;
-- cancellation, delayed-fence, transfer, allocation, and catalog-failure injection;
-- streaming and ID-correlation checks;
-- sustained mixed-model fairness, deadline, backpressure, and diagnostic-overflow workloads;
-- long-context copy, cache-hit, graph-reuse, latency, and throughput measurements;
-- real-GPU evidence with declared model, build, device, workload, and provenance.
-
-Tests should be added alongside each preceding contract change, but the final gate structure comes here because its stable dimensions depend on the new ownership, capacity, scheduler, and lifecycle boundaries. Historical phase-numbered scripts should not be restored if they encode superseded architecture.
+The smoke runner reconstructs Chat Completions and Responses SSE streams,
+requires stable request, correlation, inference, and execution-session IDs, and
+requires terminal usage events in addition to its existing context reuse and
+compaction continuation checks. `results/acceptance-report.json` indexes the
+complete run with per-command outcomes, durations, artifacts and hashes,
+versioned workload hashes, model identity and resolved-file metadata when
+available, source state, toolchains, CUDA configuration, and GPU identity.
+Focused phase-numbered proofs remain diagnostics rather than competing release
+gates.
 
 ### 9. Close Phase 10 semantic evidence on top of the stable execution path
 

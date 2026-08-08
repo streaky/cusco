@@ -1505,5 +1505,15 @@ Correctness and performance evidence is part of the product contract:
 - API acceptance reconstructs buffered and streamed lifecycle state and verifies stable, distinct correlation identities;
 - fixed throughput or latency gates may be added only with complete model, build, configuration, workload, and hardware provenance.
 
+`config/acceptance.json` is the versioned reusable test-set contract.
+`acceptance-model-free` executes its deterministic failure and lifecycle
+workloads without a model or GPU. `acceptance` runs the complete real-model
+stack—exact executor continuation, mapped publication, representation scaling,
+sustained mixed scheduling, and buffered/streamed API reconstruction—and writes
+`results/acceptance-report.json`. That report indexes each gate and artifact
+with available source, model, workload, toolchain, configuration, runtime, and
+device provenance. Phase-numbered proof services remain focused diagnostics;
+only the complete acceptance report is a release-level pass.
+
 Local development builds cover `sm_61` and `sm_70`. Production release builds target the useful architecture range from `sm_61` through `sm_120`, including supported intervening targets, and record the exact compiled targets and observed GPU. Newer devices may use progressively stronger paths; support for older devices does not require reducing every GPU to the oldest implementation.
 

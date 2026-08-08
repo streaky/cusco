@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "test_set_version": "cusco-acceptance-v1",
+  "model": "hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf",
+  "model_free": [
+    {"crate": "cusco-context-store", "test": "publication_is_atomic_and_epoch_changes_invalidate_mappings", "contract": "logical publication and epoch invalidation"},
+    {"crate": "cusco-context-store", "test": "publication_revision_rejects_aba_binding_changes", "contract": "publication ABA rollback"},
+    {"crate": "cusco-physical-manager", "test": "abort_preserves_binding_and_transfer_owner_until_completion", "contract": "delayed transfer fence ownership"},
+    {"crate": "cusco-physical-manager", "test": "failed_transfer_cannot_publish_or_replace_source", "contract": "transfer failure rollback"},
+    {"crate": "cusco-physical-manager", "test": "mapped_commit_failure_preserves_prior_binding_and_table", "contract": "allocation and block-table rollback"},
+    {"crate": "cusco-server", "test": "spilled_mapping_restores_exact_continuation", "contract": "spill exact continuation"},
+    {"crate": "cusco-server", "test": "publication_failure_keeps_the_prior_mapping_reusable", "contract": "mapped publication rollback"},
+    {"crate": "cusco-server", "test": "policy_preserves_flow_fifo_and_promotes_waiting_batch_work", "contract": "fairness and starvation prevention"},
+    {"crate": "cusco-server", "test": "one_event_stream_buffer_applies_backpressure_without_deadlock", "contract": "stream backpressure"},
+    {"crate": "cusco-server", "test": "dropping_scheduler_cancels_and_joins_outstanding_work", "contract": "cancellation and shutdown fences"},
+    {"crate": "cusco-server", "test": "wall_and_active_deadline_watchdogs_abort_owned_work", "contract": "wall and active deadline cancellation"},
+    {"crate": "cusco-server", "test": "diagnostic_overflow_is_counted_without_blocking_scheduler", "contract": "diagnostic overflow"},
+    {"crate": "cusco-server", "test": "distinct_model_slots_overlap_while_each_model_remains_serialized", "contract": "mixed-model overlap and slot serialization"},
+    {"crate": "cusco-server", "test": "model_publication_and_operation_completion_are_atomic", "contract": "catalog failure atomicity"},
+    {"crate": "cusco-server", "test": "contexts_are_disposable_across_restart", "contract": "lifecycle restart boundary"},
+    {"crate": "cusco-server", "test": "namespaced_chat_streaming_and_context_routes", "contract": "streaming IDs and context routes"},
+    {"crate": "cusco-server", "test": "prepared_compaction_rolls_back_when_continuation_fails", "contract": "compaction continuation rollback"}
+  ],
+  "real_model": [
+    {"name": "executor", "command": ["cargo", "run", "-p", "cusco", "--", "proof", "{model}"], "artifact": "/results/phase1.json"},
+    {"name": "mapped", "command": ["cargo", "run", "-p", "cusco", "--", "mapped-proof", "{model}"], "artifact": "/results/phase5.json"},
+    {"name": "representation", "command": ["cargo", "run", "-p", "cusco", "--", "representation-proof", "{model}"], "artifact": "/results/representation-proof.json", "workload": "/work/config/representation-workload.json"},
+    {"name": "scheduler", "command": ["cargo", "run", "-p", "cusco", "--", "scheduler-proof", "{model}"], "artifact": "/results/phase8-server.json", "workload": "/work/config/phase8-workload.json"}
+  ]
+}

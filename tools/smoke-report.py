@@ -47,6 +47,64 @@ def call(method, path, payload=None):
         body = raw.decode("utf-8", "replace")
     return status, content_type, body, elapsed
 
+def stream_call(path, payload, accept):
+    data = json.dumps(payload, separators=(",", ":")).encode()
+    request = urllib.request.Request(
+        BASE + path,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "Accept": accept,
+            "Content-Type": "application/json",
+        },
+    )
+    started = time.perf_counter_ns()
+    with urllib.request.urlopen(request, timeout=120) as response:
+        raw = response.read().decode("utf-8")
+        status = response.status
+        content_type = response.headers.get("content-type", "")
+    elapsed = (time.perf_counter_ns() - started) / 1_000_000
+    if accept == "text/event-stream":
+        events = []
+        for block in raw.replace("\r\n", "\n").split("\n\n"):
+            data_rows = [line[6:] for line in block.splitlines() if line.startswith("data: ")]
+            if not data_rows or data_rows == ["[DONE]"]:
+                continue
+            events.append(json.loads("\n".join(data_rows)))
+    else:
+        events = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    return status, content_type, events, elapsed
+
+
+def stable_stream_ids(events):
+    keys = ("correlation_id", "inference_id", "execution_session_id")
+    observed = {key: set() for key in keys}
+    request_ids = set()
+    for event in events:
+        if isinstance(event, dict):
+            if event.get("id"):
+                request_ids.add(event["id"])
+            cusco = event.get("cusco")
+            if isinstance(cusco, dict):
+                for key in keys:
+                    if cusco.get(key):
+                        observed[key].add(cusco[key])
+            response = event.get("response")
+            if isinstance(response, dict):
+                if response.get("id"):
+                    request_ids.add(response["id"])
+                metadata = response.get("metadata")
+                if isinstance(metadata, dict):
+                    for key in keys:
+                        if metadata.get(key):
+                            observed[key].add(metadata[key])
+    assert events, "stream emitted no events"
+    assert len(request_ids) == 1, f"stream request IDs changed: {request_ids}"
+    for key, values in observed.items():
+        assert len(values) == 1, f"stream {key} changed or was missing: {values}"
+    return {"request_id": next(iter(request_ids)), **{key: next(iter(values)) for key, values in observed.items()}}
+
 
 def status_ok(status):
     assert status == 200, f"expected HTTP 200, got {status}"
@@ -383,6 +441,74 @@ def run():
                 entry["cusco_usage"] = compact_cusco_usage(body["cusco"])
         results.append(entry)
 
+
+    stream_cases = [
+        (
+            "chat_sse_reconstruction",
+            "/openai/v1/chat/completions",
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Reply with exactly: stream-ok"}],
+                "max_tokens": 8,
+                "temperature": 0,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+            lambda events: any(
+                isinstance(event.get("usage"), dict)
+                and any(choice.get("finish_reason") is not None for choice in event.get("choices", []))
+                for event in events
+            ),
+        ),
+        (
+            "responses_sse_reconstruction",
+            "/openai/v1/responses",
+            {
+                "model": MODEL,
+                "input": "Reply with exactly: stream-ok",
+                "max_output_tokens": 8,
+                "temperature": 0,
+                "stream": True,
+            },
+            lambda events: any(
+                event.get("type") == "response.completed"
+                and isinstance(event.get("response", {}).get("usage"), dict)
+                for event in events
+            ),
+        ),
+    ]
+    for name, path, payload, terminal_check in stream_cases:
+        started = time.perf_counter_ns()
+        status = 0
+        try:
+            status, content_type, events, elapsed_ms = stream_call(path, payload, "text/event-stream")
+            status_ok(status)
+            assert "text/event-stream" in content_type, f"unexpected stream content type: {content_type}"
+            ids = stable_stream_ids(events)
+            assert terminal_check(events), "stream has no terminal event with usage"
+            passed, error = True, None
+            stats["passed"] += 1
+        except (AssertionError, ValueError, urllib.error.URLError) as exc:
+            events = []
+            elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+            ids = None
+            passed, error = False, str(exc)
+            stats["failed"] += 1
+        stats["requests"] += 1
+        latencies.append(elapsed_ms)
+        results.append(
+            {
+                "name": name,
+                "method": "POST",
+                "path": path,
+                "status": status if "status" in locals() else 0,
+                "latency_ms": round(elapsed_ms, 3),
+                "passed": passed,
+                "error": error,
+                "event_count": len(events),
+                "stable_ids": ids,
+            }
+        )
     total_prefill_work = stats["prefill_cached_tokens"] + stats["prefill_uncached_tokens"]
     if total_prefill_work:
         stats["cache_ratio"] = round(stats["prefill_cached_tokens"] / total_prefill_work, 6)

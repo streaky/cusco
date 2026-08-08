@@ -53,6 +53,26 @@ The workspace is split into focused crates:
   HTTP adapters;
 - `cli` provides proof, model-management, and serving commands.
 
+## Run the acceptance gates
+
+The canonical GPU-less contract gate is:
+
+```sh
+docker compose -f compose.test.yaml run --rm acceptance-model-free
+```
+
+The canonical real-model/GPU gate is:
+
+```sh
+docker compose -f compose.test.yaml run --rm acceptance
+```
+
+Both replay the versioned test set in `config/acceptance.json`. The real gate
+runs executor continuation, mapped publication, representation scaling,
+sustained scheduler, and API smoke workloads, then writes a provenance-indexed
+`results/acceptance-report.json`. Focused proof services remain useful
+diagnostics, but do not replace the complete gate.
+
 ## Run the representation measurement proof
 
 With the validation GGUF and NVIDIA runtime available, run:

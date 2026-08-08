@@ -10,6 +10,17 @@ services:
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
       - cargo-target:/work/target
+  acceptance-model-free:
+    build: *test-build
+    command: ["python3", "tools/acceptance-report.py", "--mode", "model-free"]
+    environment:
+      CUSCO_RESULT_DIR: "/results"
+    volumes:
+      - "${CUSCO_RESULT_DIR:-./results}:/results"
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
+
   model-fetch:
     build: *test-build
     command:
@@ -67,6 +78,31 @@ services:
       - cargo-target:/work/target
     deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
 
+
+  acceptance:
+    depends_on:
+      model-fetch:
+        condition: service_completed_successfully
+    build: *test-build
+    command:
+      - python3
+      - tools/acceptance-report.py
+      - --mode
+      - real-model
+      - --model
+      - hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf
+    environment:
+      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
+      CUSCO_RESULT_DIR: "/results"
+      LD_LIBRARY_PATH: "/opt/llama-build/bin"
+    volumes:
+      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_MODEL_DIR:-./models}/cache:/data/models"
+      - "${CUSCO_RESULT_DIR:-./results}:/results"
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
 
   api-smoke:
     depends_on:
