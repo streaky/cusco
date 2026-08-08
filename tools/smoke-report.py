@@ -10,6 +10,10 @@ import urllib.request
 BASE = os.environ.get("CUSCO_SMOKE_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
 TOKEN = os.environ.get("CUSCO_SMOKE_TOKEN", "smoke-report-token")
 OUT = Path(os.environ.get("CUSCO_SMOKE_OUTPUT", "/results/smoke-report.json"))
+MODEL = os.environ.get(
+    "CUSCO_SMOKE_MODEL",
+    "hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf",
+)
 
 
 def call(method, path, payload=None):
@@ -111,6 +115,13 @@ def compact_openai_usage(usage):
 
 def run():
     cases = [
+        (
+            "model_pull",
+            "POST",
+            "/cusco/v1/api/pull",
+            {"model": MODEL, "stream": False},
+            lambda status, body: has(status, body, "status"),
+        ),
         ("openapi", "GET", "/openai/v1/openapi.json", None, lambda status, body: has(status, body, "paths")),
         ("models", "GET", "/openai/v1/models", None, lambda status, body: list_field(status, body, "data")),
         (
@@ -118,7 +129,7 @@ def run():
             "POST",
             "/openai/v1/completions",
             {
-                "model": "gemma-4-e2b-it",
+                "model": MODEL,
                 "prompt": "Reply with exactly: smoke-ok",
                 "max_tokens": 8,
                 "temperature": 0,
@@ -130,7 +141,7 @@ def run():
             "POST",
             "/openai/v1/chat/completions",
             {
-                "model": "gemma-4-e2b-it",
+                "model": MODEL,
                 "messages": [{"role": "user", "content": "Reply with exactly: smoke-ok"}],
                 "max_tokens": 8,
                 "temperature": 0,
@@ -142,7 +153,7 @@ def run():
             "POST",
             "/openai/v1/responses",
             {
-                "model": "gemma-4-e2b-it",
+                "model": MODEL,
                 "input": "Reply with exactly: smoke-ok",
                 "max_output_tokens": 8,
             },
@@ -214,7 +225,7 @@ def run():
             "POST",
             "/openai/v1/completions",
             {
-                "model": "gemma-4-e2b-it",
+                "model": MODEL,
                 "prompt": "This is a short context-seed paragraph used only for cache-reuse smoke checks. "
                           "It discusses determinism, admission control, and residency with deterministic behavior.",
                 "context_id": context_id,
@@ -253,7 +264,7 @@ def run():
             "POST",
             "/openai/v1/completions",
             {
-                "model": "gemma-4-e2b-it",
+                "model": MODEL,
                 "prompt": "Repeat the same point in one short sentence.",
                 "context_id": context_id,
                 "max_tokens": 1,
@@ -292,7 +303,7 @@ def run():
             "POST",
             "/openai/v1/completions",
             {
-                "model": "gemma-4-e2b-it",
+                "model": MODEL,
                 "prompt": "compact this context",
                 "context_id": context_id,
                 "max_tokens": 1,
@@ -337,7 +348,7 @@ def run():
             "POST",
             "/openai/v1/completions",
             {
-                "model": "gemma-4-e2b-it",
+                "model": MODEL,
                 "prompt": "continue after compaction",
                 "context_id": context_id,
                 "max_tokens": 1,

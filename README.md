@@ -67,6 +67,15 @@ comparison under `results/`. It exercises the sequence-mapping path rather
 than claiming kernel-level graph or cache reuse, which llama.cpp's public API
 does not expose.
 
+All real-model gates share one cached artifact:
+`hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf`.
+Fetch it once with `docker compose -f compose.test.yaml run --rm model-fetch`.
+Proof services accept the `hf://` identity directly, and the smoke gate installs
+that identity through the model-management API. The registry resolves and
+validates the cached local artifact internally; tests do not depend on cache
+layout or create copied, hard-linked, or symlinked paths. The model supports
+vision and tool use and is the standard fixture for both capability gates.
+
 
 ## Run the unified API smoke report
 

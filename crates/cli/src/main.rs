@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cusco_executor::{Executor, logits_identical};
-use cusco_model_registry::{GEMMA_URI, ModelRecord, fetch_hf, register_local};
+use cusco_model_registry::{GEMMA_URI, ModelRecord as RegistryModelRecord, fetch_hf, register_local};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Barrier, Mutex},
     thread,
     time::{Duration, Instant},
@@ -27,8 +27,6 @@ enum Command {
         cache: PathBuf,
         #[arg(long)]
         sha256: Option<String>,
-        #[arg(long)]
-        output: Option<PathBuf>,
     },
     Register {
         path: PathBuf,
@@ -37,7 +35,7 @@ enum Command {
     },
     Proof {
         model: PathBuf,
-        #[arg(long, required_unless_present = "allow_unverified_model")]
+        #[arg(long)]
         sha256: Option<String>,
         #[arg(long, hide = true)]
         allow_unverified_model: bool,
@@ -94,43 +92,10 @@ enum Command {
 fn main() -> Result<()> {
     run(Args::parse().command)
 }
-fn materialize_model(record: &ModelRecord, output: &std::path::Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let (Ok(source), Ok(target)) = (fs::metadata(&record.path), fs::metadata(output)) {
-            if source.dev() == target.dev() && source.ino() == target.ino() {
-                return Ok(());
-            }
-        }
-    }
-    if output.exists() && register_local(output, &record.identity, Some(&record.sha256)).is_ok() {
-        return Ok(());
-    }
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temporary = output.with_extension(format!("partial-{}", std::process::id()));
-    let _ = fs::remove_file(&temporary);
-    if fs::hard_link(&record.path, &temporary).is_err() {
-        fs::copy(&record.path, &temporary)?;
-    }
-    fs::rename(temporary, output)?;
-    Ok(())
-}
 fn run(command: Command) -> Result<()> {
     match command {
-        Command::Fetch {
-            uri,
-            cache,
-            sha256,
-            output,
-        } => {
-            let mut record = fetch_hf(&uri, &cache, sha256.as_deref())?;
-            if let Some(output) = output {
-                materialize_model(&record, &output)?;
-                record = register_local(output, &record.identity, Some(&record.sha256))?;
-            }
+        Command::Fetch { uri, cache, sha256 } => {
+            let record = fetch_hf(&uri, &cache, sha256.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&record)?);
         }
         Command::Register { path, sha256 } => println!(
@@ -267,6 +232,25 @@ fn run(command: Command) -> Result<()> {
     }
     Ok(())
 }
+
+fn resolve_model(model: &Path, expected_sha256: Option<&str>) -> Result<RegistryModelRecord> {
+    let model_ref = model.to_str().context("model reference is not UTF-8")?;
+    if model_ref == "mock://deterministic" {
+        return Ok(RegistryModelRecord {
+            identity: "mock".into(),
+            path: model.to_owned(),
+            sha256: "model-free".into(),
+            size: 0,
+        });
+    }
+    if model_ref.starts_with("hf://") {
+        let cache = std::env::var_os("CUSCO_MODEL_CACHE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/models/cache"));
+        return fetch_hf(model_ref, &cache, expected_sha256).map_err(Into::into);
+    }
+    register_local(model, GEMMA_URI, expected_sha256).map_err(Into::into)
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SchedulerProofWorkload {
@@ -324,7 +308,7 @@ struct SchedulerProofResult {
 
 #[allow(clippy::too_many_arguments)]
 fn scheduler_proof(
-    model_path: PathBuf,
+    model: PathBuf,
     workload_path: PathBuf,
     output: PathBuf,
     n_ctx: u32,
@@ -335,6 +319,7 @@ fn scheduler_proof(
     use cusco_server::{MappedEngine, WorkloadScheduler};
 
     let proof_started = Instant::now();
+    let model_path = resolve_model(&model, None)?.path;
     let workload_bytes = fs::read(&workload_path)
         .with_context(|| format!("read workload {}", workload_path.display()))?;
     let workload: SchedulerProofWorkload =
@@ -668,7 +653,8 @@ fn mapped_proof(
     output: PathBuf,
 ) -> Result<()> {
     let started = Instant::now();
-    let model_path = model.to_str().context("model path is not UTF-8")?;
+    let record = resolve_model(&model, None)?;
+    let model_path = record.path.to_str().context("resolved model path is not UTF-8")?;
     let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
     ensure!(
         executor.capabilities().mapped_execution,
@@ -717,7 +703,8 @@ fn mapped_proof(
         "mapping activation copied device bytes"
     );
     let artifact = json!({
-        "model": model,
+        "model": record.identity,
+        "resolved_path": record.path,
         "branches": results,
         "metrics": metrics,
         "comparison": {
@@ -748,21 +735,19 @@ fn proof(
     output: PathBuf,
 ) -> Result<()> {
     let started = Instant::now();
-    let model_path = model.to_str().context("model path is not UTF-8")?;
-    let record = if model_path == "mock://deterministic" {
-        ModelRecord {
-            identity: "mock".into(),
-            path: model.clone(),
-            sha256: "model-free".into(),
-            size: 0,
-        }
-    } else {
-        ensure!(
-            expected_sha256.is_some() || allow_unverified_model,
-            "the Phase 1 proof requires --sha256 for the pinned Gemma artifact"
-        );
-        register_local(&model, GEMMA_URI, expected_sha256)?
-    };
+    let model_ref = model.to_str().context("model reference is not UTF-8")?;
+    ensure!(
+        model_ref.starts_with("hf://")
+            || model_ref == "mock://deterministic"
+            || expected_sha256.is_some()
+            || allow_unverified_model,
+        "a local model used by the Phase 1 proof requires --sha256"
+    );
+    let record = resolve_model(&model, expected_sha256)?;
+    let model_path = record
+        .path
+        .to_str()
+        .context("resolved model path is not UTF-8")?;
     let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
     let capabilities = executor.capabilities();
     ensure!(
@@ -936,26 +921,24 @@ mod tests {
         })
         .unwrap();
         let (uri, revision, file) = (
-            "hf://unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2/gemma-4-E2B-it-Q4_K_M.gguf",
+            "hf://unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2/gemma-4-E2B-it-Q3_K_M.gguf",
             "0314792d7f1f7e229411f620751375812bb9faf2",
-            "gemma-4-E2B-it-Q4_K_M.gguf",
+            "gemma-4-E2B-it-Q3_K_M.gguf",
         );
         let cached = root
             .join("models")
             .join("unsloth--gemma-4-E2B-it-GGUF")
             .join(revision);
         fs::create_dir_all(&cached).unwrap();
-        fs::write(cached.join(file), b"model").unwrap();
-        let output_model = root.join("fixture.gguf");
-        fs::write(&output_model, b"stale").unwrap();
+        let cached_model = cached.join(file);
+        fs::write(&cached_model, b"model").unwrap();
         run(Command::Fetch {
             uri: uri.into(),
             cache: root.clone(),
             sha256: None,
-            output: Some(output_model.clone()),
         })
         .unwrap();
-        assert_eq!(fs::read(output_model).unwrap(), b"model");
+        assert_eq!(fs::read(cached_model).unwrap(), b"model");
         let output = root.join("proof.json");
         run(Command::Proof {
             model: PathBuf::from("mock://deterministic"),
