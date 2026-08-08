@@ -521,7 +521,9 @@ impl WorkloadScheduler {
 
 impl Drop for WorkloadScheduler {
     fn drop(&mut self) {
-        let _ = self.commands.send(SchedulerEvent::Client(Command::Shutdown));
+        let _ = self
+            .commands
+            .send(SchedulerEvent::Client(Command::Shutdown));
         if let Some(worker) = self.worker.lock().take() {
             let _ = worker.join();
         }
@@ -684,7 +686,14 @@ fn run_scheduler(
     let mut slots = HashMap::<ModelSlotKey, SlotWorker>::new();
     let mut shutting_down = false;
     loop {
-        while dispatch_one(&inner, &events, &mut slots, &mut jobs, &mut policy, &counters) {}
+        while dispatch_one(
+            &inner,
+            &events,
+            &mut slots,
+            &mut jobs,
+            &mut policy,
+            &counters,
+        ) {}
         counters
             .runnable
             .store(policy.runnable.len(), Ordering::Release);
@@ -707,9 +716,15 @@ fn run_scheduler(
                     job.cancel_requested = true;
                 }
             }
-            SchedulerEvent::Client(command) if !shutting_down => {
-                handle_command(command, &inner, &events, &mut slots, &mut jobs, &mut policy, &counters)
-            }
+            SchedulerEvent::Client(command) if !shutting_down => handle_command(
+                command,
+                &inner,
+                &events,
+                &mut slots,
+                &mut jobs,
+                &mut policy,
+                &counters,
+            ),
             SchedulerEvent::Client(Command::Submit { response, .. }) => {
                 let _ = response.send(ClientMessage::Failed(Error::ShuttingDown));
             }
@@ -842,7 +857,6 @@ fn dispatch_one(
     }
 }
 
-
 fn handle_command(
     command: Command,
     inner: &Arc<dyn InferenceEngine>,
@@ -853,7 +867,11 @@ fn handle_command(
     counters: &SchedulerCounters,
 ) {
     match command {
-        Command::Submit { id, request, response } => {
+        Command::Submit {
+            id,
+            request,
+            response,
+        } => {
             let flow = FlowKey {
                 principal: request.scheduling.principal.clone(),
                 class: request.scheduling.class,
@@ -866,20 +884,23 @@ fn handle_command(
                 model_epoch: request.model.epoch,
             };
             let control = request.control.clone();
-            jobs.insert(id, Job {
-                request: Some(request),
-                session: None,
-                control,
-                response,
-                flow: flow.clone(),
-                scheduling,
-                slot,
-                execution_session_id: Uuid::new_v4().to_string(),
-                admitted_round,
-                admitted_at,
-                in_flight: false,
-                cancel_requested: false,
-            });
+            jobs.insert(
+                id,
+                Job {
+                    request: Some(request),
+                    session: None,
+                    control,
+                    response,
+                    flow: flow.clone(),
+                    scheduling,
+                    slot,
+                    execution_session_id: Uuid::new_v4().to_string(),
+                    admitted_round,
+                    admitted_at,
+                    in_flight: false,
+                    cancel_requested: false,
+                },
+            );
             counters.admitted.fetch_add(1, Ordering::Relaxed);
             policy.enqueue(id, flow, admitted_round, admitted_at);
         }
@@ -902,13 +923,21 @@ fn handle_command(
             match ensure_slot(&job.slot, inner, events, slots) {
                 Ok(slot) => {
                     slot.busy = true;
-                    if slot.sender.send(SlotTask {
-                        id,
-                        action: SlotAction::Finish(session),
-                        selection: None,
-                    }).is_err() {
+                    if slot
+                        .sender
+                        .send(SlotTask {
+                            id,
+                            action: SlotAction::Finish(session),
+                            selection: None,
+                        })
+                        .is_err()
+                    {
                         let job = jobs.remove(&id).expect("stopped job exists");
-                        send_terminal(job, Err(Error::State("model slot worker stopped".into())), counters);
+                        send_terminal(
+                            job,
+                            Err(Error::State("model slot worker stopped".into())),
+                            counters,
+                        );
                     }
                 }
                 Err(error) => {
@@ -945,7 +974,9 @@ fn handle_completion(
     counters: &SchedulerCounters,
     diagnostics: &SchedulerDiagnostics,
 ) {
-    let Some(job) = jobs.get_mut(&completion.id) else { return };
+    let Some(job) = jobs.get_mut(&completion.id) else {
+        return;
+    };
     if let Some(slot) = slots.get_mut(&job.slot) {
         slot.busy = false;
     }
@@ -955,10 +986,22 @@ fn handle_completion(
     let mut wait_for_consumer = false;
     let observation = match completion.result {
         Ok(SessionStep::Progress(observation)) => observation,
-        Ok(SessionStep::Token { id, piece, terminal_or_control, observation }) => {
-            if job.cancel_requested || job.response.send(ClientMessage::Token {
-                id, piece, terminal_or_control,
-            }).is_err() {
+        Ok(SessionStep::Token {
+            id,
+            piece,
+            terminal_or_control,
+            observation,
+        }) => {
+            if job.cancel_requested
+                || job
+                    .response
+                    .send(ClientMessage::Token {
+                        id,
+                        piece,
+                        terminal_or_control,
+                    })
+                    .is_err()
+            {
                 terminal = Some(Err(Error::Cancelled));
             } else {
                 counters.waiting.fetch_add(1, Ordering::AcqRel);
@@ -967,11 +1010,19 @@ fn handle_completion(
             observation
         }
         Ok(SessionStep::Finished(output)) => {
-            terminal = Some(if job.cancel_requested { Err(Error::Cancelled) } else { Ok(output) });
+            terminal = Some(if job.cancel_requested {
+                Err(Error::Cancelled)
+            } else {
+                Ok(output)
+            });
             QuantumObservation::model_free(QuantumKind::Publication, 1)
         }
         Err(error) => {
-            terminal = Some(if job.cancel_requested { Err(Error::Cancelled) } else { Err(error) });
+            terminal = Some(if job.cancel_requested {
+                Err(Error::Cancelled)
+            } else {
+                Err(error)
+            });
             QuantumObservation::model_free(QuantumKind::Preparation, 1)
         }
     };
@@ -979,31 +1030,42 @@ fn handle_completion(
         terminal = Some(Err(Error::Cancelled));
     }
     if let Some(selection) = completion.selection {
-        policy.charge(&job.flow, observation.charged_tokens, selection.charge_scale);
-        diagnostics.emit("scheduler_decision", &SchedulerDecision {
-            record_type: "scheduler_decision",
-            transport_correlation_id: job.scheduling.correlation_id.clone(),
-            inference_operation_id: job.scheduling.inference_id.clone(),
-            execution_session_id: job.execution_session_id.clone(),
-            principal: job.scheduling.principal.clone(),
-            class: job.scheduling.class,
-            priority_source: job.scheduling.source,
-            model_id: job.slot.model_id.clone(),
-            model_epoch: job.slot.model_epoch,
-            queue_age_ms: selection.queue_age_ms,
-            queue_age_rounds: selection.queue_age_rounds,
-            age_promotions: selection.promotions,
-            quantum_kind: observation.kind,
-            charged_tokens: observation.charged_tokens,
-            quantum_duration_ns: completion.quantum_duration_ns,
-            context_placement: observation.context_placement,
-            executor_slot_occupied: observation.executor_slot_occupied,
-            transition_cost_bytes: observation.transition_cost_bytes,
-            capacity_reserved_bytes: observation.capacity_reserved_bytes,
-            cancelled: matches!(terminal, Some(Err(Error::Cancelled))),
-            deadline_expired: matches!(terminal, Some(Err(Error::Deadline))),
-            reason: if selection.promotions > 0 { "age_promoted" } else { "class_ready" },
-        });
+        policy.charge(
+            &job.flow,
+            observation.charged_tokens,
+            selection.charge_scale,
+        );
+        diagnostics.emit(
+            "scheduler_decision",
+            &SchedulerDecision {
+                record_type: "scheduler_decision",
+                transport_correlation_id: job.scheduling.correlation_id.clone(),
+                inference_operation_id: job.scheduling.inference_id.clone(),
+                execution_session_id: job.execution_session_id.clone(),
+                principal: job.scheduling.principal.clone(),
+                class: job.scheduling.class,
+                priority_source: job.scheduling.source,
+                model_id: job.slot.model_id.clone(),
+                model_epoch: job.slot.model_epoch,
+                queue_age_ms: selection.queue_age_ms,
+                queue_age_rounds: selection.queue_age_rounds,
+                age_promotions: selection.promotions,
+                quantum_kind: observation.kind,
+                charged_tokens: observation.charged_tokens,
+                quantum_duration_ns: completion.quantum_duration_ns,
+                context_placement: observation.context_placement,
+                executor_slot_occupied: observation.executor_slot_occupied,
+                transition_cost_bytes: observation.transition_cost_bytes,
+                capacity_reserved_bytes: observation.capacity_reserved_bytes,
+                cancelled: matches!(terminal, Some(Err(Error::Cancelled))),
+                deadline_expired: matches!(terminal, Some(Err(Error::Deadline))),
+                reason: if selection.promotions > 0 {
+                    "age_promoted"
+                } else {
+                    "class_ready"
+                },
+            },
+        );
     }
     if let Some(result) = terminal {
         let job = jobs.remove(&completion.id).expect("terminal job exists");
@@ -1013,7 +1075,12 @@ fn handle_completion(
         policy.clear_if_idle(&flow, jobs);
         retire_slot_if_idle(&slot, slots, jobs);
     } else if !wait_for_consumer {
-        policy.enqueue(completion.id, job.flow.clone(), job.admitted_round, job.admitted_at);
+        policy.enqueue(
+            completion.id,
+            job.flow.clone(),
+            job.admitted_round,
+            job.admitted_at,
+        );
     }
 }
 
@@ -1026,7 +1093,11 @@ fn retire_slot_if_idle(
         return;
     }
     if let Some(slot) = slots.remove(key) {
-        let _ = slot.sender.send(SlotTask { id: 0, action: SlotAction::Shutdown, selection: None });
+        let _ = slot.sender.send(SlotTask {
+            id: 0,
+            action: SlotAction::Shutdown,
+            selection: None,
+        });
         let _ = slot.handle.join();
     }
 }
@@ -1040,7 +1111,11 @@ fn cancel_all_jobs(jobs: &mut HashMap<u64, Job>) {
 
 fn shutdown_slots(slots: &mut HashMap<ModelSlotKey, SlotWorker>) {
     for (_, slot) in slots.drain() {
-        let _ = slot.sender.send(SlotTask { id: 0, action: SlotAction::Shutdown, selection: None });
+        let _ = slot.sender.send(SlotTask {
+            id: 0,
+            action: SlotAction::Shutdown,
+            selection: None,
+        });
         let _ = slot.handle.join();
     }
 }
