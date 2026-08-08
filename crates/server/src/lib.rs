@@ -3359,11 +3359,34 @@ fn completed_response(
     finish_reason: FinishReason,
 ) -> Value {
     let usage = json!({"prompt_tokens":response.usage.input_tokens,"completion_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens});
+    let prefill = &response.usage.prefill;
+    let cached_ratio = if prefill.total_tokens > 0 {
+        Some((prefill.cached_tokens as f64) / (prefill.total_tokens as f64))
+    } else {
+        None
+    };
     let cusco = json!({
         "compaction_result": response.usage.compaction_result,
         "correlation_id": response.usage.correlation_id,
         "inference_id": response.usage.inference_id,
         "execution_session_id": response.usage.execution_session_id,
+        "usage": {
+            "input_tokens": response.usage.input_tokens,
+            "generated_tokens": response.usage.generated_tokens,
+            "evaluated_tokens": response.usage.evaluated_tokens,
+            "cached_tokens": response.usage.cached_tokens,
+            "prefill": {
+                "total_tokens": prefill.total_tokens,
+                "cached_tokens": prefill.cached_tokens,
+                "uncached_tokens": prefill.uncached_tokens,
+                "cached_ratio": cached_ratio,
+                "tokenization_ns": prefill.tokenization_ns,
+                "prefix_lookup_ns": prefill.prefix_lookup_ns,
+                "mapping_activation_ns": prefill.mapping_activation_ns,
+                "uncached_prefill_ns": prefill.uncached_prefill_ns,
+                "total_ns": prefill.total_ns,
+            },
+        },
     });
     match protocol {
         WireProtocol::OpenAiCompletion => {
