@@ -520,20 +520,13 @@ The old tail remains valid for its original branch. It must not be attached to t
 
 ## Persistent sequence representation
 
-Logical token sequences use immutable chunks in a lightweight persistent structure such as a radix tree, persistent rope, or balanced tree with subtree hashes. Constructing a branch structurally shares unchanged chunks rather than copying an entire token vector or full-prefix descriptor array. Chunk identity and executor-described component coverage meet at evaluated boundaries, but a logical chunk need not correspond one-to-one with a native allocation and must not assume identical geometry for global KV, SWA, and recurrent state.
+Logical token sequences use bounded immutable chunks in a lightweight persistent chain. The current chunk bound is 256 tokens. Constructing a branch structurally shares unchanged chunks rather than copying an entire token vector or full-prefix descriptor array; a prefix ending inside a chunk is a view consisting of the shared chunk plus its visible token count.
 
-A logical sequence node might contain:
+Each chunk carries the incremental SHA-256 state at its start and the cumulative identity at its end. This makes identity independent of how callers divide append operations, hashes only newly appended tokens, and permits deterministic identities at partial-chunk boundaries. Evaluated mappings retain an immutable sequence boundary rather than a full token copy. Lookup uses an epoch-scoped ordered boundary index, then confirms candidate tokens literally without allocating.
 
-```rust
-struct SequenceNode {
-    parent: Option<SequenceNodeId>,
-    token_block: TokenBlockId,
-    token_count: u32,
-    subtree_hash: DependencyHash,
-}
-```
+Chunk identity and executor-described component coverage meet at evaluated boundaries, but a logical chunk does not correspond one-to-one with a native allocation and does not assume identical geometry for global KV, SWA, and recurrent state.
 
-The exact representation is an implementation choice. Required properties are:
+The representation provides:
 
 - cheap append;
 - cheap branch creation;
