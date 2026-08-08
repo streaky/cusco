@@ -196,6 +196,18 @@ pub struct InferRequest {
 fn default_tokens() -> usize {
     16
 }
+fn default_compaction_workers() -> usize {
+    1
+}
+fn default_compaction_declarations() -> usize {
+    128
+}
+fn default_compaction_declaration_rate() -> usize {
+    32
+}
+fn default_compaction_lifetime_ms() -> u64 {
+    3_600_000
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InferResponse {
     pub id: String,
@@ -257,6 +269,16 @@ pub struct ServerConfig {
     pub active_time_ms: u64,
     pub stream_buffer: usize,
     pub shutdown_grace_ms: u64,
+    #[serde(default = "default_true")]
+    pub compaction_enabled: bool,
+    #[serde(default = "default_compaction_workers")]
+    pub compaction_workers: usize,
+    #[serde(default = "default_compaction_declarations")]
+    pub compaction_declarations: usize,
+    #[serde(default = "default_compaction_declaration_rate")]
+    pub compaction_declaration_rate_per_minute: usize,
+    #[serde(default = "default_compaction_lifetime_ms")]
+    pub compaction_declaration_lifetime_ms: u64,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -273,6 +295,11 @@ impl Default for ServerConfig {
             active_time_ms: 240_000,
             stream_buffer: 8,
             shutdown_grace_ms: 30_000,
+            compaction_enabled: true,
+            compaction_workers: default_compaction_workers(),
+            compaction_declarations: default_compaction_declarations(),
+            compaction_declaration_rate_per_minute: default_compaction_declaration_rate(),
+            compaction_declaration_lifetime_ms: default_compaction_lifetime_ms(),
         }
     }
 }
@@ -990,6 +1017,18 @@ impl PrequeueGate {
         })
     }
 
+    fn try_acquire(self: &Arc<Self>) -> Result<PrequeuePermit, Error> {
+        let permit = self
+            .semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
+        Ok(PrequeuePermit {
+            gate: self.clone(),
+            permit: Some(permit),
+        })
+    }
+
     fn set_limit(&self, limit: usize) {
         let mut state = self.state.lock();
         if limit < state.limit {
@@ -1025,14 +1064,20 @@ impl Drop for PrequeuePermit {
     }
 }
 
+struct DeclarationState {
+    records: HashMap<String, CompactionDeclaration>,
+    creation_times: HashMap<String, VecDeque<u64>>,
+}
+
 #[derive(Clone)]
 pub struct Server {
     state_path: PathBuf,
     inner: Arc<Mutex<Inner>>,
     pre_queue: Arc<PrequeueGate>,
+    compaction_workers: Arc<PrequeueGate>,
     model_lifecycle: Arc<Mutex<()>>,
     auth: Arc<dyn AuthProvider>,
-    declarations: Arc<Mutex<HashMap<String, CompactionDeclaration>>>,
+    declarations: Arc<Mutex<DeclarationState>>,
     engine: Arc<dyn InferenceEngine>,
     catalog: Arc<Mutex<Option<ModelCatalog>>>,
     model_directory: Arc<Mutex<PathBuf>>,
@@ -1096,9 +1141,13 @@ impl Server {
                 config,
             })),
             pre_queue: PrequeueGate::new(config.pre_queue_concurrency),
+            compaction_workers: PrequeueGate::new(config.compaction_workers),
             model_lifecycle: Arc::new(Mutex::new(())),
             auth,
-            declarations: Arc::new(Mutex::new(HashMap::new())),
+            declarations: Arc::new(Mutex::new(DeclarationState {
+                records: HashMap::new(),
+                creation_times: HashMap::new(),
+            })),
             engine,
             catalog: Arc::new(Mutex::new(None)),
             model_directory: Arc::new(Mutex::new(PathBuf::from("./data/models"))),
@@ -1235,7 +1284,21 @@ impl Server {
         &self,
         request: CreateCompactionDeclaration,
     ) -> Result<CompactionDeclaration, Error> {
-        if request.expires_in_ms == 0 || request.expires_in_ms > 3_600_000 {
+        self.create_compaction_declaration_for("local", request)
+    }
+
+    fn create_compaction_declaration_for(
+        &self,
+        principal: &str,
+        request: CreateCompactionDeclaration,
+    ) -> Result<CompactionDeclaration, Error> {
+        let config = self.config();
+        if !config.compaction_enabled {
+            return Err(Error::BadRequest("compaction is disabled".into()));
+        }
+        if request.expires_in_ms == 0
+            || request.expires_in_ms > config.compaction_declaration_lifetime_ms
+        {
             return Err(Error::BadRequest("invalid compaction declaration lifetime".into()));
         }
         let context_id = parse_context(request.context_id.clone());
@@ -1251,25 +1314,38 @@ impl Server {
             target_tokens: request.target_tokens,
             expires_at_ms: now.saturating_add(request.expires_in_ms),
         };
-        self.declarations
-            .lock()
+        let mut state = self.declarations.lock();
+        state.records.retain(|_, record| record.expires_at_ms > now);
+        if state.records.len() >= config.compaction_declarations {
+            return Err(Error::Busy);
+        }
+        let recent = state.creation_times.entry(principal.to_owned()).or_default();
+        while recent.front().is_some_and(|created| now.saturating_sub(*created) >= 60_000) {
+            recent.pop_front();
+        }
+        if recent.len() >= config.compaction_declaration_rate_per_minute {
+            return Err(Error::Busy);
+        }
+        recent.push_back(now);
+        state
+            .records
             .insert(declaration.declaration_id.clone(), declaration.clone());
         Ok(declaration)
     }
 
     pub fn compaction_declaration(&self, id: &str) -> Result<CompactionDeclaration, Error> {
-        let declaration = self
-            .declarations
-            .lock()
-            .get(id)
-            .cloned()
-            .ok_or_else(|| Error::BadRequest("compaction declaration not found".into()))?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| Error::State("system clock before unix epoch".into()))?
             .as_millis() as u64;
+        let mut state = self.declarations.lock();
+        let declaration = state
+            .records
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::BadRequest("compaction declaration not found".into()))?;
         if declaration.expires_at_ms <= now {
-            self.declarations.lock().remove(id);
+            state.records.remove(id);
             return Err(Error::BadRequest("compaction declaration expired".into()));
         }
         Ok(declaration)
@@ -1479,11 +1555,16 @@ impl Server {
             || config.active_time_ms == 0
             || config.stream_buffer == 0
             || config.shutdown_grace_ms == 0
+            || config.compaction_workers == 0
+            || config.compaction_declarations == 0
+            || config.compaction_declaration_rate_per_minute == 0
+            || config.compaction_declaration_lifetime_ms == 0
         {
             return Err(Error::State("server limits must be nonzero".into()));
         }
         let mut guard = self.inner.lock();
         self.pre_queue.set_limit(config.pre_queue_concurrency);
+        self.compaction_workers.set_limit(config.compaction_workers);
         guard.admission_limit = config.active_requests;
         guard.config = config;
         Self::promote_queued(&mut guard);
@@ -3263,6 +3344,14 @@ async fn infer_response(
     let id = request_id;
     let correlation_id = id.clone();
     let config = server.config();
+    let compaction_permit = if compaction.is_some() {
+        if !config.compaction_enabled {
+            return Err(Error::BadRequest("compaction is disabled".into()));
+        }
+        Some(server.compaction_workers.try_acquire()?)
+    } else {
+        None
+    };
     let wall_limit = Duration::from_millis(
         deadline_ms
             .unwrap_or(config.wall_time_ms)
@@ -3309,10 +3398,13 @@ async fn infer_response(
         let first = stream::once(async move { started });
         let disconnect = DisconnectGuard::new(control);
         let rest = stream::unfold(
-            (receiver, disconnect),
-            |(mut receiver, mut disconnect)| async move {
+            (receiver, disconnect, compaction_permit),
+            |(mut receiver, mut disconnect, compaction_permit)| async move {
                 match receiver.recv().await {
-                    Some(event) => Some((event, (receiver, disconnect))),
+                    Some(event) => Some((
+                        event,
+                        (receiver, disconnect, compaction_permit),
+                    )),
                     None => {
                         disconnect.disarm();
                         None
@@ -3415,8 +3507,11 @@ async fn create_compaction_declaration(
     headers: HeaderMap,
     Json(request): Json<CreateCompactionDeclaration>,
 ) -> Result<Json<CompactionDeclaration>, Error> {
-    auth(&s, &headers, Scope::Inference)?;
-    Ok(Json(s.create_compaction_declaration(request)?))
+    let request_context = auth(&s, &headers, Scope::Inference)?;
+    Ok(Json(s.create_compaction_declaration_for(
+        &request_context.principal,
+        request,
+    )?))
 }
 fn parse_context(id: String) -> ContextId {
     ContextId(id)
@@ -4875,6 +4970,11 @@ mod tests {
                 active_time_ms: 240_000,
                 stream_buffer: 8,
                 shutdown_grace_ms: 30_000,
+                compaction_enabled: true,
+                compaction_workers: default_compaction_workers(),
+                compaction_declarations: default_compaction_declarations(),
+                compaction_declaration_rate_per_minute: default_compaction_declaration_rate(),
+                compaction_declaration_lifetime_ms: default_compaction_lifetime_ms(),
             }
         );
     }
@@ -5535,6 +5635,83 @@ mod tests {
         };
         assert_eq!(mismatch.target_tokens, None);
         drop(server);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compaction_operator_limits_bound_workers_declarations_and_rate() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let mut config = ServerConfig {
+            compaction_workers: 1,
+            compaction_declarations: 1,
+            compaction_declaration_rate_per_minute: 1,
+            compaction_declaration_lifetime_ms: 100,
+            ..ServerConfig::default()
+        };
+        server.configure(config).unwrap();
+        let worker = server.compaction_workers.try_acquire().unwrap();
+        assert!(matches!(server.compaction_workers.try_acquire(), Err(Error::Busy)));
+        drop(worker);
+        assert!(server.compaction_workers.try_acquire().is_ok());
+
+        let context = server.create_context().unwrap();
+        let declaration = CreateCompactionDeclaration {
+            context_id: context.id.0,
+            strategy_preferences: vec![WINDOW_TAIL_STRATEGY_ID.into()],
+            target_tokens: Some(8),
+            expires_in_ms: 100,
+        };
+        server
+            .create_compaction_declaration_for("principal-a", declaration.clone())
+            .unwrap();
+        assert!(matches!(
+            server.create_compaction_declaration_for("principal-a", declaration.clone()),
+            Err(Error::Busy)
+        ));
+        assert!(matches!(
+            server.create_compaction_declaration_for("principal-b", declaration.clone()),
+            Err(Error::Busy)
+        ));
+
+        config.compaction_enabled = false;
+        server.configure(config).unwrap();
+        assert!(matches!(
+            server.create_compaction_declaration_for("principal-c", declaration),
+            Err(Error::BadRequest(message)) if message == "compaction is disabled"
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saturated_compaction_workers_do_not_block_interactive_inference() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let worker = server.compaction_workers.try_acquire().unwrap();
+        let app = router(server);
+        let compact = app
+            .clone()
+            .oneshot(
+                Request::post("/openai/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","prompt":"compact","max_tokens":1,"compaction":{"target_tokens":1}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(compact.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let interactive = app
+            .oneshot(
+                Request::post("/openai/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"m","prompt":"interactive","max_tokens":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(interactive.status(), StatusCode::OK);
+        drop(worker);
         fs::remove_dir_all(directory).unwrap();
     }
 

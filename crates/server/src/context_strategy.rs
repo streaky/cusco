@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 const BUILTIN_STRATEGY_VERSION: u32 = 1;
+const COMPACTION_BLOCK_TOKENS: usize = 64;
 pub const WINDOW_TAIL_STRATEGY_ID: &str = "window_tail";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -70,6 +71,7 @@ pub struct CompactionStrategyInfo {
     pub version: u32,
     pub compact_mode: String,
     pub default_target_tokens: usize,
+    pub target_alignment_tokens: usize,
     pub reason: String,
 }
 
@@ -120,6 +122,7 @@ pub fn strategy_catalog() -> CompactionStrategyCatalog {
             compact_mode: "window_tail".into(),
             default_target_tokens: 3072,
             reason: "Keep newest turns while preserving anchor boundaries".into(),
+                target_alignment_tokens: COMPACTION_BLOCK_TOKENS,
         }],
     }
 }
@@ -204,6 +207,11 @@ pub fn apply_window_tail_strategy(
         });
     }
 
+    let selection_budget = if requested_budget >= COMPACTION_BLOCK_TOKENS {
+        requested_budget / COMPACTION_BLOCK_TOKENS * COMPACTION_BLOCK_TOKENS
+    } else {
+        requested_budget
+    };
     let indexed_turns = split_indexed_turns(source_tokens);
     let mut retained = Vec::new();
     let mut used_tokens = 0usize;
@@ -219,7 +227,7 @@ pub fn apply_window_tail_strategy(
         if turn.iter().any(|(index, _)| anchors.contains(index)) {
             continue;
         }
-        if used_tokens + turn.len() > requested_budget {
+        if used_tokens + turn.len() > selection_budget {
             continue;
         }
         used_tokens += turn.len();
@@ -232,7 +240,7 @@ pub fn apply_window_tail_strategy(
             source_tokens
                 .iter()
                 .enumerate()
-                .skip(source_tokens.len().saturating_sub(requested_budget))
+                .skip(source_tokens.len().saturating_sub(selection_budget))
                 .map(|(index, token)| (index, token.clone())),
         );
         used_tokens = retained.len();
@@ -445,5 +453,14 @@ mod tests {
         );
         assert_eq!(proposal.result.compact_reason, CompactionResultReason::AnchorsOnly);
         assert!(proposal.result.fallback);
+    }
+
+    #[test]
+    fn window_tail_aligns_large_targets_to_cache_blocks() {
+        let tokens = (0..200).map(|index| index.to_string()).collect::<Vec<_>>();
+        let proposal = apply_window_tail_strategy(&tokens, 130, &[]).unwrap();
+        assert_eq!(proposal.resulting_tokens.len(), 128);
+        assert_eq!(proposal.resulting_tokens.first().map(String::as_str), Some("72"));
+        assert_eq!(strategy_catalog().strategies[0].target_alignment_tokens, 64);
     }
 }
