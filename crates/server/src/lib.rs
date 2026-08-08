@@ -7,6 +7,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
 };
+use cusco_executor::SamplingConfig;
 use futures_util::{StreamExt, stream};
 use http_body_util::BodyExt;
 use parking_lot::Mutex;
@@ -27,27 +28,25 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use cusco_executor::SamplingConfig;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod catalog;
+mod config;
 mod context_strategy;
 mod generation;
 mod mapped;
 mod prompt;
+mod residency;
 mod scheduler;
 mod vision;
-mod catalog;
-mod config;
-mod residency;
-pub use catalog::{load_user_models, ModelCatalog};
+pub use catalog::{ModelCatalog, load_user_models};
 pub use config::{DaemonConfig, OpenApiConfig, VisionConfig};
 pub use context_strategy::{
-    apply_window_tail_strategy, CompactionDeclaration, CompactionNoMatchFallback,
-    CompactionProposal, CompactionRequest, CompactionResult, CompactionResultReason,
-    CompactionStrategyCatalog, CompactionStrategyInfo, CompactionTrigger,
-    CreateCompactionDeclaration, WINDOW_TAIL_STRATEGY_ID, deterministic_strategy_id,
-    select_strategy, strategy_catalog,
+    CompactionDeclaration, CompactionNoMatchFallback, CompactionProposal, CompactionRequest,
+    CompactionResult, CompactionResultReason, CompactionStrategyCatalog, CompactionStrategyInfo,
+    CompactionTrigger, CreateCompactionDeclaration, WINDOW_TAIL_STRATEGY_ID,
+    apply_window_tail_strategy, deterministic_strategy_id, select_strategy, strategy_catalog,
 };
 pub use generation::{
     FinishReason, FrontierControl, GenerationFrontier, MAX_STOP_BYTES, MAX_STOP_SEQUENCES,
@@ -1064,8 +1063,13 @@ impl Drop for PrequeuePermit {
     }
 }
 
+struct DeclarationRecord {
+    declaration: CompactionDeclaration,
+    principal: String,
+}
+
 struct DeclarationState {
-    records: HashMap<String, CompactionDeclaration>,
+    records: HashMap<String, DeclarationRecord>,
     creation_times: HashMap<String, VecDeque<u64>>,
 }
 
@@ -1299,10 +1303,11 @@ impl Server {
         if request.expires_in_ms == 0
             || request.expires_in_ms > config.compaction_declaration_lifetime_ms
         {
-            return Err(Error::BadRequest("invalid compaction declaration lifetime".into()));
+            return Err(Error::BadRequest(
+                "invalid compaction declaration lifetime".into(),
+            ));
         }
-        let context_id = parse_context(request.context_id.clone());
-        self.context(&context_id)?;
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| Error::State("system clock before unix epoch".into()))?
@@ -1314,41 +1319,87 @@ impl Server {
             target_tokens: request.target_tokens,
             expires_at_ms: now.saturating_add(request.expires_in_ms),
         };
+
         let mut state = self.declarations.lock();
-        state.records.retain(|_, record| record.expires_at_ms > now);
+        state
+            .records
+            .retain(|_, record| record.declaration.expires_at_ms > now);
+        let stale_cutoff_ms = now.saturating_sub(60_000);
+        state.creation_times.retain(|_, recent| {
+            while recent
+                .front()
+                .is_some_and(|created| now.saturating_sub(*created) >= 60_000)
+            {
+                recent.pop_front();
+            }
+            !recent.is_empty()
+        });
         if state.records.len() >= config.compaction_declarations {
             return Err(Error::Busy);
         }
-        let recent = state.creation_times.entry(principal.to_owned()).or_default();
-        while recent.front().is_some_and(|created| now.saturating_sub(*created) >= 60_000) {
+        let recent = state
+            .creation_times
+            .entry(principal.to_owned())
+            .or_default();
+        while recent
+            .front()
+            .is_some_and(|created| *created <= stale_cutoff_ms)
+        {
             recent.pop_front();
         }
         if recent.len() >= config.compaction_declaration_rate_per_minute {
             return Err(Error::Busy);
         }
         recent.push_back(now);
-        state
-            .records
-            .insert(declaration.declaration_id.clone(), declaration.clone());
+        state.records.insert(
+            declaration.declaration_id.clone(),
+            DeclarationRecord {
+                declaration: declaration.clone(),
+                principal: principal.to_owned(),
+            },
+        );
         Ok(declaration)
     }
 
     pub fn compaction_declaration(&self, id: &str) -> Result<CompactionDeclaration, Error> {
+        self.compaction_declaration_for("local", id)
+    }
+
+    fn compaction_declaration_for(
+        &self,
+        principal: &str,
+        id: &str,
+    ) -> Result<CompactionDeclaration, Error> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| Error::State("system clock before unix epoch".into()))?
             .as_millis() as u64;
         let mut state = self.declarations.lock();
-        let declaration = state
+        let record = state
             .records
             .get(id)
-            .cloned()
             .ok_or_else(|| Error::BadRequest("compaction declaration not found".into()))?;
-        if declaration.expires_at_ms <= now {
+        if record.declaration.expires_at_ms <= now {
             state.records.remove(id);
             return Err(Error::BadRequest("compaction declaration expired".into()));
         }
-        Ok(declaration)
+        if record.principal != principal {
+            return Err(Error::Forbidden);
+        }
+        Ok(record.declaration.clone())
+    }
+
+    fn revoke_compaction_declaration_for(&self, principal: &str, id: &str) -> Result<(), Error> {
+        let mut state = self.declarations.lock();
+        let record = state
+            .records
+            .get(id)
+            .ok_or_else(|| Error::BadRequest("compaction declaration not found".into()))?;
+        if record.principal != principal {
+            return Err(Error::Forbidden);
+        }
+        state.records.remove(id);
+        Ok(())
     }
     pub fn register_model(&self, model: ModelRecord) -> Result<ModelRecord, Error> {
         self.register_model_with(|_| Ok(()), model)
@@ -1440,7 +1491,6 @@ impl Server {
         }
         Ok(stops)
     }
-
 
     pub fn models(&self) -> Vec<ModelRecord> {
         self.inner.lock().durable.models.values().cloned().collect()
@@ -1611,8 +1661,7 @@ impl Server {
         req: InferRequest,
     ) -> Result<(InferResponse, Vec<StreamEvent>), Error> {
         let stops = self.effective_stop_sequences(&req)?;
-        let frontier =
-            GenerationFrontier::new(&stops, req.raw_continuation).map_err(state_err)?;
+        let frontier = GenerationFrontier::new(&stops, req.raw_continuation).map_err(state_err)?;
         let successor_id = req.context_id.clone().unwrap_or_else(ContextId::new);
         let execution_session_id = req.scheduling.inference_id.clone();
         let mut events = vec![StreamEvent::Started {
@@ -1637,8 +1686,7 @@ impl Server {
         admission: AdmissionGuard,
     ) -> Result<(StreamEvent, tokio::sync::mpsc::Receiver<StreamEvent>), Error> {
         let stops = self.effective_stop_sequences(&req)?;
-        let frontier =
-            GenerationFrontier::new(&stops, req.raw_continuation).map_err(state_err)?;
+        let frontier = GenerationFrontier::new(&stops, req.raw_continuation).map_err(state_err)?;
         let successor_id = req.context_id.clone().unwrap_or_else(ContextId::new);
         let started = StreamEvent::Started {
             request_id: request_id.clone(),
@@ -1821,13 +1869,15 @@ impl Server {
     ) -> Result<(InferResponse, StreamEvent), Error> {
         if let Some(compaction) = req.compaction.as_mut() {
             if let Some(declaration_id) = compaction.declaration_id.clone() {
-                let declaration = self.compaction_declaration(&declaration_id)?;
-                let context_id = req
-                    .context_id
-                    .as_ref()
-                    .ok_or_else(|| Error::BadRequest("compaction declaration requires context".into()))?;
+                let declaration =
+                    self.compaction_declaration_for(&req.scheduling.principal, &declaration_id)?;
+                let context_id = req.context_id.as_ref().ok_or_else(|| {
+                    Error::BadRequest("compaction declaration requires context".into())
+                })?;
                 if context_id.0 != declaration.context_id {
-                    return Err(Error::BadRequest("compaction declaration context mismatch".into()));
+                    return Err(Error::BadRequest(
+                        "compaction declaration context mismatch".into(),
+                    ));
                 }
                 compaction.strategy_preferences = declaration.strategy_preferences;
                 if compaction.target_tokens.is_none() {
@@ -1975,6 +2025,7 @@ impl Server {
             return Err(Error::Deadline);
         }
         logical_context_tokens.extend(req.prompt.split_whitespace().map(str::to_owned));
+        logical_context_tokens.extend(frontier.text.split_whitespace().map(str::to_owned));
         let EngineOutput {
             successor_tokens,
             input_tokens,
@@ -2039,7 +2090,6 @@ impl Server {
         ))
     }
 }
-
 
 fn state_err(error: impl std::fmt::Display) -> Error {
     Error::State(error.to_string())
@@ -2338,10 +2388,7 @@ fn lower_messages(
     let admission = ImageAdmission::new(vision);
     let mut normalized = Vec::with_capacity(messages.len());
     for message in messages {
-        if !matches!(
-            message.role.as_str(),
-            "system" | "user" | "assistant"
-        ) {
+        if !matches!(message.role.as_str(), "system" | "user" | "assistant") {
             return Err(Error::BadRequest(format!(
                 "unsupported message role {}",
                 message.role
@@ -2418,8 +2465,18 @@ fn routes(server: Server) -> Router {
         )
         .route("/cusco/v1/requests/{id}", delete(cancel_request))
         .route("/cusco/v1/status", get(native_status))
-        .route("/cusco/v1/compaction/strategies", get(compaction_strategies))
-        .route("/cusco/v1/compaction/declarations", post(create_compaction_declaration))
+        .route(
+            "/cusco/v1/compaction/strategies",
+            get(compaction_strategies),
+        )
+        .route(
+            "/cusco/v1/compaction/declarations",
+            post(create_compaction_declaration),
+        )
+        .route(
+            "/cusco/v1/compaction/declarations/{id}",
+            delete(revoke_compaction_declaration),
+        )
         .route("/cusco/v1/contexts/{id}/branches", post(branch_context));
     let app = if server.openapi_ui_enabled() {
         app.route("/openapi/ui", get(swagger_ui))
@@ -2435,6 +2492,7 @@ async fn http_debug_middleware(
     next: Next,
 ) -> Response {
     let request_id = Uuid::new_v4().to_string();
+    let request_started = Instant::now();
     let method = request.method().to_string();
     let path = request.uri().path().to_owned();
     let request_content_type = request
@@ -2498,6 +2556,7 @@ async fn http_debug_middleware(
     }
     let request = Request::from_parts(parts, Body::from(body_bytes));
     let response = next.run(request).await;
+    let duration_ms = request_started.elapsed().as_millis();
     let (mut parts, body) = response.into_parts();
     parts.headers.insert(
         "x-request-id",
@@ -2509,7 +2568,7 @@ async fn http_debug_middleware(
         "direction": "out",
         "request_id": request_id,
         "status": parts.status.as_u16(),
-        "duration_ms": 0,
+        "duration_ms": duration_ms,
         "headers": if debug.level == HttpDebugLevel::Full {
             unredacted_headers(&parts.headers)
         } else {
@@ -2526,7 +2585,10 @@ async fn http_debug_middleware(
     let chunk_index = chunk_index.clone();
     let body = Body::new(body.map_frame(move |frame| {
         if let Some(bytes) = frame.data_ref() {
-            let mut capture = HttpBodyCapture::full();
+            let mut capture = match debug.level {
+                HttpDebugLevel::Full => HttpBodyCapture::full(),
+                HttpDebugLevel::Safe | HttpDebugLevel::Off => HttpBodyCapture::default(),
+            };
             capture.push(bytes);
             debug.emit(json!({
                 "type": "http_debug",
@@ -3401,10 +3463,7 @@ async fn infer_response(
             (receiver, disconnect, compaction_permit),
             |(mut receiver, mut disconnect, compaction_permit)| async move {
                 match receiver.recv().await {
-                    Some(event) => Some((
-                        event,
-                        (receiver, disconnect, compaction_permit),
-                    )),
+                    Some(event) => Some((event, (receiver, disconnect, compaction_permit))),
                     None => {
                         disconnect.disarm();
                         None
@@ -3512,6 +3571,15 @@ async fn create_compaction_declaration(
         &request_context.principal,
         request,
     )?))
+}
+async fn revoke_compaction_declaration(
+    State(s): State<Server>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, Error> {
+    let request_context = auth(&s, &headers, Scope::Inference)?;
+    s.revoke_compaction_declaration_for(&request_context.principal, &id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 fn parse_context(id: String) -> ContextId {
     ContextId(id)
@@ -3660,13 +3728,35 @@ pub fn openapi_document() -> Value {
             "cuscoImportContext",
             Some("ImportContextRequest"),
         ),
-        ("/cusco/v1/compaction/strategies", "get", "cuscoCompactionStrategies", None),
-        ("/cusco/v1/compaction/declarations", "post", "cuscoCreateCompactionDeclaration", Some("CreateCompactionDeclaration")),
+        (
+            "/cusco/v1/compaction/strategies",
+            "get",
+            "cuscoCompactionStrategies",
+            None,
+        ),
+        (
+            "/cusco/v1/compaction/declarations",
+            "post",
+            "cuscoCreateCompactionDeclaration",
+            Some("CreateCompactionDeclaration"),
+        ),
+        (
+            "/cusco/v1/compaction/declarations/{id}",
+            "delete",
+            "cuscoRevokeCompactionDeclaration",
+            None,
+        ),
         ("/cusco/v1/contexts/{id}", "get", "cuscoContext", None),
         (
             "/cusco/v1/contexts/{id}",
             "delete",
             "cuscoDeleteContext",
+            None,
+        ),
+        (
+            "/cusco/v1/contexts/{id}/branches",
+            "post",
+            "cuscoCreateContextBranch",
             None,
         ),
         (
@@ -4398,23 +4488,18 @@ mod tests {
                 assert!(operation["responses"]["200"].is_object());
             }
         }
-        assert_eq!(
-            spec["paths"]["/openai/v1/completions"]["post"]["requestBody"]["content"]["application/json"]
-                ["schema"]["$ref"],
-            "#/components/schemas/CompletionRequest"
-        );
-        fs::remove_dir_all(d).unwrap()
+        assert!(spec["paths"]["/cusco/v1/contexts"].is_object());
+        assert!(spec["paths"]["/cusco/v1/contexts/{id}"].is_object());
+        assert!(spec["paths"]["/cusco/v1/contexts/{id}/branches"].is_object());
+        assert!(spec["paths"]["/cusco/v1/compaction/declarations/{id}"].is_object());
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[tokio::test]
     async fn swagger_ui_default_off() {
         let (server, directory) = setup(Arc::new(AnonymousAdmin));
         let response = router(server)
-            .oneshot(
-                Request::get("/openapi/ui")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/openapi/ui").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -4429,15 +4514,14 @@ mod tests {
         });
         let app = router(server);
         let response = app
-            .oneshot(
-                Request::get("/openapi/ui")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/openapi/ui").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["content-type"], "text/html; charset=utf-8");
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/html; charset=utf-8"
+        );
         let body = String::from_utf8(
             to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -5626,9 +5710,31 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            server.compaction_declaration(&declaration.declaration_id).unwrap(),
+            server
+                .compaction_declaration(&declaration.declaration_id)
+                .unwrap(),
             declaration
         );
+        assert!(matches!(
+            server.compaction_declaration_for("another-principal", &declaration.declaration_id),
+            Err(Error::Forbidden)
+        ));
+        let mut unauthorized = compacting_request(context.id.clone());
+        unauthorized.scheduling.principal = "another-principal".into();
+        unauthorized.compaction.as_mut().unwrap().declaration_id =
+            Some(declaration.declaration_id.clone());
+        assert!(matches!(
+            server.infer("declaration-owner", unauthorized),
+            Err(Error::Forbidden)
+        ));
+        assert_eq!(server.context(&context.id).unwrap(), context);
+        server
+            .revoke_compaction_declaration_for("local", &declaration.declaration_id)
+            .unwrap();
+        assert!(matches!(
+            server.compaction_declaration(&declaration.declaration_id),
+            Err(Error::BadRequest(message)) if message == "compaction declaration not found"
+        ));
         let mismatch = CompactionRequest {
             declaration_id: Some(declaration.declaration_id),
             ..CompactionRequest::default()
@@ -5650,7 +5756,10 @@ mod tests {
         };
         server.configure(config).unwrap();
         let worker = server.compaction_workers.try_acquire().unwrap();
-        assert!(matches!(server.compaction_workers.try_acquire(), Err(Error::Busy)));
+        assert!(matches!(
+            server.compaction_workers.try_acquire(),
+            Err(Error::Busy)
+        ));
         drop(worker);
         assert!(server.compaction_workers.try_acquire().is_ok());
 
@@ -5682,6 +5791,46 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn compaction_creation_times_prune_stale_principals() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let context = server.create_context().unwrap();
+        let declaration = CreateCompactionDeclaration {
+            context_id: context.id.0,
+            strategy_preferences: vec![WINDOW_TAIL_STRATEGY_ID.into()],
+            target_tokens: Some(8),
+            expires_in_ms: 10_000,
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        {
+            let mut state = server.declarations.lock();
+            state.creation_times.insert(
+                "stale-principal".into(),
+                VecDeque::from(vec![now - 120_000]),
+            );
+            state
+                .creation_times
+                .insert("active-principal".into(), VecDeque::from(vec![now]));
+            state.creation_times.insert(
+                "stale-principal-2".into(),
+                VecDeque::from(vec![now - 120_000]),
+            );
+            state.records.clear();
+        }
+        server
+            .create_compaction_declaration_for("fresh-principal", declaration)
+            .unwrap();
+        let state = server.declarations.lock();
+        assert!(state.creation_times.get("stale-principal").is_none());
+        assert!(state.creation_times.get("stale-principal-2").is_none());
+        assert!(state.creation_times.get("active-principal").is_some());
+        assert!(state.creation_times.get("fresh-principal").is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn saturated_compaction_workers_do_not_block_interactive_inference() {
         let (server, directory) = setup(Arc::new(AnonymousAdmin));
@@ -5705,7 +5854,9 @@ mod tests {
             .oneshot(
                 Request::post("/openai/v1/completions")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"model":"m","prompt":"interactive","max_tokens":1}"#))
+                    .body(Body::from(
+                        r#"{"model":"m","prompt":"interactive","max_tokens":1}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -5744,13 +5895,31 @@ mod tests {
                 "older question".into(),
             ])
             .unwrap();
-        let (response, _) = server.infer("compact-success", compacting_request(source.id.clone())).unwrap();
+        let (response, _) = server
+            .infer("compact-success", compacting_request(source.id.clone()))
+            .unwrap();
+        let generated_text = response.text.clone();
+        assert!(!generated_text.is_empty());
         let result = response.usage.compaction_result.unwrap();
         let successor = server.context(&source.id).unwrap();
         assert!(result.success);
-        assert_eq!(result.selected_strategy_id.as_deref(), Some("window_tail:v1"));
+        assert_eq!(
+            result.selected_strategy_id.as_deref(),
+            Some("window_tail:v1")
+        );
         assert_eq!(successor.revision, source.revision + 1);
-        assert!(successor.tokens.iter().any(|token| token.contains("system")));
+        assert!(
+            successor
+                .tokens
+                .iter()
+                .any(|token| token.contains("system"))
+        );
+        assert!(successor.tokens.iter().any(|token| token == "new"));
+        assert!(
+            generated_text
+                .split_whitespace()
+                .all(|token| successor.tokens.iter().any(|stored| stored == token))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -5758,7 +5927,6 @@ mod tests {
     fn compaction_result_payload_for_openai_replay() {
         let (server, directory) = setup(Arc::new(AnonymousAdmin));
         let source = server
-
             .import_context(vec![
                 "<start_of_turn>system".into(),
                 "policy".into(),
@@ -5814,10 +5982,7 @@ mod tests {
             ])
             .unwrap();
         let (response, _) = server
-            .infer(
-                "compaction-proof",
-                compacting_request(source.id.clone()),
-            )
+            .infer("compaction-proof", compacting_request(source.id.clone()))
             .unwrap();
         let successor = server.context(&source.id).unwrap();
         assert!(response.usage.compaction_result.unwrap().success);
@@ -5871,7 +6036,9 @@ mod tests {
     #[test]
     fn compaction_failure_rolls_back_source_context() {
         let (server, directory) = setup(Arc::new(AnonymousAdmin));
-        let source = server.import_context(vec!["one".into(), "two".into()]).unwrap();
+        let source = server
+            .import_context(vec!["one".into(), "two".into()])
+            .unwrap();
         let mut request = compacting_request(source.id.clone());
         request.compaction.as_mut().unwrap().strategy_preferences = vec!["missing".into()];
         request.compaction.as_mut().unwrap().fallback_when_no_match =
@@ -5887,7 +6054,9 @@ mod tests {
     #[test]
     fn compaction_cancel_disconnect_race() {
         let (server, directory) = setup(Arc::new(AnonymousAdmin));
-        let source = server.import_context(vec!["one".into(), "two".into()]).unwrap();
+        let source = server
+            .import_context(vec!["one".into(), "two".into()])
+            .unwrap();
         server.cancel("compact-cancel");
         assert!(matches!(
             server.infer("compact-cancel", compacting_request(source.id.clone())),
@@ -5897,53 +6066,50 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    fn assert_semantic_fixture(name: &str) {
+        let fixtures: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/phase10_semantic.json")).unwrap();
+        let fixture = &fixtures[name];
+        let tokens = fixture["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|token| token.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let target_tokens = fixture["target_tokens"].as_u64().unwrap() as usize;
+        let proposal = apply_window_tail_strategy(&tokens, target_tokens, &[]).unwrap();
+        for required in fixture["required_fragments"].as_array().unwrap() {
+            let required = required.as_str().unwrap();
+            assert!(
+                proposal
+                    .resulting_tokens
+                    .iter()
+                    .any(|token| token.contains(required)),
+                "fixture {name} lost required fragment {required}"
+            );
+        }
+        let repeated = apply_window_tail_strategy(&tokens, target_tokens, &[]).unwrap();
+        assert_eq!(proposal, repeated, "fixture {name} is not deterministic");
+    }
+
     #[test]
     fn semantic_regression_pronoun_continuity() {
-        let tokens = vec![
-            "<start_of_turn>system".into(), "Refer to Ada by name.".into(),
-            "<start_of_turn>user".into(), "Ada designed the plan.".into(),
-            "<start_of_turn>assistant".into(), "Ada designed it.".into(),
-            "<start_of_turn>user".into(), "What did she design?".into(),
-        ];
-        let proposal = apply_window_tail_strategy(&tokens, 6, &[]).unwrap();
-        assert!(proposal.resulting_tokens.iter().any(|token| token.contains("Ada")));
-        assert!(proposal.resulting_tokens.iter().any(|token| token.contains("she")));
+        assert_semantic_fixture("pronoun_continuity");
     }
 
     #[test]
     fn semantic_regression_instruction_retention() {
-        let tokens = vec![
-            "<start_of_turn>system".into(), "Answer in JSON.".into(),
-            "<start_of_turn>user".into(), "old request".into(),
-            "<start_of_turn>assistant".into(), "old response".into(),
-            "<start_of_turn>user".into(), "latest request".into(),
-        ];
-        let proposal = apply_window_tail_strategy(&tokens, 4, &[]).unwrap();
-        assert!(proposal.resulting_tokens.iter().any(|token| token == "Answer in JSON."));
+        assert_semantic_fixture("instruction_retention");
     }
 
     #[test]
     fn semantic_regression_tool_call_consistency() {
-        let tokens = vec![
-            "<start_of_turn>system".into(), "policy".into(),
-            "<start_of_turn>tool".into(), "weather contract".into(),
-            "<start_of_turn>user".into(), "weather?".into(),
-        ];
-        let proposal = apply_window_tail_strategy(&tokens, 4, &[]).unwrap();
-        assert!(proposal.resulting_tokens.iter().any(|token| token.contains("tool")));
-        assert!(proposal.resulting_tokens.iter().any(|token| token == "weather contract"));
+        assert_semantic_fixture("tool_call_consistency");
     }
 
     #[test]
     fn semantic_regression_followup_fidelity() {
-        let tokens = vec![
-            "<start_of_turn>system".into(), "policy".into(),
-            "<start_of_turn>user".into(), "first".into(),
-            "<start_of_turn>assistant".into(), "answer".into(),
-            "<start_of_turn>user".into(), "follow up".into(),
-        ];
-        let proposal = apply_window_tail_strategy(&tokens, 5, &[]).unwrap();
-        assert!(proposal.resulting_tokens.iter().any(|token| token == "follow up"));
+        assert_semantic_fixture("followup_fidelity");
     }
 
     #[test]
