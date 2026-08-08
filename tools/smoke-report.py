@@ -40,6 +40,12 @@ def run():
             has(s,b,'cusco'); result=b['cusco'].get('compaction_result'); assert result and result['success'] and result['selected_strategy_id']=='window_tail:v1','missing successful window-tail result'; passed=True; stats['passed']+=1
         except AssertionError as e: passed=False; error=str(e); stats['failed']+=1
         results.append({'name':'window_tail_compaction','method':'POST','path':'/openai/v1/completions','status':s,'latency_ms':round(ms,3),'passed':passed,'error':error})
+        s,c,b,ms=call('POST','/openai/v1/completions',{'model':'gemma-4-e2b-it','prompt':'continue after compaction','context_id':context_id,'max_tokens':1})
+        lat.append(ms); stats['requests']+=1; error=None
+        if isinstance(b,dict) and isinstance(b.get('usage'),dict): stats['input_tokens']+=int(b['usage'].get('prompt_tokens',0) or 0); stats['output_tokens']+=int(b['usage'].get('completion_tokens',0) or 0)
+        try: list_field(s,b,'choices'); passed=True; stats['passed']+=1
+        except AssertionError as e: passed=False; error=str(e); stats['failed']+=1
+        results.append({'name':'compacted_successor_continuation','method':'POST','path':'/openai/v1/completions','status':s,'latency_ms':round(ms,3),'passed':passed,'error':error})
     stats['latency_ms']={'count':len(lat),'min':round(min(lat),3),'median':round(statistics.median(lat),3),'max':round(max(lat),3)}
     report={'schema_version':1,'deterministic':True,'base_url':BASE,'scenarios':results,'stats':stats}
     OUT.parent.mkdir(parents=True,exist_ok=True); OUT.write_text(json.dumps(report,indent=2)+'\n'); print(json.dumps(report,indent=2)); return 0 if stats['failed']==0 else 1

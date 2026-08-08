@@ -209,8 +209,8 @@ pub fn apply_window_tail_strategy(
     let mut used_tokens = 0usize;
 
     for turn in &indexed_turns {
-        if turn_has_policy_anchor(turn) && used_tokens + turn.len() <= requested_budget {
-            used_tokens += turn.len();
+        if turn_has_policy_anchor(turn) {
+            used_tokens = used_tokens.saturating_add(turn.len());
             retained.extend(turn.iter().cloned());
         }
     }
@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_anchor_is_skipped_when_budget_cannot_fit_it() {
+    fn policy_anchor_exceeds_budget_without_being_dropped() {
         let tokens = vec![
             "<start_of_turn>system".into(),
             "policy".into(),
@@ -439,7 +439,11 @@ mod tests {
             "answer".into(),
         ];
         let proposal = apply_window_tail_strategy(&tokens, 1, &[]).unwrap();
-        assert_eq!(proposal.resulting_tokens, vec!["answer".to_string()]);
+        assert_eq!(
+            proposal.resulting_tokens,
+            vec!["<start_of_turn>system".to_string(), "policy".to_string()]
+        );
         assert_eq!(proposal.result.compact_reason, CompactionResultReason::AnchorsOnly);
+        assert!(proposal.result.fallback);
     }
 }

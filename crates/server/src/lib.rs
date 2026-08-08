@@ -1774,70 +1774,17 @@ impl Server {
             Some(id) => Some(self.context(id)?),
             None => None,
         };
-        let context_tokens: Vec<String> = context
+        let mut logical_context_tokens: Vec<String> = context
             .as_ref()
             .map_or_else(Vec::new, |record| record.tokens.clone());
-        let prior_tokens = context
+        let mut prior_tokens = context
             .as_ref()
-            .map_or(&[][..], |record| record.native_tokens.as_slice());
-        let mut generated_pieces = Vec::new();
-        let mut delta_index = 0;
-        let generated = self.engine.generate(
-            EngineRequest {
-                model: model.clone(),
-                prompt: req.prompt.clone(),
-                max_tokens: req.max_tokens,
-                prior_tokens: prior_tokens.to_vec(),
-                sampling: req.sampling,
-                control: control.clone(),
-                scheduling: req.scheduling.clone(),
-                prefill_chunk_tokens: 32,
-            },
-            &mut |_id, piece, terminal_or_control| {
-                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    control.expire();
-                }
-                control.check()?;
-                frontier.push(piece, terminal_or_control, |delta| {
-                    let token = delta.to_owned();
-                    emit(StreamEvent::Token {
-                        token: token.clone(),
-                        index: delta_index,
-                    })?;
-                    delta_index += 1;
-                    generated_pieces.push(token);
-                    Ok(())
-                })
-            },
-        )?;
-        let frontier = frontier.finish(|delta| {
-            let token = delta.to_owned();
-            emit(StreamEvent::Token {
-                token: token.clone(),
-                index: delta_index,
-            })?;
-            delta_index += 1;
-            generated_pieces.push(token);
-            Ok(())
-        })?;
-        control.check()?;
-        if req
-            .deadline_ms
-            .is_some_and(|ms| started.elapsed() > Duration::from_millis(ms))
-        {
-            return Err(Error::Deadline);
-        }
+            .map_or_else(Vec::new, |record| record.native_tokens.clone());
         let mut compaction_result = None;
-        let mut raw_context_tokens = context_tokens;
-        raw_context_tokens.extend(req.prompt.split_whitespace().map(str::to_owned));
-        let EngineOutput {
-            mut successor_tokens,
-            input_tokens,
-            cached_tokens,
-            evaluated_tokens,
-            prefill,
-        } = generated;
-        if let Some(compaction) = req.compaction {
+        if let Some(compaction) = req.compaction.take() {
+            let source = context.as_ref().ok_or_else(|| {
+                Error::BadRequest("compaction requires an existing context".into())
+            })?;
             let selected = match select_strategy(&compaction.strategy_preferences) {
                 Some(selected) => selected,
                 None => {
@@ -1853,16 +1800,14 @@ impl Server {
                         requested_strategy_ids: compaction.strategy_preferences,
                         selected_strategy_id: None,
                         requested_strategy_budget: compaction.target_tokens.unwrap_or(3072),
-                        resulting_budget: raw_context_tokens.len(),
-                        retained_indices: (0..raw_context_tokens.len()).collect(),
-                        retained_message_count: raw_context_tokens.len(),
-                        source_message_count: raw_context_tokens.len(),
+                        resulting_budget: logical_context_tokens.len(),
+                        retained_indices: (0..logical_context_tokens.len()).collect(),
+                        retained_message_count: logical_context_tokens.len(),
+                        source_message_count: logical_context_tokens.len(),
                         retained_anchor_count: 0,
                         success: false,
                         fallback: true,
-                        resulting_context_epoch: context
-                            .as_ref()
-                            .map_or(1u64, |record| record.revision.saturating_add(1)),
+                        resulting_context_epoch: source.revision.saturating_add(1),
                     });
                     String::new()
                 }
@@ -1873,28 +1818,89 @@ impl Server {
                         "unsupported compaction strategy for this release".into(),
                     ));
                 }
-                let target_tokens = compaction.target_tokens.unwrap_or(3072);
                 let proposal = apply_window_tail_strategy(
-                    &raw_context_tokens,
-                    target_tokens,
+                    &logical_context_tokens,
+                    compaction.target_tokens.unwrap_or(3072),
                     &[selected.clone()],
                 )
-                    .map_err(Error::BadRequest)?;
+                .map_err(Error::BadRequest)?;
+                control.check()?;
+                let prepared = self.engine.generate(
+                    EngineRequest {
+                        model: model.clone(),
+                        prompt: proposal.resulting_tokens.join(" "),
+                        max_tokens: 0,
+                        prior_tokens: Vec::new(),
+                        sampling: req.sampling,
+                        control: control.clone(),
+                        scheduling: req.scheduling.clone(),
+                        prefill_chunk_tokens: 32,
+                    },
+                    &mut |_, _, _| {
+                        Err(Error::State(
+                            "compaction preparation unexpectedly generated output".into(),
+                        ))
+                    },
+                )?;
+                control.check()?;
                 let mut result = proposal.result;
                 result.selected_strategy_id = Some(deterministic_strategy_id(&selected));
-                result.fallback = false;
-                result.resulting_context_epoch = context
-                    .as_ref()
-                    .map_or(1u64, |record| record.revision.saturating_add(1));
+                result.resulting_context_epoch = source.revision.saturating_add(1);
                 compaction_result = Some(result);
-                raw_context_tokens = proposal.resulting_tokens;
-                let native_cap = compaction_native_trim(&successor_tokens, raw_context_tokens.len())
-                    .ok_or(Error::State(
-                        "compaction context tokens exceed native context".into(),
-                    ))?;
-                successor_tokens = native_cap;
+                logical_context_tokens = proposal.resulting_tokens;
+                prior_tokens = prepared.successor_tokens;
             }
         }
+        let mut delta_index = 0;
+        let generated = self.engine.generate(
+            EngineRequest {
+                model: model.clone(),
+                prompt: req.prompt.clone(),
+                max_tokens: req.max_tokens,
+                prior_tokens,
+                sampling: req.sampling,
+                control: control.clone(),
+                scheduling: req.scheduling.clone(),
+                prefill_chunk_tokens: 32,
+            },
+            &mut |_id, piece, terminal_or_control| {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    control.expire();
+                }
+                control.check()?;
+                frontier.push(piece, terminal_or_control, |delta| {
+                    emit(StreamEvent::Token {
+                        token: delta.to_owned(),
+                        index: delta_index,
+                    })?;
+                    delta_index += 1;
+                    Ok(())
+                })
+            },
+        )?;
+        let frontier = frontier.finish(|delta| {
+            emit(StreamEvent::Token {
+                token: delta.to_owned(),
+                index: delta_index,
+            })?;
+            delta_index += 1;
+            Ok(())
+        })?;
+        control.check()?;
+        if req
+            .deadline_ms
+            .is_some_and(|ms| started.elapsed() > Duration::from_millis(ms))
+        {
+            return Err(Error::Deadline);
+        }
+        logical_context_tokens.extend(req.prompt.split_whitespace().map(str::to_owned));
+        let EngineOutput {
+            successor_tokens,
+            input_tokens,
+            cached_tokens,
+            evaluated_tokens,
+            prefill,
+        } = generated;
         let mut guard = self.inner.lock();
         let context_id = if let Some(context) = context {
             let stored = guard
@@ -1905,7 +1911,7 @@ impl Server {
             if stored.revision != context.revision {
                 return Err(Error::State("context changed during compaction".into()));
             }
-            stored.tokens = raw_context_tokens;
+            stored.tokens = logical_context_tokens;
             stored.native_tokens = successor_tokens;
             stored.revision += 1;
             stored.id.clone()
@@ -1915,7 +1921,7 @@ impl Server {
                 ContextRecord {
                     id: successor_id.clone(),
                     revision: 1,
-                    tokens: raw_context_tokens,
+                    tokens: logical_context_tokens,
                     native_tokens: successor_tokens,
                 },
             );
@@ -1953,16 +1959,6 @@ impl Server {
     }
 }
 
-fn compaction_native_trim(native_tokens: &[i32], token_count: usize) -> Option<Vec<i32>> {
-    if native_tokens.is_empty() {
-        return Some(Vec::new());
-    }
-    (token_count <= native_tokens.len()).then_some(
-        native_tokens
-            .get(native_tokens.len().saturating_sub(token_count)..)?
-            .to_vec(),
-    )
-}
 
 fn state_err(error: impl std::fmt::Display) -> Error {
     Error::State(error.to_string())
@@ -3762,6 +3758,49 @@ mod tests {
         (s, d)
     }
 
+    struct CompactionProofEngine;
+
+    struct CompactionProofSession {
+        request: EngineRequest,
+    }
+
+    impl ExecutionSession for CompactionProofSession {
+        fn step(&mut self) -> Result<SessionStep, Error> {
+            self.finish().map(SessionStep::Finished)
+        }
+
+        fn finish(&mut self) -> Result<EngineOutput, Error> {
+            self.request.control.check()?;
+            if self.request.max_tokens != 0 && self.request.prompt == "fail continuation" {
+                return Err(Error::State("continuation failed after compaction".into()));
+            }
+            let successor_tokens = if self.request.max_tokens == 0 {
+                assert!(self.request.prior_tokens.is_empty());
+                assert!(self.request.prompt.contains("policy"));
+                vec![41, 42]
+            } else {
+                assert_eq!(self.request.prior_tokens, vec![41, 42]);
+                vec![41, 42, 43]
+            };
+            Ok(EngineOutput {
+                successor_tokens,
+                input_tokens: self.request.prompt.split_whitespace().count(),
+                cached_tokens: usize::from(self.request.max_tokens != 0) * 2,
+                evaluated_tokens: self.request.prompt.split_whitespace().count(),
+                prefill: PrefillMetrics::default(),
+            })
+        }
+    }
+
+    impl InferenceEngine for CompactionProofEngine {
+        fn start_session(
+            &self,
+            request: EngineRequest,
+        ) -> Result<Box<dyn ExecutionSession>, Error> {
+            Ok(Box::new(CompactionProofSession { request }))
+        }
+    }
+
     struct FailingEngine;
     impl InferenceEngine for FailingEngine {
         fn start_session(&self, _: EngineRequest) -> Result<Box<dyn ExecutionSession>, Error> {
@@ -5542,6 +5581,7 @@ mod tests {
     fn compaction_result_payload_for_openai_replay() {
         let (server, directory) = setup(Arc::new(AnonymousAdmin));
         let source = server
+
             .import_context(vec![
                 "<start_of_turn>system".into(),
                 "policy".into(),
@@ -5562,6 +5602,92 @@ mod tests {
             "window_tail:v1"
         );
         assert_eq!(payload["cusco"]["compaction_result"]["success"], true);
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn compacted_successor_is_evaluated_before_continuation() {
+        let directory = dir();
+        fs::create_dir_all(&directory).unwrap();
+        let model_path = directory.join("m.gguf");
+        fs::write(&model_path, b"model").unwrap();
+        let server = Server::open(
+            directory.join("state.json"),
+            Arc::new(AnonymousAdmin),
+            Arc::new(CompactionProofEngine),
+        )
+        .unwrap();
+        server
+            .register_model(ModelRecord {
+                id: "m".into(),
+                revision: "r1".into(),
+                path: model_path,
+                sha256: hex_digest(b"model"),
+                aliases: Vec::new(),
+                family: "gemma4".into(),
+                size_bytes: 5,
+                epoch: 0,
+            })
+            .unwrap();
+        let source = server
+            .import_context(vec![
+                "<start_of_turn>system".into(),
+                "policy".into(),
+                "<start_of_turn>user".into(),
+                "discard me".into(),
+            ])
+            .unwrap();
+        let (response, _) = server
+            .infer(
+                "compaction-proof",
+                compacting_request(source.id.clone()),
+            )
+            .unwrap();
+        let successor = server.context(&source.id).unwrap();
+        assert!(response.usage.compaction_result.unwrap().success);
+        assert_eq!(successor.native_tokens, vec![41, 42, 43]);
+        assert!(successor.tokens.iter().any(|token| token == "policy"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepared_compaction_rolls_back_when_continuation_fails() {
+        let directory = dir();
+        fs::create_dir_all(&directory).unwrap();
+        let model_path = directory.join("m.gguf");
+        fs::write(&model_path, b"model").unwrap();
+        let server = Server::open(
+            directory.join("state.json"),
+            Arc::new(AnonymousAdmin),
+            Arc::new(CompactionProofEngine),
+        )
+        .unwrap();
+        server
+            .register_model(ModelRecord {
+                id: "m".into(),
+                revision: "r1".into(),
+                path: model_path,
+                sha256: hex_digest(b"model"),
+                aliases: Vec::new(),
+                family: "gemma4".into(),
+                size_bytes: 5,
+                epoch: 0,
+            })
+            .unwrap();
+        let source = server
+            .import_context(vec![
+                "<start_of_turn>system".into(),
+                "policy".into(),
+                "<start_of_turn>user".into(),
+                "discard me".into(),
+            ])
+            .unwrap();
+        let mut request = compacting_request(source.id.clone());
+        request.prompt = "fail continuation".into();
+        assert!(matches!(
+            server.infer("compaction-rollback", request),
+            Err(Error::State(message)) if message == "continuation failed after compaction"
+        ));
+        assert_eq!(server.context(&source.id).unwrap(), source);
         fs::remove_dir_all(directory).unwrap();
     }
 
