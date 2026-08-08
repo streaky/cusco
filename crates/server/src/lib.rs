@@ -2439,21 +2439,18 @@ pub fn router_with_http_debug(server: Server, debug: HttpDebug) -> Router {
 fn routes(server: Server) -> Router {
     let app = Router::new()
         .route("/openai/v1/openapi.json", get(openapi))
-        .route("/ollama/api/openapi.json", get(openapi))
         .route("/cusco/v1/openapi.json", get(openapi))
         .route("/openai/v1/completions", post(completion))
         .route("/openai/v1/chat/completions", post(chat))
         .route("/openai/v1/models", get(list_models))
         .route("/openai/v1/responses", post(responses))
-        .route("/ollama/api/generate", post(ollama_generate))
-        .route("/ollama/api/chat", post(ollama_chat))
-        .route("/ollama/api/version", get(ollama_version))
-        .route("/ollama/api/tags", get(ollama_tags))
-        .route("/ollama/api/show", post(ollama_show))
-        .route("/ollama/api/pull", post(ollama_pull))
-        .route("/ollama/api/copy", post(ollama_copy))
-        .route("/ollama/api/delete", delete(ollama_delete))
-        .route("/ollama/api/ps", get(ollama_ps))
+        .route("/cusco/v1/api/version", get(ollama_version))
+        .route("/cusco/v1/api/tags", get(ollama_tags))
+        .route("/cusco/v1/api/show", post(ollama_show))
+        .route("/cusco/v1/api/pull", post(ollama_pull))
+        .route("/cusco/v1/api/copy", post(ollama_copy))
+        .route("/cusco/v1/api/delete", delete(ollama_delete))
+        .route("/cusco/v1/api/ps", get(ollama_ps))
         .route(
             "/cusco/v1/contexts",
             get(list_contexts).post(create_context),
@@ -2824,111 +2821,6 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OllamaOptions {
-    #[serde(default)]
-    temperature: Option<f32>,
-    #[serde(default)]
-    top_p: Option<f32>,
-    #[serde(default)]
-    seed: Option<u64>,
-    #[serde(default)]
-    num_predict: Option<usize>,
-    #[serde(default)]
-    stop: Option<StopInput>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OllamaGenerateRequest {
-    model: String,
-    prompt: String,
-    #[serde(default = "default_true")]
-    stream: bool,
-    #[serde(default)]
-    options: OllamaOptions,
-}
-async fn ollama_generate(
-    State(s): State<Server>,
-    PrequeueJson {
-        headers,
-        value: r,
-        retained_bytes,
-        _permit: permit,
-    }: PrequeueJson<OllamaGenerateRequest>,
-) -> Result<Response, Error> {
-    let request_context = auth(&s, &headers, Scope::Inference)?;
-    validate_controls(r.options.temperature, r.options.top_p, &[], None, None)?;
-    let sampling = sampling_config(r.options.temperature, r.options.top_p, r.options.seed)?;
-    s.model(&r.model)?;
-    drop(permit);
-    infer_response(
-        s,
-        r.model,
-        r.prompt,
-        r.options.num_predict,
-        sampling,
-        None,
-        true,
-        r.stream,
-        None,
-        r.options.stop.map(StopInput::into_vec).unwrap_or_default(),
-        false,
-        None,
-        retained_bytes,
-        request_context.request_id,
-        request_context.principal,
-        WireProtocol::OllamaGenerate,
-    )
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OllamaChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    #[serde(default = "default_true")]
-    stream: bool,
-    #[serde(default)]
-    options: OllamaOptions,
-}
-async fn ollama_chat(
-    State(s): State<Server>,
-    PrequeueJson {
-        headers,
-        value: r,
-        retained_bytes,
-        _permit: permit,
-    }: PrequeueJson<OllamaChatRequest>,
-) -> Result<Response, Error> {
-    let request_context = auth(&s, &headers, Scope::Inference)?;
-    validate_controls(r.options.temperature, r.options.top_p, &[], None, None)?;
-    let sampling = sampling_config(r.options.temperature, r.options.top_p, r.options.seed)?;
-    let model = s.model(&r.model)?;
-    let prompt = lower_messages(&model.family, r.messages, s.vision_config())?;
-    drop(permit);
-    infer_response(
-        s,
-        r.model,
-        prompt,
-        r.options.num_predict,
-        sampling,
-        None,
-        true,
-        r.stream,
-        None,
-        r.options.stop.map(StopInput::into_vec).unwrap_or_default(),
-        false,
-        None,
-        retained_bytes,
-        request_context.request_id,
-        request_context.principal,
-        WireProtocol::OllamaChat,
-    )
-    .await
-}
 
 async fn ollama_version(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
     auth(&s, &headers, Scope::Inference)?;
@@ -3238,8 +3130,6 @@ enum WireProtocol {
     OpenAiCompletion,
     OpenAiChat,
     OpenAiResponses,
-    OllamaGenerate,
-    OllamaChat,
 }
 
 fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
@@ -3276,12 +3166,6 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
         (WireProtocol::OpenAiResponses, StreamEvent::Token { token, .. }) => {
             json!({"type":"response.output_text.delta","delta":token})
         }
-        (WireProtocol::OllamaGenerate, StreamEvent::Token { token, .. }) => {
-            json!({"response":token,"done":false})
-        }
-        (WireProtocol::OllamaChat, StreamEvent::Token { token, .. }) => {
-            json!({"message":{"role":"assistant","content":token},"done":false})
-        }
         (
             WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat,
             StreamEvent::Finished { reason, usage },
@@ -3294,12 +3178,6 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
         }
         (WireProtocol::OpenAiResponses, StreamEvent::Finished { reason, usage }) => {
             json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}})
-        }
-        (
-            WireProtocol::OllamaGenerate | WireProtocol::OllamaChat,
-            StreamEvent::Finished { reason, usage },
-        ) => {
-            json!({"done":true,"done_reason":reason,"prompt_eval_count":usage.input_tokens,"eval_count":usage.generated_tokens})
         }
         (_, StreamEvent::Error { message }) => {
             json!({"error":{"message":message,"type":"server_error"}})
@@ -3331,14 +3209,8 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
         (WireProtocol::OpenAiResponses, StreamEvent::Started { request_id, .. }) => {
             json!({"type":"response.created","response":{"id":request_id,"status":"in_progress"}})
         }
-        (_, StreamEvent::Started { request_id, .. }) => json!({"id":request_id}),
     };
-    let row = match protocol {
-        WireProtocol::OpenAiCompletion
-        | WireProtocol::OpenAiChat
-        | WireProtocol::OpenAiResponses => format!("data: {value}\n\n"),
-        WireProtocol::OllamaGenerate | WireProtocol::OllamaChat => format!("{value}\n"),
-    };
+    let row = format!("data: {value}\n\n");
     if matches!(
         protocol,
         WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat
@@ -3397,12 +3269,6 @@ fn completed_response(
         }
         WireProtocol::OpenAiResponses => {
             json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"finish_reason":finish_reason,"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens},"cusco":cusco})
-        }
-        WireProtocol::OllamaGenerate => {
-            json!({"model":response.usage.model,"response":response.text,"done":true,"done_reason":finish_reason,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens})
-        }
-        WireProtocol::OllamaChat => {
-            json!({"model":response.usage.model,"message":{"role":"assistant","content":response.text},"done":true,"done_reason":finish_reason,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens})
         }
     }
 }
@@ -3497,12 +3363,7 @@ async fn infer_response(
         let rows = first
             .chain(rest)
             .map(move |event| Ok::<_, Infallible>(stream_row(protocol, event, include_usage)));
-        let content_type = match protocol {
-            WireProtocol::OpenAiCompletion
-            | WireProtocol::OpenAiChat
-            | WireProtocol::OpenAiResponses => "text/event-stream",
-            WireProtocol::OllamaGenerate | WireProtocol::OllamaChat => "application/x-ndjson",
-        };
+        let content_type = "text/event-stream";
         let mut response = Response::new(Body::from_stream(rows));
         response.headers_mut().insert(
             axum::http::header::CONTENT_TYPE,
@@ -3704,45 +3565,33 @@ pub fn openapi_document() -> Value {
             Some("ResponsesRequest"),
         ),
         ("/openai/v1/models", "get", "openaiModels", None),
+        ("/cusco/v1/api/tags", "get", "ollamaTags", None),
+        ("/cusco/v1/api/version", "get", "ollamaVersion", None),
         (
-            "/ollama/api/generate",
-            "post",
-            "ollamaGenerate",
-            Some("OllamaGenerateRequest"),
-        ),
-        (
-            "/ollama/api/chat",
-            "post",
-            "ollamaChat",
-            Some("OllamaChatRequest"),
-        ),
-        ("/ollama/api/tags", "get", "ollamaTags", None),
-        ("/ollama/api/version", "get", "ollamaVersion", None),
-        (
-            "/ollama/api/show",
+            "/cusco/v1/api/show",
             "post",
             "ollamaShow",
             Some("OllamaModelRequest"),
         ),
         (
-            "/ollama/api/pull",
+            "/cusco/v1/api/pull",
             "post",
             "ollamaPull",
             Some("OllamaPullRequest"),
         ),
         (
-            "/ollama/api/copy",
+            "/cusco/v1/api/copy",
             "post",
             "ollamaCopy",
             Some("OllamaCopyRequest"),
         ),
         (
-            "/ollama/api/delete",
+            "/cusco/v1/api/delete",
             "delete",
             "ollamaDelete",
             Some("OllamaModelRequest"),
         ),
-        ("/ollama/api/ps", "get", "ollamaPs", None),
+        ("/cusco/v1/api/ps", "get", "ollamaPs", None),
         ("/cusco/v1/contexts", "get", "cuscoContexts", None),
         ("/cusco/v1/contexts", "post", "cuscoCreateContext", None),
         (
@@ -3796,7 +3645,7 @@ pub fn openapi_document() -> Value {
             .or_insert_with(|| Value::Object(serde_json::Map::new()))[method] =
             openapi_operation(operation_id, schema);
     }
-    paths["/ollama/api/pull"]["post"]["responses"]["200"]["content"] = json!({
+    paths["/cusco/v1/api/pull"]["post"]["responses"]["200"]["content"] = json!({
         "application/json": {"schema": {"$ref": "#/components/schemas/OllamaPullProgress"}},
         "application/x-ndjson": {"schema": {"$ref": "#/components/schemas/OllamaPullProgress"}}
     });
@@ -3812,8 +3661,6 @@ pub fn openapi_document() -> Value {
             "ChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}}},
             "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"oneOf": [{"type": "string"}, {"type": "array"}]}, "stream": {"type": "boolean"}, "tools": {"type": "array", "items": {"$ref": "#/components/schemas/ResponsesFunctionTool"}}}},
             "ResponsesFunctionTool": {"type": "object", "additionalProperties": false, "required": ["type", "name", "parameters"], "properties": {"type": {"const": "function"}, "name": {"type": "string", "minLength": 1}, "description": {"type": "string"}, "parameters": {"type": "object"}}},
-            "OllamaGenerateRequest": {"type": "object", "additionalProperties": false, "required": ["model", "prompt"], "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
-            "OllamaChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
             "OllamaModelRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["model"]}, {"required": ["name"]}], "properties": {"model": {"type": "string"}, "name": {"type": "string"}}},
             "OllamaPullRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["name"]}, {"required": ["model"]}], "properties": {"name": {"type": "string"}, "model": {"type": "string"}, "sha256": {"type": "string"}, "insecure": {"type": "boolean"}, "stream": {"type": "boolean"}}},
             "OllamaPullProgress": {
@@ -4408,7 +4255,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ollama/api/pull")
+                    .uri("/cusco/v1/api/pull")
                     .header("authorization", "Bearer secret")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"model":"not-a-hugging-face-uri"}"#))
@@ -4437,7 +4284,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ollama/api/pull")
+                    .uri("/cusco/v1/api/pull")
                     .header("authorization", "Bearer secret")
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -4488,7 +4335,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ollama/api/version")
+                    .uri("/cusco/v1/api/version")
                     .header("authorization", "Bearer secret")
                     .body(Body::empty())
                     .unwrap(),
@@ -4500,11 +4347,28 @@ mod tests {
             serde_json::from_slice(&to_bytes(version.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(version, json!({"version": env!("CARGO_PKG_VERSION")}));
+        for path in [
+            "/ollama/api/version",
+            "/cusco/v1/api/chat",
+            "/cusco/v1/api/generate",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        assert!(openapi_document()["paths"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|path| !path.starts_with("/ollama/")));
         let spec = openapi_document();
         assert_eq!(spec["openapi"], "3.1.0");
         assert!(spec["paths"]["/openai/v1/chat/completions"].is_object());
         assert!(spec["paths"]["/cusco/v1/status"].is_object());
-        assert!(spec["paths"]["/ollama/api/version"].is_object());
+        assert!(spec["paths"]["/cusco/v1/api/version"].is_object());
         for path in spec["paths"].as_object().unwrap().values() {
             for operation in path.as_object().unwrap().values() {
                 assert!(operation["operationId"].is_string());
@@ -4555,7 +4419,7 @@ mod tests {
         assert!(body.contains("SwaggerUIBundle"));
         let spec = openapi_document();
         assert!(spec["paths"]["/openai/v1/completions"].is_object());
-        assert!(spec["paths"]["/ollama/api/generate"].is_object());
+        assert!(spec["paths"]["/cusco/v1/api/pull"].is_object());
         assert!(spec["paths"]["/cusco/v1/contexts"].is_object());
         fs::remove_dir_all(directory).unwrap();
     }
@@ -5281,7 +5145,7 @@ mod tests {
         );
         let response = app
             .oneshot(
-                Request::delete("/ollama/api/delete")
+                Request::delete("/cusco/v1/api/delete")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"model":"m"}"#))
                     .unwrap(),
@@ -5325,7 +5189,7 @@ mod tests {
             })
             .unwrap();
         let response = router(server)
-            .oneshot(Request::get("/ollama/api/ps").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/cusco/v1/api/ps").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
