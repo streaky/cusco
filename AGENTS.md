@@ -58,6 +58,15 @@ Select the proof GPU with `CUSCO_GPU_DEVICE_ID`; do not assume a particular host
 - Verify failure behavior transactionally: cancellation, preparation failure, transfer failure, validation failure, and commit failure must leave the prior binding usable.
 - For behavioral work, exercise the changed path end to end. A successful compile alone is not sufficient.
 
+## Warnings and linting
+
+- New or modified code must not introduce compiler or linter warnings.
+- Before considering a change complete, run `cargo check` and `cargo clippy` for the relevant crates, targets, and features through `compose.test.yaml`.
+- Fix the underlying issue rather than suppressing its warning.
+- Use `#[allow(...)]`, `#[expect(...)]`, or equivalent suppressions only when the warning is intentional, narrowly scoped, and the reason is clear from the surrounding code.
+- Do not broaden an otherwise unrelated change solely to clean up pre-existing warnings.
+- CI may enforce warning-free code with `cargo clippy -- -D warnings`.
+
 ## Engineering expectations
 
 - Preserve the ownership boundary: Rust owns policy and logical state; llama.cpp owns model-specific tensors, graphs, and kernels.
