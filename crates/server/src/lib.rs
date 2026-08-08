@@ -4,9 +4,10 @@ use axum::{
     extract::{FromRequest, Path as AxumPath, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header::RETRY_AFTER},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
 };
+use cusco_executor::SamplingConfig;
 use futures_util::{StreamExt, stream};
 use http_body_util::BodyExt;
 use parking_lot::Mutex;
@@ -23,24 +24,30 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-mod catalog;
-mod config;
-mod residency;
-use cusco_executor::SamplingConfig;
 use thiserror::Error;
 use uuid::Uuid;
+
+mod catalog;
+mod config;
+mod context_strategy;
 mod generation;
 mod mapped;
 mod prompt;
+mod residency;
 mod scheduler;
 mod vision;
-
-pub use catalog::{CatalogError, ModelCatalog, UserModelConfig, UserModels, load_user_models};
-pub use config::{ByteSize, ConfigError, DaemonConfig, DataPaths, ExecutionConfig, VisionConfig};
+pub use catalog::{ModelCatalog, load_user_models};
+pub use config::{DaemonConfig, OpenApiConfig, VisionConfig};
+pub use context_strategy::{
+    CompactionDeclaration, CompactionNoMatchFallback, CompactionProposal, CompactionRequest,
+    CompactionResult, CompactionResultReason, CompactionStrategyCatalog, CompactionStrategyInfo,
+    CompactionTrigger, CreateCompactionDeclaration, WINDOW_TAIL_STRATEGY_ID,
+    apply_window_tail_strategy, deterministic_strategy_id, select_strategy, strategy_catalog,
+};
 pub use generation::{
     FinishReason, FrontierControl, GenerationFrontier, MAX_STOP_BYTES, MAX_STOP_SEQUENCES,
     StopAlignment,
@@ -87,8 +94,7 @@ pub struct PrefillMetrics {
     pub device_bytes: usize,
     pub host_bytes: usize,
 }
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: usize,
     pub generated_tokens: usize,
@@ -98,8 +104,12 @@ pub struct Usage {
     pub model: String,
     pub model_revision: String,
     pub context_id: ContextId,
+    pub compaction_result: Option<CompactionResult>,
     pub latency_ms: u128,
     pub status: String,
+    pub correlation_id: String,
+    pub inference_id: String,
+    pub execution_session_id: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -107,6 +117,9 @@ pub enum StreamEvent {
     Started {
         request_id: String,
         context_id: ContextId,
+        correlation_id: String,
+        inference_id: String,
+        execution_session_id: String,
     },
     Token {
         token: String,
@@ -172,6 +185,8 @@ pub struct InferRequest {
     pub stop: Vec<String>,
     #[serde(default)]
     pub raw_continuation: bool,
+    #[serde(default)]
+    pub compaction: Option<CompactionRequest>,
     #[serde(skip, default)]
     pub sampling: SamplingConfig,
     #[serde(skip, default)]
@@ -179,6 +194,18 @@ pub struct InferRequest {
 }
 fn default_tokens() -> usize {
     16
+}
+fn default_compaction_workers() -> usize {
+    1
+}
+fn default_compaction_declarations() -> usize {
+    128
+}
+fn default_compaction_declaration_rate() -> usize {
+    32
+}
+fn default_compaction_lifetime_ms() -> u64 {
+    3_600_000
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InferResponse {
@@ -241,6 +268,16 @@ pub struct ServerConfig {
     pub active_time_ms: u64,
     pub stream_buffer: usize,
     pub shutdown_grace_ms: u64,
+    #[serde(default = "default_true")]
+    pub compaction_enabled: bool,
+    #[serde(default = "default_compaction_workers")]
+    pub compaction_workers: usize,
+    #[serde(default = "default_compaction_declarations")]
+    pub compaction_declarations: usize,
+    #[serde(default = "default_compaction_declaration_rate")]
+    pub compaction_declaration_rate_per_minute: usize,
+    #[serde(default = "default_compaction_lifetime_ms")]
+    pub compaction_declaration_lifetime_ms: u64,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -257,6 +294,11 @@ impl Default for ServerConfig {
             active_time_ms: 240_000,
             stream_buffer: 8,
             shutdown_grace_ms: 30_000,
+            compaction_enabled: true,
+            compaction_workers: default_compaction_workers(),
+            compaction_declarations: default_compaction_declarations(),
+            compaction_declaration_rate_per_minute: default_compaction_declaration_rate(),
+            compaction_declaration_lifetime_ms: default_compaction_lifetime_ms(),
         }
     }
 }
@@ -974,6 +1016,18 @@ impl PrequeueGate {
         })
     }
 
+    fn try_acquire(self: &Arc<Self>) -> Result<PrequeuePermit, Error> {
+        let permit = self
+            .semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
+        Ok(PrequeuePermit {
+            gate: self.clone(),
+            permit: Some(permit),
+        })
+    }
+
     fn set_limit(&self, limit: usize) {
         let mut state = self.state.lock();
         if limit < state.limit {
@@ -1009,17 +1063,30 @@ impl Drop for PrequeuePermit {
     }
 }
 
+struct DeclarationRecord {
+    declaration: CompactionDeclaration,
+    principal: String,
+}
+
+struct DeclarationState {
+    records: HashMap<String, DeclarationRecord>,
+    creation_times: HashMap<String, VecDeque<u64>>,
+}
+
 #[derive(Clone)]
 pub struct Server {
     state_path: PathBuf,
     inner: Arc<Mutex<Inner>>,
     pre_queue: Arc<PrequeueGate>,
+    compaction_workers: Arc<PrequeueGate>,
     model_lifecycle: Arc<Mutex<()>>,
     auth: Arc<dyn AuthProvider>,
+    declarations: Arc<Mutex<DeclarationState>>,
     engine: Arc<dyn InferenceEngine>,
     catalog: Arc<Mutex<Option<ModelCatalog>>>,
     model_directory: Arc<Mutex<PathBuf>>,
     vision: Arc<Mutex<VisionConfig>>,
+    openapi: Arc<Mutex<OpenApiConfig>>,
 }
 struct AdmissionGuard {
     server: Server,
@@ -1078,12 +1145,18 @@ impl Server {
                 config,
             })),
             pre_queue: PrequeueGate::new(config.pre_queue_concurrency),
+            compaction_workers: PrequeueGate::new(config.compaction_workers),
             model_lifecycle: Arc::new(Mutex::new(())),
             auth,
+            declarations: Arc::new(Mutex::new(DeclarationState {
+                records: HashMap::new(),
+                creation_times: HashMap::new(),
+            })),
             engine,
             catalog: Arc::new(Mutex::new(None)),
             model_directory: Arc::new(Mutex::new(PathBuf::from("./data/models"))),
             vision: Arc::new(Mutex::new(VisionConfig::default())),
+            openapi: Arc::new(Mutex::new(OpenApiConfig::default())),
         };
         server.persist()?;
         Ok(server)
@@ -1097,6 +1170,12 @@ impl Server {
     }
     pub fn configure_vision(&self, config: VisionConfig) {
         *self.vision.lock() = config;
+    }
+    pub fn configure_openapi(&self, config: OpenApiConfig) {
+        *self.openapi.lock() = config;
+    }
+    fn openapi_ui_enabled(&self) -> bool {
+        self.openapi.lock().ui.enabled
     }
     fn vision_config(&self) -> VisionConfig {
         self.vision.lock().clone()
@@ -1205,6 +1284,123 @@ impl Server {
             .ok_or(Error::ContextNotFound)?;
         self.persist()
     }
+    pub fn create_compaction_declaration(
+        &self,
+        request: CreateCompactionDeclaration,
+    ) -> Result<CompactionDeclaration, Error> {
+        self.create_compaction_declaration_for("local", request)
+    }
+
+    fn create_compaction_declaration_for(
+        &self,
+        principal: &str,
+        request: CreateCompactionDeclaration,
+    ) -> Result<CompactionDeclaration, Error> {
+        let config = self.config();
+        if !config.compaction_enabled {
+            return Err(Error::BadRequest("compaction is disabled".into()));
+        }
+        if request.expires_in_ms == 0
+            || request.expires_in_ms > config.compaction_declaration_lifetime_ms
+        {
+            return Err(Error::BadRequest(
+                "invalid compaction declaration lifetime".into(),
+            ));
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| Error::State("system clock before unix epoch".into()))?
+            .as_millis() as u64;
+        let declaration = CompactionDeclaration {
+            declaration_id: Uuid::new_v4().to_string(),
+            context_id: request.context_id,
+            strategy_preferences: request.strategy_preferences,
+            target_tokens: request.target_tokens,
+            expires_at_ms: now.saturating_add(request.expires_in_ms),
+        };
+
+        let mut state = self.declarations.lock();
+        state
+            .records
+            .retain(|_, record| record.declaration.expires_at_ms > now);
+        let stale_cutoff_ms = now.saturating_sub(60_000);
+        state.creation_times.retain(|_, recent| {
+            while recent
+                .front()
+                .is_some_and(|created| now.saturating_sub(*created) >= 60_000)
+            {
+                recent.pop_front();
+            }
+            !recent.is_empty()
+        });
+        if state.records.len() >= config.compaction_declarations {
+            return Err(Error::Busy);
+        }
+        let recent = state
+            .creation_times
+            .entry(principal.to_owned())
+            .or_default();
+        while recent
+            .front()
+            .is_some_and(|created| *created <= stale_cutoff_ms)
+        {
+            recent.pop_front();
+        }
+        if recent.len() >= config.compaction_declaration_rate_per_minute {
+            return Err(Error::Busy);
+        }
+        recent.push_back(now);
+        state.records.insert(
+            declaration.declaration_id.clone(),
+            DeclarationRecord {
+                declaration: declaration.clone(),
+                principal: principal.to_owned(),
+            },
+        );
+        Ok(declaration)
+    }
+
+    pub fn compaction_declaration(&self, id: &str) -> Result<CompactionDeclaration, Error> {
+        self.compaction_declaration_for("local", id)
+    }
+
+    fn compaction_declaration_for(
+        &self,
+        principal: &str,
+        id: &str,
+    ) -> Result<CompactionDeclaration, Error> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| Error::State("system clock before unix epoch".into()))?
+            .as_millis() as u64;
+        let mut state = self.declarations.lock();
+        let record = state
+            .records
+            .get(id)
+            .ok_or_else(|| Error::BadRequest("compaction declaration not found".into()))?;
+        if record.declaration.expires_at_ms <= now {
+            state.records.remove(id);
+            return Err(Error::BadRequest("compaction declaration expired".into()));
+        }
+        if record.principal != principal {
+            return Err(Error::Forbidden);
+        }
+        Ok(record.declaration.clone())
+    }
+
+    fn revoke_compaction_declaration_for(&self, principal: &str, id: &str) -> Result<(), Error> {
+        let mut state = self.declarations.lock();
+        let record = state
+            .records
+            .get(id)
+            .ok_or_else(|| Error::BadRequest("compaction declaration not found".into()))?;
+        if record.principal != principal {
+            return Err(Error::Forbidden);
+        }
+        state.records.remove(id);
+        Ok(())
+    }
     pub fn register_model(&self, model: ModelRecord) -> Result<ModelRecord, Error> {
         self.register_model_with(|_| Ok(()), model)
     }
@@ -1287,7 +1483,14 @@ impl Server {
             .commit_model(&model, previous.as_ref().map(|record| record.epoch));
         Ok(model)
     }
-
+    fn effective_stop_sequences(&self, req: &InferRequest) -> Result<Vec<String>, Error> {
+        let mut stops = req.stop.clone();
+        let model = self.model(&req.model)?;
+        if model.family == "gemma4" && !stops.iter().any(|stop| stop == "<end_of_turn>") {
+            stops.push("<end_of_turn>".into());
+        }
+        Ok(stops)
+    }
 
     pub fn models(&self) -> Vec<ModelRecord> {
         self.inner.lock().durable.models.values().cloned().collect()
@@ -1402,11 +1605,16 @@ impl Server {
             || config.active_time_ms == 0
             || config.stream_buffer == 0
             || config.shutdown_grace_ms == 0
+            || config.compaction_workers == 0
+            || config.compaction_declarations == 0
+            || config.compaction_declaration_rate_per_minute == 0
+            || config.compaction_declaration_lifetime_ms == 0
         {
             return Err(Error::State("server limits must be nonzero".into()));
         }
         let mut guard = self.inner.lock();
         self.pre_queue.set_limit(config.pre_queue_concurrency);
+        self.compaction_workers.set_limit(config.compaction_workers);
         guard.admission_limit = config.active_requests;
         guard.config = config;
         Self::promote_queued(&mut guard);
@@ -1452,12 +1660,16 @@ impl Server {
         request_id: &str,
         req: InferRequest,
     ) -> Result<(InferResponse, Vec<StreamEvent>), Error> {
-        let frontier =
-            GenerationFrontier::new(&req.stop, req.raw_continuation).map_err(state_err)?;
+        let stops = self.effective_stop_sequences(&req)?;
+        let frontier = GenerationFrontier::new(&stops, req.raw_continuation).map_err(state_err)?;
         let successor_id = req.context_id.clone().unwrap_or_else(ContextId::new);
+        let execution_session_id = req.scheduling.inference_id.clone();
         let mut events = vec![StreamEvent::Started {
             request_id: request_id.into(),
             context_id: successor_id.clone(),
+            correlation_id: req.scheduling.correlation_id.clone(),
+            inference_id: req.scheduling.inference_id.clone(),
+            execution_session_id,
         }];
         let (response, terminal) =
             self.infer_admitted(request_id, req, successor_id, frontier, |event| {
@@ -1473,12 +1685,15 @@ impl Server {
         req: InferRequest,
         admission: AdmissionGuard,
     ) -> Result<(StreamEvent, tokio::sync::mpsc::Receiver<StreamEvent>), Error> {
-        let frontier =
-            GenerationFrontier::new(&req.stop, req.raw_continuation).map_err(state_err)?;
+        let stops = self.effective_stop_sequences(&req)?;
+        let frontier = GenerationFrontier::new(&stops, req.raw_continuation).map_err(state_err)?;
         let successor_id = req.context_id.clone().unwrap_or_else(ContextId::new);
         let started = StreamEvent::Started {
             request_id: request_id.clone(),
             context_id: successor_id.clone(),
+            correlation_id: req.scheduling.correlation_id.clone(),
+            inference_id: req.scheduling.inference_id.clone(),
+            execution_session_id: req.scheduling.inference_id.clone(),
         };
         let stream_buffer = self.inner.lock().config.stream_buffer;
         let (sender, receiver) = tokio::sync::mpsc::channel(stream_buffer);
@@ -1647,11 +1862,29 @@ impl Server {
     fn infer_admitted(
         &self,
         request_id: &str,
-        req: InferRequest,
+        mut req: InferRequest,
         successor_id: ContextId,
         mut frontier: GenerationFrontier,
         mut emit: impl FnMut(StreamEvent) -> Result<(), Error>,
     ) -> Result<(InferResponse, StreamEvent), Error> {
+        if let Some(compaction) = req.compaction.as_mut() {
+            if let Some(declaration_id) = compaction.declaration_id.clone() {
+                let declaration =
+                    self.compaction_declaration_for(&req.scheduling.principal, &declaration_id)?;
+                let context_id = req.context_id.as_ref().ok_or_else(|| {
+                    Error::BadRequest("compaction declaration requires context".into())
+                })?;
+                if context_id.0 != declaration.context_id {
+                    return Err(Error::BadRequest(
+                        "compaction declaration context mismatch".into(),
+                    ));
+                }
+                compaction.strategy_preferences = declaration.strategy_preferences;
+                if compaction.target_tokens.is_none() {
+                    compaction.target_tokens = declaration.target_tokens;
+                }
+            }
+        }
         let started = Instant::now();
         let deadline = req
             .deadline_ms
@@ -1672,17 +1905,90 @@ impl Server {
             Some(id) => Some(self.context(id)?),
             None => None,
         };
-        let prior_tokens = context
+        let mut logical_context_tokens: Vec<String> = context
             .as_ref()
-            .map_or(&[][..], |record| record.native_tokens.as_slice());
-        let mut generated_pieces = Vec::new();
+            .map_or_else(Vec::new, |record| record.tokens.clone());
+        let mut prior_tokens = context
+            .as_ref()
+            .map_or_else(Vec::new, |record| record.native_tokens.clone());
+        let mut compaction_result = None;
+        if let Some(compaction) = req.compaction.take() {
+            let source = context.as_ref().ok_or_else(|| {
+                Error::BadRequest("compaction requires an existing context".into())
+            })?;
+            let selected = match select_strategy(&compaction.strategy_preferences) {
+                Some(selected) => selected,
+                None => {
+                    if matches!(
+                        compaction.fallback_when_no_match,
+                        CompactionNoMatchFallback::Reject
+                    ) {
+                        return Err(Error::BadRequest("unsupported_compaction_strategy".into()));
+                    }
+                    compaction_result = Some(CompactionResult {
+                        compact_mode: "window_tail".into(),
+                        compact_reason: CompactionResultReason::None,
+                        requested_strategy_ids: compaction.strategy_preferences,
+                        selected_strategy_id: None,
+                        requested_strategy_budget: compaction.target_tokens.unwrap_or(3072),
+                        resulting_budget: logical_context_tokens.len(),
+                        retained_indices: (0..logical_context_tokens.len()).collect(),
+                        retained_message_count: logical_context_tokens.len(),
+                        source_message_count: logical_context_tokens.len(),
+                        retained_anchor_count: 0,
+                        success: false,
+                        fallback: true,
+                        resulting_context_epoch: source.revision.saturating_add(1),
+                    });
+                    String::new()
+                }
+            };
+            if !selected.is_empty() {
+                if selected != WINDOW_TAIL_STRATEGY_ID {
+                    return Err(Error::BadRequest(
+                        "unsupported compaction strategy for this release".into(),
+                    ));
+                }
+                let proposal = apply_window_tail_strategy(
+                    &logical_context_tokens,
+                    compaction.target_tokens.unwrap_or(3072),
+                    &[selected.clone()],
+                )
+                .map_err(Error::BadRequest)?;
+                control.check()?;
+                let prepared = self.engine.generate(
+                    EngineRequest {
+                        model: model.clone(),
+                        prompt: proposal.resulting_tokens.join(" "),
+                        max_tokens: 0,
+                        prior_tokens: Vec::new(),
+                        sampling: req.sampling,
+                        control: control.clone(),
+                        scheduling: req.scheduling.clone(),
+                        prefill_chunk_tokens: 32,
+                    },
+                    &mut |_, _, _| {
+                        Err(Error::State(
+                            "compaction preparation unexpectedly generated output".into(),
+                        ))
+                    },
+                )?;
+                control.check()?;
+                let mut result = proposal.result;
+                result.selected_strategy_id = Some(deterministic_strategy_id(&selected));
+                result.resulting_context_epoch = source.revision.saturating_add(1);
+                compaction_result = Some(result);
+                logical_context_tokens = proposal.resulting_tokens;
+                prior_tokens = prepared.successor_tokens;
+            }
+        }
         let mut delta_index = 0;
         let generated = self.engine.generate(
             EngineRequest {
                 model: model.clone(),
                 prompt: req.prompt.clone(),
                 max_tokens: req.max_tokens,
-                prior_tokens: prior_tokens.to_vec(),
+                prior_tokens,
                 sampling: req.sampling,
                 control: control.clone(),
                 scheduling: req.scheduling.clone(),
@@ -1694,25 +2000,21 @@ impl Server {
                 }
                 control.check()?;
                 frontier.push(piece, terminal_or_control, |delta| {
-                    let token = delta.to_owned();
                     emit(StreamEvent::Token {
-                        token: token.clone(),
+                        token: delta.to_owned(),
                         index: delta_index,
                     })?;
                     delta_index += 1;
-                    generated_pieces.push(token);
                     Ok(())
                 })
             },
         )?;
         let frontier = frontier.finish(|delta| {
-            let token = delta.to_owned();
             emit(StreamEvent::Token {
-                token: token.clone(),
+                token: delta.to_owned(),
                 index: delta_index,
             })?;
             delta_index += 1;
-            generated_pieces.push(token);
             Ok(())
         })?;
         control.check()?;
@@ -1722,7 +2024,8 @@ impl Server {
         {
             return Err(Error::Deadline);
         }
-        let input: Vec<_> = req.prompt.split_whitespace().map(str::to_owned).collect();
+        logical_context_tokens.extend(req.prompt.split_whitespace().map(str::to_owned));
+        logical_context_tokens.extend(frontier.text.split_whitespace().map(str::to_owned));
         let EngineOutput {
             successor_tokens,
             input_tokens,
@@ -1737,20 +2040,20 @@ impl Server {
                 .contexts
                 .get_mut(&context.id)
                 .ok_or(Error::ContextNotFound)?;
-            stored.tokens.extend(input.iter().cloned());
-            stored.tokens.extend(generated_pieces.iter().cloned());
+            if stored.revision != context.revision {
+                return Err(Error::State("context changed during compaction".into()));
+            }
+            stored.tokens = logical_context_tokens;
             stored.native_tokens = successor_tokens;
             stored.revision += 1;
             stored.id.clone()
         } else {
-            let mut tokens = input.clone();
-            tokens.extend(generated_pieces.iter().cloned());
             guard.durable.contexts.insert(
                 successor_id.clone(),
                 ContextRecord {
                     id: successor_id.clone(),
                     revision: 1,
-                    tokens,
+                    tokens: logical_context_tokens,
                     native_tokens: successor_tokens,
                 },
             );
@@ -1767,8 +2070,12 @@ impl Server {
             model: model.id,
             model_revision: model.revision,
             context_id: context_id.clone(),
+            compaction_result,
             latency_ms: started.elapsed().as_millis(),
             status: "completed".into(),
+            correlation_id: req.scheduling.correlation_id.clone(),
+            inference_id: req.scheduling.inference_id.clone(),
+            execution_session_id: req.scheduling.inference_id.clone(),
         };
         Ok((
             InferResponse {
@@ -1783,6 +2090,7 @@ impl Server {
         ))
     }
 }
+
 fn state_err(error: impl std::fmt::Display) -> Error {
     Error::State(error.to_string())
 }
@@ -1871,6 +2179,8 @@ struct CompletionRequest {
     stop: Option<StopInput>,
     #[serde(default)]
     raw_continuation: bool,
+    #[serde(default)]
+    compaction: Option<CompactionRequest>,
     #[serde(default)]
     deadline_ms: Option<u64>,
     #[serde(default)]
@@ -2021,11 +2331,15 @@ struct ChatRequest {
     #[serde(default)]
     deadline_ms: Option<u64>,
     #[serde(default)]
-    temperature: Option<f32>,
+    raw_continuation: bool,
     #[serde(default)]
     top_p: Option<f32>,
     #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
     seed: Option<u64>,
+    #[serde(default)]
+    compaction: Option<CompactionRequest>,
     #[serde(default)]
     tools: Vec<ToolDefinition>,
     #[serde(default)]
@@ -2044,6 +2358,9 @@ struct ChatMessage {
 }
 fn default_user_role() -> String {
     "user".into()
+}
+fn default_message_type() -> String {
+    "message".into()
 }
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -2071,10 +2388,7 @@ fn lower_messages(
     let admission = ImageAdmission::new(vision);
     let mut normalized = Vec::with_capacity(messages.len());
     for message in messages {
-        if !matches!(
-            message.role.as_str(),
-            "system" | "user" | "assistant"
-        ) {
+        if !matches!(message.role.as_str(), "system" | "user" | "assistant") {
             return Err(Error::BadRequest(format!(
                 "unsupported message role {}",
                 message.role
@@ -2096,7 +2410,9 @@ fn lower_messages(
                             admission
                                 .admit_data_uri(&image_url.url)
                                 .map_err(|error| Error::BadRequest(error.to_string()))?;
-                            return Err(Error::BadRequest("image_unsupported: selected model has no compatible vision projector".into()));
+                            return Err(Error::BadRequest(
+                                "image_unsupported: selected model has no compatible vision projector".into(),
+                            ));
                         }
                     }
                 }
@@ -2110,11 +2426,9 @@ fn lower_messages(
     }
     prompt::apply_chat_template(family, normalized)
 }
-
 pub fn router(server: Server) -> Router {
     routes(server)
 }
-
 pub fn router_with_http_debug(server: Server, debug: HttpDebug) -> Router {
     if debug.level == HttpDebugLevel::Off {
         routes(server)
@@ -2122,25 +2436,21 @@ pub fn router_with_http_debug(server: Server, debug: HttpDebug) -> Router {
         routes(server).layer(middleware::from_fn_with_state(debug, http_debug_middleware))
     }
 }
-
 fn routes(server: Server) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/openai/v1/openapi.json", get(openapi))
-        .route("/ollama/api/openapi.json", get(openapi))
         .route("/cusco/v1/openapi.json", get(openapi))
         .route("/openai/v1/completions", post(completion))
         .route("/openai/v1/chat/completions", post(chat))
         .route("/openai/v1/models", get(list_models))
         .route("/openai/v1/responses", post(responses))
-        .route("/ollama/api/generate", post(ollama_generate))
-        .route("/ollama/api/chat", post(ollama_chat))
-        .route("/ollama/api/version", get(ollama_version))
-        .route("/ollama/api/tags", get(ollama_tags))
-        .route("/ollama/api/show", post(ollama_show))
-        .route("/ollama/api/pull", post(ollama_pull))
-        .route("/ollama/api/copy", post(ollama_copy))
-        .route("/ollama/api/delete", delete(ollama_delete))
-        .route("/ollama/api/ps", get(ollama_ps))
+        .route("/cusco/v1/api/version", get(ollama_version))
+        .route("/cusco/v1/api/tags", get(ollama_tags))
+        .route("/cusco/v1/api/show", post(ollama_show))
+        .route("/cusco/v1/api/pull", post(ollama_pull))
+        .route("/cusco/v1/api/copy", post(ollama_copy))
+        .route("/cusco/v1/api/delete", delete(ollama_delete))
+        .route("/cusco/v1/api/ps", get(ollama_ps))
         .route(
             "/cusco/v1/contexts",
             get(list_contexts).post(create_context),
@@ -2150,10 +2460,27 @@ fn routes(server: Server) -> Router {
             "/cusco/v1/contexts/{id}",
             get(get_context).delete(delete_context),
         )
-        .route("/cusco/v1/status", get(native_status))
-        .route("/cusco/v1/contexts/{id}/branches", post(branch_context))
         .route("/cusco/v1/requests/{id}", delete(cancel_request))
-        .with_state(server)
+        .route("/cusco/v1/status", get(native_status))
+        .route(
+            "/cusco/v1/compaction/strategies",
+            get(compaction_strategies),
+        )
+        .route(
+            "/cusco/v1/compaction/declarations",
+            post(create_compaction_declaration),
+        )
+        .route(
+            "/cusco/v1/compaction/declarations/{id}",
+            delete(revoke_compaction_declaration),
+        )
+        .route("/cusco/v1/contexts/{id}/branches", post(branch_context));
+    let app = if server.openapi_ui_enabled() {
+        app.route("/openapi/ui", get(swagger_ui))
+    } else {
+        app
+    };
+    app.with_state(server)
 }
 
 async fn http_debug_middleware(
@@ -2162,6 +2489,7 @@ async fn http_debug_middleware(
     next: Next,
 ) -> Response {
     let request_id = Uuid::new_v4().to_string();
+    let request_started = Instant::now();
     let method = request.method().to_string();
     let path = request.uri().path().to_owned();
     let request_content_type = request
@@ -2178,71 +2506,85 @@ async fn http_debug_middleware(
         (
             request.uri().to_string(),
             unredacted_headers(request.headers()),
+            request.headers().clone(),
         )
     });
-    let request_body = Arc::new(Mutex::new(match debug.level {
-        HttpDebugLevel::Full => HttpBodyCapture::full(),
-        HttpDebugLevel::Off | HttpDebugLevel::Safe => HttpBodyCapture::default(),
-    }));
-    let body_capture = request_body.clone();
     let (parts, body) = request.into_parts();
-    let body = Body::new(body.map_frame(move |frame| {
-        if let Some(bytes) = frame.data_ref() {
-            body_capture.lock().push(bytes);
-        }
-        frame
-    }));
-    let started = Instant::now();
-    let mut response = next.run(Request::from_parts(parts, body)).await;
-    let mut request_record = json!({
-        "type": "http_debug",
-        "level": debug.level,
-        "direction": "in",
-        "request_id": request_id,
-        "method": method,
-        "path": path,
-        "content_type": request_content_type,
-        "content_length": request_content_length,
-        "body": request_body.lock().rendered(debug.level, request_content_type.as_deref())
-    });
-    if let Some((uri, headers)) = full_request {
-        request_record["uri"] = Value::String(uri);
-        request_record["headers"] = headers;
+    let body_bytes = to_bytes(body, HTTP_DEBUG_BODY_LIMIT)
+        .await
+        .unwrap_or_default()
+        .to_vec();
+    {
+        let mut capture = HttpBodyCapture::default();
+        capture.push(&body_bytes);
+        let rendered_body = if debug.level == HttpDebugLevel::Safe {
+            capture.redacted(request_content_type.as_deref())
+        } else {
+            capture.rendered(debug.level, request_content_type.as_deref())
+        };
+        debug.emit(json!({
+            "type": "http_debug",
+            "level": debug.level,
+            "direction": "in",
+            "request_id": request_id,
+            "method": method,
+            "path": path,
+            "content_type": request_content_type,
+            "content_length": request_content_length,
+            "headers": full_request
+                .as_ref()
+                .and_then(|(_, headers, _)| Some(json!(headers))),
+            "uri": full_request
+                .as_ref()
+                .and_then(|(uri, _, _)| Some(uri.clone())),
+            "body": rendered_body,
+            "raw_body": full_request.as_ref().and_then(|(_, _, headers)| {
+                headers
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+                    .and_then(|content_type| {
+                        (debug.level == HttpDebugLevel::Full
+                            && content_type.starts_with("text/plain"))
+                        .then(|| String::from_utf8_lossy(&body_bytes).to_string())
+                    })
+            }),
+        }));
     }
-    debug.emit(request_record);
-
-    let status = response.status();
-    let response_content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    response.headers_mut().insert(
+    let request = Request::from_parts(parts, Body::from(body_bytes));
+    let response = next.run(request).await;
+    let duration_ms = request_started.elapsed().as_millis();
+    let (mut parts, body) = response.into_parts();
+    parts.headers.insert(
         "x-request-id",
         HeaderValue::from_str(&request_id).expect("UUID is a valid header value"),
     );
-    let mut response_record = json!({
+    debug.emit(json!({
         "type": "http_debug",
         "level": debug.level,
         "direction": "out",
         "request_id": request_id,
-        "method": method,
-        "path": path,
-        "status": status.as_u16(),
-        "duration_ms": started.elapsed().as_millis()
-    });
-    if debug.level == HttpDebugLevel::Full {
-        response_record["headers"] = unredacted_headers(response.headers());
-    }
-    debug.emit(response_record);
-
-    let (parts, body) = response.into_parts();
-    let mut chunk_index = 0_u64;
+        "status": parts.status.as_u16(),
+        "duration_ms": duration_ms,
+        "headers": if debug.level == HttpDebugLevel::Full {
+            unredacted_headers(&parts.headers)
+        } else {
+            json!([])
+        },
+    }));
+    let body = body;
+    let chunk_index = Arc::new(AtomicUsize::new(0));
+    let response_content_type = parts
+        .headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let chunk_index = chunk_index.clone();
     let body = Body::new(body.map_frame(move |frame| {
         if let Some(bytes) = frame.data_ref() {
             let mut capture = match debug.level {
                 HttpDebugLevel::Full => HttpBodyCapture::full(),
-                HttpDebugLevel::Off | HttpDebugLevel::Safe => HttpBodyCapture::default(),
+                HttpDebugLevel::Safe | HttpDebugLevel::Off => HttpBodyCapture::default(),
             };
             capture.push(bytes);
             debug.emit(json!({
@@ -2250,10 +2592,9 @@ async fn http_debug_middleware(
                 "level": debug.level,
                 "direction": "out_body",
                 "request_id": request_id,
-                "chunk_index": chunk_index,
-                "body": capture.rendered(debug.level, response_content_type.as_deref())
+                "chunk_index": chunk_index.fetch_add(1, Ordering::Relaxed),
+                "body": capture.rendered(debug.level, response_content_type.as_deref()),
             }));
-            chunk_index += 1;
         }
         frame
     }));
@@ -2286,6 +2627,7 @@ async fn completion(
         r.prompt,
         r.max_tokens,
         sampling,
+        r.compaction,
         include_usage,
         r.stream,
         r.context_id,
@@ -2293,6 +2635,7 @@ async fn completion(
         r.raw_continuation,
         r.deadline_ms,
         retained_bytes,
+        request_context.request_id,
         request_context.principal,
         WireProtocol::OpenAiCompletion,
     )
@@ -2322,20 +2665,21 @@ async fn chat(
         .is_some_and(|options| options.include_usage);
     let model = s.model(&r.model)?;
     let prompt = lower_messages(&model.family, r.messages, s.vision_config())?;
-    drop(permit);
     infer_response(
         s,
         r.model,
         prompt,
         r.max_tokens,
         sampling,
+        r.compaction,
         include_usage,
         r.stream,
         r.context_id,
         r.stop.map(StopInput::into_vec).unwrap_or_default(),
-        false,
+        r.raw_continuation,
         r.deadline_ms,
         retained_bytes,
+        request_context.request_id,
         request_context.principal,
         WireProtocol::OpenAiChat,
     )
@@ -2352,6 +2696,7 @@ enum ResponsesInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResponsesInputItem {
+    #[serde(default = "default_message_type")]
     r#type: String,
     #[serde(default = "default_user_role")]
     role: String,
@@ -2377,8 +2722,9 @@ enum ResponsesContentPart {
 struct ResponsesRequest {
     model: String,
     input: ResponsesInput,
-    #[serde(default)]
     max_output_tokens: Option<usize>,
+    #[serde(default)]
+    compaction: Option<CompactionRequest>,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
@@ -2394,7 +2740,6 @@ struct ResponsesRequest {
     #[serde(default)]
     reasoning_effort: Option<ReasoningEffort>,
 }
-
 async fn responses(
     State(s): State<Server>,
     PrequeueJson {
@@ -2451,13 +2796,13 @@ async fn responses(
             lower_messages(&model.family, messages, s.vision_config())?
         }
     };
-    drop(permit);
     infer_response(
         s,
         r.model,
         input,
         r.max_output_tokens,
         sampling,
+        r.compaction,
         true,
         r.stream,
         None,
@@ -2465,6 +2810,7 @@ async fn responses(
         false,
         None,
         retained_bytes,
+        request_context.request_id,
         request_context.principal,
         WireProtocol::OpenAiResponses,
     )
@@ -2475,107 +2821,6 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OllamaOptions {
-    #[serde(default)]
-    temperature: Option<f32>,
-    #[serde(default)]
-    top_p: Option<f32>,
-    #[serde(default)]
-    seed: Option<u64>,
-    #[serde(default)]
-    num_predict: Option<usize>,
-    #[serde(default)]
-    stop: Option<StopInput>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OllamaGenerateRequest {
-    model: String,
-    prompt: String,
-    #[serde(default = "default_true")]
-    stream: bool,
-    #[serde(default)]
-    options: OllamaOptions,
-}
-async fn ollama_generate(
-    State(s): State<Server>,
-    PrequeueJson {
-        headers,
-        value: r,
-        retained_bytes,
-        _permit: permit,
-    }: PrequeueJson<OllamaGenerateRequest>,
-) -> Result<Response, Error> {
-    let request_context = auth(&s, &headers, Scope::Inference)?;
-    validate_controls(r.options.temperature, r.options.top_p, &[], None, None)?;
-    let sampling = sampling_config(r.options.temperature, r.options.top_p, r.options.seed)?;
-    s.model(&r.model)?;
-    drop(permit);
-    infer_response(
-        s,
-        r.model,
-        r.prompt,
-        r.options.num_predict,
-        sampling,
-        true,
-        r.stream,
-        None,
-        r.options.stop.map(StopInput::into_vec).unwrap_or_default(),
-        false,
-        None,
-        retained_bytes,
-        request_context.principal,
-        WireProtocol::OllamaGenerate,
-    )
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OllamaChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    #[serde(default = "default_true")]
-    stream: bool,
-    #[serde(default)]
-    options: OllamaOptions,
-}
-async fn ollama_chat(
-    State(s): State<Server>,
-    PrequeueJson {
-        headers,
-        value: r,
-        retained_bytes,
-        _permit: permit,
-    }: PrequeueJson<OllamaChatRequest>,
-) -> Result<Response, Error> {
-    let request_context = auth(&s, &headers, Scope::Inference)?;
-    validate_controls(r.options.temperature, r.options.top_p, &[], None, None)?;
-    let sampling = sampling_config(r.options.temperature, r.options.top_p, r.options.seed)?;
-    let model = s.model(&r.model)?;
-    let prompt = lower_messages(&model.family, r.messages, s.vision_config())?;
-    drop(permit);
-    infer_response(
-        s,
-        r.model,
-        prompt,
-        r.options.num_predict,
-        sampling,
-        true,
-        r.stream,
-        None,
-        r.options.stop.map(StopInput::into_vec).unwrap_or_default(),
-        false,
-        None,
-        retained_bytes,
-        request_context.principal,
-        WireProtocol::OllamaChat,
-    )
-    .await
-}
 
 async fn ollama_version(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
     auth(&s, &headers, Scope::Inference)?;
@@ -2885,11 +3130,32 @@ enum WireProtocol {
     OpenAiCompletion,
     OpenAiChat,
     OpenAiResponses,
-    OllamaGenerate,
-    OllamaChat,
 }
 
 fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
+    if matches!(protocol, WireProtocol::OpenAiResponses) {
+        match event {
+            StreamEvent::Started {
+                request_id,
+                correlation_id,
+                inference_id,
+                execution_session_id,
+                ..
+            } => return [
+                json!({"type":"response.created","response":{"id":request_id,"status":"in_progress","metadata":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}}}),
+                json!({"type":"response.output_item.added","item":{"id":"msg_0","type":"message","role":"assistant","status":"in_progress"},"output_index":0}),
+                json!({"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
+            ].into_iter().map(|value| format!("data: {value}\n\n")).collect(),
+            StreamEvent::Token { token, index } => return format!("data: {}\n\n", json!({"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":token,"sequence_number":index})),
+            StreamEvent::Finished { reason, usage } => return [
+                json!({"type":"response.output_text.done","item_id":"msg_0","output_index":0,"content_index":0,"text":""}),
+                json!({"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":0}),
+                json!({"type":"response.output_item.done","item":{"id":"msg_0","type":"message","role":"assistant","status":"completed"},"output_index":0}),
+                json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}}),
+            ].into_iter().map(|value| format!("data: {value}\n\n")).collect(),
+            StreamEvent::Error { message } => return format!("data: {}\n\n", json!({"type":"error","error":{"message":message,"type":"server_error"}})),
+        }
+    }
     let value = match (protocol, event) {
         (WireProtocol::OpenAiCompletion, StreamEvent::Token { token, .. }) => {
             json!({"object":"text_completion","choices":[{"text":token,"index":0,"finish_reason":null}]})
@@ -2899,12 +3165,6 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
         }
         (WireProtocol::OpenAiResponses, StreamEvent::Token { token, .. }) => {
             json!({"type":"response.output_text.delta","delta":token})
-        }
-        (WireProtocol::OllamaGenerate, StreamEvent::Token { token, .. }) => {
-            json!({"response":token,"done":false})
-        }
-        (WireProtocol::OllamaChat, StreamEvent::Token { token, .. }) => {
-            json!({"message":{"role":"assistant","content":token},"done":false})
         }
         (
             WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat,
@@ -2919,32 +3179,38 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
         (WireProtocol::OpenAiResponses, StreamEvent::Finished { reason, usage }) => {
             json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}})
         }
-        (
-            WireProtocol::OllamaGenerate | WireProtocol::OllamaChat,
-            StreamEvent::Finished { reason, usage },
-        ) => {
-            json!({"done":true,"done_reason":reason,"prompt_eval_count":usage.input_tokens,"eval_count":usage.generated_tokens})
-        }
         (_, StreamEvent::Error { message }) => {
             json!({"error":{"message":message,"type":"server_error"}})
         }
-        (WireProtocol::OpenAiChat, StreamEvent::Started { request_id, .. }) => {
-            json!({"id":request_id,"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]})
+        (
+            WireProtocol::OpenAiChat,
+            StreamEvent::Started {
+                request_id,
+                correlation_id,
+                inference_id,
+                execution_session_id,
+                ..
+            },
+        ) => {
+            json!({"id":request_id,"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}],"cusco":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}})
         }
-        (WireProtocol::OpenAiCompletion, StreamEvent::Started { request_id, .. }) => {
-            json!({"id":request_id,"object":"text_completion","choices":[]})
+        (
+            WireProtocol::OpenAiCompletion,
+            StreamEvent::Started {
+                request_id,
+                correlation_id,
+                inference_id,
+                execution_session_id,
+                ..
+            },
+        ) => {
+            json!({"id":request_id,"object":"text_completion","choices":[],"cusco":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}})
         }
         (WireProtocol::OpenAiResponses, StreamEvent::Started { request_id, .. }) => {
             json!({"type":"response.created","response":{"id":request_id,"status":"in_progress"}})
         }
-        (_, StreamEvent::Started { request_id, .. }) => json!({"id":request_id}),
     };
-    let row = match protocol {
-        WireProtocol::OpenAiCompletion
-        | WireProtocol::OpenAiChat
-        | WireProtocol::OpenAiResponses => format!("data: {value}\n\n"),
-        WireProtocol::OllamaGenerate | WireProtocol::OllamaChat => format!("{value}\n"),
-    };
+    let row = format!("data: {value}\n\n");
     if matches!(
         protocol,
         WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat
@@ -2965,21 +3231,44 @@ fn completed_response(
     finish_reason: FinishReason,
 ) -> Value {
     let usage = json!({"prompt_tokens":response.usage.input_tokens,"completion_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens});
+    let prefill = &response.usage.prefill;
+    let cached_ratio = if prefill.total_tokens > 0 {
+        Some((prefill.cached_tokens as f64) / (prefill.total_tokens as f64))
+    } else {
+        None
+    };
+    let cusco = json!({
+        "compaction_result": response.usage.compaction_result,
+        "correlation_id": response.usage.correlation_id,
+        "inference_id": response.usage.inference_id,
+        "execution_session_id": response.usage.execution_session_id,
+        "usage": {
+            "input_tokens": response.usage.input_tokens,
+            "generated_tokens": response.usage.generated_tokens,
+            "evaluated_tokens": response.usage.evaluated_tokens,
+            "cached_tokens": response.usage.cached_tokens,
+            "prefill": {
+                "total_tokens": prefill.total_tokens,
+                "cached_tokens": prefill.cached_tokens,
+                "uncached_tokens": prefill.uncached_tokens,
+                "cached_ratio": cached_ratio,
+                "tokenization_ns": prefill.tokenization_ns,
+                "prefix_lookup_ns": prefill.prefix_lookup_ns,
+                "mapping_activation_ns": prefill.mapping_activation_ns,
+                "uncached_prefill_ns": prefill.uncached_prefill_ns,
+                "total_ns": prefill.total_ns,
+            },
+        },
+    });
     match protocol {
         WireProtocol::OpenAiCompletion => {
-            json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text,"index":0,"finish_reason":finish_reason}],"usage":usage})
+            json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text,"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
         WireProtocol::OpenAiChat => {
-            json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":finish_reason}],"usage":usage})
+            json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
         WireProtocol::OpenAiResponses => {
-            json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"finish_reason":finish_reason,"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens}})
-        }
-        WireProtocol::OllamaGenerate => {
-            json!({"model":response.usage.model,"response":response.text,"done":true,"done_reason":finish_reason,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens})
-        }
-        WireProtocol::OllamaChat => {
-            json!({"model":response.usage.model,"message":{"role":"assistant","content":response.text},"done":true,"done_reason":finish_reason,"prompt_eval_count":response.usage.input_tokens,"eval_count":response.usage.generated_tokens})
+            json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"finish_reason":finish_reason,"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens},"cusco":cusco})
         }
     }
 }
@@ -2990,6 +3279,7 @@ async fn infer_response(
     prompt: String,
     max_tokens: Option<usize>,
     sampling: SamplingConfig,
+    compaction: Option<CompactionRequest>,
     include_usage: bool,
     streaming: bool,
     context_id: Option<ContextId>,
@@ -2997,13 +3287,22 @@ async fn infer_response(
     raw_continuation: bool,
     deadline_ms: Option<u64>,
     retained_bytes: usize,
+    request_id: String,
     principal: String,
     protocol: WireProtocol,
 ) -> Result<Response, Error> {
     server.model(&model)?;
-    let id = Uuid::new_v4().to_string();
+    let id = request_id;
     let correlation_id = id.clone();
     let config = server.config();
+    let compaction_permit = if compaction.is_some() {
+        if !config.compaction_enabled {
+            return Err(Error::BadRequest("compaction is disabled".into()));
+        }
+        Some(server.compaction_workers.try_acquire()?)
+    } else {
+        None
+    };
     let wall_limit = Duration::from_millis(
         deadline_ms
             .unwrap_or(config.wall_time_ms)
@@ -3022,6 +3321,7 @@ async fn infer_response(
         wall_remaining,
         Duration::from_millis(config.active_time_ms),
     );
+    let inference_id = Uuid::new_v4().to_string();
     let request = InferRequest {
         model,
         prompt,
@@ -3035,12 +3335,13 @@ async fn infer_response(
         ),
         stop,
         raw_continuation,
+        compaction,
         scheduling: SchedulingMetadata {
             class: SchedulingClass::Standard,
             source: PrioritySource::AdapterDefault,
             principal,
             correlation_id: correlation_id.clone(),
-            inference_id: Uuid::new_v4().to_string(),
+            inference_id,
         },
     };
     if streaming {
@@ -3048,10 +3349,10 @@ async fn infer_response(
         let first = stream::once(async move { started });
         let disconnect = DisconnectGuard::new(control);
         let rest = stream::unfold(
-            (receiver, disconnect),
-            |(mut receiver, mut disconnect)| async move {
+            (receiver, disconnect, compaction_permit),
+            |(mut receiver, mut disconnect, compaction_permit)| async move {
                 match receiver.recv().await {
-                    Some(event) => Some((event, (receiver, disconnect))),
+                    Some(event) => Some((event, (receiver, disconnect, compaction_permit))),
                     None => {
                         disconnect.disarm();
                         None
@@ -3062,12 +3363,7 @@ async fn infer_response(
         let rows = first
             .chain(rest)
             .map(move |event| Ok::<_, Infallible>(stream_row(protocol, event, include_usage)));
-        let content_type = match protocol {
-            WireProtocol::OpenAiCompletion
-            | WireProtocol::OpenAiChat
-            | WireProtocol::OpenAiResponses => "text/event-stream",
-            WireProtocol::OllamaGenerate | WireProtocol::OllamaChat => "application/x-ndjson",
-        };
+        let content_type = "text/event-stream";
         let mut response = Response::new(Body::from_stream(rows));
         response.headers_mut().insert(
             axum::http::header::CONTENT_TYPE,
@@ -3142,6 +3438,33 @@ async fn import_context(
     auth(&s, &headers, Scope::Inference)?;
     Ok(Json(s.import_context(r.tokens)?))
 }
+async fn compaction_strategies(
+    State(s): State<Server>,
+    headers: HeaderMap,
+) -> Result<Json<CompactionStrategyCatalog>, Error> {
+    auth(&s, &headers, Scope::Inference)?;
+    Ok(Json(strategy_catalog()))
+}
+async fn create_compaction_declaration(
+    State(s): State<Server>,
+    headers: HeaderMap,
+    Json(request): Json<CreateCompactionDeclaration>,
+) -> Result<Json<CompactionDeclaration>, Error> {
+    let request_context = auth(&s, &headers, Scope::Inference)?;
+    Ok(Json(s.create_compaction_declaration_for(
+        &request_context.principal,
+        request,
+    )?))
+}
+async fn revoke_compaction_declaration(
+    State(s): State<Server>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, Error> {
+    let request_context = auth(&s, &headers, Scope::Inference)?;
+    s.revoke_compaction_declaration_for(&request_context.principal, &id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
 fn parse_context(id: String) -> ContextId {
     ContextId(id)
 }
@@ -3201,6 +3524,25 @@ fn openapi_operation(operation_id: &str, request_schema: Option<&str>) -> Value 
     operation
 }
 
+async fn swagger_ui() -> Html<&'static str> {
+    Html(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cusco API</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>SwaggerUIBundle({url:"/openai/v1/openapi.json",dom_id:"#swagger-ui"});</script>
+</body>
+</html>"##,
+    )
+}
+
 pub fn openapi_document() -> Value {
     let mut paths = serde_json::Map::new();
     let operations = [
@@ -3223,45 +3565,33 @@ pub fn openapi_document() -> Value {
             Some("ResponsesRequest"),
         ),
         ("/openai/v1/models", "get", "openaiModels", None),
+        ("/cusco/v1/api/tags", "get", "ollamaTags", None),
+        ("/cusco/v1/api/version", "get", "ollamaVersion", None),
         (
-            "/ollama/api/generate",
-            "post",
-            "ollamaGenerate",
-            Some("OllamaGenerateRequest"),
-        ),
-        (
-            "/ollama/api/chat",
-            "post",
-            "ollamaChat",
-            Some("OllamaChatRequest"),
-        ),
-        ("/ollama/api/tags", "get", "ollamaTags", None),
-        ("/ollama/api/version", "get", "ollamaVersion", None),
-        (
-            "/ollama/api/show",
+            "/cusco/v1/api/show",
             "post",
             "ollamaShow",
             Some("OllamaModelRequest"),
         ),
         (
-            "/ollama/api/pull",
+            "/cusco/v1/api/pull",
             "post",
             "ollamaPull",
             Some("OllamaPullRequest"),
         ),
         (
-            "/ollama/api/copy",
+            "/cusco/v1/api/copy",
             "post",
             "ollamaCopy",
             Some("OllamaCopyRequest"),
         ),
         (
-            "/ollama/api/delete",
+            "/cusco/v1/api/delete",
             "delete",
             "ollamaDelete",
             Some("OllamaModelRequest"),
         ),
-        ("/ollama/api/ps", "get", "ollamaPs", None),
+        ("/cusco/v1/api/ps", "get", "ollamaPs", None),
         ("/cusco/v1/contexts", "get", "cuscoContexts", None),
         ("/cusco/v1/contexts", "post", "cuscoCreateContext", None),
         (
@@ -3269,6 +3599,24 @@ pub fn openapi_document() -> Value {
             "post",
             "cuscoImportContext",
             Some("ImportContextRequest"),
+        ),
+        (
+            "/cusco/v1/compaction/strategies",
+            "get",
+            "cuscoCompactionStrategies",
+            None,
+        ),
+        (
+            "/cusco/v1/compaction/declarations",
+            "post",
+            "cuscoCreateCompactionDeclaration",
+            Some("CreateCompactionDeclaration"),
+        ),
+        (
+            "/cusco/v1/compaction/declarations/{id}",
+            "delete",
+            "cuscoRevokeCompactionDeclaration",
+            None,
         ),
         ("/cusco/v1/contexts/{id}", "get", "cuscoContext", None),
         (
@@ -3280,7 +3628,7 @@ pub fn openapi_document() -> Value {
         (
             "/cusco/v1/contexts/{id}/branches",
             "post",
-            "cuscoBranchContext",
+            "cuscoCreateContextBranch",
             None,
         ),
         (
@@ -3297,7 +3645,7 @@ pub fn openapi_document() -> Value {
             .or_insert_with(|| Value::Object(serde_json::Map::new()))[method] =
             openapi_operation(operation_id, schema);
     }
-    paths["/ollama/api/pull"]["post"]["responses"]["200"]["content"] = json!({
+    paths["/cusco/v1/api/pull"]["post"]["responses"]["200"]["content"] = json!({
         "application/json": {"schema": {"$ref": "#/components/schemas/OllamaPullProgress"}},
         "application/x-ndjson": {"schema": {"$ref": "#/components/schemas/OllamaPullProgress"}}
     });
@@ -3313,8 +3661,6 @@ pub fn openapi_document() -> Value {
             "ChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}}},
             "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"oneOf": [{"type": "string"}, {"type": "array"}]}, "stream": {"type": "boolean"}, "tools": {"type": "array", "items": {"$ref": "#/components/schemas/ResponsesFunctionTool"}}}},
             "ResponsesFunctionTool": {"type": "object", "additionalProperties": false, "required": ["type", "name", "parameters"], "properties": {"type": {"const": "function"}, "name": {"type": "string", "minLength": 1}, "description": {"type": "string"}, "parameters": {"type": "object"}}},
-            "OllamaGenerateRequest": {"type": "object", "additionalProperties": false, "required": ["model", "prompt"], "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
-            "OllamaChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}, "options": {"type": "object"}}},
             "OllamaModelRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["model"]}, {"required": ["name"]}], "properties": {"model": {"type": "string"}, "name": {"type": "string"}}},
             "OllamaPullRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["name"]}, {"required": ["model"]}], "properties": {"name": {"type": "string"}, "model": {"type": "string"}, "sha256": {"type": "string"}, "insecure": {"type": "boolean"}, "stream": {"type": "boolean"}}},
             "OllamaPullProgress": {
@@ -3328,7 +3674,8 @@ pub fn openapi_document() -> Value {
                     "error": {"type": "string"}
                 }
             },
-            "ImportContextRequest": {"type": "object", "additionalProperties": false, "required": ["tokens"], "properties": {"tokens": {"type": "array", "items": {"type": "string"}}}}
+            "ImportContextRequest": {"type": "object", "additionalProperties": false, "required": ["tokens"], "properties": {"tokens": {"type": "array", "items": {"type": "string"}}}},
+            "CreateCompactionDeclaration": {"type": "object", "additionalProperties": false, "required": ["context_id", "expires_in_ms"], "properties": {"context_id": {"type": "string"}, "strategy_preferences": {"type": "array", "items": {"type": "string"}}, "target_tokens": {"type": "integer", "minimum": 1}, "expires_in_ms": {"type": "integer", "minimum": 1, "maximum": 3600000}}}
         }}
     })
 }
@@ -3376,12 +3723,11 @@ async fn serve_until(
     http_debug: Option<HttpDebug>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
-    Server::validate_listener(addr, anonymous, unsafe_public)?;
     let grace = Duration::from_millis(server.config().shutdown_grace_ms);
-    let lifecycle = server.clone();
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(state_err)?;
+    let lifecycle = server.clone();
     let (begin_shutdown, shutdown_requested) = tokio::sync::oneshot::channel();
     let serving = async move {
         let app = match http_debug {
@@ -3396,15 +3742,22 @@ async fn serve_until(
     };
     tokio::pin!(serving);
     tokio::select! {
-        result = &mut serving => result.map_err(state_err),
+        result = &mut serving => match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(state_err(error)),
+        },
         () = shutdown => {
             lifecycle.begin_shutdown();
             let _ = begin_shutdown.send(());
             match tokio::time::timeout(grace, &mut serving).await {
-                Ok(result) => result.map_err(state_err),
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(state_err(error)),
                 Err(_) => {
                     lifecycle.cancel_remaining();
-                    (&mut serving).await.map_err(state_err)
+                    match (&mut serving).await {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(state_err(error)),
+                    }
                 }
             }
         }
@@ -3458,6 +3811,49 @@ mod tests {
         })
         .unwrap();
         (s, d)
+    }
+
+    struct CompactionProofEngine;
+
+    struct CompactionProofSession {
+        request: EngineRequest,
+    }
+
+    impl ExecutionSession for CompactionProofSession {
+        fn step(&mut self) -> Result<SessionStep, Error> {
+            self.finish().map(SessionStep::Finished)
+        }
+
+        fn finish(&mut self) -> Result<EngineOutput, Error> {
+            self.request.control.check()?;
+            if self.request.max_tokens != 0 && self.request.prompt == "fail continuation" {
+                return Err(Error::State("continuation failed after compaction".into()));
+            }
+            let successor_tokens = if self.request.max_tokens == 0 {
+                assert!(self.request.prior_tokens.is_empty());
+                assert!(self.request.prompt.contains("policy"));
+                vec![41, 42]
+            } else {
+                assert_eq!(self.request.prior_tokens, vec![41, 42]);
+                vec![41, 42, 43]
+            };
+            Ok(EngineOutput {
+                successor_tokens,
+                input_tokens: self.request.prompt.split_whitespace().count(),
+                cached_tokens: usize::from(self.request.max_tokens != 0) * 2,
+                evaluated_tokens: self.request.prompt.split_whitespace().count(),
+                prefill: PrefillMetrics::default(),
+            })
+        }
+    }
+
+    impl InferenceEngine for CompactionProofEngine {
+        fn start_session(
+            &self,
+            request: EngineRequest,
+        ) -> Result<Box<dyn ExecutionSession>, Error> {
+            Ok(Box::new(CompactionProofSession { request }))
+        }
     }
 
     struct FailingEngine;
@@ -3578,6 +3974,7 @@ mod tests {
             prompt: "one two".into(),
             max_tokens: 2,
             context_id: None,
+            compaction: None,
             deadline_ms: Some(1000),
             scheduling: SchedulingMetadata::default(),
             stop: vec![],
@@ -3598,6 +3995,7 @@ mod tests {
                     prompt: "x".into(),
                     max_tokens: 1,
                     context_id: Some(before.id.clone()),
+                    compaction: None,
                     deadline_ms: None,
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
@@ -3616,6 +4014,7 @@ mod tests {
                     prompt: "x".into(),
                     max_tokens: 1,
                     context_id: Some(before.id),
+                    compaction: None,
                     deadline_ms: Some(0),
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
@@ -3634,6 +4033,7 @@ mod tests {
                     prompt: "x".into(),
                     max_tokens: 1,
                     context_id: None,
+                    compaction: None,
                     deadline_ms: None,
                     scheduling: SchedulingMetadata::default(),
                     stop: vec![],
@@ -3658,6 +4058,7 @@ mod tests {
                     model: "m".into(),
                     prompt: "x".into(),
                     max_tokens: 1,
+                    compaction: None,
                     context_id: None,
                     deadline_ms: None,
                     scheduling: SchedulingMetadata::default(),
@@ -3854,7 +4255,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ollama/api/pull")
+                    .uri("/cusco/v1/api/pull")
                     .header("authorization", "Bearer secret")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"model":"not-a-hugging-face-uri"}"#))
@@ -3883,7 +4284,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ollama/api/pull")
+                    .uri("/cusco/v1/api/pull")
                     .header("authorization", "Bearer secret")
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -3934,7 +4335,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/ollama/api/version")
+                    .uri("/cusco/v1/api/version")
                     .header("authorization", "Bearer secret")
                     .body(Body::empty())
                     .unwrap(),
@@ -3946,23 +4347,81 @@ mod tests {
             serde_json::from_slice(&to_bytes(version.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(version, json!({"version": env!("CARGO_PKG_VERSION")}));
+        for path in [
+            "/ollama/api/version",
+            "/cusco/v1/api/chat",
+            "/cusco/v1/api/generate",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        assert!(openapi_document()["paths"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|path| !path.starts_with("/ollama/")));
         let spec = openapi_document();
         assert_eq!(spec["openapi"], "3.1.0");
         assert!(spec["paths"]["/openai/v1/chat/completions"].is_object());
         assert!(spec["paths"]["/cusco/v1/status"].is_object());
-        assert!(spec["paths"]["/ollama/api/version"].is_object());
+        assert!(spec["paths"]["/cusco/v1/api/version"].is_object());
         for path in spec["paths"].as_object().unwrap().values() {
             for operation in path.as_object().unwrap().values() {
                 assert!(operation["operationId"].is_string());
                 assert!(operation["responses"]["200"].is_object());
             }
         }
+        assert!(spec["paths"]["/cusco/v1/contexts"].is_object());
+        assert!(spec["paths"]["/cusco/v1/contexts/{id}"].is_object());
+        assert!(spec["paths"]["/cusco/v1/contexts/{id}/branches"].is_object());
+        assert!(spec["paths"]["/cusco/v1/compaction/declarations/{id}"].is_object());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn swagger_ui_default_off() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let response = router(server)
+            .oneshot(Request::get("/openapi/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn swagger_combined_spec_and_ui_smoke() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        server.configure_openapi(OpenApiConfig {
+            ui: crate::config::OpenApiUiConfig { enabled: true },
+        });
+        let app = router(server);
+        let response = app
+            .oneshot(Request::get("/openapi/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            spec["paths"]["/openai/v1/completions"]["post"]["requestBody"]["content"]["application/json"]
-                ["schema"]["$ref"],
-            "#/components/schemas/CompletionRequest"
+            response.headers()["content-type"],
+            "text/html; charset=utf-8"
         );
-        fs::remove_dir_all(d).unwrap()
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("SwaggerUIBundle"));
+        let spec = openapi_document();
+        assert!(spec["paths"]["/openai/v1/completions"].is_object());
+        assert!(spec["paths"]["/cusco/v1/api/pull"].is_object());
+        assert!(spec["paths"]["/cusco/v1/contexts"].is_object());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -4304,6 +4763,7 @@ mod tests {
                     prompt: "one two three".into(),
                     max_tokens: 32,
                     context_id: None,
+                    compaction: None,
                     deadline_ms: None,
                     stop: vec![],
                     raw_continuation: false,
@@ -4351,6 +4811,7 @@ mod tests {
                     model: "m".into(),
                     prompt: "one two".into(),
                     max_tokens: 3,
+                    compaction: None,
                     context_id: None,
                     deadline_ms: None,
                     stop: vec![],
@@ -4411,6 +4872,7 @@ mod tests {
                         model: "m".into(),
                         prompt: "prompt".into(),
                         max_tokens: 8,
+                        compaction: None,
                         context_id: None,
                         deadline_ms: None,
                         stop: vec![],
@@ -4433,6 +4895,7 @@ mod tests {
                     prompt: "prompt".into(),
                     max_tokens: 8,
                     context_id: None,
+                    compaction: None,
                     deadline_ms: Some(5),
                     stop: vec![],
                     raw_continuation: false,
@@ -4478,6 +4941,11 @@ mod tests {
                 active_time_ms: 240_000,
                 stream_buffer: 8,
                 shutdown_grace_ms: 30_000,
+                compaction_enabled: true,
+                compaction_workers: default_compaction_workers(),
+                compaction_declarations: default_compaction_declarations(),
+                compaction_declaration_rate_per_minute: default_compaction_declaration_rate(),
+                compaction_declaration_lifetime_ms: default_compaction_lifetime_ms(),
             }
         );
     }
@@ -4677,7 +5145,7 @@ mod tests {
         );
         let response = app
             .oneshot(
-                Request::delete("/ollama/api/delete")
+                Request::delete("/cusco/v1/api/delete")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"model":"m"}"#))
                     .unwrap(),
@@ -4721,7 +5189,7 @@ mod tests {
             })
             .unwrap();
         let response = router(server)
-            .oneshot(Request::get("/ollama/api/ps").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/cusco/v1/api/ps").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -5045,7 +5513,7 @@ mod tests {
         let active = Arc::new(RequestControl::new());
         start_deadline_watchdogs(&wall, Duration::from_millis(5), Duration::from_secs(1));
         start_deadline_watchdogs(&active, Duration::from_secs(1), Duration::from_millis(5));
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(matches!(wall.check(), Err(Error::Deadline)));
         assert!(matches!(active.check(), Err(Error::Deadline)));
     }
@@ -5079,11 +5547,15 @@ mod tests {
             StreamEvent::Started {
                 request_id: "request".into(),
                 context_id: ContextId::new(),
+                correlation_id: "corr".into(),
+                inference_id: "inf".into(),
+                execution_session_id: "sess".into(),
             },
             false,
         );
-        assert!(started.contains("\"role\":\"assistant\""));
-
+        assert!(started.contains("\"correlation_id\":\"corr\""));
+        assert!(started.contains("\"inference_id\":\"inf\""));
+        assert!(started.contains("\"execution_session_id\":\"sess\""));
         let terminal = StreamEvent::Finished {
             reason: FinishReason::Length,
             usage: Usage {
@@ -5095,8 +5567,12 @@ mod tests {
                 model: "model".into(),
                 model_revision: "revision".into(),
                 context_id: ContextId::new(),
+                compaction_result: None,
                 latency_ms: 1,
                 status: "completed".into(),
+                correlation_id: String::new(),
+                inference_id: String::new(),
+                execution_session_id: String::new(),
             },
         };
         let without_usage = stream_row(WireProtocol::OpenAiChat, terminal.clone(), false);
@@ -5107,5 +5583,437 @@ mod tests {
         let with_usage = stream_row(WireProtocol::OpenAiChat, terminal, true);
         assert!(with_usage.contains("\"usage\""));
         assert!(with_usage.ends_with("data: [DONE]\n\n"));
+    }
+    #[test]
+    fn compaction_declarations_are_context_bound_and_expire() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let context = server.create_context().unwrap();
+        let declaration = server
+            .create_compaction_declaration(CreateCompactionDeclaration {
+                context_id: context.id.0.clone(),
+                strategy_preferences: vec![WINDOW_TAIL_STRATEGY_ID.into()],
+                target_tokens: Some(8),
+                expires_in_ms: 1_000,
+            })
+            .unwrap();
+        assert_eq!(
+            server
+                .compaction_declaration(&declaration.declaration_id)
+                .unwrap(),
+            declaration
+        );
+        assert!(matches!(
+            server.compaction_declaration_for("another-principal", &declaration.declaration_id),
+            Err(Error::Forbidden)
+        ));
+        let mut unauthorized = compacting_request(context.id.clone());
+        unauthorized.scheduling.principal = "another-principal".into();
+        unauthorized.compaction.as_mut().unwrap().declaration_id =
+            Some(declaration.declaration_id.clone());
+        assert!(matches!(
+            server.infer("declaration-owner", unauthorized),
+            Err(Error::Forbidden)
+        ));
+        assert_eq!(server.context(&context.id).unwrap(), context);
+        server
+            .revoke_compaction_declaration_for("local", &declaration.declaration_id)
+            .unwrap();
+        assert!(matches!(
+            server.compaction_declaration(&declaration.declaration_id),
+            Err(Error::BadRequest(message)) if message == "compaction declaration not found"
+        ));
+        let mismatch = CompactionRequest {
+            declaration_id: Some(declaration.declaration_id),
+            ..CompactionRequest::default()
+        };
+        assert_eq!(mismatch.target_tokens, None);
+        drop(server);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compaction_operator_limits_bound_workers_declarations_and_rate() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let mut config = ServerConfig {
+            compaction_workers: 1,
+            compaction_declarations: 1,
+            compaction_declaration_rate_per_minute: 1,
+            compaction_declaration_lifetime_ms: 100,
+            ..ServerConfig::default()
+        };
+        server.configure(config).unwrap();
+        let worker = server.compaction_workers.try_acquire().unwrap();
+        assert!(matches!(
+            server.compaction_workers.try_acquire(),
+            Err(Error::Busy)
+        ));
+        drop(worker);
+        assert!(server.compaction_workers.try_acquire().is_ok());
+
+        let context = server.create_context().unwrap();
+        let declaration = CreateCompactionDeclaration {
+            context_id: context.id.0,
+            strategy_preferences: vec![WINDOW_TAIL_STRATEGY_ID.into()],
+            target_tokens: Some(8),
+            expires_in_ms: 100,
+        };
+        server
+            .create_compaction_declaration_for("principal-a", declaration.clone())
+            .unwrap();
+        assert!(matches!(
+            server.create_compaction_declaration_for("principal-a", declaration.clone()),
+            Err(Error::Busy)
+        ));
+        assert!(matches!(
+            server.create_compaction_declaration_for("principal-b", declaration.clone()),
+            Err(Error::Busy)
+        ));
+
+        config.compaction_enabled = false;
+        server.configure(config).unwrap();
+        assert!(matches!(
+            server.create_compaction_declaration_for("principal-c", declaration),
+            Err(Error::BadRequest(message)) if message == "compaction is disabled"
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compaction_creation_times_prune_stale_principals() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let context = server.create_context().unwrap();
+        let declaration = CreateCompactionDeclaration {
+            context_id: context.id.0,
+            strategy_preferences: vec![WINDOW_TAIL_STRATEGY_ID.into()],
+            target_tokens: Some(8),
+            expires_in_ms: 10_000,
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        {
+            let mut state = server.declarations.lock();
+            state.creation_times.insert(
+                "stale-principal".into(),
+                VecDeque::from(vec![now - 120_000]),
+            );
+            state
+                .creation_times
+                .insert("active-principal".into(), VecDeque::from(vec![now]));
+            state.creation_times.insert(
+                "stale-principal-2".into(),
+                VecDeque::from(vec![now - 120_000]),
+            );
+            state.records.clear();
+        }
+        server
+            .create_compaction_declaration_for("fresh-principal", declaration)
+            .unwrap();
+        let state = server.declarations.lock();
+        assert!(state.creation_times.get("stale-principal").is_none());
+        assert!(state.creation_times.get("stale-principal-2").is_none());
+        assert!(state.creation_times.get("active-principal").is_some());
+        assert!(state.creation_times.get("fresh-principal").is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saturated_compaction_workers_do_not_block_interactive_inference() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let worker = server.compaction_workers.try_acquire().unwrap();
+        let app = router(server);
+        let compact = app
+            .clone()
+            .oneshot(
+                Request::post("/openai/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","prompt":"compact","max_tokens":1,"compaction":{"target_tokens":1}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(compact.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let interactive = app
+            .oneshot(
+                Request::post("/openai/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","prompt":"interactive","max_tokens":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(interactive.status(), StatusCode::OK);
+        drop(worker);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn compacting_request(context_id: ContextId) -> InferRequest {
+        InferRequest {
+            model: "m".into(),
+            prompt: "new question".into(),
+            max_tokens: 2,
+            context_id: Some(context_id),
+            compaction: Some(CompactionRequest {
+                target_tokens: Some(4),
+                ..CompactionRequest::default()
+            }),
+            deadline_ms: None,
+            stop: vec![],
+            raw_continuation: false,
+            sampling: SamplingConfig::default(),
+            scheduling: SchedulingMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn compaction_success_successor_commit() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let source = server
+            .import_context(vec![
+                "<start_of_turn>system".into(),
+                "policy".into(),
+                "<start_of_turn>user".into(),
+                "older question".into(),
+            ])
+            .unwrap();
+        let (response, _) = server
+            .infer("compact-success", compacting_request(source.id.clone()))
+            .unwrap();
+        let generated_text = response.text.clone();
+        assert!(!generated_text.is_empty());
+        let result = response.usage.compaction_result.unwrap();
+        let successor = server.context(&source.id).unwrap();
+        assert!(result.success);
+        assert_eq!(
+            result.selected_strategy_id.as_deref(),
+            Some("window_tail:v1")
+        );
+        assert_eq!(successor.revision, source.revision + 1);
+        assert!(
+            successor
+                .tokens
+                .iter()
+                .any(|token| token.contains("system"))
+        );
+        assert!(successor.tokens.iter().any(|token| token == "new"));
+        assert!(
+            generated_text
+                .split_whitespace()
+                .all(|token| successor.tokens.iter().any(|stored| stored == token))
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compaction_result_payload_for_openai_replay() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let source = server
+            .import_context(vec![
+                "<start_of_turn>system".into(),
+                "policy".into(),
+                "<start_of_turn>user".into(),
+                "older question".into(),
+            ])
+            .unwrap();
+        let (response, _) = server
+            .infer("compact-replay", compacting_request(source.id))
+            .unwrap();
+        let payload = completed_response(
+            WireProtocol::OpenAiCompletion,
+            response,
+            FinishReason::Length,
+        );
+        assert_eq!(
+            payload["cusco"]["compaction_result"]["selected_strategy_id"],
+            "window_tail:v1"
+        );
+        assert_eq!(payload["cusco"]["compaction_result"]["success"], true);
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn compacted_successor_is_evaluated_before_continuation() {
+        let directory = dir();
+        fs::create_dir_all(&directory).unwrap();
+        let model_path = directory.join("m.gguf");
+        fs::write(&model_path, b"model").unwrap();
+        let server = Server::open(
+            directory.join("state.json"),
+            Arc::new(AnonymousAdmin),
+            Arc::new(CompactionProofEngine),
+        )
+        .unwrap();
+        server
+            .register_model(ModelRecord {
+                id: "m".into(),
+                revision: "r1".into(),
+                path: model_path,
+                sha256: hex_digest(b"model"),
+                aliases: Vec::new(),
+                family: "gemma4".into(),
+                size_bytes: 5,
+                epoch: 0,
+            })
+            .unwrap();
+        let source = server
+            .import_context(vec![
+                "<start_of_turn>system".into(),
+                "policy".into(),
+                "<start_of_turn>user".into(),
+                "discard me".into(),
+            ])
+            .unwrap();
+        let (response, _) = server
+            .infer("compaction-proof", compacting_request(source.id.clone()))
+            .unwrap();
+        let successor = server.context(&source.id).unwrap();
+        assert!(response.usage.compaction_result.unwrap().success);
+        assert_eq!(successor.native_tokens, vec![41, 42, 43]);
+        assert!(successor.tokens.iter().any(|token| token == "policy"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepared_compaction_rolls_back_when_continuation_fails() {
+        let directory = dir();
+        fs::create_dir_all(&directory).unwrap();
+        let model_path = directory.join("m.gguf");
+        fs::write(&model_path, b"model").unwrap();
+        let server = Server::open(
+            directory.join("state.json"),
+            Arc::new(AnonymousAdmin),
+            Arc::new(CompactionProofEngine),
+        )
+        .unwrap();
+        server
+            .register_model(ModelRecord {
+                id: "m".into(),
+                revision: "r1".into(),
+                path: model_path,
+                sha256: hex_digest(b"model"),
+                aliases: Vec::new(),
+                family: "gemma4".into(),
+                size_bytes: 5,
+                epoch: 0,
+            })
+            .unwrap();
+        let source = server
+            .import_context(vec![
+                "<start_of_turn>system".into(),
+                "policy".into(),
+                "<start_of_turn>user".into(),
+                "discard me".into(),
+            ])
+            .unwrap();
+        let mut request = compacting_request(source.id.clone());
+        request.prompt = "fail continuation".into();
+        assert!(matches!(
+            server.infer("compaction-rollback", request),
+            Err(Error::State(message)) if message == "continuation failed after compaction"
+        ));
+        assert_eq!(server.context(&source.id).unwrap(), source);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compaction_failure_rolls_back_source_context() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let source = server
+            .import_context(vec!["one".into(), "two".into()])
+            .unwrap();
+        let mut request = compacting_request(source.id.clone());
+        request.compaction.as_mut().unwrap().strategy_preferences = vec!["missing".into()];
+        request.compaction.as_mut().unwrap().fallback_when_no_match =
+            CompactionNoMatchFallback::Reject;
+        assert!(matches!(
+            server.infer("compact-failure", request),
+            Err(Error::BadRequest(_))
+        ));
+        assert_eq!(server.context(&source.id).unwrap(), source);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compaction_cancel_disconnect_race() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let source = server
+            .import_context(vec!["one".into(), "two".into()])
+            .unwrap();
+        server.cancel("compact-cancel");
+        assert!(matches!(
+            server.infer("compact-cancel", compacting_request(source.id.clone())),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(server.context(&source.id).unwrap(), source);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn assert_semantic_fixture(name: &str) {
+        let fixtures: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/phase10_semantic.json")).unwrap();
+        let fixture = &fixtures[name];
+        let tokens = fixture["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|token| token.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let target_tokens = fixture["target_tokens"].as_u64().unwrap() as usize;
+        let proposal = apply_window_tail_strategy(&tokens, target_tokens, &[]).unwrap();
+        for required in fixture["required_fragments"].as_array().unwrap() {
+            let required = required.as_str().unwrap();
+            assert!(
+                proposal
+                    .resulting_tokens
+                    .iter()
+                    .any(|token| token.contains(required)),
+                "fixture {name} lost required fragment {required}"
+            );
+        }
+        let repeated = apply_window_tail_strategy(&tokens, target_tokens, &[]).unwrap();
+        assert_eq!(proposal, repeated, "fixture {name} is not deterministic");
+    }
+
+    #[test]
+    fn semantic_regression_pronoun_continuity() {
+        assert_semantic_fixture("pronoun_continuity");
+    }
+
+    #[test]
+    fn semantic_regression_instruction_retention() {
+        assert_semantic_fixture("instruction_retention");
+    }
+
+    #[test]
+    fn semantic_regression_tool_call_consistency() {
+        assert_semantic_fixture("tool_call_consistency");
+    }
+
+    #[test]
+    fn semantic_regression_followup_fidelity() {
+        assert_semantic_fixture("followup_fidelity");
+    }
+
+    #[test]
+    fn openai_responses_stream_correlates_ids() {
+        let row = stream_row(
+            WireProtocol::OpenAiResponses,
+            StreamEvent::Started {
+                request_id: "transport".into(),
+                context_id: ContextId::new(),
+                correlation_id: "correlation".into(),
+                inference_id: "inference".into(),
+                execution_session_id: "session".into(),
+            },
+            false,
+        );
+        assert!(row.contains("\"correlation_id\":\"correlation\""));
+        assert!(row.contains("\"inference_id\":\"inference\""));
+        assert!(row.contains("\"execution_session_id\":\"session\""));
     }
 }

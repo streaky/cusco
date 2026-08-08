@@ -10,7 +10,7 @@ Keep this `AGENTS.md` up to date whenever development workflows, architecture, s
 
 ## Current state
 
-Phases 1 through 9 are implemented. The real Gemma executor proof demonstrated exact checkpoint continuation. The logical context store and physical manager own shared logical branches, tier capacity, transactional mappings, transfers, and bindings. Phases 5 through 8 add mapped execution, bounded live generation, multi-model residency, resumable execution sessions, priority-aware deficit round-robin with monotonic promotion, and real-GPU acceptance evidence. Phase 9 adds the clean `/openai/v1/*`, `/ollama/api/*`, and `/cusco/v1/*` API cutover, strict compatibility controls, native wire streaming, bounded text-plus-image admission, immutable Hub resolution, metadata-driven execution profiles, a migrated SQLite model catalog, versioned daemon configuration, and production Compose packaging. Only model identity, configuration, aliases, and lifecycle operation records survive restart in the v1 profile; contexts and native execution state are disposable.
+Phases 1 through 10 are implemented. The real Gemma executor proof demonstrated exact checkpoint continuation. The logical context store and physical manager own shared logical branches, tier capacity, transactional mappings, transfers, and bindings. Phases 5 through 8 add mapped execution, bounded live generation, multi-model residency, resumable execution sessions, priority-aware deficit round-robin with monotonic promotion, and real-GPU acceptance evidence. Phase 9 adds the clean `/openai/v1/*` and `/cusco/v1/*` API cutover, strict compatibility controls, native wire streaming, bounded text-plus-image admission, immutable Hub resolution, metadata-driven execution profiles, a migrated SQLite model catalog, versioned daemon configuration, and production Compose packaging. OpenAI is the sole inference surface; `/cusco/v1/api/*` is a bounded Ollama-compatible model-management profile without chat or generation, and no standalone `/ollama/*` routes exist. Phase 10 adds request-tied deterministic `window_tail` context compaction, bounded declarations, atomic successor publication, and OpenAI replay metadata. Only model identity, configuration, aliases, and lifecycle operation records survive restart in the v1 profile; contexts and native execution state are disposable.
 
 The repository currently contains:
 
@@ -35,7 +35,7 @@ The server dynamically admits and reuses multiple model epochs within configured
 - Local builds must support CUDA architectures `sm_61` and `sm_70`. Use `CUSCO_CUDA_ARCHITECTURES="61;70"` for normal local builds.
 - Reserve the broad, full CUDA architecture build for production releases. Do not spend local development time compiling every supported CUDA target unless release validation specifically requires it.
 - `llama.cpp-version.txt` is the sole source of truth for the llama.cpp version. It contains a release tag only. Build and fetch tooling must read it; never duplicate the tag or record the corresponding commit hash.
-- Keep llama.cpp changes behind the versioned C ABI in `native/include/cusco_executor.h` (currently ABI version 6). Rust should not depend directly on unstable llama.cpp internals.
+- Keep llama.cpp changes behind the versioned C ABI in `native/include/cusco_executor.h` (currently ABI version 7). Rust should not depend directly on unstable llama.cpp internals.
 - Model files and generated proof results are local artifacts and must not be committed.
 
 A normal local image build is:
@@ -49,10 +49,10 @@ Select the proof GPU with `CUSCO_GPU_DEVICE_ID`; do not assume a particular host
 ## Testing and verification
 
 - Write behavioral tests alongside permanent changes.
-- Every measured Rust source file must maintain at least 80% line coverage. `tools/coverage.sh` runs the tests and enforces the per-file threshold.
-- Run the GPU-less coverage path with `docker compose -f compose.test.yaml run --rm test`.
-- Phase 6 lifecycle or live-executor changes require `CUSCO_GPU_DEVICE_ID=<index> tools/phase6c-report.sh`; it runs coverage plus the executor, mapped, cancellation/deadline/overload, graceful-shutdown, and restart gates and writes `results/phase6c-server.json`.
-- Phase 7 residency or model-lifecycle changes require `CUSCO_GPU_DEVICE_ID=<index> tools/phase7-report.sh`; it runs coverage plus the multi-model load/reuse/reload/remove/restart matrix and writes `results/phase7-server.json`.
+ - Every measured Rust source file must maintain at least 80% line coverage. `tools/coverage.sh` runs the tests and enforces the per-file threshold.
+ - Run the GPU-less coverage path with `docker compose -f compose.test.yaml run --rm test`.
+ - The unified real-model API smoke gate is `docker compose -f compose.test.yaml run --rm api-smoke`; it exercises the primary OpenAI, Cusco context/compaction, and status APIs and writes `results/smoke-report.json` with request, token, and latency statistics.
+ - Focused executor, mapped-execution, and scheduler proofs remain available through their Compose services when changing those subsystems.
 - Real-model tests and proofs use `hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf`. Run the Compose `model-fetch` service before them; it reuses the persistent host cache under `${CUSCO_MODEL_DIR:-./models}/cache`, validates the cached artifact, and only downloads when it is absent or invalid. The stable test path is `models/gemma-4-e2b-it.gguf`. Executor-boundary changes require the real model proof, not only deterministic model-free tests, and must write machine-readable evidence under `results/`.
 - Mapped-executor changes require `docker compose -f compose.test.yaml run --rm mapped-proof`; it writes staged-versus-mapped evidence to `results/phase5.json`.
 - Verify failure behavior transactionally: cancellation, preparation failure, transfer failure, validation failure, and commit failure must leave the prior binding usable.

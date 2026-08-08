@@ -55,71 +55,34 @@ services:
       - cargo-git:/root/.cargo/git
       - cargo-target:/work/target
     deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
-  phase6c-report:
-    build: *test-build
-    command:
-      - sh
-      - -c
-      - >-
-        chmod a+rwx /results &&
-        nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader
-        > /results/phase6c-gpu.csv &&
-        cargo run -p cusco -- serve /models/gemma-4-e2b-it.gguf --listen 0.0.0.0:8080
-        --state /results/phase6c-state.json
-        --bearer-token phase6c-report-token
-    environment:
-      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
-      LD_LIBRARY_PATH: "/opt/llama-build/bin"
-    ports: ["127.0.0.1:${CUSCO_PHASE6C_REPORT_PORT:-18082}:8080"]
-    volumes:
-      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
-      - "${CUSCO_RESULT_DIR:-./results}:/results"
-      - cargo-registry:/root/.cargo/registry
-      - cargo-git:/root/.cargo/git
-      - cargo-target:/work/target
-    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
-  phase7-report:
-    build: *test-build
-    command:
-      - sh
-      - -c
-      - >-
-        umask 000 && chmod a+rwx /results &&
-        nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader
-        > /results/phase7-gpu.csv &&
-        cargo run -p cusco -- serve /models/gemma-4-e2b-it.gguf --listen 0.0.0.0:8080
-        --state /results/phase7-state.json
-        --spill-directory /results/phase7-spill
-        --bearer-token phase7-report-token
-    environment:
-      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
-      LD_LIBRARY_PATH: "/opt/llama-build/bin"
-    ports: ["127.0.0.1:${CUSCO_PHASE7_REPORT_PORT:-18083}:8080"]
-    volumes:
-      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
-      - "${CUSCO_RESULT_DIR:-./results}:/results"
-      - cargo-registry:/root/.cargo/registry
-      - cargo-git:/root/.cargo/git
-      - cargo-target:/work/target
-    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
 
-  phase8-proof:
+  api-smoke:
+    depends_on:
+      model-fetch:
+        condition: service_completed_successfully
     build: *test-build
     command:
       - sh
       - -c
       - >-
-        umask 000 && chmod a+rwx /results &&
-        nvidia-smi --query-gpu=uuid,name,compute_cap,driver_version
-        --format=csv,noheader > /results/phase8-gpu.csv &&
-        cargo run -p cusco -- scheduler-proof
-        /models/gemma-4-e2b-it.gguf
-        --workload /work/config/phase8-workload.json
-        --output /results/phase8-server.json
+        mkdir -p /data/db /data/spill /data/user-models /data/models &&
+        printf 'models:\n  - {name: gemma-4-e2b-it, path: gemma-4-e2b-it.gguf}\n' > /data/user.yaml &&
+        CUSCO_BEARER_TOKEN=smoke-report-token cargo run -p cusco -- serve
+        --config /work/config/config.yaml &
+        server=$$!; trap 'kill $$server' EXIT;
+        until curl -sf -H 'Authorization: Bearer smoke-report-token'
+        http://127.0.0.1:8080/cusco/v1/status >/dev/null; do
+        kill -0 $$server || exit 1; sleep 1; done;
+        CUSCO_SMOKE_BASE_URL=http://127.0.0.1:8080
+        CUSCO_SMOKE_OUTPUT=/results/smoke-report.json
+        CUSCO_SMOKE_TOKEN=smoke-report-token python3 tools/smoke-report.py
     environment:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
+      CUSCO_BEARER_TOKEN: smoke-report-token
     volumes:
+      - "${CUSCO_MODEL_DIR:-./models}:/data/user-models"
+      - "${CUSCO_MODEL_DIR:-./models}:/data/models"
       - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
       - "${CUSCO_RESULT_DIR:-./results}:/results"
       - cargo-registry:/root/.cargo/registry

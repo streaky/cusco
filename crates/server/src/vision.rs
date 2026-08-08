@@ -1,4 +1,4 @@
-use crate::VisionConfig;
+use crate::config::VisionConfig;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{AnimationDecoder, ImageDecoder, ImageFormat};
 use parking_lot::Mutex;
@@ -140,17 +140,29 @@ impl ImageAdmission {
             ImageFormat::Jpeg => {
                 let decoder = image::codecs::jpeg::JpegDecoder::new(Cursor::new(&bytes))
                     .map_err(|_| VisionError::malformed("invalid JPEG image"))?;
-                (decoder.dimensions().0, decoder.dimensions().1, decoder.color_type().has_alpha())
+                (
+                    decoder.dimensions().0,
+                    decoder.dimensions().1,
+                    decoder.color_type().has_alpha(),
+                )
             }
             ImageFormat::Png => {
                 let decoder = image::codecs::png::PngDecoder::new(Cursor::new(&bytes))
                     .map_err(|_| VisionError::malformed("invalid PNG image"))?;
-                (decoder.dimensions().0, decoder.dimensions().1, decoder.color_type().has_alpha())
+                (
+                    decoder.dimensions().0,
+                    decoder.dimensions().1,
+                    decoder.color_type().has_alpha(),
+                )
             }
             ImageFormat::WebP => {
                 let decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(&bytes))
                     .map_err(|_| VisionError::malformed("invalid WebP image"))?;
-                (decoder.dimensions().0, decoder.dimensions().1, decoder.color_type().has_alpha())
+                (
+                    decoder.dimensions().0,
+                    decoder.dimensions().1,
+                    decoder.color_type().has_alpha(),
+                )
             }
             ImageFormat::Gif => {
                 let frames = image::codecs::gif::GifDecoder::new(Cursor::new(&bytes))
@@ -231,6 +243,7 @@ impl ImageAdmission {
 
 mod tests {
     use super::*;
+    use crate::config::{ByteSize, VisionConfig};
     fn admission() -> ImageAdmission {
         ImageAdmission::new(VisionConfig::default())
     }
@@ -336,7 +349,7 @@ mod tests {
             "total_pixels"
         );
         let mut config = VisionConfig::default();
-        config.retention_capacity = crate::ByteSize(1);
+        config.retention_capacity = ByteSize(1);
         assert_eq!(
             ImageAdmission::new(config)
                 .admit_base64("image/png", &png)

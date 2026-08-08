@@ -86,6 +86,8 @@ pub struct DaemonConfig {
     pub bearer_token: Option<String>,
     #[serde(default)]
     pub http_debug: HttpDebugLevel,
+    #[serde(default)]
+    pub openapi: OpenApiConfig,
     pub paths: DataPaths,
     pub execution: ExecutionConfig,
     #[serde(default)]
@@ -94,6 +96,20 @@ pub struct DaemonConfig {
     pub scheduler: SchedulerPolicyConfig,
     #[serde(default)]
     pub vision: VisionConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenApiConfig {
+    #[serde(default)]
+    pub ui: OpenApiUiConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenApiUiConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -275,6 +291,7 @@ mod tests {
             unsafe_public_unauthenticated: false,
             bearer_token: None,
             http_debug: HttpDebugLevel::Off,
+            openapi: OpenApiConfig::default(),
             paths: DataPaths {
                 database: "db".into(),
                 models: "models".into(),
