@@ -35,7 +35,7 @@ The server dynamically admits and reuses multiple model epochs within configured
 - Local builds must support CUDA architectures `sm_61` and `sm_70`. Use `CUSCO_CUDA_ARCHITECTURES="61;70"` for normal local builds.
 - Reserve the broad, full CUDA architecture build for production releases. Do not spend local development time compiling every supported CUDA target unless release validation specifically requires it.
 - `llama.cpp-version.txt` is the sole source of truth for the llama.cpp version. It contains a release tag only. Build and fetch tooling must read it; never duplicate the tag or record the corresponding commit hash.
-- Keep llama.cpp changes behind the versioned C ABI in `native/include/cusco_executor.h` (currently ABI version 8). Rust should not depend directly on unstable llama.cpp internals.
+- Keep llama.cpp changes behind the versioned C ABI in `native/include/cusco_executor.h` (currently ABI version 9). Rust should not depend directly on unstable llama.cpp internals.
 - Model files and generated proof results are local artifacts and must not be committed.
 
 A normal local image build is:

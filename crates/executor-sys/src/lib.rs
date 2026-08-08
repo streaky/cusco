@@ -5,6 +5,10 @@ pub struct CuscoExecutor {
     _private: [u8; 0],
 }
 #[repr(C)]
+pub struct CuscoRepresentation {
+    _private: [u8; 0],
+}
+#[repr(C)]
 pub struct CuscoCheckpoint {
     _private: [u8; 0],
 }
@@ -30,6 +34,16 @@ pub struct Capabilities {
     pub n_vocab: c_int,
     pub has_mapped_execution: c_uint,
     pub max_mappings: c_uint,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RepresentationDescriptor {
+    pub identity: c_ulonglong,
+    pub component_mask: c_uint,
+    pub tier: c_uint,
+    pub represented_position: usize,
+    pub serialized_bytes: usize,
+    pub completion_fence: c_ulonglong,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -121,26 +135,41 @@ unsafe extern "C" {
         executor: *mut CuscoExecutor,
         prepared: *mut CuscoPreparedRestore,
     ) -> c_int;
+    pub fn cusco_executor_active_representation(
+        executor: *mut CuscoExecutor,
+        out: *mut *mut CuscoRepresentation,
+    ) -> c_int;
+    pub fn cusco_representation_retain(representation: *mut CuscoRepresentation);
+    pub fn cusco_representation_release(representation: *mut CuscoRepresentation);
+    pub fn cusco_representation_identity(
+        representation: *const CuscoRepresentation,
+    ) -> c_ulonglong;
+    pub fn cusco_representation_describe(
+        representation: *const CuscoRepresentation,
+        out: *mut RepresentationDescriptor,
+    ) -> c_int;
     pub fn cusco_executor_prepare_mapping_fork(
         executor: *mut CuscoExecutor,
-        source_mapping: c_uint,
+        source: *const CuscoRepresentation,
         out: *mut *mut CuscoPreparedMapping,
     ) -> c_int;
     pub fn cusco_prepared_mapping_free(prepared: *mut CuscoPreparedMapping);
     pub fn cusco_executor_commit_mapping(
         executor: *mut CuscoExecutor,
         prepared: *mut CuscoPreparedMapping,
-        mapping: *mut c_uint,
+        out: *mut *mut CuscoRepresentation,
     ) -> c_int;
-    pub fn cusco_executor_activate_mapping(executor: *mut CuscoExecutor, mapping: c_uint) -> c_int;
-    pub fn cusco_executor_remove_mapping(executor: *mut CuscoExecutor, mapping: c_uint) -> c_int;
+    pub fn cusco_executor_activate_mapping(
+        executor: *mut CuscoExecutor,
+        representation: *const CuscoRepresentation,
+    ) -> c_int;
     pub fn cusco_executor_mapping_state_size(
         executor: *mut CuscoExecutor,
-        mapping: c_uint,
+        representation: *const CuscoRepresentation,
     ) -> usize;
     pub fn cusco_executor_export_mapping(
         executor: *mut CuscoExecutor,
-        mapping: c_uint,
+        representation: *const CuscoRepresentation,
         buffer: *mut u8,
         capacity: usize,
         written: *mut usize,
@@ -151,9 +180,11 @@ unsafe extern "C" {
         buffer: *const u8,
         size: usize,
         position: usize,
-        mapping: *mut c_uint,
+        out: *mut *mut CuscoRepresentation,
     ) -> c_int;
-    pub fn cusco_executor_active_mapping(executor: *const CuscoExecutor) -> c_uint;
+    pub fn cusco_executor_active_mapping_identity(
+        executor: *const CuscoExecutor,
+    ) -> c_ulonglong;
     pub fn cusco_executor_mapping_count(executor: *const CuscoExecutor) -> usize;
     pub fn cusco_executor_reference_switches(executor: *const CuscoExecutor) -> c_ulonglong;
     pub fn cusco_executor_mapping_fork_bytes_copied(

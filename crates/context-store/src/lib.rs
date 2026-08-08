@@ -360,19 +360,17 @@ impl ContextStore {
         })
     }
 
-    pub fn commit_publication(
-        &mut self,
-        prepared: PreparedPublication,
-    ) -> Result<Arc<EvaluatedPrefix>, Error> {
+    /// Validate that a prepared publication can commit without mutating the store.
+    pub fn validate_publication(&self, prepared: &PreparedPublication) -> Result<(), Error> {
         let context = self
             .contexts
             .get(&prepared.context)
             .ok_or(Error::ContextNotFound)?;
-        let current = context.evaluated;
-        if current != prepared.expected_current || context.revision != prepared.expected_revision {
+        if context.evaluated != prepared.expected_current
+            || context.revision != prepared.expected_revision
+        {
             return Err(Error::PublicationConflict);
         }
-        let context = self.contexts.get(&prepared.context).unwrap();
         if context.model_epoch != prepared.mapping.model_epoch
             || context.adapter_epoch != prepared.mapping.adapter_epoch
         {
@@ -385,12 +383,29 @@ impl ContextStore {
         ) {
             return Err(Error::PublicationConflict);
         }
-        let id = prepared.mapping.id;
         if let Some(existing) = self.mappings.get(&prepared.mapping.id) {
             if *existing.mapping != prepared.mapping {
                 return Err(Error::IdentityConflict);
             }
-        } else {
+        } else if prepared
+            .mapping
+            .parent
+            .is_some_and(|parent| !self.mappings.contains_key(&parent))
+        {
+            return Err(Error::InvalidDependency);
+        }
+        Ok(())
+    }
+
+    pub fn commit_publication(
+        &mut self,
+        prepared: PreparedPublication,
+    ) -> Result<Arc<EvaluatedPrefix>, Error> {
+        self.validate_publication(&prepared)?;
+        let context = self.contexts.get(&prepared.context).unwrap();
+        let current = context.evaluated;
+        let id = prepared.mapping.id;
+        if !self.mappings.contains_key(&prepared.mapping.id) {
             if let Some(parent) = prepared.mapping.parent {
                 self.mappings
                     .get_mut(&parent)

@@ -6,10 +6,12 @@
 extern "C" {
 #endif
 
-#define CUSCO_EXECUTOR_ABI_VERSION 8u
+#define CUSCO_EXECUTOR_ABI_VERSION 9u
+
+typedef struct cusco_executor cusco_executor;
+typedef struct cusco_representation cusco_representation;
 
 /* Opaque, uniquely owned handles. Only the cancellation signal is thread-safe. */
-typedef struct cusco_executor cusco_executor;
 typedef struct cusco_checkpoint cusco_checkpoint;
 typedef struct cusco_prepared_restore cusco_prepared_restore;
 typedef struct cusco_prepared_mapping cusco_prepared_mapping;
@@ -102,30 +104,40 @@ void cusco_prepared_restore_free(cusco_prepared_restore *);
  * valid. CUSCO_ROLLBACK_FAILED reports that restoring the prior binding also failed. */
 cusco_status cusco_executor_commit_restore(cusco_executor *, cusco_prepared_restore * prepared);
 
-/* A mapped execution binding is a llama.cpp sequence that remains resident in
- * the executor context. Preparing a fork allocates and copies sequence
- * references, but it is invisible to activation until commit publishes it.
- * Activation changes only the block-table reference used by subsequent decode
- * calls; it does not serialize or restore checkpoint bytes. Fork, export, and
- * import byte counters report payload bytes actually copied by this shim. */
+/* Published physical state is exposed only through opaque, reference-counted
+ * handles. Handles are executor-owned and keep a stable diagnostic identity;
+ * release is the only destruction operation. */
+typedef struct {
+    uint64_t identity;
+    uint32_t component_mask;
+    uint32_t tier;
+    size_t represented_position;
+    size_t serialized_bytes;
+    uint64_t completion_fence;
+} cusco_representation_descriptor;
+cusco_status cusco_executor_active_representation(
+    cusco_executor *, cusco_representation ** out);
+void cusco_representation_retain(cusco_representation *);
+void cusco_representation_release(cusco_representation *);
+uint64_t cusco_representation_identity(const cusco_representation *);
+cusco_status cusco_representation_describe(
+    const cusco_representation *, cusco_representation_descriptor * out);
 cusco_status cusco_executor_prepare_mapping_fork(
-    cusco_executor *, uint32_t source_mapping, cusco_prepared_mapping ** out);
+    cusco_executor *, const cusco_representation *, cusco_prepared_mapping ** out);
 void cusco_prepared_mapping_free(cusco_prepared_mapping *);
 cusco_status cusco_executor_commit_mapping(
-    cusco_executor *, cusco_prepared_mapping *, uint32_t * mapping);
-cusco_status cusco_executor_activate_mapping(cusco_executor *, uint32_t mapping);
-cusco_status cusco_executor_remove_mapping(cusco_executor *, uint32_t mapping);
-/* Serialize one published sequence mapping for bounded host/storage spill.
- * Export is non-mutating. Import publishes a new mapping only after the
- * complete payload has been restored; remove the old mapping separately. */
-size_t cusco_executor_mapping_state_size(cusco_executor *, uint32_t mapping);
+    cusco_executor *, cusco_prepared_mapping *, cusco_representation ** out);
+cusco_status cusco_executor_activate_mapping(
+    cusco_executor *, const cusco_representation *);
+size_t cusco_executor_mapping_state_size(
+    cusco_executor *, const cusco_representation *);
 cusco_status cusco_executor_export_mapping(
-    cusco_executor *, uint32_t mapping, uint8_t * buffer, size_t capacity,
-    size_t * written, size_t * position);
+    cusco_executor *, const cusco_representation *, uint8_t * buffer,
+    size_t capacity, size_t * written, size_t * position);
 cusco_status cusco_executor_import_mapping(
     cusco_executor *, const uint8_t * buffer, size_t size, size_t position,
-    uint32_t * mapping);
-uint32_t cusco_executor_active_mapping(const cusco_executor *);
+    cusco_representation ** out);
+uint64_t cusco_executor_active_mapping_identity(const cusco_executor *);
 size_t cusco_executor_mapping_count(const cusco_executor *);
 uint64_t cusco_executor_reference_switches(const cusco_executor *);
 uint64_t cusco_executor_mapping_fork_bytes_copied(const cusco_executor *);

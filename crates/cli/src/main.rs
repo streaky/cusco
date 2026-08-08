@@ -719,23 +719,23 @@ fn representation_proof(
         final_boundary + 1
     );
 
-    let mut active = cusco_executor::MappingId(0);
+    let mut active = executor.active_representation()?;
     let mut cursor = 0usize;
     let mut boundaries = Vec::with_capacity(workload.represented_prefix_tokens.len());
     for &represented_prefix_tokens in &workload.represented_prefix_tokens {
         executor.decode(&tokens[cursor..represented_prefix_tokens])?;
         let before = executor.mapping_metrics();
         let publication_started = Instant::now();
-        let prepared = executor.prepare_mapping_fork(active)?;
+        let prepared = executor.prepare_mapping_fork(&active)?;
         let successor = executor.commit_mapping(prepared)?;
         let publication_ns = publication_started.elapsed().as_nanos();
         let after = executor.mapping_metrics();
         let fork_bytes_copied = after.fork_bytes_copied - before.fork_bytes_copied;
 
         let continuation_input_token = tokens[represented_prefix_tokens];
-        executor.activate_mapping(active)?;
+        executor.activate_mapping(&active)?;
         let source = executor.decode(&[continuation_input_token])?;
-        executor.activate_mapping(successor)?;
+        executor.activate_mapping(&successor)?;
         let successor_decode = executor.decode(&[continuation_input_token])?;
         let token_equal = source.token == successor_decode.token;
         let logits_equal = logits_identical(&source.logits, &successor_decode.logits);
@@ -753,8 +753,8 @@ fn representation_proof(
             "represented_prefix_tokens": represented_prefix_tokens,
             "publication_ns": publication_ns,
             "fork_bytes_copied": fork_bytes_copied,
-            "source_mapping": active.0,
-            "successor_mapping": successor.0,
+            "source_mapping": active.identity(),
+            "successor_mapping": successor.identity(),
             "continuation_input_token": continuation_input_token,
             "next_token": successor_decode.token,
             "token_equal": token_equal,
@@ -766,7 +766,7 @@ fn representation_proof(
 
     let movement_before = executor.mapping_metrics();
     let export_started = Instant::now();
-    let exported = executor.export_mapping(active)?;
+    let exported = executor.export_mapping(&active)?;
     let export_ns = export_started.elapsed().as_nanos();
     let after_export = executor.mapping_metrics();
     let import_started = Instant::now();
@@ -774,9 +774,9 @@ fn representation_proof(
     let import_ns = import_started.elapsed().as_nanos();
     let after_import = executor.mapping_metrics();
     let movement_token = tokens[cursor];
-    executor.activate_mapping(active)?;
+    executor.activate_mapping(&active)?;
     let resident = executor.decode(&[movement_token])?;
-    executor.activate_mapping(imported)?;
+    executor.activate_mapping(&imported)?;
     let restored = executor.decode(&[movement_token])?;
     let movement_token_equal = resident.token == restored.token;
     let movement_logits_equal = logits_identical(&resident.logits, &restored.logits);
@@ -876,9 +876,10 @@ fn mapped_proof(
         executor.commit_restore(prepared)?;
     }
     let staged_restore_ns = staged_started.elapsed().as_nanos();
+    let source = executor.active_representation()?;
     let mut mappings = Vec::with_capacity(4);
     for _ in 0..4 {
-        let prepared = executor.prepare_mapping_fork(cusco_executor::MappingId(0))?;
+        let prepared = executor.prepare_mapping_fork(&source)?;
         mappings.push(executor.commit_mapping(prepared)?);
     }
     let continuation = *tokens.last().unwrap();
@@ -887,7 +888,7 @@ fn mapped_proof(
     let mut activation_ns = 0u128;
     for mapping in mappings {
         let activation_started = Instant::now();
-        executor.activate_mapping(mapping)?;
+        executor.activate_mapping(&mapping)?;
         activation_ns += activation_started.elapsed().as_nanos();
         let decoded = executor.decode(&[continuation])?;
         if let Some((token, logits)) = &expected {
@@ -898,7 +899,7 @@ fn mapped_proof(
         } else {
             expected = Some((decoded.token, decoded.logits.clone()));
         }
-        results.push(json!({"mapping": mapping.0, "next_token": decoded.token}));
+        results.push(json!({"mapping": mapping.identity(), "next_token": decoded.token}));
     }
     let metrics = executor.mapping_metrics();
     let artifact = json!({
