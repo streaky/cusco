@@ -241,6 +241,17 @@ The ABI should distinguish three operations that may collapse differently in sta
 3. **Executor binding construction:** combine validated logical state and completed physical representations into a candidate binding that the executor can publish atomically.
 In Approach A, preparation resolves or creates opaque native state while binding construction publishes an opaque candidate. A future B1 implementation may resolve existing native-allocated blocks and publish a block table behind the same Rust-owned transaction. Native code may fuse internal copies where useful, but the logical operation remains prepare, validate, commit, or abort.
 
+The current Approach A mapped path implements that ordering under the
+executor-owned mapped-state lock. Ordinary block publication creates an opaque,
+reference-only snapshot of the active llama sequence and does not activate a new
+continuation mapping; the request stays on one working branch. Activation of a
+fork is reserved for a request that genuinely branches from a cached immutable
+snapshot. Physical-manager binding and block-table replacement is a single
+fallible commit whose validation and allocation precede mutation, after which
+logical publication is the infallible linearization point. Authoritative native
+allocation descriptors and any measured B1 block composition remain separate
+capacity and scaling work.
+
 ## External API adapter architecture
 
 External compatibility is a shim layer over a protocol-neutral application API, not a set of alternate request paths wired directly into scheduling or the executor. To avoid confusion with the native C ABI shim, this document calls these modules **protocol adapters**.

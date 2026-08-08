@@ -377,6 +377,64 @@ impl PhysicalManager {
         self.metrics.mapped_publications += 1;
         Ok(id)
     }
+    /// Atomically commits a prepared binding and its executor-facing block table.
+    ///
+    /// Every fallible validation and table allocation completes before the active
+    /// binding is replaced, so an error leaves the prior binding and table intact.
+    pub fn commit_mapped_transition(
+        &mut self,
+        transition: PreparedTransitionId,
+        current_revision: u64,
+        executor_mapping: u32,
+    ) -> Result<(ActiveBindingId, DeviceBlockTableId), Error> {
+        let prepared = self
+            .transitions
+            .get(&transition)
+            .ok_or(Error::TransitionNotFound)?;
+        if prepared.revision != current_revision {
+            return Err(Error::StaleRevision);
+        }
+        for transfer in &prepared.transfers {
+            let transfer = &self.transfers[transfer];
+            if !transfer.completed {
+                return Err(Error::TransferPending);
+            }
+            if !transfer.success {
+                return Err(Error::TransferFailed);
+            }
+        }
+        let blocks = prepared
+            .representations
+            .iter()
+            .map(|id| {
+                let representation = &self.representations[id];
+                if !representation.device {
+                    return Err(Error::TransferPending);
+                }
+                Ok(DeviceBlock {
+                    representation: *id,
+                    component: representation.component,
+                    bytes: representation.bytes,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let context = prepared.context;
+        let mapping = prepared.mapping;
+        let table_id = DeviceBlockTableId(self.id());
+        let binding = self.commit_transition(transition, current_revision)?;
+        self.block_tables.insert(
+            context,
+            DeviceBlockTable {
+                id: table_id,
+                binding,
+                mapping,
+                executor_mapping,
+                blocks,
+            },
+        );
+        self.metrics.mapped_publications += 1;
+        Ok((binding, table_id))
+    }
 
     pub fn device_block_table(&self, context: LogicalContextId) -> Option<&DeviceBlockTable> {
         self.block_tables.get(&context)
@@ -1207,6 +1265,7 @@ mod tests {
             .unwrap();
         assert_eq!(class, TransitionClass::Recompute);
         assert_eq!(manager.transition_class(transition), Some(class));
+
         assert!(transfers.is_empty());
         assert_eq!(
             manager.commit_transition(transition, 1),
@@ -1223,6 +1282,34 @@ mod tests {
             manager.release_logical_reference(rep).unwrap();
             assert!(manager.representation(rep).is_none());
         }
+    }
+    #[test]
+    fn mapped_commit_failure_preserves_prior_binding_and_table() {
+        let mut manager = PhysicalManager::new(Capacity {
+            device_bytes: 64,
+            host_bytes: 64,
+        });
+        let first = register_composite(&mut manager, mapping(1), Tier::Device, 2);
+        let (initial, _, _) = manager
+            .prepare_transition(context(1), 1, mapping(1), 32, all(), &first, false)
+            .unwrap();
+        let (binding, table) = manager.commit_mapped_transition(initial, 1, 7).unwrap();
+
+        let candidate = register_composite(&mut manager, mapping(2), Tier::Host, 2);
+        let (pending, _, transfers) = manager
+            .prepare_transition(context(1), 2, mapping(2), 32, all(), &candidate, false)
+            .unwrap();
+        assert!(!transfers.is_empty());
+        assert_eq!(
+            manager.commit_mapped_transition(pending, 2, 8),
+            Err(Error::TransferPending)
+        );
+        assert_eq!(
+            manager.active_binding(context(1)),
+            Some((binding, mapping(1)))
+        );
+        assert_eq!(manager.device_block_table(context(1)).unwrap().id, table);
+        manager.abort_transition(pending).unwrap();
     }
 
     #[test]

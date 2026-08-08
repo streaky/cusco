@@ -81,14 +81,23 @@ the physical transition and device table, so a later failure could expose a
 logical successor without an executable binding.
 
 The ownership cutover now validates the immutable logical prepared publication
-before mutation, completes and commits the physical transition, publishes the
-device table, and only then linearizes the logical successor while
-`MappedState` is exclusively locked. The final logical commit repeats validation
-and is infallible under that lock. Focused context-store publication-conflict
-tests and the mapped-engine prior-mapping failure test cover the boundary. The
-remaining work is to replace the physical manager's projected representation
-records with authoritative native descriptors and fences; atomic ordering no
-longer makes those records more truthful than their source.
+before mutation and atomically commits the physical binding plus device table
+before it linearizes the logical successor while `MappedState` is exclusively
+locked. The final logical commit repeats validation and is infallible under that
+lock. Every fallible physical validation and table-allocation step completes
+before the prior binding is replaced, and focused physical-manager,
+context-store, and mapped-engine failure tests verify that rejected publication
+leaves the prior binding and table usable.
+
+Ordinary block publication now snapshots the active native representation
+without switching execution to the snapshot; the request continues on its one
+working branch, and only a genuine request branch activates a fork. For the
+current llama sequence implementation this snapshot is a reference-only
+`llama_memory_seq_cp`, so it copies no KV payload. The remaining work is to
+replace projected physical records with authoritative native descriptors and,
+if measured metadata traversal or coarse eviction warrants it, evolve to B1
+native blocks. Atomic ordering does not make the current projected records more
+truthful than their source.
 ### C4. Mapped capacity accounting is fictitious and cumulative
 
 **Evidence**
@@ -305,11 +314,20 @@ Everything below depends on the selected Approach A contract. Capacity cannot be
 
 Lookup is indexed by model epoch, adapter epoch, and represented length, searches deterministically from the longest eligible boundary, and confirms both the branch digest and literal tokens without allocation. Logical chunks remain independent of executor allocation geometry, preserving the Approach A contract and its B1 evolution path. Long-context scaling measurements remain to be added to the reusable benchmark harness, but the storage and identity cutover itself is complete.
 
-### 4. Rebuild mapped publication as one atomic transaction
+### 4. Rebuild mapped publication as one atomic transaction — implemented for Approach A
 
-Implement physical preparation and binding construction against the new logical/physical contracts. A publication should prepare all required representations, validate lineage and capacity, construct the candidate executor binding, and only then atomically publish both logical and physical state. Every failure and cancellation path must leave the previous binding executable.
+Mapped publication now prepares and validates the logical successor without
+mutation, completes transfers, and commits the physical binding and device table
+atomically before the infallible logical linearization point. Allocation,
+transfer, validation, and commit failures preserve the prior executable binding.
 
-At the same time, remove routine full-sequence forks from ordinary block publication. Fork native state only for a genuine branch if that remains necessary, or publish reference/block-table changes without copying KV state. This step should close the current logical-before-physical commit gap and the mapped-execution zero-copy fiction together; fixing either in isolation would likely be discarded by the other.
+Routine publication no longer switches continuation onto a new native mapping:
+it snapshots the active sequence by reference and leaves the request on its one
+working branch. A native fork is activated only when a request genuinely
+branches from a cached mapping. The current llama sequence snapshot still has
+coarse sequence-level metadata traversal and eviction behavior; measured
+pressure there is the explicit trigger for the B1 native-block evolution, not a
+reason to restore KV-copying publication.
 
 ### 5. Make capacity and operating points authoritative
 

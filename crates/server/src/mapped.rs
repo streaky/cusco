@@ -467,7 +467,7 @@ impl MappedSession {
             .executor
             .active_representation()
             .map_err(state_error)?;
-        self.active_mapping = Some(fork_and_activate(&mut state.executor, &source)?);
+        self.active_mapping = Some(fork_for_request_branch(&mut state.executor, &source)?);
         self.prefill.mapping_activation_ns = elapsed_ns(activation_started);
         let transfer_after = state.physical.metrics().transfer_bytes;
         self.logical_context = Some(logical_context);
@@ -533,24 +533,21 @@ impl MappedSession {
         state.metrics.decoded_tokens += charged as u64;
         self.evaluated = end;
         if self.evaluated % self.profile.block_size == 0 {
+            let snapshot = snapshot_active_mapping(
+                &mut state.executor,
+                self.active_mapping
+                    .as_ref()
+                    .expect("prepared mapping exists"),
+            )?;
             self.parent = Some(publish_block(
                 &mut state,
                 &self.profile,
                 self.logical_context.expect("prepared context exists"),
                 self.evaluated,
                 self.parent,
-                self.active_mapping
-                    .as_ref()
-                    .expect("prepared mapping exists")
-                    .clone(),
+                snapshot,
                 self.next.as_ref().expect("decode result exists"),
             )?);
-            let source = self
-                .active_mapping
-                .as_ref()
-                .expect("published mapping exists")
-                .clone();
-            self.active_mapping = Some(fork_and_activate(&mut state.executor, &source)?);
         }
         self.prefill.uncached_prefill_ns = self
             .prefill
@@ -612,24 +609,21 @@ impl MappedSession {
             state.metrics.decoded_tokens += 1;
             self.evaluated += 1;
             if self.evaluated % self.profile.block_size == 0 {
+                let snapshot = snapshot_active_mapping(
+                    &mut state.executor,
+                    self.active_mapping
+                        .as_ref()
+                        .expect("prepared mapping exists"),
+                )?;
                 self.parent = Some(publish_block(
                     &mut state,
                     &self.profile,
                     self.logical_context.expect("prepared context exists"),
                     self.evaluated,
                     self.parent,
-                    self.active_mapping
-                        .as_ref()
-                        .expect("prepared mapping exists")
-                        .clone(),
+                    snapshot,
                     self.next.as_ref().expect("decode result exists"),
                 )?);
-                let source = self
-                    .active_mapping
-                    .as_ref()
-                    .expect("published mapping exists")
-                    .clone();
-                self.active_mapping = Some(fork_and_activate(&mut state.executor, &source)?);
             }
         }
         Ok(SessionStep::Token {
@@ -852,16 +846,13 @@ fn activate_prefix(
         let _ = state.physical.abort_transition(prepared);
         return Err(state_error(error));
     }
-    match state.physical.commit_transition(prepared, revision) {
-        Ok(binding) => {
-            state
-                .physical
-                .publish_device_block_table(
-                    EXECUTION_SLOT,
-                    binding,
-                    u32::try_from(native.identity()).unwrap_or(u32::MAX),
-                )
-                .map_err(state_error)?;
+    match state.physical.commit_mapped_transition(
+        prepared,
+        revision,
+        u32::try_from(native.identity())
+            .map_err(|_| Error::State("native representation identity exhausted".into()))?,
+    ) {
+        Ok(_) => {
             if restored {
                 let spilled = state
                     .resident
@@ -883,7 +874,7 @@ fn activate_prefix(
     }
 }
 
-fn fork_and_activate(
+fn fork_for_request_branch(
     executor: &mut Executor,
     source: &RepresentationHandle,
 ) -> Result<RepresentationHandle, Error> {
@@ -891,6 +882,14 @@ fn fork_and_activate(
     let mapping = executor.commit_mapping(prepared).map_err(state_error)?;
     executor.activate_mapping(&mapping).map_err(state_error)?;
     Ok(mapping)
+}
+
+fn snapshot_active_mapping(
+    executor: &mut Executor,
+    active: &RepresentationHandle,
+) -> Result<RepresentationHandle, Error> {
+    let prepared = executor.prepare_mapping_fork(active).map_err(state_error)?;
+    executor.commit_mapping(prepared).map_err(state_error)
 }
 
 fn publish_block(
@@ -1000,29 +999,20 @@ fn publish_block(
             return Err(state_error(error));
         }
     }
-    let binding = match state
-        .physical
-        .commit_transition(transition, expected_revision)
-    {
-        Ok(binding) => binding,
-        Err(error) => {
-            release_representations(&mut state.physical, &registered);
-            let _ = state.executor.activate_mapping(&rollback);
-            return Err(state_error(error));
-        }
-    };
     let published_native = existing
         .as_ref()
         .and_then(|resident| resident.native.clone())
         .unwrap_or_else(|| native.clone());
-    state
-        .physical
-        .publish_device_block_table(
-            EXECUTION_SLOT,
-            binding,
-            u32::try_from(published_native.identity()).unwrap_or(u32::MAX),
-        )
-        .expect("validated committed binding must publish its device block table");
+    if let Err(error) = state.physical.commit_mapped_transition(
+        transition,
+        expected_revision,
+        u32::try_from(published_native.identity())
+            .map_err(|_| Error::State("native representation identity exhausted".into()))?,
+    ) {
+        release_representations(&mut state.physical, &registered);
+        let _ = state.executor.activate_mapping(&rollback);
+        return Err(state_error(error));
+    }
     let mapping = state
         .logical
         .commit_publication(prepared_publication)
@@ -1186,9 +1176,21 @@ mod tests {
         assert_eq!(metrics.requests, 2);
         assert_eq!(metrics.cache_hits, 1);
         assert!(metrics.cached_tokens >= 32);
-        assert_eq!(metrics.fork_bytes_copied, 0);
         assert_eq!(metrics.graph_recaptures, None);
         assert!(metrics.reference_switches >= 2);
+    }
+
+    #[test]
+    fn linear_publication_snapshots_do_not_switch_the_active_branch() {
+        let engine =
+            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+                .unwrap();
+        engine
+            .generate_collected(test_request(&model(), "a".repeat(160), 2, &[]))
+            .unwrap();
+        let metrics = engine.metrics();
+        assert!(metrics.published_blocks >= 5);
+        assert_eq!(metrics.reference_switches, 2);
     }
 
     #[test]
