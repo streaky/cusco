@@ -28,6 +28,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -690,6 +691,12 @@ impl RequestControl {
         if let Some(abort) = abort {
             abort();
         }
+    }
+}
+
+impl Default for RequestControl {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -2531,12 +2538,12 @@ async fn http_debug_middleware(
             "path": path,
             "content_type": request_content_type,
             "content_length": request_content_length,
-            "headers": full_request
-                .as_ref()
-                .and_then(|(_, headers, _)| Some(json!(headers))),
-            "uri": full_request
-                .as_ref()
-                .and_then(|(uri, _, _)| Some(uri.clone())),
+        "headers": full_request
+            .as_ref()
+            .map(|(_, headers, _)| json!(headers)),
+        "uri": full_request
+            .as_ref()
+            .map(|(uri, _, _)| uri.clone()),
             "body": rendered_body,
             "raw_body": full_request.as_ref().and_then(|(_, _, headers)| {
                 headers
@@ -3131,6 +3138,14 @@ enum WireProtocol {
     OpenAiResponses,
 }
 
+fn sse_rows<const N: usize>(values: [Value; N]) -> String {
+    values.into_iter().fold(String::new(), |mut rows, value| {
+        use std::fmt::Write as _;
+        write!(rows, "data: {value}\n\n").expect("writing to a String cannot fail");
+        rows
+    })
+}
+
 fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
     if matches!(protocol, WireProtocol::OpenAiResponses) {
         match event {
@@ -3140,19 +3155,33 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
                 inference_id,
                 execution_session_id,
                 ..
-            } => return [
-                json!({"type":"response.created","response":{"id":request_id,"status":"in_progress","metadata":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}}}),
-                json!({"type":"response.output_item.added","item":{"id":"msg_0","type":"message","role":"assistant","status":"in_progress"},"output_index":0}),
-                json!({"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
-            ].into_iter().map(|value| format!("data: {value}\n\n")).collect(),
-            StreamEvent::Token { token, index } => return format!("data: {}\n\n", json!({"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":token,"sequence_number":index})),
-            StreamEvent::Finished { reason, usage } => return [
-                json!({"type":"response.output_text.done","item_id":"msg_0","output_index":0,"content_index":0,"text":""}),
-                json!({"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":0}),
-                json!({"type":"response.output_item.done","item":{"id":"msg_0","type":"message","role":"assistant","status":"completed"},"output_index":0}),
-                json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}}),
-            ].into_iter().map(|value| format!("data: {value}\n\n")).collect(),
-            StreamEvent::Error { message } => return format!("data: {}\n\n", json!({"type":"error","error":{"message":message,"type":"server_error"}})),
+            } => {
+                return sse_rows([
+                    json!({"type":"response.created","response":{"id":request_id,"status":"in_progress","metadata":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}}}),
+                    json!({"type":"response.output_item.added","item":{"id":"msg_0","type":"message","role":"assistant","status":"in_progress"},"output_index":0}),
+                    json!({"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
+                ]);
+            }
+            StreamEvent::Token { token, index } => {
+                return format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":token,"sequence_number":index})
+                );
+            }
+            StreamEvent::Finished { reason, usage } => {
+                return sse_rows([
+                    json!({"type":"response.output_text.done","item_id":"msg_0","output_index":0,"content_index":0,"text":""}),
+                    json!({"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":0}),
+                    json!({"type":"response.output_item.done","item":{"id":"msg_0","type":"message","role":"assistant","status":"completed"},"output_index":0}),
+                    json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}}),
+                ]);
+            }
+            StreamEvent::Error { message } => {
+                return format!(
+                    "data: {}\n\n",
+                    json!({"type":"error","error":{"message":message,"type":"server_error"}})
+                );
+            }
         }
     }
     let value = match (protocol, event) {
@@ -5690,16 +5719,15 @@ mod tests {
                 "stale-principal-2".into(),
                 VecDeque::from(vec![now - 120_000]),
             );
-            state.records.clear();
         }
         server
             .create_compaction_declaration_for("fresh-principal", declaration)
             .unwrap();
         let state = server.declarations.lock();
-        assert!(state.creation_times.get("stale-principal").is_none());
-        assert!(state.creation_times.get("stale-principal-2").is_none());
-        assert!(state.creation_times.get("active-principal").is_some());
-        assert!(state.creation_times.get("fresh-principal").is_some());
+        assert!(!state.creation_times.contains_key("stale-principal"));
+        assert!(!state.creation_times.contains_key("stale-principal-2"));
+        assert!(state.creation_times.contains_key("active-principal"));
+        assert!(state.creation_times.contains_key("fresh-principal"));
         fs::remove_dir_all(directory).unwrap();
     }
 

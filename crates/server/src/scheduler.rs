@@ -917,8 +917,10 @@ mod tests {
 
     #[test]
     fn policy_preserves_flow_fifo_and_promotes_waiting_batch_work() {
-        let mut config = SchedulerPolicyConfig::default();
-        config.promotion_rounds = 2;
+        let config = SchedulerPolicyConfig {
+            promotion_rounds: 2,
+            ..Default::default()
+        };
         let mut policy = FairPolicy::new(config);
         let now = Instant::now();
         policy.enqueue(

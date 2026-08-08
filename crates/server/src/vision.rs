@@ -313,8 +313,10 @@ mod tests {
             "image_malformed"
         );
 
-        let mut config = VisionConfig::default();
-        config.max_encoded_bytes = 1;
+        let config = VisionConfig {
+            max_encoded_bytes: 1,
+            ..Default::default()
+        };
         assert_eq!(
             ImageAdmission::new(config)
                 .admit_base64("image/png", &png)
@@ -322,8 +324,10 @@ mod tests {
                 .field,
             "encoded_bytes"
         );
-        let mut config = VisionConfig::default();
-        config.max_decoded_bytes = 1;
+        let config = VisionConfig {
+            max_decoded_bytes: 1,
+            ..Default::default()
+        };
         assert_eq!(
             ImageAdmission::new(config)
                 .admit_base64("image/png", &png)
@@ -331,8 +335,10 @@ mod tests {
                 .field,
             "decoded_bytes"
         );
-        let mut config = VisionConfig::default();
-        config.max_dimension = 1;
+        let config = VisionConfig {
+            max_dimension: 1,
+            ..Default::default()
+        };
         assert_eq!(
             ImageAdmission::new(config)
                 .admit_base64("image/png", &png)
@@ -340,8 +346,10 @@ mod tests {
                 .field,
             "width"
         );
-        let mut config = VisionConfig::default();
-        config.max_total_pixels = 1;
+        let config = VisionConfig {
+            max_total_pixels: 1,
+            ..Default::default()
+        };
         assert_eq!(
             ImageAdmission::new(config)
                 .admit_base64("image/png", &png)
@@ -349,8 +357,10 @@ mod tests {
                 .field,
             "total_pixels"
         );
-        let mut config = VisionConfig::default();
-        config.retention_capacity = ByteSize(1);
+        let config = VisionConfig {
+            retention_capacity: ByteSize(1),
+            ..Default::default()
+        };
         assert_eq!(
             ImageAdmission::new(config)
                 .admit_base64("image/png", &png)
