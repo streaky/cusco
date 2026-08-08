@@ -12,7 +12,14 @@ def call(method,path,payload=None):
     start=time.perf_counter_ns(); req=urllib.request.Request(BASE+path,data=data,headers=headers,method=method)
     try:
         with urllib.request.urlopen(req,timeout=60) as r: status,ctype,raw=r.status,r.headers.get('content-type',''),r.read()
-    except urllib.error.HTTPError as e: status,ctype,raw=e.code,e.headers.get('content-type',''),e.read()
+    except urllib.error.HTTPError as e:
+        status,ctype,raw=e.code,e.headers.get('content-type',''),e.read()
+    except urllib.error.URLError as e:
+        elapsed=(time.perf_counter_ns()-start)/1_000_000
+        return 0,'application/json',{"error":str(e)},elapsed
+    except Exception as e:
+        elapsed=(time.perf_counter_ns()-start)/1_000_000
+        return 0,'application/json',{"error":str(e)},elapsed
     elapsed=(time.perf_counter_ns()-start)/1_000_000
     try: body=json.loads(raw) if raw else None
     except json.JSONDecodeError: body=raw.decode('utf-8','replace')
