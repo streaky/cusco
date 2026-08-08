@@ -1,0 +1,22 @@
+{
+  "pronoun_continuity": {
+    "tokens": ["<start_of_turn>system", "Refer to Ada by name.", "<start_of_turn>user", "Ada designed the plan.", "<start_of_turn>assistant", "Ada designed it.", "<start_of_turn>user", "What did she design?"],
+    "target_tokens": 6,
+    "required_fragments": ["Ada", "she"]
+  },
+  "instruction_retention": {
+    "tokens": ["<start_of_turn>system", "Answer in JSON.", "<start_of_turn>user", "old request", "<start_of_turn>assistant", "old response", "<start_of_turn>user", "latest request"],
+    "target_tokens": 4,
+    "required_fragments": ["Answer in JSON.", "latest request"]
+  },
+  "tool_call_consistency": {
+    "tokens": ["<start_of_turn>system", "policy", "<start_of_turn>tool", "weather contract", "<start_of_turn>user", "weather?"],
+    "target_tokens": 6,
+    "required_fragments": ["<start_of_turn>tool", "weather contract", "weather?"]
+  },
+  "followup_fidelity": {
+    "tokens": ["<start_of_turn>system", "policy", "<start_of_turn>user", "first", "<start_of_turn>assistant", "answer", "<start_of_turn>user", "follow up"],
+    "target_tokens": 6,
+    "required_fragments": ["answer", "follow up"]
+  }
+}

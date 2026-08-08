@@ -6,14 +6,16 @@ The project separates responsibilities deliberately: Rust will manage logical co
 
 ## Current state
 
-Cusco has completed Phases 1 through 9. In addition to exact checkpoint
+Cusco has completed Phases 1 through 10. In addition to exact checkpoint
 continuation, transactional mapped execution, multi-model residency, and
-priority-aware scheduling, the server now exposes cleanly namespaced OpenAI,
-Ollama, and Cusco APIs. Phase 9 adds strict compatibility request validation,
-OpenAI- and Ollama-native streaming frames, Responses, bounded inline images,
-tool and structured-output controls, immutable Hub resolution, a migrated
-SQLite model catalog, versioned daemon configuration, and a production
-Compose profile.
+priority-aware scheduling, the server exposes cleanly namespaced OpenAI,
+Ollama, and Cusco APIs with strict compatibility validation, native streaming,
+Responses, bounded inline images, tool and structured-output controls,
+immutable Hub resolution, a migrated SQLite model catalog, versioned daemon
+configuration, and production Compose packaging. Phase 10 adds request-tied,
+deterministic semantic context compaction with transactional successor
+publication, principal-owned expiring declarations, bounded worker admission,
+correlated response metadata, and repeated-compaction-safe logical history.
 
 Model identity, immutable revision, aliases, and lifecycle operation records
 survive restart. Logical contexts, active requests, queues, native execution
