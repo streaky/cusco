@@ -147,8 +147,12 @@ CUSCO_BEARER_TOKEN='replace-with-a-secret' docker compose up --build -d server
 
 The production definition mounts the versioned daemon configuration read-only,
 listens on `127.0.0.1:8080` by default, persists the migrated SQLite catalog
-under `data/state`, and uses bounded storage under `data/spill`. Override
-`CUSCO_LISTEN_ADDRESS`, `CUSCO_PORT`, and `CUSCO_GPU_DEVICE_ID` as needed.
+under `data/state`, and uses bounded storage under `data/spill`. The typed
+Responses lifecycle has a file-backed resource store under
+`data/state/responses`; current `store: false` requests do not publish there,
+while the store provides atomic-write and deterministic-recovery foundations
+for durable response resources. Override `CUSCO_LISTEN_ADDRESS`, `CUSCO_PORT`,
+and `CUSCO_GPU_DEVICE_ID` as needed.
 The entire `data/` tree is ignored by Git and excluded from image build
 contexts.
 

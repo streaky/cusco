@@ -33,6 +33,8 @@ mod catalog;
 mod config;
 mod context_strategy;
 mod generation;
+pub mod response_store;
+pub mod responses;
 mod lifecycle;
 mod mapped;
 mod prompt;
@@ -1080,6 +1082,7 @@ pub struct Server {
     lifecycle: lifecycle::ModelLifecycleService,
     vision: Arc<Mutex<VisionConfig>>,
     openapi: Arc<Mutex<OpenApiConfig>>,
+    response_service: responses::ResponseService,
 }
 struct AdmissionGuard {
     server: Server,
@@ -1099,11 +1102,14 @@ impl Drop for AdmissionGuard {
 }
 impl Server {
     pub fn open(
-        _path: impl AsRef<Path>,
+        path: impl AsRef<Path>,
         auth: Arc<dyn AuthProvider>,
         engine: Arc<dyn InferenceEngine>,
     ) -> Result<Self, Error> {
         let config = ServerConfig::default();
+        let state_root = path.as_ref().parent().unwrap_or_else(|| Path::new("."));
+        let response_store = response_store::FileResponseResourceStore::open(state_root)
+            .map_err(|error| Error::State(error.to_string()))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 durable: RuntimeState {
@@ -1130,6 +1136,7 @@ impl Server {
             engine,
             vision: Arc::new(Mutex::new(VisionConfig::default())),
             openapi: Arc::new(Mutex::new(OpenApiConfig::default())),
+            response_service: responses::ResponseService::new(Arc::new(response_store)),
         })
     }
     pub fn attach_catalog(&self, catalog: ModelCatalog, model_directory: impl Into<PathBuf>) {
@@ -3039,170 +3046,16 @@ struct InferResponseRequest {
     protocol: WireProtocol,
 }
 
-fn sse_rows<const N: usize>(values: [Value; N]) -> String {
-    values.into_iter().fold(String::new(), |mut rows, value| {
-        use std::fmt::Write as _;
-        write!(rows, "data: {value}\n\n").expect("writing to a String cannot fail");
-        rows
-    })
-}
 
-struct ResponsesStreamState {
-    model: String,
-    response_id: Option<String>,
-    created_at: u64,
-    text: String,
-    sequence_number: usize,
-    metadata: Value,
-}
-
-impl ResponsesStreamState {
-    fn new(model: String) -> Self {
-        Self {
-            model,
-            response_id: None,
-            created_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_secs()),
-            text: String::new(),
-            sequence_number: 0,
-            metadata: json!({}),
-        }
-    }
-
-    fn sequence_number(&mut self) -> usize {
-        let current = self.sequence_number;
-        self.sequence_number += 1;
-        current
-    }
-
-    fn message(&self, status: &str) -> Value {
-        json!({
-            "id": "msg_0",
-            "type": "message",
-            "role": "assistant",
-            "status": status,
-            "content": [{
-                "type": "output_text",
-                "text": self.text,
-                "annotations": [],
-                "logprobs": []
-            }]
-        })
-    }
-
-    fn response(&self, status: &str, output: Value, usage: Value) -> Value {
-        json!({
-            "id": self.response_id.as_deref().unwrap_or_default(),
-            "object": "response",
-            "created_at": self.created_at,
-            "status": status,
-            "background": false,
-            "error": null,
-            "incomplete_details": null,
-            "instructions": null,
-            "max_output_tokens": null,
-            "metadata": self.metadata,
-            "model": self.model,
-            "output": output,
-            "parallel_tool_calls": true,
-            "previous_response_id": null,
-            "prompt_cache_key": null,
-            "reasoning": null,
-            "safety_identifier": null,
-            "service_tier": "default",
-            "store": false,
-            "temperature": 1.0,
-            "text": {"format": {"type": "text"}, "verbosity": "medium"},
-            "tool_choice": "auto",
-            "tools": [],
-            "top_logprobs": 0,
-            "top_p": 1.0,
-            "truncation": "disabled",
-            "usage": usage
-        })
-    }
-}
-
-fn responses_stream_row(state: &mut ResponsesStreamState, event: StreamEvent) -> String {
-    match event {
-        StreamEvent::Started {
-            request_id,
-            correlation_id,
-            inference_id,
-            execution_session_id,
-            ..
-        } => {
-            state.response_id = Some(request_id);
-            state.metadata = json!({
-                "correlation_id": correlation_id,
-                "inference_id": inference_id,
-                "execution_session_id": execution_session_id
-            });
-            let created = state.sequence_number();
-            let item_added = state.sequence_number();
-            let part_added = state.sequence_number();
-            sse_rows([
-                json!({"type":"response.created","sequence_number":created,"response":state.response("in_progress", json!([]), Value::Null)}),
-                json!({"type":"response.output_item.added","sequence_number":item_added,"item":state.message("in_progress"),"output_index":0}),
-                json!({"type":"response.content_part.added","sequence_number":part_added,"item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}}),
-            ])
-        }
-        StreamEvent::Token { token, .. } => {
-            state.text.push_str(&token);
-            let sequence_number = state.sequence_number();
-            format!(
-                "data: {}\n\n",
-                json!({"type":"response.output_text.delta","sequence_number":sequence_number,"item_id":"msg_0","output_index":0,"content_index":0,"delta":token,"logprobs":[]})
-            )
-        }
-        StreamEvent::Finished { reason, usage } => {
-            let text_done = state.sequence_number();
-            let part_done = state.sequence_number();
-            let item_done = state.sequence_number();
-            let completed = state.sequence_number();
-            let part = json!({
-                "type": "output_text",
-                "text": state.text,
-                "annotations": [],
-                "logprobs": []
-            });
-            let message = state.message("completed");
-            let response_usage = json!({
-                "input_tokens": usage.input_tokens,
-                "input_tokens_details": {"cached_tokens": usage.cached_tokens},
-                "output_tokens": usage.generated_tokens,
-                "output_tokens_details": {"reasoning_tokens": 0},
-                "total_tokens": usage.input_tokens + usage.generated_tokens
-            });
-            let mut response =
-                state.response("completed", json!([message.clone()]), response_usage);
-            response["finish_reason"] = json!(reason);
-            sse_rows([
-                json!({"type":"response.output_text.done","sequence_number":text_done,"item_id":"msg_0","output_index":0,"content_index":0,"text":state.text,"logprobs":[]}),
-                json!({"type":"response.content_part.done","sequence_number":part_done,"item_id":"msg_0","output_index":0,"content_index":0,"part":part}),
-                json!({"type":"response.output_item.done","sequence_number":item_done,"item":message,"output_index":0}),
-                json!({"type":"response.completed","sequence_number":completed,"response":response}),
-            ])
-        }
-        StreamEvent::Error { message } => {
-            let sequence_number = state.sequence_number();
-            format!(
-                "data: {}\n\n",
-                json!({"type":"error","sequence_number":sequence_number,"code":"server_error","message":message,"param":null})
-            )
-        }
-    }
-}
 
 fn stream_row_with_state(
     protocol: WireProtocol,
     event: StreamEvent,
     include_usage: bool,
-    responses_state: &mut ResponsesStreamState,
+    responses_state: &mut responses::ResponseProjection,
 ) -> String {
     if matches!(protocol, WireProtocol::Responses) {
-        return responses_stream_row(responses_state, event);
+        return responses_state.project(event);
     }
     let value = match (protocol, event) {
         (WireProtocol::Completion, StreamEvent::Token { token, .. }) => {
@@ -3266,6 +3119,7 @@ fn completed_response(
     protocol: WireProtocol,
     response: InferResponse,
     finish_reason: FinishReason,
+    response_service: Option<&responses::ResponseService>,
 ) -> Value {
     let usage = json!({"prompt_tokens":response.usage.input_tokens,"completion_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens});
     let prefill = &response.usage.prefill;
@@ -3305,24 +3159,16 @@ fn completed_response(
             json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
         WireProtocol::Responses => {
-            let mut state = ResponsesStreamState::new(response.usage.model.clone());
-            state.response_id = Some(response.id.clone());
-            state.text = response.text.clone();
-            state.metadata = json!({
-                "correlation_id": response.usage.correlation_id,
-                "inference_id": response.usage.inference_id,
-                "execution_session_id": response.usage.execution_session_id
-            });
-            let message = state.message("completed");
-            let response_usage = json!({
-                "input_tokens": response.usage.input_tokens,
-                "input_tokens_details": {"cached_tokens": response.usage.cached_tokens},
-                "output_tokens": response.usage.generated_tokens,
-                "output_tokens_details": {"reasoning_tokens": 0},
-                "total_tokens": response.usage.input_tokens + response.usage.generated_tokens
-            });
-            let mut value = state.response("completed", json!([message]), response_usage);
-            value["finish_reason"] = json!(finish_reason);
+            let resource = response_service
+                .expect("Responses projection requires the response service")
+                .complete(
+                    response.id.clone(),
+                    response.usage.model.clone(),
+                    response.text.clone(),
+                    finish_reason,
+                    &response.usage,
+                );
+            let mut value = responses::project_resource(&resource);
             value["cusco"] = cusco;
             value
         }
@@ -3402,6 +3248,7 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
             inference_id,
         },
     };
+    let response_service = server.response_service.clone();
     if streaming {
         let (started, receiver) = server.infer_stream_reserved(id, request, admission).await?;
         let first = stream::once(async move { started });
@@ -3418,7 +3265,7 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
                 }
             },
         );
-        let mut responses_state = ResponsesStreamState::new(response_model);
+        let mut responses_state = response_service.projection(response_model);
         let rows = first.chain(rest).map(move |event| {
             Ok::<_, Infallible>(stream_row_with_state(
                 protocol,
@@ -3457,7 +3304,7 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
             })
             .ok_or_else(|| Error::State("inference completed without a finish reason".into()))?;
         let mut response =
-            Json(completed_response(protocol, response, finish_reason)).into_response();
+            Json(completed_response(protocol, response, finish_reason, Some(&response_service))).into_response();
         response.headers_mut().insert(
             "x-request-id",
             HeaderValue::from_str(&correlation_id).expect("UUID is a valid header value"),
@@ -5688,7 +5535,7 @@ mod tests {
     }
 
     fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
-        let mut state = ResponsesStreamState::new("m".into());
+        let mut state = responses::ResponseProjection::new("m".into());
         stream_row_with_state(protocol, event, include_usage, &mut state)
     }
 
@@ -5975,7 +5822,7 @@ mod tests {
         let (response, _) = server
             .infer("compact-replay", compacting_request(source.id))
             .unwrap();
-        let payload = completed_response(WireProtocol::Completion, response, FinishReason::Length);
+        let payload = completed_response(WireProtocol::Completion, response, FinishReason::Length, None);
         assert_eq!(
             payload["cusco"]["compaction_result"]["selected_strategy_id"],
             "window_tail:v1"
@@ -6164,9 +6011,8 @@ mod tests {
         assert!(row.contains("\"inference_id\":\"inference\""));
         assert!(row.contains("\"execution_session_id\":\"session\""));
 
-        let mut state = ResponsesStreamState::new("m".into());
-        let started = responses_stream_row(
-            &mut state,
+        let mut state = responses::ResponseProjection::new("m".into());
+        let started = state.project(
             StreamEvent::Started {
                 request_id: "response".into(),
                 context_id: ContextId::new(),
@@ -6175,15 +6021,13 @@ mod tests {
                 execution_session_id: "session".into(),
             },
         );
-        let delta = responses_stream_row(
-            &mut state,
+        let delta = state.project(
             StreamEvent::Token {
                 token: "hello".into(),
                 index: 0,
             },
         );
-        let done = responses_stream_row(
-            &mut state,
+        let done = state.project(
             StreamEvent::Finished {
                 reason: FinishReason::Stop,
                 usage: Box::new(Usage {
