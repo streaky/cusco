@@ -847,17 +847,29 @@ cusco_status cusco_executor_import_mapping(
         llama_memory_seq_rm(llama_get_memory(executor->ctx), sequence, -1, -1);
         return CUSCO_INCOMPATIBLE;
     }
-    executor->block_table.emplace(mapping, sequence);
-    executor->positions.emplace(mapping, position);
-    const uint64_t identity = ++executor->mapping_epoch;
-    auto representation = std::unique_ptr<cusco_representation>(
-        new cusco_representation{executor, mapping, identity, 1,
-            ++executor->completion_fence});
-    executor->published_mappings.insert(mapping);
-    executor->representations.emplace(mapping, representation.get());
-    *out = representation.release();
-    executor->mapping_import_bytes_copied += size;
-    return CUSCO_OK;
+    try {
+        executor->block_table.emplace(mapping, sequence);
+        executor->positions.emplace(mapping, position);
+        const uint64_t identity = ++executor->mapping_epoch;
+        auto representation = std::unique_ptr<cusco_representation>(
+            new cusco_representation{executor, mapping, identity, 1,
+                ++executor->completion_fence});
+        executor->published_mappings.insert(mapping);
+        executor->representations.emplace(mapping, representation.get());
+        *out = representation.release();
+        executor->mapping_import_bytes_copied += size;
+        return CUSCO_OK;
+    } catch (...) {
+        if (!is_mock(executor)) {
+            llama_memory_seq_rm(llama_get_memory(executor->ctx), sequence, -1, -1);
+        }
+        executor->published_mappings.erase(mapping);
+        executor->representations.erase(mapping);
+        executor->positions.erase(mapping);
+        executor->block_table.erase(mapping);
+        executor->mock_mappings.erase(mapping);
+        throw;
+    }
 } catch (const std::bad_alloc &) {
     return CUSCO_NOMEM;
 } catch (...) {
