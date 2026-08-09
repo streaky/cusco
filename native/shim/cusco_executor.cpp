@@ -448,24 +448,39 @@ void cusco_sampler_free(cusco_sampler * sampler) {
 
 cusco_status cusco_sampler_sample(
     cusco_sampler * sampler,
-    cusco_executor * executor,
+    const float * logits,
+    size_t logits_len,
     int32_t * token) try {
-    if (!sampler || !executor || !token || sampler->owner != executor) {
+    if (!sampler || !logits || logits_len == 0 || !token) {
         return CUSCO_INVALID;
     }
-    if (is_mock(executor)) {
-        if (executor->logits.empty()) {
-            return CUSCO_INVALID;
-        }
+    if (is_mock(sampler->owner)) {
         size_t selected = 0;
-        for (size_t i = 1; i < executor->logits.size(); ++i) {
-            if (executor->logits[i] > executor->logits[selected]) {
+        for (size_t i = 1; i < logits_len; ++i) {
+            if (logits[i] > logits[selected]) {
                 selected = i;
             }
         }
         *token = static_cast<int32_t>(selected);
     } else {
-        *token = llama_sampler_sample(sampler->raw, executor->ctx, -1);
+        const int32_t vocab_size = llama_vocab_n_tokens(sampler->owner->vocab);
+        if (vocab_size <= 0 || logits_len != static_cast<size_t>(vocab_size)) {
+            return CUSCO_INVALID;
+        }
+        std::vector<llama_token_data> candidates;
+        candidates.reserve(logits_len);
+        for (size_t i = 0; i < logits_len; ++i) {
+            candidates.push_back(
+                llama_token_data{static_cast<llama_token>(i), logits[i], 0.0F});
+        }
+        llama_token_data_array array{
+            candidates.data(), candidates.size(), -1, false};
+        llama_sampler_apply(sampler->raw, &array);
+        if (array.selected < 0 ||
+            static_cast<size_t>(array.selected) >= array.size) {
+            return CUSCO_BACKEND;
+        }
+        *token = array.data[array.selected].id;
         llama_sampler_accept(sampler->raw, *token);
     }
     return CUSCO_OK;

@@ -416,8 +416,8 @@ impl Executor {
 }
 
 impl Sampler {
-    pub fn sample(&mut self, executor: &mut Executor) -> Result<i32, Error> {
-        ffi::sample(self.raw, executor.raw)
+    pub fn sample(&mut self, decode: &Decode) -> Result<i32, Error> {
+        ffi::sample(self.raw, &decode.logits)
     }
 }
 
@@ -584,12 +584,17 @@ mod ffi {
 
     pub(super) fn sample(
         sampler: NonNull<sys::CuscoSampler>,
-        executor: NonNull<sys::CuscoExecutor>,
+        logits: &[f32],
     ) -> Result<i32, Error> {
         let mut token = 0;
-        // SAFETY: both uniquely owned handles are live for the call.
+        // SAFETY: the sampler is live and logits is borrowed for the call.
         status(unsafe {
-            sys::cusco_sampler_sample(sampler.as_ptr(), executor.as_ptr(), &mut token)
+            sys::cusco_sampler_sample(
+                sampler.as_ptr(),
+                logits.as_ptr(),
+                logits.len(),
+                &mut token,
+            )
         })?;
         Ok(token)
     }
@@ -943,7 +948,7 @@ mod tests {
         let mut executor = Executor::open("mock://deterministic", 128, 0).unwrap();
         let decoded = executor.decode(&[11]).unwrap();
         let mut sampler = executor.sampler(SamplingConfig::default()).unwrap();
-        assert_eq!(sampler.sample(&mut executor).unwrap(), decoded.token);
+        assert_eq!(sampler.sample(&decoded).unwrap(), decoded.token);
 
         let mut piece = Vec::with_capacity(32);
         executor.render_token(decoded.token, &mut piece).unwrap();
@@ -954,8 +959,8 @@ mod tests {
         assert_eq!(piece.as_ptr(), allocation);
 
         let mut other = Executor::open("mock://deterministic", 128, 0).unwrap();
-        other.decode(&[11]).unwrap();
-        assert_eq!(sampler.sample(&mut other), Err(Error::Backend(1)));
+        let other_decoded = other.decode(&[12]).unwrap();
+        assert_eq!(sampler.sample(&other_decoded).unwrap(), other_decoded.token);
     }
     #[test]
     fn mapped_forks_publish_transactionally_and_switch_by_reference() {

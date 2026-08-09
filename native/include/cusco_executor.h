@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define CUSCO_EXECUTOR_ABI_VERSION 11u
+#define CUSCO_EXECUTOR_ABI_VERSION 12u
 
 typedef struct cusco_executor cusco_executor;
 typedef struct cusco_representation cusco_representation;
@@ -91,7 +91,8 @@ uint32_t cusco_executor_token_is_eog(const cusco_executor *, int32_t token);
 cusco_status cusco_sampler_create(
     cusco_executor *, const cusco_sampler_config *, cusco_sampler ** out);
 void cusco_sampler_free(cusco_sampler *);
-cusco_status cusco_sampler_sample(cusco_sampler *, cusco_executor *, int32_t * token);
+cusco_status cusco_sampler_sample(
+    cusco_sampler *, const float * logits, size_t logits_len, int32_t * token);
 /* Mutates executor state. Input tokens are borrowed for the duration of the call. */
 cusco_status cusco_executor_decode(cusco_executor *, const int32_t *, size_t, cusco_decode_result *);
 

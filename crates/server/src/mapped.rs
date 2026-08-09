@@ -558,7 +558,7 @@ impl MappedSession {
             .sampler
             .as_mut()
             .expect("decode owns sampler")
-            .sample(&mut state.executor)
+            .sample(self.next.as_ref().expect("decode owns next-token logits"))
             .map_err(state_error)?;
         let terminal_or_control = state.executor.token_is_eog(sampled);
         let mut piece = Vec::with_capacity(32);

@@ -33,12 +33,12 @@ mod catalog;
 mod config;
 mod context_strategy;
 mod generation;
-pub mod response_store;
-pub mod responses;
 mod lifecycle;
 mod mapped;
 mod prompt;
 mod residency;
+pub mod response_store;
+pub mod responses;
 mod scheduler;
 mod vision;
 pub use catalog::{ModelCatalog, load_user_models};
@@ -2057,7 +2057,7 @@ enum ReasoningEffort {
 struct ResponseFormat {
     r#type: String,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FunctionTool {
     name: String,
@@ -2066,13 +2066,13 @@ struct FunctionTool {
     #[serde(default)]
     strict: bool,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct NestedToolDefinition {
     r#type: String,
     function: FunctionTool,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FlatToolDefinition {
     r#type: String,
@@ -2082,7 +2082,7 @@ struct FlatToolDefinition {
     #[serde(default)]
     strict: bool,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 enum ToolDefinition {
     Nested(NestedToolDefinition),
@@ -2103,6 +2103,57 @@ impl ToolDefinition {
                 tool.r#type == "function" && !tool.name.is_empty() && tool.parameters.is_object()
             }
         }
+    }
+}
+fn tool_names(tools: &[ToolDefinition]) -> Vec<String> {
+    tools
+        .iter()
+        .map(|tool| match tool {
+            ToolDefinition::Nested(tool) => tool.function.name.clone(),
+            ToolDefinition::Flat(tool) => tool.name.clone(),
+        })
+        .collect()
+}
+
+fn append_tool_instructions(
+    prompt: &mut String,
+    tools: &[ToolDefinition],
+    choice: Option<&ResponsesToolChoice>,
+    has_tool_output: bool,
+) {
+    if tools.is_empty()
+        || matches!(
+            choice,
+            Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::None))
+        )
+    {
+        return;
+    }
+    let definitions = serde_json::to_string(tools).expect("tool definitions serialize");
+    let mut instructions = format!(
+        "\n\nAvailable tools: {definitions}\nWhen calling a tool, output only JSON in the form \
+         {{\"name\":\"function_name\",\"arguments\":{{...}}}}."
+    );
+    match choice {
+        Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required)) => {
+            instructions.push_str(" You must call a tool.");
+        }
+        Some(ResponsesToolChoice::Function { name, .. }) => {
+            instructions.push_str(&format!(" You must call the `{name}` function."));
+        }
+        _ => {}
+    }
+    if has_tool_output {
+        instructions.push_str(
+            " A tool result is already provided above. Use it to answer the user; \
+             do not repeat a completed call.",
+        );
+    }
+    const GENERATION_SUFFIX: &str = "<end_of_turn>\n<start_of_turn>model\n";
+    if let Some(position) = prompt.rfind(GENERATION_SUFFIX) {
+        prompt.insert_str(position, &instructions);
+    } else {
+        prompt.push_str(&instructions);
     }
 }
 
@@ -2205,9 +2256,6 @@ struct ChatMessage {
 fn default_user_role() -> String {
     "user".into()
 }
-fn default_message_type() -> String {
-    "message".into()
-}
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ChatContent {
@@ -2290,6 +2338,10 @@ fn routes(server: Server) -> Router {
         .route("/openai/v1/chat/completions", post(chat))
         .route("/openai/v1/models", get(list_models))
         .route("/openai/v1/responses", post(responses))
+        .route(
+            "/openai/v1/responses/{id}",
+            get(get_response).delete(delete_response),
+        )
         .route("/cusco/v1/api/version", get(ollama_version))
         .route("/cusco/v1/api/tags", get(ollama_tags))
         .route("/cusco/v1/api/show", post(ollama_show))
@@ -2484,6 +2536,7 @@ async fn completion(
         request_id: request_context.request_id,
         principal: request_context.principal,
         protocol: WireProtocol::Completion,
+        responses: None,
     })
     .await
 }
@@ -2528,6 +2581,7 @@ async fn chat(
         request_id: request_context.request_id,
         principal: request_context.principal,
         protocol: WireProtocol::Chat,
+        responses: None,
     })
     .await
 }
@@ -2540,13 +2594,17 @@ enum ResponsesInput {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ResponsesInputItem {
-    #[serde(default = "default_message_type")]
-    r#type: String,
-    #[serde(default = "default_user_role")]
-    role: String,
-    content: ResponsesContent,
+#[serde(untagged)]
+enum ResponsesInputItem {
+    Message {
+        #[serde(default = "default_user_role")]
+        role: String,
+        content: ResponsesContent,
+    },
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -2560,10 +2618,14 @@ enum ResponsesContent {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ResponsesContentPart {
     InputText { text: String },
-    InputImage { image_url: String },
+    InputImage {
+        image_url: String,
+        #[serde(default, rename = "detail")]
+        _detail: Option<String>,
+    },
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ResponsesToolChoiceMode {
     Auto,
@@ -2571,7 +2633,7 @@ enum ResponsesToolChoiceMode {
     Required,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(untagged)]
 enum ResponsesToolChoice {
     Mode(ResponsesToolChoiceMode),
@@ -2579,20 +2641,25 @@ enum ResponsesToolChoice {
 }
 
 impl ResponsesToolChoice {
-    fn validate(&self) -> Result<(), Error> {
+    fn validate(&self, tools: &[ToolDefinition]) -> Result<(), Error> {
         match self {
             Self::Mode(ResponsesToolChoiceMode::Auto | ResponsesToolChoiceMode::None) => Ok(()),
-            Self::Mode(ResponsesToolChoiceMode::Required) => Err(Error::BadRequest(
-                "tool_choice `required` is unsupported because this model does not advertise tool calling"
-                    .into(),
-            )),
-            Self::Function { r#type, name } if r#type == "function" && !name.is_empty() => {
-                Err(Error::BadRequest(format!(
-                    "tool_choice function `{name}` is unsupported because this model does not advertise tool calling"
-                )))
+            Self::Mode(ResponsesToolChoiceMode::Required) if tools.is_empty() => Err(
+                Error::BadRequest("tool_choice `required` requires at least one tool".into()),
+            ),
+            Self::Mode(ResponsesToolChoiceMode::Required) => Ok(()),
+            Self::Function { r#type, name }
+                if r#type == "function"
+                    && tool_names(tools).iter().any(|candidate| candidate == name) =>
+            {
+                Ok(())
             }
+            Self::Function { r#type, name } if r#type == "function" => Err(Error::BadRequest(
+                format!("tool_choice references undeclared function `{name}`"),
+            )),
             Self::Function { .. } => Err(Error::BadRequest(
-                "tool_choice function must have type `function` and a non-empty name".into(),
+                "tool_choice function must have type `function` and a declared non-empty name"
+                    .into(),
             )),
         }
     }
@@ -2603,8 +2670,10 @@ impl ResponsesToolChoice {
 struct ResponsesRequest {
     model: String,
     input: ResponsesInput,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     store: bool,
+    #[serde(default)]
+    previous_response_id: Option<String>,
     max_output_tokens: Option<usize>,
     #[serde(default)]
     compaction: Option<CompactionRequest>,
@@ -2635,12 +2704,6 @@ async fn responses(
     }: PrequeueJson<ResponsesRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
-    if r.store {
-        return Err(Error::BadRequest(
-            "`store: true` is unsupported; Cusco only supports stateless Responses with `store: false`"
-                .into(),
-        ));
-    }
     validate_controls(
         r.temperature,
         r.top_p,
@@ -2649,51 +2712,125 @@ async fn responses(
         r.reasoning_effort.as_ref(),
     )?;
     if let Some(tool_choice) = &r.tool_choice {
-        tool_choice.validate()?;
+        tool_choice.validate(&r.tools)?;
     }
     let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
     let model = s.model(&r.model)?;
-    let input = match r.input {
-        ResponsesInput::Text(text) => text,
-        ResponsesInput::Items(items) => {
-            let mut messages = Vec::with_capacity(items.len());
-            for item in items {
-                if item.r#type != "message" {
-                    return Err(Error::BadRequest(format!(
-                        "unsupported Responses input item type {}",
-                        item.r#type
-                    )));
-                }
-                let content = match item.content {
-                    ResponsesContent::Text(text) => ChatContent::Text(text),
-                    ResponsesContent::Parts(parts) => ChatContent::Parts(
-                        parts
-                            .into_iter()
-                            .map(|part| match part {
-                                ResponsesContentPart::InputText { text } => {
-                                    ContentPart::Text { text }
-                                }
-                                ResponsesContentPart::InputImage { image_url } => {
-                                    ContentPart::ImageUrl {
-                                        image_url: ImageUrlPart { url: image_url },
-                                    }
-                                }
-                            })
-                            .collect(),
-                    ),
-                };
-                messages.push(ChatMessage {
-                    role: item.role,
-                    content,
-                });
-            }
-            lower_messages(&model.family, messages, s.vision_config())?
+    let mut input_ledger = Vec::new();
+    let mut prompt = String::new();
+    if let Some(previous_id) = &r.previous_response_id {
+        let predecessor = s
+            .response_service
+            .retrieve(previous_id, &request_context.principal)
+            .map_err(response_store_error)?;
+        if predecessor.model != r.model {
+            return Err(Error::BadRequest(
+                "previous_response_id uses an incompatible model".into(),
+            ));
         }
+        prompt.push_str(&response_lineage_prompt(
+            &s.response_service,
+            predecessor,
+            &request_context.principal,
+        )?);
+    }
+    match r.input {
+        ResponsesInput::Text(text) => {
+            input_ledger.push(responses::ResponseInputItem::Message {
+                role: "user".into(),
+                text: text.clone(),
+            });
+            prompt.push_str(&lower_messages(
+                &model.family,
+                vec![ChatMessage {
+                    role: "user".into(),
+                    content: ChatContent::Text(text),
+                }],
+                s.vision_config(),
+            )?);
+        }
+        ResponsesInput::Items(items) => {
+            for item in items {
+                match item {
+                    ResponsesInputItem::Message { role, content } => {
+                        let content = match content {
+                            ResponsesContent::Text(text) => ChatContent::Text(text),
+                            ResponsesContent::Parts(parts) => ChatContent::Parts(
+                                parts
+                                    .into_iter()
+                                    .map(|part| match part {
+                                        ResponsesContentPart::InputText { text } => {
+                                            ContentPart::Text { text }
+                                        }
+                                        ResponsesContentPart::InputImage { image_url, .. } => {
+                                            ContentPart::ImageUrl {
+                                                image_url: ImageUrlPart { url: image_url },
+                                            }
+                                        }
+                                    })
+                                    .collect(),
+                            ),
+                        };
+                        let lowered = lower_messages(
+                            &model.family,
+                            vec![ChatMessage {
+                                role: role.clone(),
+                                content,
+                            }],
+                            s.vision_config(),
+                        )?;
+                        input_ledger.push(responses::ResponseInputItem::Message {
+                            role,
+                            text: lowered.clone(),
+                        });
+                        prompt.push_str(&lowered);
+                    }
+                    ResponsesInputItem::FunctionCallOutput { call_id, output } => {
+                        if !lineage_has_call(
+                            &s.response_service,
+                            r.previous_response_id.as_deref(),
+                            &request_context.principal,
+                            &call_id,
+                        )? {
+                            return Err(Error::BadRequest(format!(
+                                "function_call_output references unknown call_id `{call_id}`"
+                            )));
+                        }
+                        input_ledger.push(responses::ResponseInputItem::FunctionCallOutput {
+                            call_id: call_id.clone(),
+                            output: output.clone(),
+                        });
+                        prompt.push_str(&format!(
+                            "<start_of_turn>user\nTool result for {call_id}: {output}<end_of_turn>\n<start_of_turn>model\n"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let has_tool_output = input_ledger.iter().any(|item| {
+        matches!(
+            item,
+            responses::ResponseInputItem::FunctionCallOutput { .. }
+        )
+    });
+    append_tool_instructions(
+        &mut prompt,
+        &r.tools,
+        r.tool_choice.as_ref(),
+        has_tool_output,
+    );
+    let response_options = ResponseRequestOptions {
+        store: r.store,
+        previous_response_id: r.previous_response_id,
+        input: input_ledger,
+        tool_names: tool_names(&r.tools),
+        tool_choice: r.tool_choice,
     };
     infer_response(InferResponseRequest {
         server: s,
         model: r.model,
-        prompt: input,
+        prompt,
         max_tokens: r.max_output_tokens,
         sampling,
         compaction: r.compaction,
@@ -2707,10 +2844,91 @@ async fn responses(
         request_id: request_context.request_id,
         principal: request_context.principal,
         protocol: WireProtocol::Responses,
+        responses: Some(response_options),
     })
     .await
 }
 
+fn response_store_error(error: response_store::StoreError) -> Error {
+    match error {
+        response_store::StoreError::NotFound(_) => Error::ContextNotFound,
+        other => Error::State(other.to_string()),
+    }
+}
+
+fn response_lineage_prompt(
+    service: &responses::ResponseService,
+    mut resource: responses::ResponseResource,
+    owner: &str,
+) -> Result<String, Error> {
+    let mut lineage = Vec::new();
+    for _ in 0..1024 {
+        let previous = resource.previous_response_id.clone();
+        lineage.push(resource);
+        let Some(id) = previous else { break };
+        resource = service.retrieve(&id, owner).map_err(response_store_error)?;
+    }
+    if lineage
+        .last()
+        .is_some_and(|resource| resource.previous_response_id.is_some())
+    {
+        return Err(Error::BadRequest(
+            "response lineage exceeds 1024 resources".into(),
+        ));
+    }
+    lineage.reverse();
+    let mut prompt = String::new();
+    for resource in lineage {
+        for item in resource.input {
+            match item {
+                responses::ResponseInputItem::Message { role, text } => {
+                    prompt.push_str(&format!("\n{role}: {text}\n"))
+                }
+                responses::ResponseInputItem::FunctionCallOutput { call_id, output } => {
+                    prompt.push_str(&format!("\ntool {call_id}: {output}\n"))
+                }
+            }
+        }
+        for item in resource.output {
+            match item {
+                responses::ResponseOutputItem::Message(message) => {
+                    for part in message.content {
+                        prompt.push_str(&format!("\nassistant: {}\n", part.text));
+                    }
+                }
+                responses::ResponseOutputItem::FunctionCall(call) => {
+                    let call = json!({
+                        "name": call.name,
+                        "arguments": serde_json::from_str::<Value>(&call.arguments)
+                            .unwrap_or(Value::String(call.arguments)),
+                    });
+                    prompt.push_str(&format!("{call}<end_of_turn>\n"));
+                }
+            }
+        }
+    }
+    Ok(prompt)
+}
+
+fn lineage_has_call(
+    service: &responses::ResponseService,
+    previous: Option<&str>,
+    owner: &str,
+    call_id: &str,
+) -> Result<bool, Error> {
+    let Some(id) = previous else { return Ok(false) };
+    let mut resource = service.retrieve(id, owner).map_err(response_store_error)?;
+    for _ in 0..1024 {
+        if resource.output.iter().any(|item| matches!(item, responses::ResponseOutputItem::FunctionCall(call) if call.call_id == call_id)) { return Ok(true); }
+        let Some(id) = resource.previous_response_id.clone() else {
+            return Ok(false);
+        };
+        resource = service.retrieve(&id, owner).map_err(response_store_error)?;
+    }
+    Err(Error::BadRequest(
+        "response lineage exceeds 1024 resources".into(),
+    ))
+}
 fn default_true() -> bool {
     true
 }
@@ -3027,6 +3245,14 @@ enum WireProtocol {
     Chat,
     Responses,
 }
+#[derive(Clone)]
+struct ResponseRequestOptions {
+    store: bool,
+    previous_response_id: Option<String>,
+    input: Vec<responses::ResponseInputItem>,
+    tool_names: Vec<String>,
+    tool_choice: Option<ResponsesToolChoice>,
+}
 
 struct InferResponseRequest {
     server: Server,
@@ -3045,9 +3271,8 @@ struct InferResponseRequest {
     request_id: String,
     principal: String,
     protocol: WireProtocol,
+    responses: Option<ResponseRequestOptions>,
 }
-
-
 
 fn stream_row_with_state(
     protocol: WireProtocol,
@@ -3121,38 +3346,22 @@ fn completed_response(
     response: InferResponse,
     finish_reason: FinishReason,
     response_service: Option<&responses::ResponseService>,
-) -> Value {
+    owner: &str,
+    options: Option<&ResponseRequestOptions>,
+) -> Result<Value, Error> {
     let usage = json!({"prompt_tokens":response.usage.input_tokens,"completion_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens});
     let prefill = &response.usage.prefill;
-    let cached_ratio = if prefill.total_tokens > 0 {
-        Some((prefill.cached_tokens as f64) / (prefill.total_tokens as f64))
-    } else {
-        None
-    };
+    let cached_ratio = (prefill.total_tokens > 0)
+        .then_some((prefill.cached_tokens as f64) / (prefill.total_tokens as f64));
     let cusco = json!({
         "compaction_result": response.usage.compaction_result,
         "correlation_id": response.usage.correlation_id,
         "inference_id": response.usage.inference_id,
         "execution_session_id": response.usage.execution_session_id,
-        "usage": {
-            "input_tokens": response.usage.input_tokens,
-            "generated_tokens": response.usage.generated_tokens,
-            "evaluated_tokens": response.usage.evaluated_tokens,
-            "cached_tokens": response.usage.cached_tokens,
-            "prefill": {
-                "total_tokens": prefill.total_tokens,
-                "cached_tokens": prefill.cached_tokens,
-                "uncached_tokens": prefill.uncached_tokens,
-                "cached_ratio": cached_ratio,
-                "tokenization_ns": prefill.tokenization_ns,
-                "prefix_lookup_ns": prefill.prefix_lookup_ns,
-                "mapping_activation_ns": prefill.mapping_activation_ns,
-                "uncached_prefill_ns": prefill.uncached_prefill_ns,
-                "total_ns": prefill.total_ns,
-            },
-        },
+        "usage": {"input_tokens":response.usage.input_tokens,"generated_tokens":response.usage.generated_tokens,"evaluated_tokens":response.usage.evaluated_tokens,"cached_tokens":response.usage.cached_tokens,
+            "prefill":{"total_tokens":prefill.total_tokens,"cached_tokens":prefill.cached_tokens,"uncached_tokens":prefill.uncached_tokens,"cached_ratio":cached_ratio,"tokenization_ns":prefill.tokenization_ns,"prefix_lookup_ns":prefill.prefix_lookup_ns,"mapping_activation_ns":prefill.mapping_activation_ns,"uncached_prefill_ns":prefill.uncached_prefill_ns,"total_ns":prefill.total_ns}}
     });
-    match protocol {
+    Ok(match protocol {
         WireProtocol::Completion => {
             json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text,"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
@@ -3160,20 +3369,85 @@ fn completed_response(
             json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
         WireProtocol::Responses => {
-            let resource = response_service
-                .expect("Responses projection requires the response service")
-                .complete(
-                    response.id.clone(),
-                    response.usage.model.clone(),
-                    response.text.clone(),
-                    finish_reason,
-                    &response.usage,
-                );
+            let service =
+                response_service.expect("Responses projection requires the response service");
+            let options = options.expect("Responses projection requires request options");
+            let function_call = parse_function_call(&response.text, options)?;
+            let resource = service.complete(responses::CompleteResponse {
+                id: &response.id,
+                owner,
+                model: &response.usage.model,
+                text: &response.text,
+                reason: finish_reason,
+                usage: &response.usage,
+                store: options.store,
+                previous_response_id: options.previous_response_id.as_deref(),
+                input: &options.input,
+                function_call,
+            });
+            service.remember(&resource).map_err(response_store_error)?;
             let mut value = responses::project_resource(&resource);
             value["cusco"] = cusco;
             value
         }
+    })
+}
+
+fn parse_function_call(
+    text: &str,
+    options: &ResponseRequestOptions,
+) -> Result<Option<responses::ResponseFunctionCall>, Error> {
+    if options.tool_names.is_empty()
+        || matches!(
+            options.tool_choice,
+            Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::None))
+        )
+    {
+        return Ok(None);
     }
+    let parsed = serde_json::from_str::<Value>(text.trim()).ok();
+    let call = parsed
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|object| {
+            let name = object.get("name")?.as_str()?.to_owned();
+            let arguments = object.get("arguments")?;
+            Some((
+                name,
+                if let Some(arguments) = arguments.as_str() {
+                    arguments.to_owned()
+                } else {
+                    arguments.to_string()
+                },
+            ))
+        });
+    if let Some((name, arguments)) = call {
+        if !options.tool_names.contains(&name) {
+            return Err(Error::BadRequest(format!(
+                "model selected undeclared function `{name}`"
+            )));
+        }
+        if let Some(ResponsesToolChoice::Function { name: required, .. }) = &options.tool_choice {
+            if &name != required {
+                return Err(Error::BadRequest(format!(
+                    "model selected `{name}` instead of required function `{required}`"
+                )));
+            }
+        }
+        return Ok(Some(responses::new_function_call(name, arguments)));
+    }
+    if matches!(
+        options.tool_choice,
+        Some(
+            ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required)
+                | ResponsesToolChoice::Function { .. }
+        )
+    ) {
+        return Err(Error::BadRequest(
+            "model did not produce the required function call".into(),
+        ));
+    }
+    Ok(None)
 }
 
 async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Error> {
@@ -3194,6 +3468,7 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
         request_id,
         principal,
         protocol,
+        responses,
     } = parameters;
     server.model(&model)?;
     let id = request_id;
@@ -3227,6 +3502,7 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
     );
     let inference_id = Uuid::new_v4().to_string();
     let response_model = model.clone();
+    let response_owner = principal.clone();
     let request = InferRequest {
         model,
         prompt,
@@ -3266,14 +3542,43 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
                 }
             },
         );
-        let mut responses_state = response_service.projection(response_model);
+        let mut responses_state = match &responses {
+            Some(options) => response_service.stream_projection(
+                response_model,
+                response_owner,
+                options.store,
+                options.previous_response_id.clone(),
+                options.input.clone(),
+                !options.tool_names.is_empty(),
+            ),
+            None => response_service.projection(response_model),
+        };
+        let stream_response_service = response_service.clone();
+        let stream_response_options = responses.clone();
         let rows = first.chain(rest).map(move |event| {
-            Ok::<_, Infallible>(stream_row_with_state(
-                protocol,
-                event,
-                include_usage,
-                &mut responses_state,
-            ))
+            if matches!(event, StreamEvent::Finished { .. }) {
+                if let Some(options) = &stream_response_options {
+                    match parse_function_call(responses_state.generated_text(), options) {
+                        Ok(call) => responses_state.set_function_call(call),
+                        Err(error) => {
+                            return Ok::<_, Infallible>(format!(
+                                "data: {}\n\n",
+                                json!({"type":"error","error":{"message":error.to_string()}})
+                            ));
+                        }
+                    }
+                }
+            }
+            let row = stream_row_with_state(protocol, event, include_usage, &mut responses_state);
+            if let Some(resource) = responses_state.completed_resource() {
+                if let Err(error) = stream_response_service.remember(resource) {
+                    return Ok::<_, Infallible>(format!(
+                        "data: {}\n\n",
+                        json!({"type":"error","error":{"message":error.to_string()}})
+                    ));
+                }
+            }
+            Ok::<_, Infallible>(row)
         });
         let content_type = "text/event-stream";
         let mut response = Response::new(Body::from_stream(rows));
@@ -3304,8 +3609,15 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
                 _ => None,
             })
             .ok_or_else(|| Error::State("inference completed without a finish reason".into()))?;
-        let mut response =
-            Json(completed_response(protocol, response, finish_reason, Some(&response_service))).into_response();
+        let value = completed_response(
+            protocol,
+            response,
+            finish_reason,
+            Some(&response_service),
+            &response_owner,
+            responses.as_ref(),
+        )?;
+        let mut response = Json(value).into_response();
         response.headers_mut().insert(
             "x-request-id",
             HeaderValue::from_str(&correlation_id).expect("UUID is a valid header value"),
@@ -3313,6 +3625,34 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
         Ok(response)
     }
 }
+async fn get_response(
+    State(server): State<Server>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Error> {
+    let context = auth(&server, &headers, Scope::Inference)?;
+    let resource = server
+        .response_service
+        .retrieve(&id, &context.principal)
+        .map_err(response_store_error)?;
+    Ok(Json(responses::project_resource(&resource)))
+}
+
+async fn delete_response(
+    State(server): State<Server>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Error> {
+    let context = auth(&server, &headers, Scope::Inference)?;
+    server
+        .response_service
+        .delete(&id, &context.principal)
+        .map_err(response_store_error)?;
+    Ok(Json(
+        json!({"id":id,"object":"response.deleted","deleted":true}),
+    ))
+}
+
 async fn list_models(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
     auth(&s, &headers, Scope::Inference)?;
     Ok(Json(json!({"data":s.models()})))
@@ -4112,8 +4452,67 @@ mod tests {
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(body["output"][0]["content"][0]["text"], "world");
+        assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
+        assert!(
+
+            body["output"][0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
         fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn responses_tool_instructions_remain_inside_the_user_turn() {
+        let mut prompt = prompt::apply_chat_template(
+            "gemma4",
+            vec![prompt::Message {
+                role: "user".into(),
+                content: "Use the tool.".into(),
+            }],
+        )
+        .unwrap();
+        append_tool_instructions(
+            &mut prompt,
+            &[ToolDefinition::Flat(FlatToolDefinition {
+                r#type: "function".into(),
+                name: "lookup".into(),
+                description: None,
+                parameters: json!({"type": "object"}),
+                strict: false,
+            })],
+            Some(&ResponsesToolChoice::Function {
+                r#type: "function".into(),
+                name: "lookup".into(),
+            }),
+            false,
+        );
+        assert!(prompt.contains(
+            "You must call the `lookup` function.<end_of_turn>\n<start_of_turn>model\n"
+        ));
+        assert!(!prompt.ends_with("function."));
+    }
+    #[test]
+    fn responses_tool_result_instructions_prevent_duplicate_calls() {
+        let mut prompt =
+            "<start_of_turn>user\nTool result for call_1: blue<end_of_turn>\n\
+             <start_of_turn>model\n"
+                .to_string();
+        append_tool_instructions(
+            &mut prompt,
+            &[ToolDefinition::Flat(FlatToolDefinition {
+                r#type: "function".into(),
+                name: "lookup".into(),
+                description: None,
+                parameters: json!({"type": "object"}),
+                strict: false,
+            })],
+            None,
+            true,
+        );
+        assert!(prompt.contains(
+            "Use it to answer the user; do not repeat a completed call.<end_of_turn>"
+        ));
     }
     #[test]
     fn responses_tool_choice_is_typed_and_capability_checked() {
@@ -4123,7 +4522,11 @@ mod tests {
             "tool_choice": "auto"
         }))
         .unwrap();
-        automatic.tool_choice.unwrap().validate().unwrap();
+        automatic
+            .tool_choice
+            .unwrap()
+            .validate(&automatic.tools)
+            .unwrap();
 
         let required: ResponsesRequest = serde_json::from_value(json!({
             "model": "m",
@@ -4132,8 +4535,8 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(
-            required.tool_choice.unwrap().validate(),
-            Err(Error::BadRequest(message)) if message.contains("does not advertise tool calling")
+            required.tool_choice.unwrap().validate(&required.tools),
+            Err(Error::BadRequest(message)) if message.contains("requires at least one tool")
         ));
 
         let selected: ResponsesRequest = serde_json::from_value(json!({
@@ -4143,8 +4546,8 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(
-            selected.tool_choice.unwrap().validate(),
-            Err(Error::BadRequest(message)) if message.contains("function `lookup`")
+            selected.tool_choice.unwrap().validate(&selected.tools),
+            Err(Error::BadRequest(message)) if message.contains("undeclared function `lookup`")
         ));
     }
     #[test]
@@ -4152,12 +4555,8 @@ mod tests {
         let request: ResponsesRequest = serde_json::from_value(json!({
             "model": "m",
             "input": [{
-                "type": "message",
                 "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": "hey"
-                }]
+                "content": "hey"
             }]
         }))
         .unwrap();
@@ -4166,12 +4565,42 @@ mod tests {
         };
         assert_eq!(items.len(), 1);
         assert!(matches!(
-            &items[0].content,
-            ResponsesContent::Parts(parts)
-                if matches!(
-                    parts.as_slice(),
-                    [ResponsesContentPart::InputText { text }] if text == "hey"
-                )
+            &items[0],
+            ResponsesInputItem::Message {
+                content: ResponsesContent::Text(text),
+                ..
+            } if text == "hey"
+        ));
+    }
+    #[test]
+    fn accepts_responses_image_detail_hint() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,AA==",
+                    "detail": "low"
+                }]
+            }]
+        }))
+        .unwrap();
+        let ResponsesInput::Items(items) = request.input else {
+            panic!("canonical message input must parse as items");
+        };
+        assert!(matches!(
+            &items[0],
+            ResponsesInputItem::Message {
+                content: ResponsesContent::Parts(parts),
+                ..
+            } if matches!(
+                parts.as_slice(),
+                [ResponsesContentPart::InputImage {
+                    image_url,
+                    _detail: Some(detail)
+                }] if image_url == "data:image/png;base64,AA==" && detail == "low"
+            )
         ));
     }
     #[test]
@@ -5544,49 +5973,178 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
-    async fn responses_accept_store_false_and_reject_store_true() {
+    async fn responses_store_retrieve_delete_and_stateless_mode() {
         let (server, dir) = setup(Arc::new(AnonymousAdmin));
         let app = router(server);
-        let accepted = app
+        let stored = app
             .clone()
             .oneshot(request(
                 "POST",
                 "/openai/v1/responses",
-                json!({
-                    "model": "m",
-                    "input": "hello",
-                    "max_output_tokens": 1,
-                    "store": false
-                }),
+                json!({"model":"m","input":"hello","max_output_tokens":1,"store":true}),
             ))
             .await
             .unwrap();
-        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(stored.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(stored.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let id = body["id"].as_str().unwrap();
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "GET",
+                    &format!("/openai/v1/responses/{id}"),
+                    json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let continued = app.clone().oneshot(request(
+            "POST", "/openai/v1/responses",
+            json!({"model":"m","input":"continue","max_output_tokens":1,"store":true,"previous_response_id":id}),
+        )).await.unwrap();
+        assert_eq!(continued.status(), StatusCode::OK);
+        let continued_body: Value =
+            serde_json::from_slice(&to_bytes(continued.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(continued_body["previous_response_id"], id);
 
-        let rejected = app
+        let reopened = Server::open(
+            dir.join("state.json"),
+            Arc::new(AnonymousAdmin),
+            Arc::new(DeterministicEngine),
+        )
+        .unwrap();
+        let reopened_app = router(reopened);
+        assert_eq!(
+            reopened_app
+                .oneshot(request(
+                    "GET",
+                    &format!("/openai/v1/responses/{id}"),
+                    json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "DELETE",
+                    &format!("/openai/v1/responses/{id}"),
+                    json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "GET",
+                    &format!("/openai/v1/responses/{id}"),
+                    json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let streamed = app.clone().oneshot(request(
+            "POST", "/openai/v1/responses",
+            json!({"model":"m","input":"stream","max_output_tokens":1,"store":true,"stream":true}),
+        )).await.unwrap();
+        assert_eq!(streamed.status(), StatusCode::OK);
+        let stream_body = String::from_utf8(
+            to_bytes(streamed.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let completed = stream_body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|row| serde_json::from_str::<Value>(row).ok())
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let stream_id = completed["response"]["id"].as_str().unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "GET",
+                    &format!("/openai/v1/responses/{stream_id}"),
+                    json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let stateless = app
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({"model":"m","input":"hello","max_output_tokens":1,"store":false}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stateless.status(), StatusCode::OK);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_continue_from_persisted_function_calls() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let seed_app = router(server.clone());
+        let seeded = seed_app
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({"model":"m","input":"lookup","max_output_tokens":1,"store":true}),
+            ))
+            .await
+            .unwrap();
+        let seeded_body: Value =
+            serde_json::from_slice(&to_bytes(seeded.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let seeded_id = seeded_body["id"].as_str().unwrap();
+        let mut predecessor = server
+            .response_service
+            .retrieve(seeded_id, "anonymous-admin")
+            .unwrap();
+        predecessor.output = vec![responses::ResponseOutputItem::FunctionCall(
+            responses::new_function_call("lookup".into(), r#"{"key":"value"}"#.into()),
+        )];
+        let call_id = match &predecessor.output[0] {
+            responses::ResponseOutputItem::FunctionCall(call) => call.call_id.clone(),
+            _ => unreachable!(),
+        };
+        server.response_service.persist(&predecessor).unwrap();
+        let app = router(server);
+        let continued = app
             .oneshot(request(
                 "POST",
                 "/openai/v1/responses",
                 json!({
-                    "model": "m",
-                    "input": "hello",
-                    "max_output_tokens": 1,
-                    "store": true
+                    "model":"m",
+                    "previous_response_id":seeded_id,
+                    "input":[{"type":"function_call_output","call_id":call_id,"output":"result"}],
+                    "max_output_tokens":1,
+                    "store":true
                 }),
             ))
             .await
             .unwrap();
-        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
-        let body: Value =
-            serde_json::from_slice(&to_bytes(rejected.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(body["error"]["code"], "invalid_request");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("`store: true` is unsupported")
-        );
+        assert_eq!(continued.status(), StatusCode::OK);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5878,7 +6436,15 @@ mod tests {
         let (response, _) = server
             .infer("compact-replay", compacting_request(source.id))
             .unwrap();
-        let payload = completed_response(WireProtocol::Completion, response, FinishReason::Length, None);
+        let payload = completed_response(
+            WireProtocol::Completion,
+            response,
+            FinishReason::Length,
+            None,
+            "local",
+            None,
+        )
+        .unwrap();
         assert_eq!(
             payload["cusco"]["compaction_result"]["selected_strategy_id"],
             "window_tail:v1"
@@ -6068,42 +6634,36 @@ mod tests {
         assert!(row.contains("\"execution_session_id\":\"session\""));
 
         let mut state = responses::ResponseProjection::new("m".into());
-        let started = state.project(
-            StreamEvent::Started {
-                request_id: "response".into(),
+        let started = state.project(StreamEvent::Started {
+            request_id: "response".into(),
+            context_id: ContextId::new(),
+            correlation_id: "correlation".into(),
+            inference_id: "inference".into(),
+            execution_session_id: "session".into(),
+        });
+        let delta = state.project(StreamEvent::Token {
+            token: "hello".into(),
+            index: 0,
+        });
+        let done = state.project(StreamEvent::Finished {
+            reason: FinishReason::Stop,
+            usage: Box::new(Usage {
+                input_tokens: 2,
+                generated_tokens: 1,
+                evaluated_tokens: 2,
+                cached_tokens: 0,
+                prefill: PrefillMetrics::default(),
+                model: "m".into(),
+                model_revision: "r".into(),
                 context_id: ContextId::new(),
+                compaction_result: None,
+                latency_ms: 1,
+                status: "completed".into(),
                 correlation_id: "correlation".into(),
                 inference_id: "inference".into(),
                 execution_session_id: "session".into(),
-            },
-        );
-        let delta = state.project(
-            StreamEvent::Token {
-                token: "hello".into(),
-                index: 0,
-            },
-        );
-        let done = state.project(
-            StreamEvent::Finished {
-                reason: FinishReason::Stop,
-                usage: Box::new(Usage {
-                    input_tokens: 2,
-                    generated_tokens: 1,
-                    evaluated_tokens: 2,
-                    cached_tokens: 0,
-                    prefill: PrefillMetrics::default(),
-                    model: "m".into(),
-                    model_revision: "r".into(),
-                    context_id: ContextId::new(),
-                    compaction_result: None,
-                    latency_ms: 1,
-                    status: "completed".into(),
-                    correlation_id: "correlation".into(),
-                    inference_id: "inference".into(),
-                    execution_session_id: "session".into(),
-                }),
-            },
-        );
+            }),
+        });
         assert!(started.contains("\"sequence_number\":0"));
         assert!(started.contains("\"sequence_number\":2"));
         assert!(delta.contains("\"sequence_number\":3"));

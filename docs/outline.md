@@ -1522,7 +1522,7 @@ Future work is organized by confidence and dependency, not by an implementation 
 The following work is expected, but is prioritized from deployment measurements rather than used as permission to bypass the current contract:
 
 - implement explicit, separately tested public-API and Codex compatibility profiles, including their incompatible input, streaming, storage, completion-object, continuation, Chat Completions, and event-authority contracts; accept explicit `max_output_tokens` in both Cusco profiles while preserving omitted output limits through the canonical boundary instead of applying the current low shared default;
-- complete stateful OpenAI Responses resources: opaque `previous_response_id` continuation, retrieval, cancellation, deletion, background lifecycle, typed events, stable request/inference/session identity, tool-result continuation, and retained application context;
+- extend the stateful OpenAI Responses lifecycle—whose durable creation, retrieval, deletion, `previous_response_id` replay, typed streaming events, and tool-result continuation are implemented—with cancellation, background execution, retained application context, and explicit separately tested public-API and Codex storage/event-authority profiles;
 - semantic compaction beyond `window_tail`, beginning with deterministic extractive and model-assisted summaries evaluated against uncompacted controls and fixture-backed observable answers;
 - configured authentication providers, secret management, least-privilege roles, tenant quotas, policy administration, audit records, and hardened deployment defaults;
 - multi-GPU tensor placement, device-set admission, topology-aware scheduling, replica placement, failure recovery, and capacity reporting;

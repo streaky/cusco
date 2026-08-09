@@ -756,35 +756,33 @@ fn spawn_slot(
                     return;
                 }
                 let started = Instant::now();
-            let (result, session) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                match task.action {
-                    SlotAction::Start(request) => match inner.start_session(*request) {
-                        Ok(session) => (
-                            Ok(SessionStep::Progress(QuantumObservation::model_free(
-                                QuantumKind::Preparation,
-                                1,
-                            ))),
-                            Some(session),
-                        ),
-                        Err(error) => (Err(error), None),
-                    },
-                    SlotAction::Step(mut session) => {
-                        let result = session.step();
-                        (result, Some(session))
-                    }
-                    SlotAction::Finish(mut session) => {
-                        let result = session.finish().map(SessionStep::Finished);
-                        (result, None)
-                    }
-                    SlotAction::Shutdown => unreachable!("shutdown tasks exit before execution"),
-                }
-            }))
-            .unwrap_or_else(|_| {
-                (
-                    Err(Error::State("model slot worker panicked".into())),
-                    None,
-                )
-            });
+                let (result, session) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match task.action {
+                        SlotAction::Start(request) => match inner.start_session(*request) {
+                            Ok(session) => (
+                                Ok(SessionStep::Progress(QuantumObservation::model_free(
+                                    QuantumKind::Preparation,
+                                    1,
+                                ))),
+                                Some(session),
+                            ),
+                            Err(error) => (Err(error), None),
+                        },
+                        SlotAction::Step(mut session) => {
+                            let result = session.step();
+                            (result, Some(session))
+                        }
+                        SlotAction::Finish(mut session) => {
+                            let result = session.finish().map(SessionStep::Finished);
+                            (result, None)
+                        }
+                        SlotAction::Shutdown => {
+                            unreachable!("shutdown tasks exit before execution")
+                        }
+                    }))
+                    .unwrap_or_else(|_| {
+                        (Err(Error::State("model slot worker panicked".into())), None)
+                    });
                 if events
                     .send(SchedulerEvent::SlotCompleted(Box::new(SlotCompletion {
                         id: task.id,

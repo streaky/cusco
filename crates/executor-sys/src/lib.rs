@@ -116,7 +116,8 @@ unsafe extern "C" {
     pub fn cusco_sampler_free(sampler: *mut CuscoSampler);
     pub fn cusco_sampler_sample(
         sampler: *mut CuscoSampler,
-        executor: *mut CuscoExecutor,
+        logits: *const f32,
+        logits_len: usize,
         token: *mut i32,
     ) -> c_int;
     pub fn cusco_executor_decode(

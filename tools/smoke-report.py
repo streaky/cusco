@@ -103,6 +103,69 @@ def create_response(payload):
         )
     )
 
+def response_lifecycle():
+    started = time.perf_counter_ns()
+    created_id = None
+    deleted = False
+    try:
+        created = OPENAI.responses.create(
+            model=MODEL,
+            input="What is two plus two? Answer with one word.",
+            max_output_tokens=8,
+            temperature=0,
+            store=True,
+            extra_body={"seed": 10},
+        )
+        created_id = created.id
+        assert created.status == "completed", f"unexpected created status: {created.status}"
+        assert created.output_text, (
+            "created response has no SDK output_text: "
+            f"{created.model_dump(mode='json')}"
+        )
+
+        retrieved = OPENAI.responses.retrieve(created_id)
+        assert retrieved.id == created_id, "retrieved response ID changed"
+        assert retrieved.output_text == created.output_text, "retrieved SDK output_text changed"
+
+        continued = OPENAI.responses.create(
+            model=MODEL,
+            input="What is three plus three? Answer with one word.",
+            max_output_tokens=8,
+            previous_response_id=created_id,
+            temperature=0,
+            store=True,
+            extra_body={"seed": 10},
+        )
+        assert continued.previous_response_id == created_id, "continuation lost previous_response_id"
+        assert continued.output_text, "continued response has no SDK output_text"
+
+        OPENAI.responses.delete(created_id)
+        deleted = True
+        try:
+            OPENAI.responses.retrieve(created_id)
+        except APIStatusError as exc:
+            assert exc.status_code == 404, f"deleted response returned {exc.status_code}"
+        else:
+            raise AssertionError("deleted response remains retrievable")
+
+        elapsed = (time.perf_counter_ns() - started) / 1_000_000
+        return 200, "application/json", {
+            "id": created_id,
+            "continued_id": continued.id,
+            "output_text": created.output_text,
+            "continued_output_text": continued.output_text,
+            "deleted": True,
+        }, elapsed
+    except Exception as exc:
+        elapsed = (time.perf_counter_ns() - started) / 1_000_000
+        return 0, "application/json", {"error": str(exc)}, elapsed
+    finally:
+        if created_id is not None and not deleted:
+            try:
+                OPENAI.responses.delete(created_id)
+            except APIStatusError:
+                pass
+
 
 def stream_chat_completion(payload):
     payload = dict(payload)
@@ -475,6 +538,7 @@ def run():
                     "temperature": 0,
                     "seed": 10,
                     "tool_choice": "auto",
+                    "store": False,
                     "tools": [
                         {
                             "type": "function",
@@ -486,6 +550,13 @@ def run():
                 }
             ),
             lambda status, body: has(status, body, "output"),
+        ),
+        (
+            "responses_sdk_lifecycle",
+            "POST,GET,DELETE",
+            "/openai/v1/responses",
+            response_lifecycle,
+            lambda status, body: has(status, body, "deleted"),
         ),
         (
             "context_create",
@@ -552,7 +623,7 @@ def run():
                     context_id = created_id
         except AssertionError as exc:
             passed = False
-            error = str(exc)
+            error = f"{exc}; response={body!r}"
             stats["failed"] += 1
 
         entry = {

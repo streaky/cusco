@@ -1,5 +1,5 @@
 target:
-  base_url: http://host.docker.internal:8080/openai/v1
+  base_url: http://oai-lens-server:8080/openai/v1
   model: hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf
   api_key_env: CANDIDATE_API_KEY
   timeout_seconds: 120

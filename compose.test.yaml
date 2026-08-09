@@ -136,7 +136,50 @@ services:
       - cargo-target:/work/target
     deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
 
+  oai-lens-server:
+    depends_on:
+      model-fetch:
+        condition: service_completed_successfully
+    build: *test-build
+    command:
+      - sh
+      - -c
+      - >-
+        touch crates/server/src/*.rs crates/cli/src/*.rs &&
+        mkdir -p /data/db /data/spill /data/user-models /data/models &&
+        printf 'models: []\n' > /data/user.yaml &&
+        CUSCO_BEARER_TOKEN=smoke-report-token cargo run -p cusco -- serve
+        --config /work/config/test.yaml &
+        server=$$!; trap 'kill $$server' EXIT;
+        until curl -sf -H 'Authorization: Bearer smoke-report-token'
+        http://127.0.0.1:8080/cusco/v1/status >/dev/null; do
+        kill -0 $$server || exit 1; sleep 1; done;
+        curl -sf -H 'Authorization: Bearer smoke-report-token'
+        -H 'Content-Type: application/json'
+        -d '{"name":"hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf","stream":false}'
+        http://127.0.0.1:8080/cusco/v1/api/pull >/dev/null &&
+        touch /tmp/oai-lens-ready &&
+        wait $$server
+    environment:
+      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
+      LD_LIBRARY_PATH: "/opt/llama-build/bin"
+    volumes:
+      - "${CUSCO_MODEL_DIR:-./models}:/data/user-models"
+      - "${CUSCO_MODEL_DIR:-./models}/cache:/data/models"
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/oai-lens-ready"]
+      interval: 2s
+      timeout: 1s
+      retries: 300
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
+
   oai-lens:
+    depends_on:
+      oai-lens-server:
+        condition: service_healthy
     build:
       context: .tools/oai-lens
     entrypoint: ["python3", "/cusco/tools/oai-lens-gate.py"]
@@ -154,10 +197,8 @@ services:
       - --config
       - /config/oai-lens.yaml
       - test
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
-      CANDIDATE_API_KEY: "${CUSCO_OAI_LENS_TOKEN:-}"
+      CANDIDATE_API_KEY: "${CUSCO_OAI_LENS_TOKEN:-smoke-report-token}"
     volumes:
       - ./config/oai-lens.yaml:/config/oai-lens.yaml:ro
       - ./config/oai-lens-expectations.json:/cusco/config/oai-lens-expectations.json:ro
