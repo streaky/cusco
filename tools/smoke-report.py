@@ -474,6 +474,15 @@ def run():
                     "max_output_tokens": 4,
                     "temperature": 0,
                     "seed": 10,
+                    "tool_choice": "auto",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "unused_smoke_tool",
+                            "description": "An optional tool that the prompt does not require",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
                 }
             ),
             lambda status, body: has(status, body, "output"),

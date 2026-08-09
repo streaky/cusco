@@ -23,7 +23,9 @@ details and optimized kernels.
   pulling, aliases, deletion, and residency reporting.
 - Cusco-native context, compaction, lifecycle, status, and OpenAPI endpoints.
 - Buffered and streaming generation, deterministic sampling controls, stop
-  handling, structured-output constraints, and tool-call normalization.
+  handling, and request-shape validation. Optional `auto`/`none` tool
+  definitions are accepted for text generation but are not yet passed to the
+  model; required or explicitly selected tool calls remain unsupported.
 - Deterministic `window_tail` context compaction with transactional successor
   publication and replay metadata.
 - Versioned YAML configuration, bearer authentication, transport diagnostics,

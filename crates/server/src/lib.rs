@@ -2128,9 +2128,6 @@ fn validate_controls(
                 let _ = &tool.function.description;
             }
         }
-        return Err(Error::BadRequest(
-            "unsupported_capability: selected model profile does not advertise tool calling".into(),
-        ));
     }
     if response_format.is_some_and(|format| format.r#type != "text") {
         return Err(Error::BadRequest(
@@ -4037,10 +4034,7 @@ mod tests {
             responses.tools.as_slice(),
             [ToolDefinition::Flat(_)]
         ));
-        assert!(matches!(
-            validate_controls(None, None, &responses.tools, None, None),
-            Err(Error::BadRequest(message)) if message.contains("does not advertise tool calling")
-        ));
+        validate_controls(None, None, &responses.tools, None, None).unwrap();
 
         let chat: ChatRequest = serde_json::from_value(json!({
             "model": "m",
@@ -4058,6 +4052,36 @@ mod tests {
         .unwrap();
         assert!(chat.tools[0].valid_function());
         assert!(matches!(chat.tools.as_slice(), [ToolDefinition::Nested(_)]));
+    }
+
+    #[tokio::test]
+    async fn optional_tools_are_tolerated_as_text_generation() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let response = router(server)
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({
+                    "model": "m",
+                    "input": "hello world",
+                    "max_output_tokens": 1,
+                    "tool_choice": "auto",
+                    "tools": [{
+                        "type": "function",
+                        "name": "lookup",
+                        "description": "Look something up",
+                        "parameters": {"type": "object", "properties": {}}
+                    }]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["output"][0]["content"][0]["text"], "world");
+        fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn responses_tool_choice_is_typed_and_capability_checked() {
