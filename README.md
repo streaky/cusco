@@ -73,6 +73,24 @@ sustained scheduler, and API smoke workloads, then writes a provenance-indexed
 `results/acceptance-report.json`. Focused proof services remain useful
 diagnostics, but do not replace the complete gate.
 
+## Run the OpenAI SDK conformance gate
+
+Bootstrap the exact reviewed `oai-lens` revision, then run it against a Cusco
+server listening on the configured host port:
+
+```sh
+tools/fetch-oai-lens.sh
+CUSCO_OAI_LENS_TOKEN=your-token \
+  docker compose -f compose.test.yaml run --rm oai-lens
+```
+
+The runner source remains in the ignored `.tools/oai-lens/` checkout. The
+complete upstream exchange report is written to `results/oai-lens-report.json`;
+`results/oai-lens-gate.json` records its digest, runner provenance, probe
+counts, and changes from `config/oai-lens-expectations.json`. Probe failures
+are initially advisory and leave the gate successful. A runner, configuration,
+reporting, or artifact failure is a blocking harness failure.
+
 ## Run the representation measurement proof
 
 With the validation GGUF and NVIDIA runtime available, run:
