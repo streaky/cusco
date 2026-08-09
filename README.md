@@ -53,6 +53,12 @@ The workspace is split into focused crates:
   HTTP adapters;
 - `cli` provides proof, model-management, and serving commands.
 
+## Platform support
+
+Cusco currently targets Linux. Native Windows and macOS support is not
+currently planned; development, packaging, and verification assume a Linux
+host and the documented Docker Compose workflow.
+
 ## Run the acceptance gates
 
 The canonical GPU-less contract gate is:
