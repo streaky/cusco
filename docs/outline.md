@@ -260,6 +260,21 @@ The first-class external surfaces are an explicitly versioned local-inference pr
 
 The supported OpenAI profile is a tested behavioral contract. It includes model discovery, text and chat completion, streaming, deterministic and commonly used sampling controls, stop handling, structured output, tool calls where the selected model supports them, and the Responses shape. Embeddings remain unavailable until the executor exposes them. Compatibility covers request defaults and validation, model-name resolution, chat-template application, terminal-token suppression, whitespace semantics, finish and stop reasons, usage accounting, error envelopes, cancellation, and streaming-native rather than JSON-shaped chunks. Durable contexts, branches, cache policy, extended usage, model administration, billing, organization administration, and other hosted-service control planes remain Cusco concerns rather than OpenAI compatibility claims.
 
+The label "OpenAI-compatible" does not identify one uniform wire contract. Cusco must treat the public OpenAI API and the Codex backend as two explicit, independently tested compatibility profiles rather than assuming that Codex is a subset of the public Responses API. Their material differences include:
+
+| Area | Public API profile | Codex backend profile |
+| --- | --- | --- |
+| Input | String or structured item list | Structured item list required |
+| Streaming | Optional | Required |
+| Storage | Supported and configurable | Must be disabled |
+| Output limit | `max_output_tokens` accepted | `max_output_tokens` rejected |
+| Final output | Completed `Response` contains the final output | Completed response may be empty; streamed items are authoritative |
+| Continuation | `previous_response_id` | Replay prior input and output items |
+| Chat Completions | Native endpoint | Translate Chat Completions over Responses |
+| Output processing | Final object may be sufficient | Event stream is authoritative |
+
+Profile selection must be explicit configuration or endpoint policy, not payload-shape guessing. The adapters may share canonical generation and event machinery, but each owns its distinct validation, defaults, lifecycle, and reconstruction contract. In particular, omission of `max_output_tokens` must remain "no client-specified output limit" in canonical request state. The public profile may accept an explicit value; the Codex profile must reject it. Neither profile may silently replace omission with a small compatibility default: doing so truncates agentic workloads that intentionally rely on streaming, tool turns, stop conditions, context capacity, and server resource/deadline ceilings. Safety remains enforced by model context capacity, admission budgets, cancellation, and wall/active-time limits rather than by an undocumented low token cap.
+
 Multimodal input is deliberately limited to text plus images for chat and Responses requests on models whose llama.cpp executor path exposes a compatible vision projector. The OpenAI adapter accepts typed content parts and `image_url` data URIs. Remote URL fetching, audio, video, image generation, and cross-model media pipelines are later work. Image bytes must be size-bounded, content-addressed for request and cache identity, decoded once, and tied to the model/projector epoch; unsupported media or models fail before admission rather than silently degrading to text.
 
 The internal boundary should normalize each adapter into the same operations and event stream:
@@ -1452,6 +1467,7 @@ Future work is organized by confidence and dependency, not by an implementation 
 
 The following work is expected, but is prioritized from deployment measurements rather than used as permission to bypass the current contract:
 
+- implement explicit, separately tested public-API and Codex compatibility profiles, including their incompatible input, streaming, storage, output-limit, completion-object, continuation, Chat Completions, and event-authority contracts; preserve omitted output limits through the canonical boundary instead of applying the current low shared default;
 - complete stateful OpenAI Responses resources: opaque `previous_response_id` continuation, retrieval, cancellation, deletion, background lifecycle, typed events, stable request/inference/session identity, tool-result continuation, and retained application context;
 - semantic compaction beyond `window_tail`, beginning with deterministic extractive and model-assisted summaries evaluated against uncompacted controls and fixture-backed observable answers;
 - configured authentication providers, secret management, least-privilege roles, tenant quotas, policy administration, audit records, and hardened deployment defaults;
