@@ -37,6 +37,7 @@ The server dynamically admits and reuses multiple model epochs within configured
 - `llama.cpp-version.txt` is the sole source of truth for the llama.cpp version. It contains a release tag only. Build and fetch tooling must read it; never duplicate the tag or record the corresponding commit hash.
 - Keep llama.cpp changes behind the versioned C ABI in `native/include/cusco_executor.h` (currently ABI version 9). Rust should not depend directly on unstable llama.cpp internals.
 - Model files and generated proof results are local artifacts and must not be committed.
+- Files matched by `.gitignore` are intentionally local artifacts. Never force-add, stage, or commit them; if an ignored artifact contains durable project guidance, move that guidance into an appropriate tracked document instead.
 
 A normal local image build is:
 
