@@ -1385,8 +1385,12 @@ impl Server {
     fn effective_stop_sequences(&self, req: &InferRequest) -> Result<Vec<String>, Error> {
         let mut stops = req.stop.clone();
         let model = self.model(&req.model)?;
-        if model.family == "gemma4" && !stops.iter().any(|stop| stop == "<end_of_turn>") {
-            stops.push("<end_of_turn>".into());
+        if model.family == "gemma4" {
+            for marker in ["<end_of_turn>", "</end_of_turn>"] {
+                if !stops.iter().any(|stop| stop == marker) {
+                    stops.push(marker.into());
+                }
+            }
         }
         Ok(stops)
     }
