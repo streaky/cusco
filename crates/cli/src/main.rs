@@ -389,15 +389,8 @@ fn scheduler_proof(
             .with_context(|| format!("stat model {}", model_path.display()))?
             .len()
     };
-    let engine = MappedEngine::open(
-        &workload.model_family,
-        &model_path,
-        n_ctx,
-        gpu_layers,
-        device_bytes,
-        host_bytes,
-    )
-    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let engine = MappedEngine::open(&model_path, n_ctx, gpu_layers, device_bytes, host_bytes)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let model = cusco_server::ModelRecord {
         id: "scheduler-proof-model".into(),
         revision: "proof".into(),
@@ -987,6 +980,11 @@ fn proof(options: ProofOptions) -> Result<()> {
         .context("resolved model path is not UTF-8")?;
     let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
     let capabilities = executor.capabilities();
+    let architecture = executor.model_architecture()?;
+    ensure!(
+        architecture == "gemma4",
+        "reference model reported unsupported architecture {architecture}"
+    );
     ensure!(
         capabilities.global_kv && capabilities.swa && capabilities.recurrent,
         "model lacks a complete composite checkpoint capability"
@@ -1062,7 +1060,7 @@ fn proof(options: ProofOptions) -> Result<()> {
         failed_promotion_preserved,
         "failed promotion changed the active binding"
     );
-    let artifact = json!({"model":record,"capabilities":capabilities,"contexts":comparisons,"host_round_trip":true,"cancellation_preserved_binding":cancellation_preserved,"failed_promotion_preserved_binding":failed_promotion_preserved,"elapsed_ms":started.elapsed().as_millis()});
+    let artifact = json!({"model":record,"architecture":architecture,"capabilities":capabilities,"contexts":comparisons,"host_round_trip":true,"cancellation_preserved_binding":cancellation_preserved,"failed_promotion_preserved_binding":failed_promotion_preserved,"elapsed_ms":started.elapsed().as_millis()});
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?
     }

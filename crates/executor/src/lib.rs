@@ -36,6 +36,7 @@ pub struct Capabilities {
     pub vocabulary: i32,
     pub mapped_execution: bool,
     pub max_mappings: u32,
+    pub training_context_tokens: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -243,7 +244,12 @@ impl Executor {
             vocabulary: c.n_vocab,
             mapped_execution: c.has_mapped_execution != 0,
             max_mappings: c.max_mappings,
+            training_context_tokens: c.training_context_tokens,
         }
+    }
+    pub fn model_architecture(&self) -> Result<String, Error> {
+        let bytes = ffi::model_architecture(self.raw)?;
+        String::from_utf8(bytes).map_err(|_| Error::Backend(sys::INCOMPATIBLE))
     }
     pub fn operating_point(&self) -> OperatingPoint {
         let point = unsafe { sys::cusco_executor_operating_point(self.raw.as_ptr()) };
@@ -278,6 +284,11 @@ impl Executor {
     ) -> Result<&'a [u8], Error> {
         ffi::render_token(self.raw, token, buffer)?;
         Ok(buffer)
+    }
+
+    pub fn token_is_eog(&self, token: i32) -> bool {
+        // SAFETY: raw is live for the duration of the call.
+        unsafe { sys::cusco_executor_token_is_eog(self.raw.as_ptr(), token) != 0 }
     }
 
     pub fn token_to_piece(&mut self, token: i32) -> Result<String, Error> {
@@ -465,6 +476,35 @@ mod ffi {
     pub(super) fn capabilities(raw: NonNull<sys::CuscoExecutor>) -> sys::Capabilities {
         // SAFETY: raw is live for the duration of the call.
         unsafe { sys::cusco_executor_capabilities(raw.as_ptr()) }
+    }
+
+    pub(super) fn model_architecture(raw: NonNull<sys::CuscoExecutor>) -> Result<Vec<u8>, Error> {
+        let mut buffer = vec![0; 32];
+        let mut size = 0;
+        // SAFETY: raw is live and buffer is initialized writable storage.
+        let mut code = unsafe {
+            sys::cusco_executor_model_architecture(
+                raw.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut size,
+            )
+        };
+        if code == sys::BUFFER_TOO_SMALL {
+            buffer.resize(size, 0);
+            // SAFETY: resizing provides the capacity requested by the ABI.
+            code = unsafe {
+                sys::cusco_executor_model_architecture(
+                    raw.as_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut size,
+                )
+            };
+        }
+        status(code)?;
+        buffer.truncate(size);
+        Ok(buffer)
     }
 
     pub(super) fn tokenize(
@@ -842,6 +882,11 @@ mod tests {
         let mut executor = Executor::open("mock://deterministic", 128, 0).unwrap();
         let capabilities = executor.capabilities();
         assert!(capabilities.global_kv && capabilities.swa && capabilities.recurrent);
+        assert_eq!(capabilities.training_context_tokens, u32::MAX);
+        assert_eq!(executor.model_architecture().unwrap(), "gemma4");
+        assert!(executor.token_is_eog(1));
+        assert!(executor.token_is_eog(106));
+        assert!(!executor.token_is_eog(42));
         let prefix = executor.tokenize("prefix").unwrap();
         assert_eq!(executor.token_to_piece(42).unwrap(), "42");
         executor.replace_state_for_proof(&prefix).unwrap();

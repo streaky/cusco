@@ -90,7 +90,6 @@ impl ModelLoader for NativeLoader {
     ) -> Result<(Arc<dyn InferenceEngine>, OperatingPoint), Error> {
         let spill_dir = self.spill_dir.join(format!("{}-{}", model.id, model.epoch));
         let engine = MappedEngine::open_at_epoch_with_spill(
-            &model.family,
             &model.path,
             config.n_ctx,
             config.gpu_layers,

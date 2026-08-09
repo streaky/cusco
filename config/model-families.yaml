@@ -1,20 +1,8 @@
 schema_version: 1
 families:
-  - id: gemma4
-    architecture: gemma4
-    model_type: gemma4_text
+  - architecture: gemma4
     block_size: 32
-    recurrent_checkpoint_interval: 8
-    context_limit: 4096
     required_components:
       - kv
       - swa
       - recurrent
-    tokenizer:
-      add_bos: true
-      parse_special: true
-    terminal_tokens:
-      - 1
-      - 106
-    sampler:
-      kind: greedy

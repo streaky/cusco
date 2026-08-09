@@ -187,7 +187,7 @@ void cusco_executor_close(cusco_executor * executor) {
 
 cusco_capabilities cusco_executor_capabilities(const cusco_executor * executor) {
     if (is_mock(executor)) {
-        return {CUSCO_EXECUTOR_ABI_VERSION, 1, 1, 1, 256, 1, 64};
+        return {CUSCO_EXECUTOR_ABI_VERSION, 1, 1, 1, 256, 1, 64, UINT32_MAX};
     }
     return {
         CUSCO_EXECUTOR_ABI_VERSION,
@@ -197,7 +197,41 @@ cusco_capabilities cusco_executor_capabilities(const cusco_executor * executor) 
         llama_vocab_n_tokens(executor->vocab),
         1,
         64,
+        static_cast<uint32_t>(std::max(0, llama_model_n_ctx_train(executor->model))),
     };
+}
+
+cusco_status cusco_executor_model_architecture(
+    const cusco_executor * executor,
+    char * buffer,
+    size_t capacity,
+    size_t * size) try {
+    if (!executor || !size || (!buffer && capacity != 0)) {
+        return CUSCO_INVALID;
+    }
+    if (is_mock(executor)) {
+        constexpr char architecture[] = "gemma4";
+        constexpr size_t required = sizeof(architecture) - 1;
+        *size = required;
+        if (capacity < required) {
+            return CUSCO_BUFFER_TOO_SMALL;
+        }
+        std::memcpy(buffer, architecture, required);
+        return CUSCO_OK;
+    }
+    const int32_t written = llama_model_meta_val_str(
+        executor->model, "general.architecture", buffer, capacity);
+    if (written < 0) {
+        *size = static_cast<size_t>(-written);
+        return CUSCO_BUFFER_TOO_SMALL;
+    }
+    if (written == 0) {
+        return CUSCO_BACKEND;
+    }
+    *size = static_cast<size_t>(written);
+    return CUSCO_OK;
+} catch (...) {
+    return CUSCO_BACKEND;
 }
 
 cusco_operating_point cusco_executor_operating_point(const cusco_executor * executor) {
@@ -255,7 +289,14 @@ cusco_status cusco_executor_tokenize(
         return CUSCO_OK;
     }
 
-    int size = llama_tokenize(executor->vocab, text, strlen(text), nullptr, 0, true, true);
+    int size = llama_tokenize(
+        executor->vocab,
+        text,
+        strlen(text),
+        nullptr,
+        0,
+        llama_vocab_get_add_bos(executor->vocab),
+        true);
     if (size >= 0) {
         return CUSCO_BACKEND;
     }
@@ -265,7 +306,13 @@ cusco_status cusco_executor_tokenize(
         return CUSCO_NOMEM;
     }
     const int written = llama_tokenize(
-        executor->vocab, text, strlen(text), tokens, size, true, true);
+        executor->vocab,
+        text,
+        strlen(text),
+        tokens,
+        size,
+        llama_vocab_get_add_bos(executor->vocab),
+        true);
     if (written < 0) {
         delete[] tokens;
         return CUSCO_BACKEND;
@@ -277,6 +324,16 @@ cusco_status cusco_executor_tokenize(
     return CUSCO_NOMEM;
 } catch (...) {
     return CUSCO_BACKEND;
+}
+
+uint32_t cusco_executor_token_is_eog(const cusco_executor * executor, int32_t token) {
+    if (!executor) {
+        return 0;
+    }
+    if (is_mock(executor)) {
+        return token == 1 || token == 106 ? 1u : 0u;
+    }
+    return llama_vocab_is_eog(executor->vocab, token) ? 1u : 0u;
 }
 
 void cusco_executor_tokens_free(int32_t * tokens) {
