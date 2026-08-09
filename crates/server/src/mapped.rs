@@ -734,11 +734,10 @@ impl Drop for MappedSession {
             let fallback = self
                 .parent
                 .and_then(|id| state.resident.get(&id))
-                .and_then(|resident| resident.native.clone());
-            if let Some(fallback) = fallback {
-                if active != fallback {
-                    let _ = state.executor.activate_mapping(&fallback);
-                }
+                .and_then(|resident| resident.native.clone())
+                .unwrap_or_else(|| state.root.clone());
+            if active != fallback {
+                let _ = state.executor.activate_mapping(&fallback);
             }
         }
     }
@@ -1206,6 +1205,24 @@ mod tests {
         assert_eq!(reused.pieces, baseline.pieces);
         assert_eq!(reused.successor_tokens, baseline.successor_tokens);
         assert_eq!(reused.cached_tokens, 0);
+    }
+
+    #[test]
+    fn dropping_unpublished_session_reactivates_root_mapping() {
+        let engine =
+            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+                .unwrap();
+        let root_identity = engine.state.lock().root.identity();
+        let mut session = engine
+            .start_session(test_request(&model(), "cancel before publication", 2, &[]))
+            .unwrap();
+        assert!(matches!(session.step().unwrap(), SessionStep::Progress(_)));
+        drop(session);
+        let state = engine.state.lock();
+        assert_eq!(
+            state.executor.mapping_metrics().active_identity,
+            root_identity
+        );
     }
 
     #[test]
