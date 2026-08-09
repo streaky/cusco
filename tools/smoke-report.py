@@ -18,7 +18,7 @@ MODEL = os.environ.get(
 SEMANTIC_WORKLOAD = Path(
     os.environ.get(
         "CUSCO_SEMANTIC_WORKLOAD",
-        "/work/config/phase10-semantic-workload.json",
+        "/work/config/semantic-compaction-workload.json",
     )
 )
 OPENAI = OpenAI(

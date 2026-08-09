@@ -749,7 +749,7 @@ impl InferenceEngine for MappedEngine {
         }
         if request.model.path.to_str() != Some(self.model_path()) {
             return Err(Error::State(
-                "Phase 8 admits only a resident process-owned model".into(),
+                "mapped execution admits only a resident process-owned model".into(),
             ));
         }
         let context_limit = self.context_capacity.min(self.profile.context_limit);

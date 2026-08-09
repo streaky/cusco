@@ -392,13 +392,13 @@ impl Executor {
         ffi::mapping_metrics(self.raw)
     }
 
-    /// Phase 1 proof hook: clear the slot and decode unrelated state.
+    /// Proof hook: clear the slot and decode unrelated state.
     /// This is not a production state-management operation.
     pub fn replace_state_for_proof(&mut self, tokens: &[i32]) -> Result<(), Error> {
         ffi::replace_state_for_proof(self.raw, tokens)
     }
 
-    /// Phase 1 proof hook: make the next decode return cancellation before mutation.
+    /// Proof hook: make the next decode return cancellation before mutation.
     pub fn cancel_next_decode_for_proof(&mut self) {
         ffi::cancel_next_decode_for_proof(self.raw)
     }

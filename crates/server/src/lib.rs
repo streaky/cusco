@@ -4767,7 +4767,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn phase6c_defaults_match_the_fixed_operating_contract() {
+    fn defaults_match_the_fixed_operating_contract() {
         assert_eq!(
             ServerConfig::default(),
             ServerConfig {
@@ -5802,7 +5802,7 @@ mod tests {
 
     fn assert_semantic_fixture(name: &str) {
         let fixtures: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/phase10_semantic.json")).unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/semantic_compaction.json")).unwrap();
         let fixture = &fixtures[name];
         let tokens = fixture["tokens"]
             .as_array()

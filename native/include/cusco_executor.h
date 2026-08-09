@@ -154,7 +154,7 @@ uint64_t cusco_executor_graph_recaptures(const cusco_executor *);
 void cusco_executor_cancel(cusco_executor *);
 /* Clear a stale abort signal while the caller exclusively owns the executor. */
 void cusco_executor_reset_cancel(cusco_executor *);
-/* Phase 1 proof hooks, not production executor operations. */
+/* Deterministic proof hooks, not production executor operations. */
 cusco_status cusco_executor_replace_state_for_proof(cusco_executor *, const int32_t *, size_t);
 void cusco_executor_cancel_next_decode_for_proof(cusco_executor *);
 

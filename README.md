@@ -90,7 +90,7 @@ The reusable correctness and performance artifact is written to
 `results/representation-proof.json`.
 
 The narrower `mapped-proof` service remains available as a staged-restore versus
-mapped-activation diagnostic. It writes `results/phase5.json` and does not claim
+mapped-activation diagnostic. It writes `results/mapped-proof.json` and does not claim
 kernel-level graph or cache reuse.
 
 All real-model gates share one cached artifact:

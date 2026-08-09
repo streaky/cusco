@@ -49,7 +49,7 @@ enum Command {
         prefix: String,
         #[arg(long, default_value = "Unrelated replacement context")]
         replacement: String,
-        #[arg(long, default_value = "/results/phase1.json")]
+        #[arg(long, default_value = "/results/executor-proof.json")]
         output: PathBuf,
     },
     MappedProof {
@@ -63,7 +63,7 @@ enum Command {
             default_value = "Mapped execution proves reference-only branch switching"
         )]
         prefix: String,
-        #[arg(long, default_value = "/results/phase5.json")]
+        #[arg(long, default_value = "/results/mapped-proof.json")]
         output: PathBuf,
     },
     /// Measure representation publication scaling and exact continuation.
@@ -78,12 +78,12 @@ enum Command {
         #[arg(long, default_value_t = 99)]
         gpu_layers: i32,
     },
-    /// Run the versioned real-model Phase 8 scheduler acceptance workload.
+    /// Run the versioned real-model scheduler acceptance workload.
     SchedulerProof {
         model: PathBuf,
-        #[arg(long, default_value = "/work/config/phase8-workload.json")]
+        #[arg(long, default_value = "/work/config/scheduler-workload.json")]
         workload: PathBuf,
-        #[arg(long, default_value = "/results/phase8-server.json")]
+        #[arg(long, default_value = "/results/scheduler-proof.json")]
         output: PathBuf,
         #[arg(long, default_value_t = 4096)]
         context: u32,
@@ -399,7 +399,7 @@ fn scheduler_proof(
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let model = cusco_server::ModelRecord {
-        id: "phase8-proof-model".into(),
+        id: "scheduler-proof-model".into(),
         revision: "proof".into(),
         path: model_path.clone(),
         sha256: "verified-by-proof-wrapper".into(),
@@ -539,7 +539,7 @@ fn scheduler_proof(
         .values()
         .all(|value| value == &Value::Bool(true));
     let artifact = json!({
-        "phase": "8",
+        "schema_version": 1,
         "passed": passed,
         "workload": workload,
         "provenance": {
@@ -580,7 +580,7 @@ fn scheduler_proof(
         fs::create_dir_all(parent)?;
     }
     fs::write(&output, serde_json::to_vec_pretty(&artifact)?)?;
-    ensure!(passed, "Phase 8 scheduler proof gates failed");
+    ensure!(passed, "scheduler proof gates failed");
     println!("{}", output.display());
     Ok(())
 }
@@ -619,8 +619,8 @@ fn run_scheduler_proof_case(
                 class: case.class,
                 source: cusco_server::PrioritySource::ControlledWorkload,
                 principal: case.principal.clone(),
-                correlation_id: format!("phase8-transport-{}", case.id),
-                inference_id: format!("phase8-inference-{}", case.id),
+                correlation_id: format!("scheduler-transport-{}", case.id),
+                inference_id: format!("scheduler-inference-{}", case.id),
             },
             prefill_chunk_tokens: scheduler.status().policy.prefill_tokens,
         },
@@ -965,7 +965,7 @@ fn proof(
             || model_ref == "mock://deterministic"
             || expected_sha256.is_some()
             || allow_unverified_model,
-        "a local model used by the Phase 1 proof requires --sha256"
+        "a local model used by the executor proof requires --sha256"
     );
     let record = resolve_model(&model, expected_sha256)?;
     let model_path = record

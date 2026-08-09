@@ -53,7 +53,7 @@ services:
     deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
   mapped-proof:
     build: *test-build
-    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader > /results/phase5-gpu.csv && cargo run -p cusco -- mapped-proof 'hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf'"]
+    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader > /results/mapped-proof-gpu.csv && cargo run -p cusco -- mapped-proof 'hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf'"]
     environment:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"

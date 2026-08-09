@@ -96,7 +96,7 @@ cusco_status cusco_executor_open(
         return CUSCO_INVALID;
     }
     *out = nullptr;
-    // Phase 1-only deterministic backend for model-free ABI lifecycle tests.
+    // Deterministic backend for model-free ABI lifecycle tests.
     if (strcmp(path, "mock://deterministic") == 0) {
         auto * executor = new (std::nothrow) cusco_executor{};
         if (!executor) {
