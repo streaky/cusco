@@ -267,13 +267,13 @@ The label "OpenAI-compatible" does not identify one uniform wire contract. Cusco
 | Input | String or structured item list | Structured item list required |
 | Streaming | Optional | Required |
 | Storage | Supported and configurable | Must be disabled |
-| Output limit | `max_output_tokens` accepted | `max_output_tokens` rejected |
+| Output limit | `max_output_tokens` accepted | Upstream rejects `max_output_tokens`; Cusco accepts it as an optional compatibility extension |
 | Final output | Completed `Response` contains the final output | Completed response may be empty; streamed items are authoritative |
 | Continuation | `previous_response_id` | Replay prior input and output items |
 | Chat Completions | Native endpoint | Translate Chat Completions over Responses |
 | Output processing | Final object may be sufficient | Event stream is authoritative |
 
-Profile selection must be explicit configuration or endpoint policy, not payload-shape guessing. The adapters may share canonical generation and event machinery, but each owns its distinct validation, defaults, lifecycle, and reconstruction contract. In particular, omission of `max_output_tokens` must remain "no client-specified output limit" in canonical request state. The public profile may accept an explicit value; the Codex profile must reject it. Neither profile may silently replace omission with a small compatibility default: doing so truncates agentic workloads that intentionally rely on streaming, tool turns, stop conditions, context capacity, and server resource/deadline ceilings. Safety remains enforced by model context capacity, admission budgets, cancellation, and wall/active-time limits rather than by an undocumented low token cap.
+Profile selection must be explicit configuration or endpoint policy, not payload-shape guessing. The adapters may share canonical generation and event machinery, but each owns its distinct validation, defaults, lifecycle, and reconstruction contract. Cusco should accept an explicitly supplied `max_output_tokens` in both profiles and enforce that client-requested limit, even though the upstream Codex backend rejects the field. The important compatibility distinction is omission: it must remain "no client-specified output limit" in canonical request state. Neither profile may silently replace omission with a small compatibility default, because doing so truncates agentic workloads that intentionally rely on streaming, tool turns, stop conditions, context capacity, and server resource/deadline ceilings. Safety remains enforced by model context capacity, admission budgets, cancellation, and wall/active-time limits rather than by an undocumented low token cap.
 
 Multimodal input is deliberately limited to text plus images for chat and Responses requests on models whose llama.cpp executor path exposes a compatible vision projector. The OpenAI adapter accepts typed content parts and `image_url` data URIs. Remote URL fetching, audio, video, image generation, and cross-model media pipelines are later work. Image bytes must be size-bounded, content-addressed for request and cache identity, decoded once, and tied to the model/projector epoch; unsupported media or models fail before admission rather than silently degrading to text.
 
@@ -1467,7 +1467,7 @@ Future work is organized by confidence and dependency, not by an implementation 
 
 The following work is expected, but is prioritized from deployment measurements rather than used as permission to bypass the current contract:
 
-- implement explicit, separately tested public-API and Codex compatibility profiles, including their incompatible input, streaming, storage, output-limit, completion-object, continuation, Chat Completions, and event-authority contracts; preserve omitted output limits through the canonical boundary instead of applying the current low shared default;
+- implement explicit, separately tested public-API and Codex compatibility profiles, including their incompatible input, streaming, storage, completion-object, continuation, Chat Completions, and event-authority contracts; accept explicit `max_output_tokens` in both Cusco profiles while preserving omitted output limits through the canonical boundary instead of applying the current low shared default;
 - complete stateful OpenAI Responses resources: opaque `previous_response_id` continuation, retrieval, cancellation, deletion, background lifecycle, typed events, stable request/inference/session identity, tool-result continuation, and retained application context;
 - semantic compaction beyond `window_tail`, beginning with deterministic extractive and model-assisted summaries evaluated against uncompacted controls and fixture-backed observable answers;
 - configured authentication providers, secret management, least-privilege roles, tenant quotas, policy administration, audit records, and hardened deployment defaults;
