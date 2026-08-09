@@ -346,7 +346,7 @@ struct ModelSlotKey {
 enum Command {
     Submit {
         id: u64,
-        request: EngineRequest,
+        request: Box<EngineRequest>,
         response: Sender<ClientMessage>,
     },
     Continue(u64),
@@ -357,11 +357,11 @@ enum Command {
 
 enum SchedulerEvent {
     Client(Command),
-    SlotCompleted(SlotCompletion),
+    SlotCompleted(Box<SlotCompletion>),
 }
 
 enum SlotAction {
-    Start(EngineRequest),
+    Start(Box<EngineRequest>),
     Step(Box<dyn ExecutionSession>),
     Finish(Box<dyn ExecutionSession>),
     Shutdown,
@@ -632,7 +632,7 @@ impl InferenceEngine for WorkloadScheduler {
         self.commands
             .send(SchedulerEvent::Client(Command::Submit {
                 id,
-                request,
+                request: Box::new(request),
                 response,
             }))
             .map_err(|_| Error::ShuttingDown)?;
@@ -730,7 +730,7 @@ fn run_scheduler(
             }
             SchedulerEvent::Client(_) => {}
             SchedulerEvent::SlotCompleted(completion) => handle_completion(
-                completion,
+                *completion,
                 &mut slots,
                 &mut jobs,
                 &mut policy,
@@ -757,7 +757,7 @@ fn spawn_slot(
                 }
                 let started = Instant::now();
                 let (result, session) = match task.action {
-                    SlotAction::Start(request) => match inner.start_session(request) {
+                    SlotAction::Start(request) => match inner.start_session(*request) {
                         Ok(session) => (
                             Ok(SessionStep::Progress(QuantumObservation::model_free(
                                 QuantumKind::Preparation,
@@ -778,13 +778,13 @@ fn spawn_slot(
                     SlotAction::Shutdown => unreachable!(),
                 };
                 if events
-                    .send(SchedulerEvent::SlotCompleted(SlotCompletion {
+                    .send(SchedulerEvent::SlotCompleted(Box::new(SlotCompletion {
                         id: task.id,
                         result,
                         session,
                         selection: task.selection,
                         quantum_duration_ns: started.elapsed().as_nanos(),
-                    }))
+                    })))
                     .is_err()
                 {
                     return;
@@ -833,7 +833,7 @@ fn dispatch_one(
         .get_mut(&id)
         .expect("policy only selects retained jobs");
     let action = if let Some(request) = job.request.take() {
-        SlotAction::Start(request)
+        SlotAction::Start(Box::new(request))
     } else {
         SlotAction::Step(job.session.take().expect("started job retains session"))
     };
@@ -872,6 +872,7 @@ fn handle_command(
             request,
             response,
         } => {
+            let request = *request;
             let flow = FlowKey {
                 principal: request.scheduling.principal.clone(),
                 class: request.scheduling.class,

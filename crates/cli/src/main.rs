@@ -125,16 +125,16 @@ fn run(command: Command) -> Result<()> {
             prefix,
             replacement,
             output,
-        } => proof(
+        } => proof(ProofOptions {
             model,
-            sha256.as_deref(),
+            expected_sha256: sha256,
             allow_unverified_model,
-            context,
+            n_ctx: context,
             gpu_layers,
-            &prefix,
-            &replacement,
+            prefix,
+            replacement,
             output,
-        )?,
+        })?,
         Command::MappedProof {
             model,
             context,
@@ -948,16 +948,29 @@ fn mapped_proof(
     Ok(())
 }
 
-fn proof(
+struct ProofOptions {
     model: PathBuf,
-    expected_sha256: Option<&str>,
+    expected_sha256: Option<String>,
     allow_unverified_model: bool,
     n_ctx: u32,
     gpu_layers: i32,
-    prefix: &str,
-    replacement: &str,
+    prefix: String,
+    replacement: String,
     output: PathBuf,
-) -> Result<()> {
+}
+
+fn proof(options: ProofOptions) -> Result<()> {
+    let ProofOptions {
+        model,
+        expected_sha256,
+        allow_unverified_model,
+        n_ctx,
+        gpu_layers,
+        prefix,
+        replacement,
+        output,
+    } = options;
+    let expected_sha256 = expected_sha256.as_deref();
     let started = Instant::now();
     let model_ref = model.to_str().context("model reference is not UTF-8")?;
     ensure!(
@@ -978,7 +991,7 @@ fn proof(
         capabilities.global_kv && capabilities.swa && capabilities.recurrent,
         "model lacks a complete composite checkpoint capability"
     );
-    let replacement = executor.tokenize(replacement)?;
+    let replacement = executor.tokenize(&replacement)?;
     let mut contexts = Vec::new();
     for i in 0..4 {
         let prompt = format!("{prefix} [{i}]");

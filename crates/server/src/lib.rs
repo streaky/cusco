@@ -126,7 +126,7 @@ pub enum StreamEvent {
     },
     Finished {
         reason: FinishReason,
-        usage: Usage,
+        usage: Box<Usage>,
     },
     Error {
         message: String,
@@ -1917,7 +1917,7 @@ impl Server {
             },
             StreamEvent::Finished {
                 reason: frontier.finish_reason,
-                usage,
+                usage: Box::new(usage),
             },
         ))
     }
@@ -2454,24 +2454,24 @@ async fn completion(
         .is_some_and(|options| options.include_usage);
     s.model(&r.model)?;
     drop(permit);
-    infer_response(
-        s,
-        r.model,
-        r.prompt,
-        r.max_tokens,
+    infer_response(InferResponseRequest {
+        server: s,
+        model: r.model,
+        prompt: r.prompt,
+        max_tokens: r.max_tokens,
         sampling,
-        r.compaction,
+        compaction: r.compaction,
         include_usage,
-        r.stream,
-        r.context_id,
-        r.stop.map(StopInput::into_vec).unwrap_or_default(),
-        r.raw_continuation,
-        r.deadline_ms,
+        streaming: r.stream,
+        context_id: r.context_id,
+        stop: r.stop.map(StopInput::into_vec).unwrap_or_default(),
+        raw_continuation: r.raw_continuation,
+        deadline_ms: r.deadline_ms,
         retained_bytes,
-        request_context.request_id,
-        request_context.principal,
-        WireProtocol::OpenAiCompletion,
-    )
+        request_id: request_context.request_id,
+        principal: request_context.principal,
+        protocol: WireProtocol::Completion,
+    })
     .await
 }
 async fn chat(
@@ -2498,24 +2498,24 @@ async fn chat(
         .is_some_and(|options| options.include_usage);
     let model = s.model(&r.model)?;
     let prompt = lower_messages(&model.family, r.messages, s.vision_config())?;
-    infer_response(
-        s,
-        r.model,
+    infer_response(InferResponseRequest {
+        server: s,
+        model: r.model,
         prompt,
-        r.max_tokens,
+        max_tokens: r.max_tokens,
         sampling,
-        r.compaction,
+        compaction: r.compaction,
         include_usage,
-        r.stream,
-        r.context_id,
-        r.stop.map(StopInput::into_vec).unwrap_or_default(),
-        r.raw_continuation,
-        r.deadline_ms,
+        streaming: r.stream,
+        context_id: r.context_id,
+        stop: r.stop.map(StopInput::into_vec).unwrap_or_default(),
+        raw_continuation: r.raw_continuation,
+        deadline_ms: r.deadline_ms,
         retained_bytes,
-        request_context.request_id,
-        request_context.principal,
-        WireProtocol::OpenAiChat,
-    )
+        request_id: request_context.request_id,
+        principal: request_context.principal,
+        protocol: WireProtocol::Chat,
+    })
     .await
 }
 
@@ -2629,24 +2629,24 @@ async fn responses(
             lower_messages(&model.family, messages, s.vision_config())?
         }
     };
-    infer_response(
-        s,
-        r.model,
-        input,
-        r.max_output_tokens,
+    infer_response(InferResponseRequest {
+        server: s,
+        model: r.model,
+        prompt: input,
+        max_tokens: r.max_output_tokens,
         sampling,
-        r.compaction,
-        true,
-        r.stream,
-        None,
-        vec![],
-        false,
-        None,
+        compaction: r.compaction,
+        include_usage: true,
+        streaming: r.stream,
+        context_id: None,
+        stop: vec![],
+        raw_continuation: false,
+        deadline_ms: None,
         retained_bytes,
-        request_context.request_id,
-        request_context.principal,
-        WireProtocol::OpenAiResponses,
-    )
+        request_id: request_context.request_id,
+        principal: request_context.principal,
+        protocol: WireProtocol::Responses,
+    })
     .await
 }
 
@@ -2962,9 +2962,28 @@ fn start_deadline_watchdogs(
 
 #[derive(Clone, Copy)]
 enum WireProtocol {
-    OpenAiCompletion,
-    OpenAiChat,
-    OpenAiResponses,
+    Completion,
+    Chat,
+    Responses,
+}
+
+struct InferResponseRequest {
+    server: Server,
+    model: String,
+    prompt: String,
+    max_tokens: Option<usize>,
+    sampling: SamplingConfig,
+    compaction: Option<CompactionRequest>,
+    include_usage: bool,
+    streaming: bool,
+    context_id: Option<ContextId>,
+    stop: Vec<String>,
+    raw_continuation: bool,
+    deadline_ms: Option<u64>,
+    retained_bytes: usize,
+    request_id: String,
+    principal: String,
+    protocol: WireProtocol,
 }
 
 fn sse_rows<const N: usize>(values: [Value; N]) -> String {
@@ -2976,7 +2995,7 @@ fn sse_rows<const N: usize>(values: [Value; N]) -> String {
 }
 
 fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
-    if matches!(protocol, WireProtocol::OpenAiResponses) {
+    if matches!(protocol, WireProtocol::Responses) {
         match event {
             StreamEvent::Started {
                 request_id,
@@ -3014,17 +3033,17 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
         }
     }
     let value = match (protocol, event) {
-        (WireProtocol::OpenAiCompletion, StreamEvent::Token { token, .. }) => {
+        (WireProtocol::Completion, StreamEvent::Token { token, .. }) => {
             json!({"object":"text_completion","choices":[{"text":token,"index":0,"finish_reason":null}]})
         }
-        (WireProtocol::OpenAiChat, StreamEvent::Token { token, .. }) => {
+        (WireProtocol::Chat, StreamEvent::Token { token, .. }) => {
             json!({"object":"chat.completion.chunk","choices":[{"delta":{"content":token},"index":0,"finish_reason":null}]})
         }
-        (WireProtocol::OpenAiResponses, StreamEvent::Token { token, .. }) => {
+        (WireProtocol::Responses, StreamEvent::Token { token, .. }) => {
             json!({"type":"response.output_text.delta","delta":token})
         }
         (
-            WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat,
+            WireProtocol::Completion | WireProtocol::Chat,
             StreamEvent::Finished { reason, usage },
         ) => {
             let mut value = json!({"choices":[{"index":0,"finish_reason":reason}]});
@@ -3033,14 +3052,14 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
             }
             value
         }
-        (WireProtocol::OpenAiResponses, StreamEvent::Finished { reason, usage }) => {
+        (WireProtocol::Responses, StreamEvent::Finished { reason, usage }) => {
             json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}})
         }
         (_, StreamEvent::Error { message }) => {
             json!({"error":{"message":message,"type":"server_error"}})
         }
         (
-            WireProtocol::OpenAiChat,
+            WireProtocol::Chat,
             StreamEvent::Started {
                 request_id,
                 correlation_id,
@@ -3052,7 +3071,7 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
             json!({"id":request_id,"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}],"cusco":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}})
         }
         (
-            WireProtocol::OpenAiCompletion,
+            WireProtocol::Completion,
             StreamEvent::Started {
                 request_id,
                 correlation_id,
@@ -3063,15 +3082,13 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
         ) => {
             json!({"id":request_id,"object":"text_completion","choices":[],"cusco":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}})
         }
-        (WireProtocol::OpenAiResponses, StreamEvent::Started { request_id, .. }) => {
+        (WireProtocol::Responses, StreamEvent::Started { request_id, .. }) => {
             json!({"type":"response.created","response":{"id":request_id,"status":"in_progress"}})
         }
     };
     let row = format!("data: {value}\n\n");
-    if matches!(
-        protocol,
-        WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat
-    ) && value["choices"]
+    if matches!(protocol, WireProtocol::Completion | WireProtocol::Chat)
+        && value["choices"]
         .as_array()
         .and_then(|choices| choices.first())
         .is_some_and(|choice| !choice["finish_reason"].is_null())
@@ -3118,36 +3135,37 @@ fn completed_response(
         },
     });
     match protocol {
-        WireProtocol::OpenAiCompletion => {
+        WireProtocol::Completion => {
             json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text,"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
-        WireProtocol::OpenAiChat => {
+        WireProtocol::Chat => {
             json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
-        WireProtocol::OpenAiResponses => {
+        WireProtocol::Responses => {
             json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"finish_reason":finish_reason,"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens},"cusco":cusco})
         }
     }
 }
 
-async fn infer_response(
-    server: Server,
-    model: String,
-    prompt: String,
-    max_tokens: Option<usize>,
-    sampling: SamplingConfig,
-    compaction: Option<CompactionRequest>,
-    include_usage: bool,
-    streaming: bool,
-    context_id: Option<ContextId>,
-    stop: Vec<String>,
-    raw_continuation: bool,
-    deadline_ms: Option<u64>,
-    retained_bytes: usize,
-    request_id: String,
-    principal: String,
-    protocol: WireProtocol,
-) -> Result<Response, Error> {
+async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Error> {
+    let InferResponseRequest {
+        server,
+        model,
+        prompt,
+        max_tokens,
+        sampling,
+        compaction,
+        include_usage,
+        streaming,
+        context_id,
+        stop,
+        raw_continuation,
+        deadline_ms,
+        retained_bytes,
+        request_id,
+        principal,
+        protocol,
+    } = parameters;
     server.model(&model)?;
     let id = request_id;
     let correlation_id = id.clone();
@@ -5391,7 +5409,7 @@ mod tests {
     #[test]
     fn openai_streams_honor_usage_option_and_end_with_done() {
         let started = stream_row(
-            WireProtocol::OpenAiChat,
+            WireProtocol::Chat,
             StreamEvent::Started {
                 request_id: "request".into(),
                 context_id: ContextId::new(),
@@ -5406,7 +5424,7 @@ mod tests {
         assert!(started.contains("\"execution_session_id\":\"sess\""));
         let terminal = StreamEvent::Finished {
             reason: FinishReason::Length,
-            usage: Usage {
+            usage: Box::new(Usage {
                 input_tokens: 1,
                 generated_tokens: 2,
                 evaluated_tokens: 1,
@@ -5421,14 +5439,14 @@ mod tests {
                 correlation_id: String::new(),
                 inference_id: String::new(),
                 execution_session_id: String::new(),
-            },
+            }),
         };
-        let without_usage = stream_row(WireProtocol::OpenAiChat, terminal.clone(), false);
+        let without_usage = stream_row(WireProtocol::Chat, terminal.clone(), false);
         assert!(!without_usage.contains("\"usage\""));
         assert!(without_usage.ends_with("data: [DONE]\n\n"));
         assert!(without_usage.contains("\"finish_reason\":\"length\""));
 
-        let with_usage = stream_row(WireProtocol::OpenAiChat, terminal, true);
+        let with_usage = stream_row(WireProtocol::Chat, terminal, true);
         assert!(with_usage.contains("\"usage\""));
         assert!(with_usage.ends_with("data: [DONE]\n\n"));
     }
@@ -5672,7 +5690,7 @@ mod tests {
             .infer("compact-replay", compacting_request(source.id))
             .unwrap();
         let payload = completed_response(
-            WireProtocol::OpenAiCompletion,
+            WireProtocol::Completion,
             response,
             FinishReason::Length,
         );
@@ -5849,7 +5867,7 @@ mod tests {
     #[test]
     fn openai_responses_stream_correlates_ids() {
         let row = stream_row(
-            WireProtocol::OpenAiResponses,
+            WireProtocol::Responses,
             StreamEvent::Started {
                 request_id: "transport".into(),
                 context_id: ContextId::new(),

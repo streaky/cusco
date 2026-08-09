@@ -1166,7 +1166,7 @@ mod tests {
                 .unwrap();
         let model = model();
         let first = engine
-            .generate_collected(test_request(&model, &"a".repeat(40), 2, &[]))
+            .generate_collected(test_request(&model, "a".repeat(40), 2, &[]))
             .unwrap();
         let second = engine
             .generate_collected(test_request(&model, "z", 1, &first.successor_tokens))
@@ -1238,16 +1238,16 @@ mod tests {
         .unwrap();
         let model = model();
         let first = engine
-            .generate_collected(test_request(&model, &"a".repeat(40), 2, &[]))
+            .generate_collected(test_request(&model, "a".repeat(40), 2, &[]))
             .unwrap();
         engine
-            .generate_collected(test_request(&model, &"b".repeat(40), 1, &[]))
+            .generate_collected(test_request(&model, "b".repeat(40), 1, &[]))
             .unwrap();
         let control =
             MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
                 .unwrap();
         let control_first = control
-            .generate_collected(test_request(&model, &"a".repeat(40), 2, &[]))
+            .generate_collected(test_request(&model, "a".repeat(40), 2, &[]))
             .unwrap();
         let baseline = control
             .generate_collected(test_request(
@@ -1276,7 +1276,7 @@ mod tests {
             MappedEngine::open("gemma4", "mock://deterministic", 64, 0, 1 << 20, 1 << 20).unwrap();
         let model = model();
         let error = engine
-            .generate_collected(test_request(&model, &"x".repeat(65), 1, &[]))
+            .generate_collected(test_request(&model, "x".repeat(65), 1, &[]))
             .unwrap_err();
         assert!(error.to_string().contains("context capacity"));
         assert_eq!(engine.metrics(), MappedMetrics::default());
@@ -1289,11 +1289,11 @@ mod tests {
                 .unwrap();
         let model = model();
         let first = engine
-            .generate_collected(test_request(&model, &"a".repeat(40), 1, &[]))
+            .generate_collected(test_request(&model, "a".repeat(40), 1, &[]))
             .unwrap();
         let failed = engine.generate_collected(test_request(
             &model,
-            &"b".repeat(25),
+            "b".repeat(25),
             1,
             &first.successor_tokens,
         ));
@@ -1313,7 +1313,7 @@ mod tests {
                 .unwrap();
         let model = model();
         let primed = engine
-            .generate_collected(test_request(&model, &"p".repeat(32), 0, &[]))
+            .generate_collected(test_request(&model, "p".repeat(32), 0, &[]))
             .unwrap();
         let resumed = engine
             .generate_collected(test_request(&model, "", 1, &primed.successor_tokens))
