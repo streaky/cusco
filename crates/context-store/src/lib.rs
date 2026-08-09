@@ -1,13 +1,18 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 use thiserror::Error;
 
 pub type Token = i32;
 
 macro_rules! id_type {
     ($name:ident) => {
-        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+        #[derive(
+            Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+        )]
         pub struct $name(pub [u8; 32]);
     };
 }
@@ -41,22 +46,38 @@ impl ComponentMask {
     }
 }
 
+/// Maximum number of tokens held by one immutable logical chunk.
+///
+/// This is deliberately independent of any native KV block size: logical
+/// chunks are the structurally shared identity unit, while executor-owned
+/// representations describe their own physical coverage.
+pub const LOGICAL_CHUNK_TOKENS: usize = 256;
+
 #[derive(Clone, Debug)]
-struct SequenceNode {
-    parent: Option<Arc<SequenceNode>>,
-    token: Token,
-    len: usize,
-    hash: BranchId,
+struct SequenceTail {
+    chunk: Arc<SequenceChunk>,
+    visible: usize,
+}
+
+#[derive(Debug)]
+struct SequenceChunk {
+    parent: Option<SequenceTail>,
+    start_len: usize,
+    tokens: Box<[Token]>,
+    start_hash: Sha256,
+    end_hash: BranchId,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct PersistentTokenSequence {
-    tail: Option<Arc<SequenceNode>>,
+    tail: Option<SequenceTail>,
 }
 
 impl PersistentTokenSequence {
     pub fn len(&self) -> usize {
-        self.tail.as_ref().map_or(0, |node| node.len)
+        self.tail
+            .as_ref()
+            .map_or(0, |tail| tail.chunk.start_len + tail.visible)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -64,26 +85,39 @@ impl PersistentTokenSequence {
     }
 
     pub fn id(&self) -> BranchId {
-        self.tail
-            .as_ref()
-            .map_or_else(empty_branch_id, |node| node.hash)
+        let Some(tail) = &self.tail else {
+            return empty_branch_id();
+        };
+        if tail.visible == tail.chunk.tokens.len() {
+            tail.chunk.end_hash
+        } else {
+            let mut hash = tail.chunk.start_hash.clone();
+            hash_tokens(&mut hash, &tail.chunk.tokens[..tail.visible]);
+            BranchId(hash.finalize().into())
+        }
     }
 
+    /// Adds tokens as bounded immutable chunks, allocating once per chunk
+    /// rather than once per token.
     pub fn append(&self, tokens: &[Token]) -> Self {
-        let mut tail = self.tail.clone();
-        for &token in tokens {
-            let (len, parent_hash) = tail
-                .as_ref()
-                .map_or((1, empty_branch_id()), |node| (node.len + 1, node.hash));
-            let hash = branch_hash(parent_hash, token, len);
-            tail = Some(Arc::new(SequenceNode {
-                parent: tail,
-                token,
-                len,
-                hash,
-            }));
+        let mut sequence = self.clone();
+        let mut hash = sequence.hash_state();
+        for tokens in tokens.chunks(LOGICAL_CHUNK_TOKENS) {
+            let start_hash = hash.clone();
+            hash_tokens(&mut hash, tokens);
+            let chunk = Arc::new(SequenceChunk {
+                parent: sequence.tail.clone(),
+                start_len: sequence.len(),
+                tokens: tokens.into(),
+                start_hash,
+                end_hash: BranchId(hash.clone().finalize().into()),
+            });
+            sequence.tail = Some(SequenceTail {
+                visible: chunk.tokens.len(),
+                chunk,
+            });
         }
-        Self { tail }
+        sequence
     }
 
     pub fn prefix(&self, len: usize) -> Option<Self> {
@@ -91,29 +125,52 @@ impl PersistentTokenSequence {
             return None;
         }
         let mut tail = self.tail.clone();
-        while tail.as_ref().is_some_and(|node| node.len > len) {
-            tail = tail.and_then(|node| node.parent.clone());
+        loop {
+            let Some(current) = tail else {
+                return Some(Self::default());
+            };
+            if len > current.chunk.start_len {
+                return Some(Self {
+                    tail: Some(SequenceTail {
+                        visible: len - current.chunk.start_len,
+                        chunk: current.chunk,
+                    }),
+                });
+            }
+            tail = current.chunk.parent.clone();
         }
-        Some(Self { tail })
     }
 
     pub fn tokens(&self) -> Vec<Token> {
-        let mut result = Vec::with_capacity(self.len());
-        let mut current = self.tail.as_deref();
-        while let Some(node) = current {
-            result.push(node.token);
-            current = node.parent.as_deref();
+        let mut tokens = self.iter_rev().collect::<Vec<_>>();
+        tokens.reverse();
+        tokens
+    }
+
+    fn hash_state(&self) -> Sha256 {
+        let Some(tail) = &self.tail else {
+            return empty_sequence_hash();
+        };
+        let mut hash = tail.chunk.start_hash.clone();
+        hash_tokens(&mut hash, &tail.chunk.tokens[..tail.visible]);
+        hash
+    }
+
+    fn iter_rev(&self) -> ReverseTokens<'_> {
+        ReverseTokens {
+            tail: self.tail.as_ref(),
+            offset: self.tail.as_ref().map_or(0, |tail| tail.visible),
         }
-        result.reverse();
-        result
     }
 
     #[cfg(test)]
-    fn shares_prefix_node(&self, other: &Self, len: usize) -> bool {
+    fn shares_prefix_storage(&self, other: &Self, len: usize) -> bool {
         match (self.prefix(len), other.prefix(len)) {
             (Some(left), Some(right)) => match (left.tail, right.tail) {
                 (None, None) => true,
-                (Some(left), Some(right)) => Arc::ptr_eq(&left, &right),
+                (Some(left), Some(right)) => {
+                    left.visible == right.visible && Arc::ptr_eq(&left.chunk, &right.chunk)
+                }
                 _ => false,
             },
             _ => false,
@@ -121,7 +178,47 @@ impl PersistentTokenSequence {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+impl PartialEq for PersistentTokenSequence {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        match (&self.tail, &other.tail) {
+            (None, None) => true,
+            (Some(left), Some(right))
+                if left.visible == right.visible && Arc::ptr_eq(&left.chunk, &right.chunk) =>
+            {
+                true
+            }
+            _ => self.iter_rev().eq(other.iter_rev()),
+        }
+    }
+}
+
+impl Eq for PersistentTokenSequence {}
+
+struct ReverseTokens<'a> {
+    tail: Option<&'a SequenceTail>,
+    offset: usize,
+}
+
+impl Iterator for ReverseTokens<'_> {
+    type Item = Token;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let tail = self.tail?;
+            if self.offset > 0 {
+                self.offset -= 1;
+                return Some(tail.chunk.tokens[self.offset]);
+            }
+            self.tail = tail.chunk.parent.as_ref();
+            self.offset = self.tail.map_or(0, |parent| parent.visible);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvaluatedPrefix {
     pub id: EvaluatedPrefixId,
     pub branch: BranchId,
@@ -133,7 +230,7 @@ pub struct EvaluatedPrefix {
     pub required_components: ComponentMask,
     pub complete_components: ComponentMask,
     pub evaluation_parameters: [u8; 32],
-    tokens: Vec<Token>,
+    sequence: PersistentTokenSequence,
 }
 
 #[derive(Clone, Debug)]
@@ -161,10 +258,9 @@ struct MappingEntry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct MappingLookupKey {
+struct MappingEpochKey {
     model_epoch: ModelEpoch,
     adapter_epoch: AdapterEpoch,
-    branch: BranchId,
 }
 
 #[derive(Debug)]
@@ -206,7 +302,7 @@ pub struct ContextStore {
     next_context: u64,
     contexts: HashMap<LogicalContextId, LogicalContext>,
     mappings: HashMap<EvaluatedPrefixId, MappingEntry>,
-    prefix_index: HashMap<MappingLookupKey, Vec<EvaluatedPrefixId>>,
+    prefix_index: HashMap<MappingEpochKey, BTreeMap<usize, Vec<EvaluatedPrefixId>>>,
 }
 
 impl ContextStore {
@@ -312,7 +408,6 @@ impl ContextStore {
             return Err(Error::IncompleteComponents);
         }
         let prefix = context.tokens.prefix(represented_end).unwrap();
-        let tokens = prefix.tokens();
         let parent_lineage = match parent {
             Some(id) => {
                 let entry = self.mappings.get(&id).ok_or(Error::InvalidDependency)?;
@@ -329,7 +424,7 @@ impl ContextStore {
             }
             None => DependencyHash([0; 32]),
         };
-        let lineage = dependency_hash(parent_lineage, &tokens);
+        let lineage = dependency_hash(parent_lineage, prefix.id(), represented_end);
         let id = mapping_id(
             context.model_epoch,
             context.adapter_epoch,
@@ -355,42 +450,58 @@ impl ContextStore {
                 required_components,
                 complete_components,
                 evaluation_parameters,
-                tokens,
+                sequence: prefix,
             },
         })
+    }
+
+    /// Validate that a prepared publication can commit without mutating the store.
+    pub fn validate_publication(&self, prepared: &PreparedPublication) -> Result<(), Error> {
+        let context = self
+            .contexts
+            .get(&prepared.context)
+            .ok_or(Error::ContextNotFound)?;
+        if context.evaluated != prepared.expected_current
+            || context.revision != prepared.expected_revision
+        {
+            return Err(Error::PublicationConflict);
+        }
+        if context.model_epoch != prepared.mapping.model_epoch
+            || context.adapter_epoch != prepared.mapping.adapter_epoch
+        {
+            return Err(Error::IncompatibleEpoch);
+        }
+        if context
+            .tokens
+            .prefix(prepared.mapping.represented_end)
+            .as_ref()
+            != Some(&prepared.mapping.sequence)
+        {
+            return Err(Error::PublicationConflict);
+        }
+        if let Some(existing) = self.mappings.get(&prepared.mapping.id) {
+            if *existing.mapping != prepared.mapping {
+                return Err(Error::IdentityConflict);
+            }
+        } else if prepared
+            .mapping
+            .parent
+            .is_some_and(|parent| !self.mappings.contains_key(&parent))
+        {
+            return Err(Error::InvalidDependency);
+        }
+        Ok(())
     }
 
     pub fn commit_publication(
         &mut self,
         prepared: PreparedPublication,
     ) -> Result<Arc<EvaluatedPrefix>, Error> {
-        let context = self
-            .contexts
-            .get(&prepared.context)
-            .ok_or(Error::ContextNotFound)?;
-        let current = context.evaluated;
-        if current != prepared.expected_current || context.revision != prepared.expected_revision {
-            return Err(Error::PublicationConflict);
-        }
+        self.validate_publication(&prepared)?;
         let context = self.contexts.get(&prepared.context).unwrap();
-        if context.model_epoch != prepared.mapping.model_epoch
-            || context.adapter_epoch != prepared.mapping.adapter_epoch
-        {
-            return Err(Error::IncompatibleEpoch);
-        }
-        if !sequence_matches_tokens(
-            &context.tokens,
-            prepared.mapping.represented_end,
-            &prepared.mapping.tokens,
-        ) {
-            return Err(Error::PublicationConflict);
-        }
+        let current = context.evaluated;
         let id = prepared.mapping.id;
-        if let Some(existing) = self.mappings.get(&prepared.mapping.id) {
-            if *existing.mapping != prepared.mapping {
-                return Err(Error::IdentityConflict);
-            }
-        } else {
+        if !self.mappings.contains_key(&prepared.mapping.id) {
             if let Some(parent) = prepared.mapping.parent {
                 self.mappings
                     .get_mut(&parent)
@@ -398,13 +509,18 @@ impl ContextStore {
                     .references
                     .dependents += 1;
             }
-            let lookup_key = MappingLookupKey {
+            let lookup_key = MappingEpochKey {
                 model_epoch: prepared.mapping.model_epoch,
                 adapter_epoch: prepared.mapping.adapter_epoch,
-                branch: prepared.mapping.branch,
             };
+            self.prefix_index
+                .entry(lookup_key)
+                .or_default()
+                .entry(prepared.mapping.represented_end)
+                .or_default()
+                .push(id);
             self.mappings.insert(
-                prepared.mapping.id,
+                id,
                 MappingEntry {
                     mapping: Arc::new(prepared.mapping),
                     references: ReferenceCounts {
@@ -414,7 +530,6 @@ impl ContextStore {
                     },
                 },
             );
-            self.prefix_index.entry(lookup_key).or_default().push(id);
         }
 
         if current != Some(id) {
@@ -442,14 +557,17 @@ impl ContextStore {
             .contexts
             .get(&context_id)
             .ok_or(Error::ContextNotFound)?;
-        let mut node = context.tokens.tail.as_deref();
-        while let Some(sequence) = node {
-            if let Some(mapping) = self.valid_mapping_for_branch(context, sequence.hash) {
-                return Ok(Some(mapping));
-            }
-            node = sequence.parent.as_deref();
-        }
-        Ok(self.valid_mapping_for_branch(context, empty_branch_id()))
+        let key = MappingEpochKey {
+            model_epoch: context.model_epoch,
+            adapter_epoch: context.adapter_epoch,
+        };
+        let Some(lengths) = self.prefix_index.get(&key) else {
+            return Ok(None);
+        };
+        Ok(lengths
+            .range(..=context.tokens.len())
+            .rev()
+            .find_map(|(_, ids)| self.valid_mapping_from_ids(context, ids)))
     }
     /// Returns immutable mapping metadata without conferring residency ownership.
     pub fn mapping(&self, id: EvaluatedPrefixId) -> Option<Arc<EvaluatedPrefix>> {
@@ -484,40 +602,40 @@ impl ContextStore {
                 .contains(mapping.required_components)
             || mapping.represented_end > context.tokens.len()
             || child_end.is_some_and(|end| mapping.represented_end > end)
-            || context.tokens.prefix(mapping.represented_end).unwrap().id() != mapping.branch
-            || !sequence_matches_tokens(&context.tokens, mapping.represented_end, &mapping.tokens)
+            || context.tokens.prefix(mapping.represented_end).as_ref() != Some(&mapping.sequence)
         {
             return false;
         }
-        match mapping.parent {
-            None => true,
-            Some(parent) => self.mappings.get(&parent).is_some_and(|entry| {
-                entry.mapping.represented_end < mapping.represented_end
-                    && self.mapping_valid_for_context(
-                        &entry.mapping,
-                        context,
-                        Some(mapping.represented_end),
-                    )
-            }),
+
+        let mut child = mapping;
+        while let Some(parent_id) = child.parent {
+            let Some(parent) = self.mappings.get(&parent_id).map(|entry| &*entry.mapping) else {
+                return false;
+            };
+            if parent.represented_end >= child.represented_end
+                || parent.model_epoch != child.model_epoch
+                || parent.adapter_epoch != child.adapter_epoch
+                || !parent
+                    .complete_components
+                    .contains(parent.required_components)
+            {
+                return false;
+            }
+            child = parent;
         }
+        true
     }
 
-    fn valid_mapping_for_branch(
+    fn valid_mapping_from_ids(
         &self,
         context: &LogicalContext,
-        branch: BranchId,
+        ids: &[EvaluatedPrefixId],
     ) -> Option<Arc<EvaluatedPrefix>> {
-        self.prefix_index
-            .get(&MappingLookupKey {
-                model_epoch: context.model_epoch,
-                adapter_epoch: context.adapter_epoch,
-                branch,
-            })?
-            .iter()
+        ids.iter()
             .filter_map(|id| self.mappings.get(id))
             .filter(|entry| self.mapping_valid_for_context(&entry.mapping, context, None))
-            .max_by_key(|entry| entry.mapping.represented_end)
             .map(|entry| entry.mapping.clone())
+            .min_by_key(|mapping| mapping.id)
     }
 
     fn adjust_context_refs(&mut self, id: EvaluatedPrefixId, increment: bool) {
@@ -543,18 +661,22 @@ impl ContextStore {
                 break;
             }
             let removed = self.mappings.remove(&id).unwrap();
-            let key = MappingLookupKey {
+            let key = MappingEpochKey {
                 model_epoch: removed.mapping.model_epoch,
                 adapter_epoch: removed.mapping.adapter_epoch,
-                branch: removed.mapping.branch,
             };
-            let remove_key = if let Some(ids) = self.prefix_index.get_mut(&key) {
-                ids.retain(|candidate| *candidate != id);
-                ids.is_empty()
-            } else {
-                false
-            };
-            if remove_key {
+            let mut remove_epoch = false;
+            if let Some(lengths) = self.prefix_index.get_mut(&key) {
+                let end = removed.mapping.represented_end;
+                if let Some(ids) = lengths.get_mut(&end) {
+                    ids.retain(|candidate| *candidate != id);
+                    if ids.is_empty() {
+                        lengths.remove(&end);
+                    }
+                }
+                remove_epoch = lengths.is_empty();
+            }
+            if remove_epoch {
                 self.prefix_index.remove(&key);
             }
             candidate = removed.mapping.parent;
@@ -567,57 +689,36 @@ impl ContextStore {
     }
 }
 
-fn sequence_matches_tokens(
-    sequence: &PersistentTokenSequence,
-    represented_end: usize,
-    expected: &[Token],
-) -> bool {
-    if expected.len() != represented_end {
-        return false;
-    }
-    if represented_end == 0 {
-        return true;
-    }
-    let mut node = sequence.tail.as_deref();
-    while node.is_some_and(|current| current.len > represented_end) {
-        node = node.and_then(|current| current.parent.as_deref());
-    }
-    for expected_token in expected.iter().rev() {
-        let Some(current) = node else {
-            return false;
-        };
-        if current.token != *expected_token {
-            return false;
-        }
-        node = current.parent.as_deref();
-    }
-    node.is_none()
+fn empty_sequence_hash() -> Sha256 {
+    let mut hash = Sha256::new();
+    hash.update(b"cusco-sequence-v2");
+    hash
 }
 
 fn empty_branch_id() -> BranchId {
-    BranchId(Sha256::digest(b"cusco-empty-sequence").into())
+    BranchId(empty_sequence_hash().finalize().into())
 }
 
-fn branch_hash(parent: BranchId, token: Token, len: usize) -> BranchId {
-    let mut hash = Sha256::new();
-    hash.update(b"cusco-sequence-v1");
-    hash.update(parent.0);
-    hash.update(token.to_le_bytes());
-    hash.update(
-        u64::try_from(len)
-            .expect("token sequence length exceeds the portable identity format")
-            .to_le_bytes(),
-    );
-    BranchId(hash.finalize().into())
-}
-
-fn dependency_hash(parent: DependencyHash, tokens: &[Token]) -> DependencyHash {
-    let mut hash = Sha256::new();
-    hash.update(b"cusco-dependency-v1");
-    hash.update(parent.0);
+fn hash_tokens(hash: &mut Sha256, tokens: &[Token]) {
     for token in tokens {
         hash.update(token.to_le_bytes());
     }
+}
+
+fn dependency_hash(
+    parent: DependencyHash,
+    branch: BranchId,
+    represented_end: usize,
+) -> DependencyHash {
+    let mut hash = Sha256::new();
+    hash.update(b"cusco-dependency-v2");
+    hash.update(parent.0);
+    hash.update(branch.0);
+    hash.update(
+        u64::try_from(represented_end)
+            .expect("represented prefix length exceeds the portable identity format")
+            .to_le_bytes(),
+    );
     DependencyHash(hash.finalize().into())
 }
 
@@ -633,7 +734,7 @@ fn mapping_id(
     lineage: DependencyHash,
 ) -> EvaluatedPrefixId {
     let mut hash = Sha256::new();
-    hash.update(b"cusco-evaluated-prefix-v1");
+    hash.update(b"cusco-evaluated-prefix-v2");
     hash.update(model.0.to_le_bytes());
     hash.update(adapter.0.to_le_bytes());
     hash.update(parent.map_or([0; 32], |id| id.0));
@@ -677,8 +778,8 @@ mod tests {
         let base = PersistentTokenSequence::default().append(&[1, 2, 3]);
         let left = base.append(&[4]);
         let right = base.append(&[5]);
-        assert!(left.shares_prefix_node(&right, 3));
-        assert!(!left.shares_prefix_node(&right, 4));
+        assert!(left.shares_prefix_storage(&right, 3));
+        assert!(!left.shares_prefix_storage(&right, 4));
         assert_eq!(left.tokens(), [1, 2, 3, 4]);
         assert_eq!(right.tokens(), [1, 2, 3, 5]);
     }
@@ -775,13 +876,18 @@ mod tests {
         );
         publish(&mut store, source, 2, None);
         let published_tail = store.context(source).unwrap().tokens.tail.clone().unwrap();
+        let colliding_chunk = Arc::new(SequenceChunk {
+            parent: published_tail.chunk.parent.clone(),
+            start_len: published_tail.chunk.start_len,
+            tokens: Box::new([1, 99]),
+            start_hash: published_tail.chunk.start_hash.clone(),
+            end_hash: published_tail.chunk.end_hash,
+        });
         let colliding_sequence = PersistentTokenSequence {
-            tail: Some(Arc::new(SequenceNode {
-                parent: published_tail.parent.clone(),
-                token: 99,
-                len: published_tail.len,
-                hash: published_tail.hash,
-            })),
+            tail: Some(SequenceTail {
+                visible: colliding_chunk.tokens.len(),
+                chunk: colliding_chunk,
+            }),
         };
         let collision = store.create(colliding_sequence, ModelEpoch(1), AdapterEpoch(1));
         assert!(store.longest_valid_prefix(collision).unwrap().is_none());
@@ -880,13 +986,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn chunking_is_bounded_and_identity_is_append_segmentation_independent() {
+        let tokens = (0..(LOGICAL_CHUNK_TOKENS * 3 + 17))
+            .map(|token| token as Token)
+            .collect::<Vec<_>>();
+        let one_append = PersistentTokenSequence::default().append(&tokens);
+        let many_appends = tokens
+            .chunks(13)
+            .fold(PersistentTokenSequence::default(), |sequence, tokens| {
+                sequence.append(tokens)
+            });
+
+        let mut chunk_count = 0;
+        let mut tail = one_append.tail.as_ref();
+        while let Some(current) = tail {
+            chunk_count += 1;
+            assert!(current.chunk.tokens.len() <= LOGICAL_CHUNK_TOKENS);
+            tail = current.chunk.parent.as_ref();
+        }
+
+        assert_eq!(chunk_count, 4);
+        assert_eq!(one_append, many_appends);
+        assert_eq!(one_append.id(), many_appends.id());
+        assert_eq!(
+            one_append.prefix(LOGICAL_CHUNK_TOKENS + 7),
+            many_appends.prefix(LOGICAL_CHUNK_TOKENS + 7)
+        );
+    }
+
     proptest! {
         #[test]
         fn arbitrary_branches_preserve_exact_shared_prefix(prefix in prop::collection::vec(any::<i32>(), 0..64), left in prop::collection::vec(any::<i32>(), 0..32), right in prop::collection::vec(any::<i32>(), 0..32)) {
             let base = PersistentTokenSequence::default().append(&prefix);
             let left_branch = base.append(&left);
             let right_branch = base.append(&right);
-            prop_assert!(left_branch.shares_prefix_node(&right_branch, prefix.len()));
+            prop_assert!(left_branch.shares_prefix_storage(&right_branch, prefix.len()));
             prop_assert_eq!(&left_branch.tokens()[..prefix.len()], prefix.as_slice());
             prop_assert_eq!(&right_branch.tokens()[..prefix.len()], prefix.as_slice());
         }

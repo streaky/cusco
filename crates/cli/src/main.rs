@@ -1,12 +1,14 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use cusco_executor::{Executor, logits_identical};
-use cusco_model_registry::{GEMMA_URI, ModelRecord, fetch_hf, register_local};
+use cusco_model_registry::{
+    GEMMA_URI, ModelRecord as RegistryModelRecord, fetch_hf, register_local,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Barrier, Mutex},
     thread,
     time::{Duration, Instant},
@@ -27,8 +29,6 @@ enum Command {
         cache: PathBuf,
         #[arg(long)]
         sha256: Option<String>,
-        #[arg(long)]
-        output: Option<PathBuf>,
     },
     Register {
         path: PathBuf,
@@ -37,7 +37,7 @@ enum Command {
     },
     Proof {
         model: PathBuf,
-        #[arg(long, required_unless_present = "allow_unverified_model")]
+        #[arg(long)]
         sha256: Option<String>,
         #[arg(long, hide = true)]
         allow_unverified_model: bool,
@@ -49,7 +49,7 @@ enum Command {
         prefix: String,
         #[arg(long, default_value = "Unrelated replacement context")]
         replacement: String,
-        #[arg(long, default_value = "/results/phase1.json")]
+        #[arg(long, default_value = "/results/executor-proof.json")]
         output: PathBuf,
     },
     MappedProof {
@@ -63,15 +63,27 @@ enum Command {
             default_value = "Mapped execution proves reference-only branch switching"
         )]
         prefix: String,
-        #[arg(long, default_value = "/results/phase5.json")]
+        #[arg(long, default_value = "/results/mapped-proof.json")]
         output: PathBuf,
     },
-    /// Run the versioned real-model Phase 8 scheduler acceptance workload.
+    /// Measure representation publication scaling and exact continuation.
+    RepresentationProof {
+        model: PathBuf,
+        #[arg(long, default_value = "/work/config/representation-workload.json")]
+        workload: PathBuf,
+        #[arg(long, default_value = "/results/representation-proof.json")]
+        output: PathBuf,
+        #[arg(long, default_value_t = 4096)]
+        context: u32,
+        #[arg(long, default_value_t = 99)]
+        gpu_layers: i32,
+    },
+    /// Run the versioned real-model scheduler acceptance workload.
     SchedulerProof {
         model: PathBuf,
-        #[arg(long, default_value = "/work/config/phase8-workload.json")]
+        #[arg(long, default_value = "/work/config/scheduler-workload.json")]
         workload: PathBuf,
-        #[arg(long, default_value = "/results/phase8-server.json")]
+        #[arg(long, default_value = "/results/scheduler-proof.json")]
         output: PathBuf,
         #[arg(long, default_value_t = 4096)]
         context: u32,
@@ -94,43 +106,10 @@ enum Command {
 fn main() -> Result<()> {
     run(Args::parse().command)
 }
-fn materialize_model(record: &ModelRecord, output: &std::path::Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let (Ok(source), Ok(target)) = (fs::metadata(&record.path), fs::metadata(output)) {
-            if source.dev() == target.dev() && source.ino() == target.ino() {
-                return Ok(());
-            }
-        }
-    }
-    if output.exists() && register_local(output, &record.identity, Some(&record.sha256)).is_ok() {
-        return Ok(());
-    }
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temporary = output.with_extension(format!("partial-{}", std::process::id()));
-    let _ = fs::remove_file(&temporary);
-    if fs::hard_link(&record.path, &temporary).is_err() {
-        fs::copy(&record.path, &temporary)?;
-    }
-    fs::rename(temporary, output)?;
-    Ok(())
-}
 fn run(command: Command) -> Result<()> {
     match command {
-        Command::Fetch {
-            uri,
-            cache,
-            sha256,
-            output,
-        } => {
-            let mut record = fetch_hf(&uri, &cache, sha256.as_deref())?;
-            if let Some(output) = output {
-                materialize_model(&record, &output)?;
-                record = register_local(output, &record.identity, Some(&record.sha256))?;
-            }
+        Command::Fetch { uri, cache, sha256 } => {
+            let record = fetch_hf(&uri, &cache, sha256.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&record)?);
         }
         Command::Register { path, sha256 } => println!(
@@ -146,16 +125,16 @@ fn run(command: Command) -> Result<()> {
             prefix,
             replacement,
             output,
-        } => proof(
+        } => proof(ProofOptions {
             model,
-            sha256.as_deref(),
+            expected_sha256: sha256,
             allow_unverified_model,
-            context,
+            n_ctx: context,
             gpu_layers,
-            &prefix,
-            &replacement,
+            prefix,
+            replacement,
             output,
-        )?,
+        })?,
         Command::MappedProof {
             model,
             context,
@@ -163,6 +142,13 @@ fn run(command: Command) -> Result<()> {
             prefix,
             output,
         } => mapped_proof(model, context, gpu_layers, &prefix, output)?,
+        Command::RepresentationProof {
+            model,
+            workload,
+            output,
+            context,
+            gpu_layers,
+        } => representation_proof(model, workload, output, context, gpu_layers)?,
         Command::SchedulerProof {
             model,
             workload,
@@ -225,7 +211,7 @@ fn run(command: Command) -> Result<()> {
             let catalog = ModelCatalog::open(&config.paths.database)?;
             server.attach_catalog(catalog.clone(), config.paths.models.clone());
             for model in catalog.models()? {
-                server.register_model(model)?;
+                server.register_catalog_model(model)?;
             }
             let declared = load_user_models(&config.paths.user_config, &config.paths.user_models)?;
             for declaration in declared.models {
@@ -235,17 +221,23 @@ fn run(command: Command) -> Result<()> {
                     declaration.sha256.as_deref(),
                 )?;
                 let metadata = cusco_model_registry::probe_gguf(&registered.path)?;
-                let model = server.register_model(ModelRecord {
-                    id: declaration.name,
-                    revision: registered.sha256.clone(),
-                    path: registered.path,
-                    sha256: registered.sha256,
-                    aliases: declaration.aliases,
-                    family: metadata.architecture,
-                    size_bytes: registered.size,
-                    epoch: 0,
-                })?;
-                catalog.publish(&model)?;
+                server.register_model_with(
+                    |model| {
+                        catalog
+                            .publish(model)
+                            .map_err(|error| cusco_server::Error::State(error.to_string()))
+                    },
+                    ModelRecord {
+                        id: declaration.name,
+                        revision: registered.sha256.clone(),
+                        path: registered.path,
+                        sha256: registered.sha256,
+                        aliases: declaration.aliases,
+                        family: metadata.architecture,
+                        size_bytes: registered.size,
+                        epoch: 0,
+                    },
+                )?;
             }
             let runtime = tokio::runtime::Runtime::new()?;
             match http_debug {
@@ -266,6 +258,36 @@ fn run(command: Command) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn resolve_model(model: &Path, expected_sha256: Option<&str>) -> Result<RegistryModelRecord> {
+    let model_ref = model.to_str().context("model reference is not UTF-8")?;
+    if model_ref == "mock://deterministic" {
+        return Ok(RegistryModelRecord {
+            identity: "mock".into(),
+            path: model.to_owned(),
+            sha256: "model-free".into(),
+            size: 0,
+        });
+    }
+    if model_ref.starts_with("hf://") {
+        let cache = std::env::var_os("CUSCO_MODEL_CACHE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/models/cache"));
+        return fetch_hf(model_ref, &cache, expected_sha256).map_err(Into::into);
+    }
+    register_local(model, GEMMA_URI, expected_sha256).map_err(Into::into)
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RepresentationProofWorkload {
+    version: u32,
+    name: String,
+    trace_text: String,
+    trace_repetitions: usize,
+    represented_prefix_tokens: Vec<usize>,
+    require_reference_only_forks: bool,
+    require_graph_reuse_signal: bool,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -324,7 +346,7 @@ struct SchedulerProofResult {
 
 #[allow(clippy::too_many_arguments)]
 fn scheduler_proof(
-    model_path: PathBuf,
+    model: PathBuf,
     workload_path: PathBuf,
     output: PathBuf,
     n_ctx: u32,
@@ -335,6 +357,7 @@ fn scheduler_proof(
     use cusco_server::{MappedEngine, WorkloadScheduler};
 
     let proof_started = Instant::now();
+    let model_path = resolve_model(&model, None)?.path;
     let workload_bytes = fs::read(&workload_path)
         .with_context(|| format!("read workload {}", workload_path.display()))?;
     let workload: SchedulerProofWorkload =
@@ -376,7 +399,7 @@ fn scheduler_proof(
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let model = cusco_server::ModelRecord {
-        id: "phase8-proof-model".into(),
+        id: "scheduler-proof-model".into(),
         revision: "proof".into(),
         path: model_path.clone(),
         sha256: "verified-by-proof-wrapper".into(),
@@ -516,7 +539,7 @@ fn scheduler_proof(
         .values()
         .all(|value| value == &Value::Bool(true));
     let artifact = json!({
-        "phase": "8",
+        "schema_version": 1,
         "passed": passed,
         "workload": workload,
         "provenance": {
@@ -557,7 +580,7 @@ fn scheduler_proof(
         fs::create_dir_all(parent)?;
     }
     fs::write(&output, serde_json::to_vec_pretty(&artifact)?)?;
-    ensure!(passed, "Phase 8 scheduler proof gates failed");
+    ensure!(passed, "scheduler proof gates failed");
     println!("{}", output.display());
     Ok(())
 }
@@ -596,8 +619,8 @@ fn run_scheduler_proof_case(
                 class: case.class,
                 source: cusco_server::PrioritySource::ControlledWorkload,
                 principal: case.principal.clone(),
-                correlation_id: format!("phase8-transport-{}", case.id),
-                inference_id: format!("phase8-inference-{}", case.id),
+                correlation_id: format!("scheduler-transport-{}", case.id),
+                inference_id: format!("scheduler-inference-{}", case.id),
             },
             prefill_chunk_tokens: scheduler.status().policy.prefill_tokens,
         },
@@ -660,6 +683,191 @@ fn percentile(values: &[u128], percentile: usize) -> u128 {
     sorted[index]
 }
 
+fn representation_proof(
+    model: PathBuf,
+    workload_path: PathBuf,
+    output: PathBuf,
+    n_ctx: u32,
+    gpu_layers: i32,
+) -> Result<()> {
+    let proof_started = Instant::now();
+    let workload_bytes = fs::read(&workload_path)
+        .with_context(|| format!("read workload {}", workload_path.display()))?;
+    let workload: RepresentationProofWorkload =
+        serde_json::from_slice(&workload_bytes).context("parse representation workload")?;
+    ensure!(
+        workload.version == 1,
+        "unsupported representation workload version"
+    );
+    ensure!(
+        !workload.trace_text.is_empty(),
+        "representation trace text is empty"
+    );
+    ensure!(
+        workload.trace_repetitions > 0,
+        "trace repetitions must be positive"
+    );
+    ensure!(
+        !workload.represented_prefix_tokens.is_empty(),
+        "represented-prefix boundary list is empty"
+    );
+    ensure!(
+        workload
+            .represented_prefix_tokens
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "represented-prefix boundaries must be strictly increasing"
+    );
+
+    let record = resolve_model(&model, None)?;
+    let model_path = record
+        .path
+        .to_str()
+        .context("resolved model path is not UTF-8")?;
+    let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
+    ensure!(
+        executor.capabilities().mapped_execution,
+        "executor does not support mapped execution"
+    );
+    let trace = workload.trace_text.repeat(workload.trace_repetitions);
+    let tokens = executor.tokenize(&trace)?;
+    let final_boundary = *workload.represented_prefix_tokens.last().unwrap();
+    ensure!(
+        tokens.len() > final_boundary + 1,
+        "trace has {} tokens but needs more than {}",
+        tokens.len(),
+        final_boundary + 1
+    );
+
+    let mut active = executor.active_representation()?;
+    let mut cursor = 0usize;
+    let mut boundaries = Vec::with_capacity(workload.represented_prefix_tokens.len());
+    for &represented_prefix_tokens in &workload.represented_prefix_tokens {
+        executor.decode(&tokens[cursor..represented_prefix_tokens])?;
+        let before = executor.mapping_metrics();
+        let publication_started = Instant::now();
+        let prepared = executor.prepare_mapping_fork(&active)?;
+        let successor = executor.commit_mapping(prepared)?;
+        let publication_ns = publication_started.elapsed().as_nanos();
+        let after = executor.mapping_metrics();
+        let fork_bytes_copied = after.fork_bytes_copied - before.fork_bytes_copied;
+
+        let continuation_input_token = tokens[represented_prefix_tokens];
+        executor.activate_mapping(&active)?;
+        let source = executor.decode(&[continuation_input_token])?;
+        executor.activate_mapping(&successor)?;
+        let successor_decode = executor.decode(&[continuation_input_token])?;
+        let token_equal = source.token == successor_decode.token;
+        let logits_equal = logits_identical(&source.logits, &successor_decode.logits);
+        ensure!(
+            token_equal && logits_equal,
+            "fork diverged at represented prefix {represented_prefix_tokens}"
+        );
+        if workload.require_reference_only_forks {
+            ensure!(
+                fork_bytes_copied == 0,
+                "fork at represented prefix {represented_prefix_tokens} copied {fork_bytes_copied} payload bytes"
+            );
+        }
+        boundaries.push(json!({
+            "represented_prefix_tokens": represented_prefix_tokens,
+            "publication_ns": publication_ns,
+            "fork_bytes_copied": fork_bytes_copied,
+            "source_mapping": active.identity(),
+            "successor_mapping": successor.identity(),
+            "continuation_input_token": continuation_input_token,
+            "next_token": successor_decode.token,
+            "token_equal": token_equal,
+            "logits_equal": logits_equal
+        }));
+        active = successor;
+        cursor = represented_prefix_tokens + 1;
+    }
+
+    let movement_before = executor.mapping_metrics();
+    let export_started = Instant::now();
+    let exported = executor.export_mapping(&active)?;
+    let export_ns = export_started.elapsed().as_nanos();
+    let after_export = executor.mapping_metrics();
+    let import_started = Instant::now();
+    let imported = executor.import_mapping(&exported)?;
+    let import_ns = import_started.elapsed().as_nanos();
+    let after_import = executor.mapping_metrics();
+    let movement_token = tokens[cursor];
+    executor.activate_mapping(&active)?;
+    let resident = executor.decode(&[movement_token])?;
+    executor.activate_mapping(&imported)?;
+    let restored = executor.decode(&[movement_token])?;
+    let movement_token_equal = resident.token == restored.token;
+    let movement_logits_equal = logits_identical(&resident.logits, &restored.logits);
+    ensure!(
+        movement_token_equal && movement_logits_equal,
+        "exported and imported mapping diverged"
+    );
+    let metrics = executor.mapping_metrics();
+    if workload.require_graph_reuse_signal {
+        ensure!(
+            metrics.graph_recaptures.is_some(),
+            "workload requires graph telemetry but the backend does not expose it"
+        );
+    }
+
+    let publication_ns: Vec<u128> = boundaries
+        .iter()
+        .map(|row| row["publication_ns"].as_u64().unwrap() as u128)
+        .collect();
+    let artifact = json!({
+        "schema_version": 1,
+        "test_set": {
+            "version": workload.version,
+            "name": workload.name,
+            "workload": workload,
+            "trace_manifest": {
+                "token_count": tokens.len(),
+                "tokens": tokens,
+                "represented_prefix_tokens": workload.represented_prefix_tokens
+            }
+        },
+        "target": {
+            "model": record.identity,
+            "resolved_path": record.path,
+            "context_tokens": n_ctx,
+            "gpu_layers": gpu_layers
+        },
+        "correctness": {
+            "passed": true,
+            "boundaries": boundaries,
+            "state_movement": {
+                "payload_bytes": exported.bytes.len(),
+                "continuation_input_token": movement_token,
+                "next_token": restored.token,
+                "token_equal": movement_token_equal,
+                "logits_equal": movement_logits_equal
+            }
+        },
+        "performance": {
+            "publication_ns": publication_ns,
+            "publication_min_ns": publication_ns.iter().min(),
+            "publication_max_ns": publication_ns.iter().max(),
+            "export_ns": export_ns,
+            "import_ns": import_ns,
+            "fork_bytes_copied": metrics.fork_bytes_copied,
+            "export_bytes_copied_delta": after_export.export_bytes_copied - movement_before.export_bytes_copied,
+            "import_bytes_copied_delta": after_import.import_bytes_copied - after_export.import_bytes_copied,
+            "total_bytes_copied": metrics.total_bytes_copied,
+            "graph_recaptures_supported": metrics.graph_recaptures.is_some(),
+            "graph_recaptures": metrics.graph_recaptures
+        },
+        "elapsed_ms": proof_started.elapsed().as_millis()
+    });
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&output, serde_json::to_vec_pretty(&artifact)?)?;
+    println!("{}", serde_json::to_string_pretty(&artifact)?);
+    Ok(())
+}
+
 fn mapped_proof(
     model: PathBuf,
     n_ctx: u32,
@@ -668,7 +876,11 @@ fn mapped_proof(
     output: PathBuf,
 ) -> Result<()> {
     let started = Instant::now();
-    let model_path = model.to_str().context("model path is not UTF-8")?;
+    let record = resolve_model(&model, None)?;
+    let model_path = record
+        .path
+        .to_str()
+        .context("resolved model path is not UTF-8")?;
     let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
     ensure!(
         executor.capabilities().mapped_execution,
@@ -687,9 +899,10 @@ fn mapped_proof(
         executor.commit_restore(prepared)?;
     }
     let staged_restore_ns = staged_started.elapsed().as_nanos();
+    let source = executor.active_representation()?;
     let mut mappings = Vec::with_capacity(4);
     for _ in 0..4 {
-        let prepared = executor.prepare_mapping_fork(cusco_executor::MappingId(0))?;
+        let prepared = executor.prepare_mapping_fork(&source)?;
         mappings.push(executor.commit_mapping(prepared)?);
     }
     let continuation = *tokens.last().unwrap();
@@ -698,7 +911,7 @@ fn mapped_proof(
     let mut activation_ns = 0u128;
     for mapping in mappings {
         let activation_started = Instant::now();
-        executor.activate_mapping(mapping)?;
+        executor.activate_mapping(&mapping)?;
         activation_ns += activation_started.elapsed().as_nanos();
         let decoded = executor.decode(&[continuation])?;
         if let Some((token, logits)) = &expected {
@@ -709,22 +922,20 @@ fn mapped_proof(
         } else {
             expected = Some((decoded.token, decoded.logits.clone()));
         }
-        results.push(json!({"mapping": mapping.0, "next_token": decoded.token}));
+        results.push(json!({"mapping": mapping.identity(), "next_token": decoded.token}));
     }
     let metrics = executor.mapping_metrics();
-    ensure!(
-        metrics.activation_bytes_copied == 0,
-        "mapping activation copied device bytes"
-    );
     let artifact = json!({
-        "model": model,
+        "model": record.identity,
+        "resolved_path": record.path,
         "branches": results,
         "metrics": metrics,
         "comparison": {
             "staged_restore_ns": staged_restore_ns,
             "mapped_activation_ns": activation_ns,
             "staged_bytes_read": checkpoint.bytes * 4,
-            "mapped_activation_bytes_copied": metrics.activation_bytes_copied,
+            "mapped_fork_bytes_copied": metrics.fork_bytes_copied,
+            "mapped_total_bytes_copied": metrics.total_bytes_copied,
             "prompt_tokens_avoided": tokens.len() * 4
         },
         "elapsed_ms": started.elapsed().as_millis()
@@ -737,39 +948,50 @@ fn mapped_proof(
     Ok(())
 }
 
-fn proof(
+struct ProofOptions {
     model: PathBuf,
-    expected_sha256: Option<&str>,
+    expected_sha256: Option<String>,
     allow_unverified_model: bool,
     n_ctx: u32,
     gpu_layers: i32,
-    prefix: &str,
-    replacement: &str,
+    prefix: String,
+    replacement: String,
     output: PathBuf,
-) -> Result<()> {
+}
+
+fn proof(options: ProofOptions) -> Result<()> {
+    let ProofOptions {
+        model,
+        expected_sha256,
+        allow_unverified_model,
+        n_ctx,
+        gpu_layers,
+        prefix,
+        replacement,
+        output,
+    } = options;
+    let expected_sha256 = expected_sha256.as_deref();
     let started = Instant::now();
-    let model_path = model.to_str().context("model path is not UTF-8")?;
-    let record = if model_path == "mock://deterministic" {
-        ModelRecord {
-            identity: "mock".into(),
-            path: model.clone(),
-            sha256: "model-free".into(),
-            size: 0,
-        }
-    } else {
-        ensure!(
-            expected_sha256.is_some() || allow_unverified_model,
-            "the Phase 1 proof requires --sha256 for the pinned Gemma artifact"
-        );
-        register_local(&model, GEMMA_URI, expected_sha256)?
-    };
+    let model_ref = model.to_str().context("model reference is not UTF-8")?;
+    ensure!(
+        model_ref.starts_with("hf://")
+            || model_ref == "mock://deterministic"
+            || expected_sha256.is_some()
+            || allow_unverified_model,
+        "a local model used by the executor proof requires --sha256"
+    );
+    let record = resolve_model(&model, expected_sha256)?;
+    let model_path = record
+        .path
+        .to_str()
+        .context("resolved model path is not UTF-8")?;
     let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
     let capabilities = executor.capabilities();
     ensure!(
         capabilities.global_kv && capabilities.swa && capabilities.recurrent,
         "model lacks a complete composite checkpoint capability"
     );
-    let replacement = executor.tokenize(replacement)?;
+    let replacement = executor.tokenize(&replacement)?;
     let mut contexts = Vec::new();
     for i in 0..4 {
         let prompt = format!("{prefix} [{i}]");
@@ -936,26 +1158,24 @@ mod tests {
         })
         .unwrap();
         let (uri, revision, file) = (
-            "hf://unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2/gemma-4-E2B-it-Q4_K_M.gguf",
+            "hf://unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2/gemma-4-E2B-it-Q3_K_M.gguf",
             "0314792d7f1f7e229411f620751375812bb9faf2",
-            "gemma-4-E2B-it-Q4_K_M.gguf",
+            "gemma-4-E2B-it-Q3_K_M.gguf",
         );
         let cached = root
             .join("models")
             .join("unsloth--gemma-4-E2B-it-GGUF")
             .join(revision);
         fs::create_dir_all(&cached).unwrap();
-        fs::write(cached.join(file), b"model").unwrap();
-        let output_model = root.join("fixture.gguf");
-        fs::write(&output_model, b"stale").unwrap();
+        let cached_model = cached.join(file);
+        fs::write(&cached_model, b"model").unwrap();
         run(Command::Fetch {
             uri: uri.into(),
             cache: root.clone(),
             sha256: None,
-            output: Some(output_model.clone()),
         })
         .unwrap();
-        assert_eq!(fs::read(output_model).unwrap(), b"model");
+        assert_eq!(fs::read(cached_model).unwrap(), b"model");
         let output = root.join("proof.json");
         run(Command::Proof {
             model: PathBuf::from("mock://deterministic"),
@@ -986,15 +1206,65 @@ mod tests {
         let mapped: serde_json::Value =
             serde_json::from_slice(&fs::read(mapped_output).unwrap()).unwrap();
         assert_eq!(mapped["branches"].as_array().unwrap().len(), 4);
-        assert_eq!(mapped["metrics"]["activation_bytes_copied"], 0);
+        assert_eq!(mapped["metrics"]["reference_switches"], 4);
         assert!(mapped["comparison"]["staged_bytes_read"].as_u64().unwrap() > 0);
-        assert_eq!(mapped["comparison"]["mapped_activation_bytes_copied"], 0);
+        assert!(
+            mapped["comparison"]["mapped_fork_bytes_copied"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
         assert!(
             mapped["comparison"]["prompt_tokens_avoided"]
                 .as_u64()
                 .unwrap()
                 > 0
         );
+        let representation_workload = root.join("representation-workload.json");
+        fs::write(
+            &representation_workload,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "name": "model-free-representation",
+                "trace_text": "deterministic representation trace ",
+                "trace_repetitions": 4,
+                "represented_prefix_tokens": [2, 4, 8],
+                "require_reference_only_forks": false,
+                "require_graph_reuse_signal": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let representation_output = root.join("representation.json");
+        run(Command::RepresentationProof {
+            model: PathBuf::from("mock://deterministic"),
+            workload: representation_workload,
+            output: representation_output.clone(),
+            context: 128,
+            gpu_layers: 0,
+        })
+        .unwrap();
+        let representation: Value =
+            serde_json::from_slice(&fs::read(representation_output).unwrap()).unwrap();
+        assert_eq!(representation["correctness"]["passed"], true);
+        assert_eq!(
+            representation["correctness"]["boundaries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(
+            representation["performance"]["fork_bytes_copied"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            representation["performance"]["graph_recaptures_supported"],
+            false
+        );
+
         let workload = root.join("scheduler-workload.json");
         fs::write(
             &workload,

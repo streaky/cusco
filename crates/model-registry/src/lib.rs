@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use thiserror::Error;
-pub const GEMMA_URI: &str = "hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf";
+pub const GEMMA_URI: &str = "hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf";
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("invalid hf uri")]
@@ -75,8 +75,8 @@ fn skip_value(reader: &mut impl Read, kind: u32) -> Result<(), Error> {
     let bytes = match kind {
         0 | 1 | 7 => 1,
         2 | 3 => 2,
-        4 | 5 | 6 => 4,
-        10 | 11 | 12 => 8,
+        4..=6 => 4,
+        10..=12 => 8,
         8 => {
             let _ = read_string(reader)?;
             return Ok(());

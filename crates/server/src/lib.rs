@@ -13,13 +13,10 @@ use http_body_util::BodyExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
-    fs,
     future::Future,
-    io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -28,6 +25,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -35,6 +33,7 @@ mod catalog;
 mod config;
 mod context_strategy;
 mod generation;
+mod lifecycle;
 mod mapped;
 mod prompt;
 mod residency;
@@ -127,7 +126,7 @@ pub enum StreamEvent {
     },
     Finished {
         reason: FinishReason,
-        usage: Usage,
+        usage: Box<Usage>,
     },
     Error {
         message: String,
@@ -236,19 +235,10 @@ pub struct ModelRecord {
     #[serde(default)]
     pub epoch: u64,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct DurableState {
-    installation: Uuid,
+#[derive(Clone, Debug)]
+struct RuntimeState {
     contexts: HashMap<ContextId, ContextRecord>,
-    models: HashMap<String, ModelRecord>,
-    #[serde(default = "initial_model_epoch")]
-    next_model_epoch: u64,
 }
-
-fn initial_model_epoch() -> u64 {
-    1
-}
-
 fn default_model_family() -> String {
     "gemma4".into()
 }
@@ -693,6 +683,12 @@ impl RequestControl {
     }
 }
 
+impl Default for RequestControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct AbortRegistration<'a> {
     control: &'a RequestControl,
 }
@@ -971,7 +967,7 @@ struct QueueEntry {
     ready: tokio::sync::oneshot::Sender<()>,
 }
 struct Inner {
-    durable: DurableState,
+    durable: RuntimeState,
     controls: HashMap<String, Arc<RequestControl>>,
     pending_cancelled: HashSet<String>,
     active: usize,
@@ -1075,16 +1071,13 @@ struct DeclarationState {
 
 #[derive(Clone)]
 pub struct Server {
-    state_path: PathBuf,
     inner: Arc<Mutex<Inner>>,
     pre_queue: Arc<PrequeueGate>,
     compaction_workers: Arc<PrequeueGate>,
-    model_lifecycle: Arc<Mutex<()>>,
     auth: Arc<dyn AuthProvider>,
     declarations: Arc<Mutex<DeclarationState>>,
     engine: Arc<dyn InferenceEngine>,
-    catalog: Arc<Mutex<Option<ModelCatalog>>>,
-    model_directory: Arc<Mutex<PathBuf>>,
+    lifecycle: lifecycle::ModelLifecycleService,
     vision: Arc<Mutex<VisionConfig>>,
     openapi: Arc<Mutex<OpenApiConfig>>,
 }
@@ -1106,34 +1099,16 @@ impl Drop for AdmissionGuard {
 }
 impl Server {
     pub fn open(
-        path: impl AsRef<Path>,
+        _path: impl AsRef<Path>,
         auth: Arc<dyn AuthProvider>,
         engine: Arc<dyn InferenceEngine>,
     ) -> Result<Self, Error> {
-        let path = path.as_ref().to_owned();
-        let mut durable: DurableState = if path.exists() {
-            serde_json::from_slice(&fs::read(&path).map_err(state_err)?).map_err(state_err)?
-        } else {
-            DurableState {
-                installation: Uuid::new_v4(),
-                contexts: HashMap::new(),
-                models: HashMap::new(),
-                next_model_epoch: initial_model_epoch(),
-            }
-        };
-        durable.next_model_epoch = durable
-            .models
-            .values()
-            .map(|model| model.epoch)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1)
-            .max(durable.next_model_epoch);
         let config = ServerConfig::default();
-        let server = Self {
-            state_path: path,
+        Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
-                durable,
+                durable: RuntimeState {
+                    contexts: HashMap::new(),
+                },
                 controls: HashMap::new(),
                 pending_cancelled: HashSet::new(),
                 active: 0,
@@ -1146,27 +1121,23 @@ impl Server {
             })),
             pre_queue: PrequeueGate::new(config.pre_queue_concurrency),
             compaction_workers: PrequeueGate::new(config.compaction_workers),
-            model_lifecycle: Arc::new(Mutex::new(())),
             auth,
             declarations: Arc::new(Mutex::new(DeclarationState {
                 records: HashMap::new(),
                 creation_times: HashMap::new(),
             })),
+            lifecycle: lifecycle::ModelLifecycleService::new(engine.clone()),
             engine,
-            catalog: Arc::new(Mutex::new(None)),
-            model_directory: Arc::new(Mutex::new(PathBuf::from("./data/models"))),
             vision: Arc::new(Mutex::new(VisionConfig::default())),
             openapi: Arc::new(Mutex::new(OpenApiConfig::default())),
-        };
-        server.persist()?;
-        Ok(server)
+        })
     }
     pub fn attach_catalog(&self, catalog: ModelCatalog, model_directory: impl Into<PathBuf>) {
-        *self.catalog.lock() = Some(catalog);
-        *self.model_directory.lock() = model_directory.into();
+        self.lifecycle
+            .attach_catalog(catalog, model_directory.into());
     }
     fn catalog(&self) -> Option<ModelCatalog> {
-        self.catalog.lock().clone()
+        self.lifecycle.catalog()
     }
     pub fn configure_vision(&self, config: VisionConfig) {
         *self.vision.lock() = config;
@@ -1181,19 +1152,7 @@ impl Server {
         self.vision.lock().clone()
     }
     fn model_directory(&self) -> PathBuf {
-        self.model_directory.lock().clone()
-    }
-    fn persist(&self) -> Result<(), Error> {
-        let guard = self.inner.lock();
-        let bytes = serde_json::to_vec_pretty(&guard.durable).map_err(state_err)?;
-        if let Some(parent) = self.state_path.parent() {
-            fs::create_dir_all(parent).map_err(state_err)?;
-        }
-        let tmp = self
-            .state_path
-            .with_extension(format!("tmp-{}", Uuid::new_v4()));
-        fs::write(&tmp, bytes).map_err(state_err)?;
-        fs::rename(tmp, &self.state_path).map_err(state_err)
+        self.lifecycle.model_directory()
     }
     fn authorize(&self, headers: &HeaderMap, scope: Scope) -> Result<RequestContext, Error> {
         self.auth.authenticate(headers, scope)
@@ -1220,7 +1179,6 @@ impl Server {
         };
         guard.durable.contexts.insert(id, record.clone());
         drop(guard);
-        self.persist()?;
         Ok(record)
     }
     pub fn branch_context(&self, source: &ContextId) -> Result<ContextRecord, Error> {
@@ -1239,7 +1197,6 @@ impl Server {
             .durable
             .contexts
             .insert(record.id.clone(), record.clone());
-        self.persist()?;
         Ok(record)
     }
     pub fn context(&self, id: &ContextId) -> Result<ContextRecord, Error> {
@@ -1272,7 +1229,6 @@ impl Server {
             .durable
             .contexts
             .insert(record.id.clone(), record.clone());
-        self.persist()?;
         Ok(record)
     }
     pub fn delete_context(&self, id: &ContextId) -> Result<(), Error> {
@@ -1282,7 +1238,7 @@ impl Server {
             .contexts
             .remove(id)
             .ok_or(Error::ContextNotFound)?;
-        self.persist()
+        Ok(())
     }
     pub fn create_compaction_declaration(
         &self,
@@ -1402,86 +1358,22 @@ impl Server {
         Ok(())
     }
     pub fn register_model(&self, model: ModelRecord) -> Result<ModelRecord, Error> {
-        self.register_model_with(|_| Ok(()), model)
+        self.lifecycle.register(model, |_| Ok(()))
+    }
+
+    pub fn register_catalog_model(&self, model: ModelRecord) -> Result<ModelRecord, Error> {
+        self.lifecycle.register_from_catalog(model)
     }
 
     pub fn register_model_with<F>(
         &self,
         finalize: F,
-        mut model: ModelRecord,
+        model: ModelRecord,
     ) -> Result<ModelRecord, Error>
     where
         F: FnOnce(&ModelRecord) -> Result<(), Error>,
     {
-        let _lifecycle = self.model_lifecycle.lock();
-        model.aliases.sort();
-        model.aliases.dedup();
-        if model.family.is_empty() {
-            model.family = default_model_family();
-        }
-        if model.size_bytes == 0 {
-            model.size_bytes = fs::metadata(&model.path).map_err(state_err)?.len();
-        }
-        let existing = self
-            .inner
-            .lock()
-            .durable
-            .models
-            .get(&model.id)
-            .cloned()
-            .filter(|existing| {
-                existing.revision == model.revision
-                    && existing.path == model.path
-                    && existing.sha256 == model.sha256
-                    && existing.family == model.family
-                    && existing.size_bytes == model.size_bytes
-            });
-        if let Some(existing) = existing {
-            self.engine.prepare_model(&existing)?;
-            return Ok(existing);
-        }
-        let (epoch, previous, previous_models) = {
-            let mut guard = self.inner.lock();
-            let epoch = guard.durable.next_model_epoch;
-            guard.durable.next_model_epoch = epoch
-                .checked_add(1)
-                .ok_or_else(|| Error::State("model epoch space exhausted".into()))?;
-            let previous = guard.durable.models.get(&model.id).cloned();
-            (epoch, previous, guard.durable.models.clone())
-        };
-        model.epoch = epoch;
-        if let Err(error) = self.engine.prepare_model(&model) {
-            self.inner.lock().durable.next_model_epoch = epoch;
-            return Err(error);
-        }
-        {
-            let mut guard = self.inner.lock();
-            for existing in guard.durable.models.values_mut() {
-                existing
-                    .aliases
-                    .retain(|alias| !model.aliases.contains(alias));
-            }
-            guard.durable.models.insert(model.id.clone(), model.clone());
-        }
-        if let Err(error) = self.persist() {
-            let mut guard = self.inner.lock();
-            guard.durable.models = previous_models;
-            guard.durable.next_model_epoch = epoch;
-            drop(guard);
-            self.engine.retire_model(&model.id, model.epoch);
-            return Err(error);
-        }
-        if let Err(error) = finalize(&model) {
-            let mut guard = self.inner.lock();
-            guard.durable.models = previous_models;
-            guard.durable.next_model_epoch = epoch;
-            drop(guard);
-            self.engine.retire_model(&model.id, model.epoch);
-            return Err(error);
-        }
-        self.engine
-            .commit_model(&model, previous.as_ref().map(|record| record.epoch));
-        Ok(model)
+        self.lifecycle.register(model, finalize)
     }
     fn effective_stop_sequences(&self, req: &InferRequest) -> Result<Vec<String>, Error> {
         let mut stops = req.stop.clone();
@@ -1493,78 +1385,19 @@ impl Server {
     }
 
     pub fn models(&self) -> Vec<ModelRecord> {
-        self.inner.lock().durable.models.values().cloned().collect()
+        self.lifecycle.models()
     }
     pub fn model(&self, id: &str) -> Result<ModelRecord, Error> {
-        let guard = self.inner.lock();
-        guard
-            .durable
-            .models
-            .get(id)
-            .or_else(|| {
-                guard
-                    .durable
-                    .models
-                    .values()
-                    .find(|m| m.aliases.iter().any(|a| a == id))
-            })
-            .cloned()
-            .ok_or_else(|| Error::ModelNotFound(id.into()))
+        self.lifecycle.model(id)
     }
     pub fn alias_model(&self, id: &str, alias: String) -> Result<ModelRecord, Error> {
-        let _lifecycle = self.model_lifecycle.lock();
-        let mut guard = self.inner.lock();
-        if !guard.durable.models.contains_key(id) {
-            return Err(Error::ModelNotFound(id.into()));
-        }
-        let previous = guard.durable.models.clone();
-        for model in guard.durable.models.values_mut() {
-            model.aliases.retain(|existing| existing != &alias);
-        }
-        let model = guard.durable.models.get_mut(id).unwrap();
-        model.aliases.push(alias);
-        model.aliases.sort();
-        let out = model.clone();
-        drop(guard);
-        if let Err(error) = self.persist() {
-            self.inner.lock().durable.models = previous;
-            return Err(error);
-        }
-        Ok(out)
+        self.lifecycle.alias(id, alias)
     }
     pub fn remove_model(&self, id: &str) -> Result<(), Error> {
-        let _lifecycle = self.model_lifecycle.lock();
-        let model = self
-            .inner
-            .lock()
-            .durable
-            .models
-            .remove(id)
-            .ok_or_else(|| Error::ModelNotFound(id.into()))?;
-        if let Err(error) = self.persist() {
-            self.inner
-                .lock()
-                .durable
-                .models
-                .insert(model.id.clone(), model);
-            return Err(error);
-        }
-        self.engine.retire_model(&model.id, model.epoch);
-        Ok(())
+        self.lifecycle.remove(id)
     }
     pub fn verify_model(&self, id: &str) -> Result<bool, Error> {
-        let model = self.model(id)?;
-        let mut file = fs::File::open(model.path).map_err(state_err)?;
-        let mut digest = Sha256::new();
-        let mut buffer = [0; 1024 * 1024];
-        loop {
-            let count = file.read(&mut buffer).map_err(state_err)?;
-            if count == 0 {
-                break;
-            }
-            digest.update(&buffer[..count]);
-        }
-        Ok(format!("{:x}", digest.finalize()) == model.sha256)
+        self.lifecycle.verify(id)
     }
     pub fn check_update(&self, id: &str, revision: &str) -> Result<bool, Error> {
         Ok(self.model(id)?.revision != revision)
@@ -2060,7 +1893,6 @@ impl Server {
             successor_id
         };
         drop(guard);
-        self.persist()?;
         let usage = Usage {
             input_tokens,
             generated_tokens: frontier.generated_tokens,
@@ -2085,7 +1917,7 @@ impl Server {
             },
             StreamEvent::Finished {
                 reason: frontier.finish_reason,
-                usage,
+                usage: Box::new(usage),
             },
         ))
     }
@@ -2096,6 +1928,7 @@ fn state_err(error: impl std::fmt::Display) -> Error {
 }
 #[cfg(test)]
 fn hex_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -2531,12 +2364,12 @@ async fn http_debug_middleware(
             "path": path,
             "content_type": request_content_type,
             "content_length": request_content_length,
-            "headers": full_request
-                .as_ref()
-                .and_then(|(_, headers, _)| Some(json!(headers))),
-            "uri": full_request
-                .as_ref()
-                .and_then(|(uri, _, _)| Some(uri.clone())),
+        "headers": full_request
+            .as_ref()
+            .map(|(_, headers, _)| json!(headers)),
+        "uri": full_request
+            .as_ref()
+            .map(|(uri, _, _)| uri.clone()),
             "body": rendered_body,
             "raw_body": full_request.as_ref().and_then(|(_, _, headers)| {
                 headers
@@ -2621,24 +2454,24 @@ async fn completion(
         .is_some_and(|options| options.include_usage);
     s.model(&r.model)?;
     drop(permit);
-    infer_response(
-        s,
-        r.model,
-        r.prompt,
-        r.max_tokens,
+    infer_response(InferResponseRequest {
+        server: s,
+        model: r.model,
+        prompt: r.prompt,
+        max_tokens: r.max_tokens,
         sampling,
-        r.compaction,
+        compaction: r.compaction,
         include_usage,
-        r.stream,
-        r.context_id,
-        r.stop.map(StopInput::into_vec).unwrap_or_default(),
-        r.raw_continuation,
-        r.deadline_ms,
+        streaming: r.stream,
+        context_id: r.context_id,
+        stop: r.stop.map(StopInput::into_vec).unwrap_or_default(),
+        raw_continuation: r.raw_continuation,
+        deadline_ms: r.deadline_ms,
         retained_bytes,
-        request_context.request_id,
-        request_context.principal,
-        WireProtocol::OpenAiCompletion,
-    )
+        request_id: request_context.request_id,
+        principal: request_context.principal,
+        protocol: WireProtocol::Completion,
+    })
     .await
 }
 async fn chat(
@@ -2647,7 +2480,7 @@ async fn chat(
         headers,
         value: r,
         retained_bytes,
-        _permit: permit,
+        _permit,
     }: PrequeueJson<ChatRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
@@ -2665,24 +2498,24 @@ async fn chat(
         .is_some_and(|options| options.include_usage);
     let model = s.model(&r.model)?;
     let prompt = lower_messages(&model.family, r.messages, s.vision_config())?;
-    infer_response(
-        s,
-        r.model,
+    infer_response(InferResponseRequest {
+        server: s,
+        model: r.model,
         prompt,
-        r.max_tokens,
+        max_tokens: r.max_tokens,
         sampling,
-        r.compaction,
+        compaction: r.compaction,
         include_usage,
-        r.stream,
-        r.context_id,
-        r.stop.map(StopInput::into_vec).unwrap_or_default(),
-        r.raw_continuation,
-        r.deadline_ms,
+        streaming: r.stream,
+        context_id: r.context_id,
+        stop: r.stop.map(StopInput::into_vec).unwrap_or_default(),
+        raw_continuation: r.raw_continuation,
+        deadline_ms: r.deadline_ms,
         retained_bytes,
-        request_context.request_id,
-        request_context.principal,
-        WireProtocol::OpenAiChat,
-    )
+        request_id: request_context.request_id,
+        principal: request_context.principal,
+        protocol: WireProtocol::Chat,
+    })
     .await
 }
 
@@ -2722,6 +2555,8 @@ enum ResponsesContentPart {
 struct ResponsesRequest {
     model: String,
     input: ResponsesInput,
+    #[serde(default)]
+    store: bool,
     max_output_tokens: Option<usize>,
     #[serde(default)]
     compaction: Option<CompactionRequest>,
@@ -2746,10 +2581,16 @@ async fn responses(
         headers,
         value: r,
         retained_bytes,
-        _permit: permit,
+        _permit,
     }: PrequeueJson<ResponsesRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
+    if r.store {
+        return Err(Error::BadRequest(
+            "`store: true` is unsupported; Cusco only supports stateless Responses with `store: false`"
+                .into(),
+        ));
+    }
     validate_controls(
         r.temperature,
         r.top_p,
@@ -2796,31 +2637,30 @@ async fn responses(
             lower_messages(&model.family, messages, s.vision_config())?
         }
     };
-    infer_response(
-        s,
-        r.model,
-        input,
-        r.max_output_tokens,
+    infer_response(InferResponseRequest {
+        server: s,
+        model: r.model,
+        prompt: input,
+        max_tokens: r.max_output_tokens,
         sampling,
-        r.compaction,
-        true,
-        r.stream,
-        None,
-        vec![],
-        false,
-        None,
+        compaction: r.compaction,
+        include_usage: true,
+        streaming: r.stream,
+        context_id: None,
+        stop: vec![],
+        raw_continuation: false,
+        deadline_ms: None,
         retained_bytes,
-        request_context.request_id,
-        request_context.principal,
-        WireProtocol::OpenAiResponses,
-    )
+        request_id: request_context.request_id,
+        principal: request_context.principal,
+        protocol: WireProtocol::Responses,
+    })
     .await
 }
 
 fn default_true() -> bool {
     true
 }
-
 
 async fn ollama_version(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
     auth(&s, &headers, Scope::Inference)?;
@@ -2876,10 +2716,7 @@ async fn ollama_copy(
     Json(r): Json<OllamaCopyRequest>,
 ) -> Result<StatusCode, Error> {
     auth(&s, &headers, Scope::Admin)?;
-    let model = s.alias_model(&r.source, r.destination)?;
-    if let Some(catalog) = s.catalog() {
-        catalog.publish(&model).map_err(state_err)?;
-    }
+    s.alias_model(&r.source, r.destination)?;
     Ok(StatusCode::OK)
 }
 async fn ollama_delete(
@@ -2888,11 +2725,7 @@ async fn ollama_delete(
     Json(r): Json<OllamaModelRequest>,
 ) -> Result<StatusCode, Error> {
     auth(&s, &headers, Scope::Admin)?;
-    let model = r.model_name()?.to_owned();
-    s.remove_model(&model)?;
-    if let Some(catalog) = s.catalog() {
-        catalog.remove(&model).map_err(state_err)?;
-    }
+    s.remove_model(r.model_name()?)?;
     Ok(StatusCode::OK)
 }
 
@@ -3051,32 +2884,42 @@ async fn perform_ollama_pull(
             .send(json!({"status":"verifying sha256 digest","digest":fetched.sha256}))
             .await;
     }
-    let metadata = tokio::task::spawn_blocking({
-        let path = fetched.path.clone();
-        move || cusco_model_registry::probe_gguf(path)
-    })
-    .await
-    .map_err(state_err)?
-    .map_err(state_err)?;
     if let Some(sender) = &progress {
         let _ = sender.send(json!({"status":"writing manifest"})).await;
     }
-    let model = s.register_model_with(
-        |model| catalog.publish(model).map_err(state_err),
-        ModelRecord {
-            id: name,
-            revision: fetched.identity.clone(),
-            path: fetched.path,
-            sha256: fetched.sha256,
-            aliases: vec![],
-            family: metadata.architecture,
-            size_bytes: fetched.size,
-            epoch: 0,
-        },
-    )?;
-    catalog
-        .finish_operation(&operation, "complete", None)
-        .map_err(state_err)?;
+    let completion = tokio::task::spawn_blocking({
+        let server = s.clone();
+        let catalog = catalog.clone();
+        let operation = operation.clone();
+        move || {
+            let metadata = cusco_model_registry::probe_gguf(&fetched.path).map_err(state_err)?;
+            server.register_model_with(
+                |model| {
+                    catalog
+                        .publish_and_finish_operation(model, &operation)
+                        .map_err(state_err)
+                },
+                ModelRecord {
+                    id: name,
+                    revision: fetched.identity,
+                    path: fetched.path,
+                    sha256: fetched.sha256,
+                    aliases: vec![],
+                    family: metadata.architecture,
+                    size_bytes: fetched.size,
+                    epoch: 0,
+                },
+            )
+        }
+    })
+    .await
+    .map_err(state_err)?;
+    if let Err(error) = completion {
+        catalog
+            .finish_operation(&operation, "failed", Some(&error.to_string()))
+            .map_err(state_err)?;
+        return Err(error);
+    }
     let result = json!({"status":"success"});
     if let Some(sender) = progress {
         let _ = sender.send(result.clone()).await;
@@ -3127,13 +2970,40 @@ fn start_deadline_watchdogs(
 
 #[derive(Clone, Copy)]
 enum WireProtocol {
-    OpenAiCompletion,
-    OpenAiChat,
-    OpenAiResponses,
+    Completion,
+    Chat,
+    Responses,
+}
+
+struct InferResponseRequest {
+    server: Server,
+    model: String,
+    prompt: String,
+    max_tokens: Option<usize>,
+    sampling: SamplingConfig,
+    compaction: Option<CompactionRequest>,
+    include_usage: bool,
+    streaming: bool,
+    context_id: Option<ContextId>,
+    stop: Vec<String>,
+    raw_continuation: bool,
+    deadline_ms: Option<u64>,
+    retained_bytes: usize,
+    request_id: String,
+    principal: String,
+    protocol: WireProtocol,
+}
+
+fn sse_rows<const N: usize>(values: [Value; N]) -> String {
+    values.into_iter().fold(String::new(), |mut rows, value| {
+        use std::fmt::Write as _;
+        write!(rows, "data: {value}\n\n").expect("writing to a String cannot fail");
+        rows
+    })
 }
 
 fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
-    if matches!(protocol, WireProtocol::OpenAiResponses) {
+    if matches!(protocol, WireProtocol::Responses) {
         match event {
             StreamEvent::Started {
                 request_id,
@@ -3141,33 +3011,47 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
                 inference_id,
                 execution_session_id,
                 ..
-            } => return [
-                json!({"type":"response.created","response":{"id":request_id,"status":"in_progress","metadata":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}}}),
-                json!({"type":"response.output_item.added","item":{"id":"msg_0","type":"message","role":"assistant","status":"in_progress"},"output_index":0}),
-                json!({"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
-            ].into_iter().map(|value| format!("data: {value}\n\n")).collect(),
-            StreamEvent::Token { token, index } => return format!("data: {}\n\n", json!({"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":token,"sequence_number":index})),
-            StreamEvent::Finished { reason, usage } => return [
-                json!({"type":"response.output_text.done","item_id":"msg_0","output_index":0,"content_index":0,"text":""}),
-                json!({"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":0}),
-                json!({"type":"response.output_item.done","item":{"id":"msg_0","type":"message","role":"assistant","status":"completed"},"output_index":0}),
-                json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}}),
-            ].into_iter().map(|value| format!("data: {value}\n\n")).collect(),
-            StreamEvent::Error { message } => return format!("data: {}\n\n", json!({"type":"error","error":{"message":message,"type":"server_error"}})),
+            } => {
+                return sse_rows([
+                    json!({"type":"response.created","response":{"id":request_id,"status":"in_progress","metadata":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}}}),
+                    json!({"type":"response.output_item.added","item":{"id":"msg_0","type":"message","role":"assistant","status":"in_progress"},"output_index":0}),
+                    json!({"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
+                ]);
+            }
+            StreamEvent::Token { token, index } => {
+                return format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":token,"sequence_number":index})
+                );
+            }
+            StreamEvent::Finished { reason, usage } => {
+                return sse_rows([
+                    json!({"type":"response.output_text.done","item_id":"msg_0","output_index":0,"content_index":0,"text":""}),
+                    json!({"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":0}),
+                    json!({"type":"response.output_item.done","item":{"id":"msg_0","type":"message","role":"assistant","status":"completed"},"output_index":0}),
+                    json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}}),
+                ]);
+            }
+            StreamEvent::Error { message } => {
+                return format!(
+                    "data: {}\n\n",
+                    json!({"type":"error","error":{"message":message,"type":"server_error"}})
+                );
+            }
         }
     }
     let value = match (protocol, event) {
-        (WireProtocol::OpenAiCompletion, StreamEvent::Token { token, .. }) => {
+        (WireProtocol::Completion, StreamEvent::Token { token, .. }) => {
             json!({"object":"text_completion","choices":[{"text":token,"index":0,"finish_reason":null}]})
         }
-        (WireProtocol::OpenAiChat, StreamEvent::Token { token, .. }) => {
+        (WireProtocol::Chat, StreamEvent::Token { token, .. }) => {
             json!({"object":"chat.completion.chunk","choices":[{"delta":{"content":token},"index":0,"finish_reason":null}]})
         }
-        (WireProtocol::OpenAiResponses, StreamEvent::Token { token, .. }) => {
+        (WireProtocol::Responses, StreamEvent::Token { token, .. }) => {
             json!({"type":"response.output_text.delta","delta":token})
         }
         (
-            WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat,
+            WireProtocol::Completion | WireProtocol::Chat,
             StreamEvent::Finished { reason, usage },
         ) => {
             let mut value = json!({"choices":[{"index":0,"finish_reason":reason}]});
@@ -3176,14 +3060,14 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
             }
             value
         }
-        (WireProtocol::OpenAiResponses, StreamEvent::Finished { reason, usage }) => {
+        (WireProtocol::Responses, StreamEvent::Finished { reason, usage }) => {
             json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}})
         }
         (_, StreamEvent::Error { message }) => {
             json!({"error":{"message":message,"type":"server_error"}})
         }
         (
-            WireProtocol::OpenAiChat,
+            WireProtocol::Chat,
             StreamEvent::Started {
                 request_id,
                 correlation_id,
@@ -3195,7 +3079,7 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
             json!({"id":request_id,"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}],"cusco":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}})
         }
         (
-            WireProtocol::OpenAiCompletion,
+            WireProtocol::Completion,
             StreamEvent::Started {
                 request_id,
                 correlation_id,
@@ -3206,15 +3090,13 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
         ) => {
             json!({"id":request_id,"object":"text_completion","choices":[],"cusco":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}})
         }
-        (WireProtocol::OpenAiResponses, StreamEvent::Started { request_id, .. }) => {
+        (WireProtocol::Responses, StreamEvent::Started { request_id, .. }) => {
             json!({"type":"response.created","response":{"id":request_id,"status":"in_progress"}})
         }
     };
     let row = format!("data: {value}\n\n");
-    if matches!(
-        protocol,
-        WireProtocol::OpenAiCompletion | WireProtocol::OpenAiChat
-    ) && value["choices"]
+    if matches!(protocol, WireProtocol::Completion | WireProtocol::Chat)
+        && value["choices"]
         .as_array()
         .and_then(|choices| choices.first())
         .is_some_and(|choice| !choice["finish_reason"].is_null())
@@ -3261,36 +3143,37 @@ fn completed_response(
         },
     });
     match protocol {
-        WireProtocol::OpenAiCompletion => {
+        WireProtocol::Completion => {
             json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text,"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
-        WireProtocol::OpenAiChat => {
+        WireProtocol::Chat => {
             json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
-        WireProtocol::OpenAiResponses => {
+        WireProtocol::Responses => {
             json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"finish_reason":finish_reason,"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens},"cusco":cusco})
         }
     }
 }
 
-async fn infer_response(
-    server: Server,
-    model: String,
-    prompt: String,
-    max_tokens: Option<usize>,
-    sampling: SamplingConfig,
-    compaction: Option<CompactionRequest>,
-    include_usage: bool,
-    streaming: bool,
-    context_id: Option<ContextId>,
-    stop: Vec<String>,
-    raw_continuation: bool,
-    deadline_ms: Option<u64>,
-    retained_bytes: usize,
-    request_id: String,
-    principal: String,
-    protocol: WireProtocol,
-) -> Result<Response, Error> {
+async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Error> {
+    let InferResponseRequest {
+        server,
+        model,
+        prompt,
+        max_tokens,
+        sampling,
+        compaction,
+        include_usage,
+        streaming,
+        context_id,
+        stop,
+        raw_continuation,
+        deadline_ms,
+        retained_bytes,
+        request_id,
+        principal,
+        protocol,
+    } = parameters;
     server.model(&model)?;
     let id = request_id;
     let correlation_id = id.clone();
@@ -3659,7 +3542,7 @@ pub fn openapi_document() -> Value {
                 "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "max_tokens": {"type": "integer", "minimum": 0}, "stream": {"type": "boolean"}, "temperature": {"type": "number", "minimum": 0, "maximum": 2}, "top_p": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}, "seed": {"type": "integer", "minimum": 0}}
             },
             "ChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}}},
-            "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"oneOf": [{"type": "string"}, {"type": "array"}]}, "stream": {"type": "boolean"}, "tools": {"type": "array", "items": {"$ref": "#/components/schemas/ResponsesFunctionTool"}}}},
+            "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"oneOf": [{"type": "string"}, {"type": "array"}]}, "store": {"type": "boolean", "enum": [false], "default": false, "description": "Cusco Responses are stateless; true is rejected."}, "stream": {"type": "boolean"}, "tools": {"type": "array", "items": {"$ref": "#/components/schemas/ResponsesFunctionTool"}}}},
             "ResponsesFunctionTool": {"type": "object", "additionalProperties": false, "required": ["type", "name", "parameters"], "properties": {"type": {"const": "function"}, "name": {"type": "string", "minLength": 1}, "description": {"type": "string"}, "parameters": {"type": "object"}}},
             "OllamaModelRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["model"]}, {"required": ["name"]}], "properties": {"model": {"type": "string"}, "name": {"type": "string"}}},
             "OllamaPullRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["name"]}, {"required": ["model"]}], "properties": {"name": {"type": "string"}, "model": {"type": "string"}, "sha256": {"type": "string"}, "insecure": {"type": "boolean"}, "stream": {"type": "boolean"}}},
@@ -3683,32 +3566,22 @@ pub fn openapi_document() -> Value {
 pub async fn serve(
     server: Server,
     addr: SocketAddr,
-    anonymous: bool,
-    unsafe_public: bool,
+    _anonymous: bool,
+    _unsafe_public: bool,
 ) -> Result<(), Error> {
-    serve_until(
-        server,
-        addr,
-        anonymous,
-        unsafe_public,
-        None,
-        shutdown_signal(),
-    )
-    .await
+    serve_until(server, addr, None, shutdown_signal()).await
 }
 
 pub async fn serve_with_http_debug(
     server: Server,
     addr: SocketAddr,
-    anonymous: bool,
-    unsafe_public: bool,
+    _anonymous: bool,
+    _unsafe_public: bool,
     level: HttpDebugLevel,
 ) -> Result<(), Error> {
     serve_until(
         server,
         addr,
-        anonymous,
-        unsafe_public,
         Some(HttpDebug::stderr(level)),
         shutdown_signal(),
     )
@@ -3718,8 +3591,7 @@ pub async fn serve_with_http_debug(
 async fn serve_until(
     server: Server,
     addr: SocketAddr,
-    anonymous: bool,
-    unsafe_public: bool,
+
     http_debug: Option<HttpDebug>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
@@ -3788,6 +3660,7 @@ mod tests {
         body::{Body, Bytes, to_bytes},
         http::Request,
     };
+    use std::fs;
     use std::net::IpAddr;
     use tower::ServiceExt;
     fn dir() -> PathBuf {
@@ -3948,23 +3821,23 @@ mod tests {
         }
     }
     #[test]
-    fn persistence_branching_and_ids_survive_restart() {
-        let (s, d) = setup(Arc::new(AnonymousAdmin));
-        let a = s.create_context().unwrap();
-        let b = s.branch_context(&a.id).unwrap();
-        assert_ne!(a.id, b.id);
-        drop(s);
-        let s = Server::open(
-            d.join("state.json"),
+    fn contexts_are_disposable_across_restart() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let context = server.create_context().unwrap();
+        server.branch_context(&context.id).unwrap();
+        drop(server);
+        let restarted = Server::open(
+            directory.join("state.json"),
             Arc::new(AnonymousAdmin),
             Arc::new(DeterministicEngine),
         )
         .unwrap();
-        assert_eq!(s.context(&a.id).unwrap(), a);
-        let c = s.create_context().unwrap();
-        assert_ne!(a.id, c.id);
-        assert_ne!(b.id, c.id);
-        fs::remove_dir_all(d).unwrap()
+        assert!(restarted.contexts().is_empty());
+        assert!(matches!(
+            restarted.context(&context.id),
+            Err(Error::ContextNotFound)
+        ));
+        fs::remove_dir_all(directory).unwrap()
     }
     #[test]
     fn inference_usage_events_deadline_and_cancel_are_transactional() {
@@ -4359,11 +4232,13 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
-        assert!(openapi_document()["paths"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .all(|path| !path.starts_with("/ollama/")));
+        assert!(
+            openapi_document()["paths"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|path| !path.starts_with("/ollama/"))
+        );
         let spec = openapi_document();
         assert_eq!(spec["openapi"], "3.1.0");
         assert!(spec["paths"]["/openai/v1/chat/completions"].is_object());
@@ -4912,20 +4787,13 @@ mod tests {
     #[tokio::test]
     async fn configured_server_stops_when_shutdown_is_requested() {
         let (server, dir) = setup(Arc::new(AnonymousAdmin));
-        serve_until(
-            server,
-            "127.0.0.1:0".parse().unwrap(),
-            true,
-            false,
-            None,
-            async {},
-        )
-        .await
-        .unwrap();
+        serve_until(server, "127.0.0.1:0".parse().unwrap(), None, async {})
+            .await
+            .unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn phase6c_defaults_match_the_fixed_operating_contract() {
+    fn defaults_match_the_fixed_operating_contract() {
         assert_eq!(
             ServerConfig::default(),
             ServerConfig {
@@ -5189,7 +5057,11 @@ mod tests {
             })
             .unwrap();
         let response = router(server)
-            .oneshot(Request::get("/cusco/v1/api/ps").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/cusco/v1/api/ps")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -5206,7 +5078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_rejects_new_work_and_restart_recovers_only_durable_state() {
+    async fn shutdown_rejects_new_work_and_restart_discards_runtime_state() {
         let (server, dir) = setup(Arc::new(AnonymousAdmin));
         let context = server.create_context().unwrap();
         let active = server
@@ -5240,7 +5112,11 @@ mod tests {
             Arc::new(DeterministicEngine),
         )
         .unwrap();
-        assert_eq!(restarted.context(&context.id).unwrap(), context);
+        assert!(restarted.contexts().is_empty());
+        assert!(matches!(
+            restarted.context(&context.id),
+            Err(Error::ContextNotFound)
+        ));
         assert_eq!(restarted.admission_metrics(), AdmissionMetrics::default());
         assert!(!restarted.inner.lock().shutting_down);
         fs::remove_dir_all(dir).unwrap();
@@ -5467,8 +5343,6 @@ mod tests {
         let serving = tokio::spawn(serve_until(
             server,
             address,
-            true,
-            false,
             Some(HttpDebug::new(HttpDebugLevel::Safe, move |line| {
                 captured.lock().push(line.to_owned())
             })),
@@ -5531,6 +5405,7 @@ mod tests {
                 }),
             ))
             .await
+
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value =
@@ -5539,11 +5414,55 @@ mod tests {
         assert_eq!(body["object"], "response");
         fs::remove_dir_all(dir).unwrap();
     }
+    #[tokio::test]
+    async fn responses_accept_store_false_and_reject_store_true() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let app = router(server);
+        let accepted = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({
+                    "model": "m",
+                    "input": "hello",
+                    "max_output_tokens": 1,
+                    "store": false
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+
+        let rejected = app
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({
+                    "model": "m",
+                    "input": "hello",
+                    "max_output_tokens": 1,
+                    "store": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(rejected.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`store: true` is unsupported"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn openai_streams_honor_usage_option_and_end_with_done() {
         let started = stream_row(
-            WireProtocol::OpenAiChat,
+            WireProtocol::Chat,
             StreamEvent::Started {
                 request_id: "request".into(),
                 context_id: ContextId::new(),
@@ -5558,7 +5477,7 @@ mod tests {
         assert!(started.contains("\"execution_session_id\":\"sess\""));
         let terminal = StreamEvent::Finished {
             reason: FinishReason::Length,
-            usage: Usage {
+            usage: Box::new(Usage {
                 input_tokens: 1,
                 generated_tokens: 2,
                 evaluated_tokens: 1,
@@ -5573,14 +5492,14 @@ mod tests {
                 correlation_id: String::new(),
                 inference_id: String::new(),
                 execution_session_id: String::new(),
-            },
+            }),
         };
-        let without_usage = stream_row(WireProtocol::OpenAiChat, terminal.clone(), false);
+        let without_usage = stream_row(WireProtocol::Chat, terminal.clone(), false);
         assert!(!without_usage.contains("\"usage\""));
         assert!(without_usage.ends_with("data: [DONE]\n\n"));
         assert!(without_usage.contains("\"finish_reason\":\"length\""));
 
-        let with_usage = stream_row(WireProtocol::OpenAiChat, terminal, true);
+        let with_usage = stream_row(WireProtocol::Chat, terminal, true);
         assert!(with_usage.contains("\"usage\""));
         assert!(with_usage.ends_with("data: [DONE]\n\n"));
     }
@@ -5705,16 +5624,15 @@ mod tests {
                 "stale-principal-2".into(),
                 VecDeque::from(vec![now - 120_000]),
             );
-            state.records.clear();
         }
         server
             .create_compaction_declaration_for("fresh-principal", declaration)
             .unwrap();
         let state = server.declarations.lock();
-        assert!(state.creation_times.get("stale-principal").is_none());
-        assert!(state.creation_times.get("stale-principal-2").is_none());
-        assert!(state.creation_times.get("active-principal").is_some());
-        assert!(state.creation_times.get("fresh-principal").is_some());
+        assert!(!state.creation_times.contains_key("stale-principal"));
+        assert!(!state.creation_times.contains_key("stale-principal-2"));
+        assert!(state.creation_times.contains_key("active-principal"));
+        assert!(state.creation_times.contains_key("fresh-principal"));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -5825,7 +5743,7 @@ mod tests {
             .infer("compact-replay", compacting_request(source.id))
             .unwrap();
         let payload = completed_response(
-            WireProtocol::OpenAiCompletion,
+            WireProtocol::Completion,
             response,
             FinishReason::Length,
         );
@@ -5955,7 +5873,7 @@ mod tests {
 
     fn assert_semantic_fixture(name: &str) {
         let fixtures: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/phase10_semantic.json")).unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/semantic_compaction.json")).unwrap();
         let fixture = &fixtures[name];
         let tokens = fixture["tokens"]
             .as_array()
@@ -6002,7 +5920,7 @@ mod tests {
     #[test]
     fn openai_responses_stream_correlates_ids() {
         let row = stream_row(
-            WireProtocol::OpenAiResponses,
+            WireProtocol::Responses,
             StreamEvent::Started {
                 request_id: "transport".into(),
                 context_id: ContextId::new(),

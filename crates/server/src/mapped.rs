@@ -6,7 +6,9 @@ use cusco_context_store::{
     AdapterEpoch, ComponentMask, ContextStore, EvaluatedPrefixId, LogicalContextId, ModelEpoch,
     PersistentTokenSequence,
 };
-use cusco_executor::{Decode, Executor, MappingId, MappingState, OperatingPoint, Sampler};
+use cusco_executor::{
+    Decode, Executor, MappingState, OperatingPoint, RepresentationHandle, Sampler,
+};
 use cusco_physical_manager::{
     Capacity, Component, PhysicalManager, PhysicalRepresentationId, Tier,
 };
@@ -148,12 +150,16 @@ pub struct MappedMetrics {
     pub decoded_tokens: u64,
     pub published_blocks: u64,
     pub reference_switches: u64,
-    pub activation_bytes_copied: u64,
+    pub fork_bytes_copied: u64,
+    pub export_bytes_copied: u64,
+    pub import_bytes_copied: u64,
+    pub total_bytes_copied: u64,
+    pub graph_recaptures: Option<u64>,
 }
 
 #[derive(Clone)]
 struct ResidentMapping {
-    native: Option<MappingId>,
+    native: Option<RepresentationHandle>,
     spill: Option<SpilledMapping>,
     representations: Vec<PhysicalRepresentationId>,
     continuation: Decode,
@@ -168,6 +174,7 @@ struct SpilledMapping {
 
 struct MappedState {
     executor: Executor,
+    root: RepresentationHandle,
     logical: ContextStore,
     physical: PhysicalManager,
     model_epoch: ModelEpoch,
@@ -258,7 +265,7 @@ impl MappedEngine {
             .to_str()
             .ok_or_else(|| Error::State("model path is not UTF-8".into()))?
             .to_owned();
-        let executor = Executor::open(&model_path, n_ctx, gpu_layers).map_err(state_error)?;
+        let mut executor = Executor::open(&model_path, n_ctx, gpu_layers).map_err(state_error)?;
         let capabilities = executor.capabilities();
         if !capabilities.mapped_execution
             || !capabilities.global_kv
@@ -269,6 +276,7 @@ impl MappedEngine {
                 "executor does not satisfy the Gemma execution profile".into(),
             ));
         }
+        let root = executor.active_representation().map_err(state_error)?;
 
         Ok(Arc::new(Self {
             profile,
@@ -278,6 +286,7 @@ impl MappedEngine {
             spill_capacity,
             state: Arc::new(Mutex::new(MappedState {
                 executor,
+                root,
                 logical: ContextStore::default(),
                 physical: PhysicalManager::new(Capacity {
                     device_bytes,
@@ -300,14 +309,16 @@ impl MappedEngine {
             return Ok(0);
         };
         let mut state = self.state.lock();
-        let active = state.executor.mapping_metrics().active;
+        let active = state.executor.mapping_metrics().active_identity;
         let candidates = state
             .resident
             .iter()
             .filter_map(|(id, resident)| {
                 resident
                     .native
-                    .filter(|native| *native != active)
+                    .as_ref()
+                    .filter(|native| native.identity() != active)
+                    .cloned()
                     .map(|native| (*id, native))
             })
             .collect::<Vec<_>>();
@@ -317,19 +328,18 @@ impl MappedEngine {
         let _ = state.physical.release_binding(EXECUTION_SLOT);
         let mut spilled = 0;
         for (id, native) in candidates {
-            let mapping = state.executor.export_mapping(native).map_err(state_error)?;
+            let mapping = state
+                .executor
+                .export_mapping(&native)
+                .map_err(state_error)?;
             if state.spill_bytes.saturating_add(mapping.bytes.len()) > self.spill_capacity {
                 continue;
             }
-            let name =
-                id.0.iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
+            let name = hex::encode(id.0);
             let path = spill_dir.join(format!("{name}.seq"));
             let temporary = path.with_extension("seq.tmp");
             fs::write(&temporary, &mapping.bytes).map_err(state_error)?;
             fs::rename(&temporary, &path).map_err(state_error)?;
-            state.executor.remove_mapping(native).map_err(state_error)?;
             let representations = state
                 .resident
                 .get(&id)
@@ -377,7 +387,7 @@ struct MappedSession {
     stage: MappedStage,
     tokens: Vec<i32>,
     logical_context: Option<LogicalContextId>,
-    active_mapping: Option<MappingId>,
+    active_mapping: Option<RepresentationHandle>,
     parent: Option<EvaluatedPrefixId>,
     next: Option<Decode>,
     sampler: Option<Sampler>,
@@ -452,8 +462,11 @@ impl MappedSession {
         let activation_started = Instant::now();
         let transfer_before = state.physical.metrics().transfer_bytes;
         activate_prefix(&mut state, logical_context, prefix.as_deref())?;
-        let source = state.executor.mapping_metrics().active;
-        self.active_mapping = Some(fork_and_activate(&mut state.executor, source)?);
+        let source = state
+            .executor
+            .active_representation()
+            .map_err(state_error)?;
+        self.active_mapping = Some(fork_for_request_branch(&mut state.executor, &source)?);
         self.prefill.mapping_activation_ns = elapsed_ns(activation_started);
         let transfer_after = state.physical.metrics().transfer_bytes;
         self.logical_context = Some(logical_context);
@@ -519,17 +532,21 @@ impl MappedSession {
         state.metrics.decoded_tokens += charged as u64;
         self.evaluated = end;
         if self.evaluated % self.profile.block_size == 0 {
+            let snapshot = snapshot_active_mapping(
+                &mut state.executor,
+                self.active_mapping
+                    .as_ref()
+                    .expect("prepared mapping exists"),
+            )?;
             self.parent = Some(publish_block(
                 &mut state,
                 &self.profile,
                 self.logical_context.expect("prepared context exists"),
                 self.evaluated,
                 self.parent,
-                self.active_mapping.expect("prepared mapping exists"),
+                snapshot,
                 self.next.as_ref().expect("decode result exists"),
             )?);
-            let source = self.active_mapping.expect("published mapping exists");
-            self.active_mapping = Some(fork_and_activate(&mut state.executor, source)?);
         }
         self.prefill.uncached_prefill_ns = self
             .prefill
@@ -591,17 +608,21 @@ impl MappedSession {
             state.metrics.decoded_tokens += 1;
             self.evaluated += 1;
             if self.evaluated % self.profile.block_size == 0 {
+                let snapshot = snapshot_active_mapping(
+                    &mut state.executor,
+                    self.active_mapping
+                        .as_ref()
+                        .expect("prepared mapping exists"),
+                )?;
                 self.parent = Some(publish_block(
                     &mut state,
                     &self.profile,
                     self.logical_context.expect("prepared context exists"),
                     self.evaluated,
                     self.parent,
-                    self.active_mapping.expect("prepared mapping exists"),
+                    snapshot,
                     self.next.as_ref().expect("decode result exists"),
                 )?);
-                let source = self.active_mapping.expect("published mapping exists");
-                self.active_mapping = Some(fork_and_activate(&mut state.executor, source)?);
             }
         }
         Ok(SessionStep::Token {
@@ -622,7 +643,11 @@ impl MappedSession {
     fn activate_owned(&self, state: &mut MappedState) -> Result<(), Error> {
         state
             .executor
-            .activate_mapping(self.active_mapping.expect("prepared mapping exists"))
+            .activate_mapping(
+                self.active_mapping
+                    .as_ref()
+                    .expect("prepared mapping exists"),
+            )
             .map_err(state_error)
     }
 
@@ -637,14 +662,18 @@ impl MappedSession {
             let fallback = self
                 .parent
                 .and_then(|id| state.resident.get(&id))
-                .and_then(|resident| resident.native)
-                .unwrap_or(MappingId(0));
+                .and_then(|resident| resident.native.clone())
+                .unwrap_or(
+                    state
+                        .executor
+                        .active_representation()
+                        .map_err(state_error)?,
+                );
             if active != fallback {
                 state
                     .executor
-                    .activate_mapping(fallback)
+                    .activate_mapping(&fallback)
                     .map_err(state_error)?;
-                state.executor.remove_mapping(active).map_err(state_error)?;
             }
         }
         let native_metrics = state.executor.mapping_metrics();
@@ -652,7 +681,11 @@ impl MappedSession {
         state.metrics.cached_tokens += self.cached as u64;
         state.metrics.cache_hits += u64::from(self.cached != 0);
         state.metrics.reference_switches = native_metrics.reference_switches;
-        state.metrics.activation_bytes_copied = native_metrics.activation_bytes_copied;
+        state.metrics.fork_bytes_copied = native_metrics.fork_bytes_copied;
+        state.metrics.export_bytes_copied = native_metrics.export_bytes_copied;
+        state.metrics.import_bytes_copied = native_metrics.import_bytes_copied;
+        state.metrics.total_bytes_copied = native_metrics.total_bytes_copied;
+        state.metrics.graph_recaptures = native_metrics.graph_recaptures;
         let physical_metrics = state.physical.metrics();
         self.prefill.transfer_bytes = physical_metrics.transfer_bytes;
         self.prefill.device_bytes = physical_metrics.device_total;
@@ -697,11 +730,10 @@ impl Drop for MappedSession {
             let fallback = self
                 .parent
                 .and_then(|id| state.resident.get(&id))
-                .and_then(|resident| resident.native)
-                .unwrap_or(MappingId(0));
+                .and_then(|resident| resident.native.clone())
+                .unwrap_or_else(|| state.root.clone());
             if active != fallback {
-                let _ = state.executor.activate_mapping(fallback);
-                let _ = state.executor.remove_mapping(active);
+                let _ = state.executor.activate_mapping(&fallback);
             }
         }
     }
@@ -715,7 +747,7 @@ impl InferenceEngine for MappedEngine {
         }
         if request.model.path.to_str() != Some(self.model_path()) {
             return Err(Error::State(
-                "Phase 8 admits only a resident process-owned model".into(),
+                "mapped execution admits only a resident process-owned model".into(),
             ));
         }
         let context_limit = self.context_capacity.min(self.profile.context_limit);
@@ -756,7 +788,7 @@ fn activate_prefix(
     let Some(prefix) = prefix else {
         state
             .executor
-            .activate_mapping(MappingId(0))
+            .activate_mapping(&state.root)
             .map_err(state_error)?;
         return Ok(());
     };
@@ -766,7 +798,7 @@ fn activate_prefix(
         .cloned()
         .ok_or_else(|| Error::State("logical mapping has no resident native mapping".into()))?;
     let restored = resident.native.is_none();
-    let native = if let Some(native) = resident.native {
+    let native = if let Some(native) = resident.native.clone() {
         native
     } else {
         let spilled = resident
@@ -790,7 +822,10 @@ fn activate_prefix(
         .context(context)
         .ok_or_else(|| Error::State("logical context disappeared".into()))?
         .revision;
-    let previous = state.executor.mapping_metrics().active;
+    let previous = state
+        .executor
+        .active_representation()
+        .map_err(state_error)?;
     let (prepared, _, transfers) = state
         .physical
         .prepare_transition(
@@ -802,34 +837,24 @@ fn activate_prefix(
             &resident.representations,
             false,
         )
-        .map_err(|error| {
-            if restored {
-                let _ = state.executor.remove_mapping(native);
-            }
-            state_error(error)
-        })?;
+        .map_err(state_error)?;
     for transfer in transfers {
         if let Err(error) = state.physical.complete_transfer(transfer, true) {
             let _ = state.physical.abort_transition(prepared);
-            if restored {
-                let _ = state.executor.remove_mapping(native);
-            }
             return Err(state_error(error));
         }
     }
-    if let Err(error) = state.executor.activate_mapping(native) {
+    if let Err(error) = state.executor.activate_mapping(&native) {
         let _ = state.physical.abort_transition(prepared);
-        if restored {
-            let _ = state.executor.remove_mapping(native);
-        }
         return Err(state_error(error));
     }
-    match state.physical.commit_transition(prepared, revision) {
-        Ok(binding) => {
-            state
-                .physical
-                .publish_device_block_table(EXECUTION_SLOT, binding, native.0)
-                .map_err(state_error)?;
+    match state.physical.commit_mapped_transition(
+        prepared,
+        revision,
+        u32::try_from(native.identity())
+            .map_err(|_| Error::State("native representation identity exhausted".into()))?,
+    ) {
+        Ok(_) => {
             if restored {
                 let spilled = state
                     .resident
@@ -845,20 +870,28 @@ fn activate_prefix(
             Ok(())
         }
         Err(error) => {
-            let _ = state.executor.activate_mapping(previous);
-            if restored {
-                let _ = state.executor.remove_mapping(native);
-            }
+            let _ = state.executor.activate_mapping(&previous);
             Err(state_error(error))
         }
     }
 }
 
-fn fork_and_activate(executor: &mut Executor, source: MappingId) -> Result<MappingId, Error> {
+fn fork_for_request_branch(
+    executor: &mut Executor,
+    source: &RepresentationHandle,
+) -> Result<RepresentationHandle, Error> {
     let prepared = executor.prepare_mapping_fork(source).map_err(state_error)?;
     let mapping = executor.commit_mapping(prepared).map_err(state_error)?;
-    executor.activate_mapping(mapping).map_err(state_error)?;
+    executor.activate_mapping(&mapping).map_err(state_error)?;
     Ok(mapping)
+}
+
+fn snapshot_active_mapping(
+    executor: &mut Executor,
+    active: &RepresentationHandle,
+) -> Result<RepresentationHandle, Error> {
+    let prepared = executor.prepare_mapping_fork(active).map_err(state_error)?;
+    executor.commit_mapping(prepared).map_err(state_error)
 }
 
 fn publish_block(
@@ -867,7 +900,7 @@ fn publish_block(
     context: LogicalContextId,
     represented_end: usize,
     parent: Option<EvaluatedPrefixId>,
-    native: MappingId,
+    native: RepresentationHandle,
     continuation: &Decode,
 ) -> Result<EvaluatedPrefixId, Error> {
     let required = profile.required_mask();
@@ -888,8 +921,13 @@ fn publish_block(
     }
     let rollback = parent
         .and_then(|id| state.resident.get(&id))
-        .and_then(|resident| resident.native)
-        .unwrap_or(MappingId(0));
+        .and_then(|resident| resident.native.clone())
+        .unwrap_or(
+            state
+                .executor
+                .active_representation()
+                .map_err(state_error)?,
+        );
     let prepared_publication = state
         .logical
         .prepare_publication(
@@ -900,6 +938,10 @@ fn publish_block(
             required,
             [0; 32],
         )
+        .map_err(state_error)?;
+    state
+        .logical
+        .validate_publication(&prepared_publication)
         .map_err(state_error)?;
     let mapping_id = prepared_publication.mapping_id();
     let existing = state.resident.get(&mapping_id).cloned();
@@ -920,7 +962,7 @@ fn publish_block(
                 Ok(id) => registered.push(id),
                 Err(error) => {
                     release_representations(&mut state.physical, &registered);
-                    let _ = state.executor.activate_mapping(rollback);
+                    let _ = state.executor.activate_mapping(&rollback);
                     return Err(state_error(error));
                 }
             }
@@ -947,7 +989,7 @@ fn publish_block(
         Ok(prepared) => prepared,
         Err(error) => {
             release_representations(&mut state.physical, &registered);
-            let _ = state.executor.activate_mapping(rollback);
+            let _ = state.executor.activate_mapping(&rollback);
             return Err(state_error(error));
         }
     };
@@ -955,42 +997,28 @@ fn publish_block(
         if let Err(error) = state.physical.complete_transfer(transfer, true) {
             let _ = state.physical.abort_transition(transition);
             release_representations(&mut state.physical, &registered);
-            let _ = state.executor.activate_mapping(rollback);
+            let _ = state.executor.activate_mapping(&rollback);
             return Err(state_error(error));
         }
     }
-    let mapping = match state.logical.commit_publication(prepared_publication) {
-        Ok(mapping) => mapping,
-        Err(error) => {
-            let _ = state.physical.abort_transition(transition);
-            release_representations(&mut state.physical, &registered);
-            let _ = state.executor.activate_mapping(rollback);
-            return Err(state_error(error));
-        }
-    };
-    let binding = match state
-        .physical
-        .commit_transition(transition, expected_revision)
-    {
-        Ok(binding) => binding,
-        Err(error) => {
-            release_representations(&mut state.physical, &registered);
-            let _ = state.executor.activate_mapping(rollback);
-            return Err(state_error(error));
-        }
-    };
     let published_native = existing
         .as_ref()
-        .and_then(|resident| resident.native)
-        .unwrap_or(native);
-    if let Err(error) =
-        state
-            .physical
-            .publish_device_block_table(EXECUTION_SLOT, binding, published_native.0)
-    {
-        let _ = state.executor.activate_mapping(rollback);
+        .and_then(|resident| resident.native.clone())
+        .unwrap_or_else(|| native.clone());
+    if let Err(error) = state.physical.commit_mapped_transition(
+        transition,
+        expected_revision,
+        u32::try_from(published_native.identity())
+            .map_err(|_| Error::State("native representation identity exhausted".into()))?,
+    ) {
+        release_representations(&mut state.physical, &registered);
+        let _ = state.executor.activate_mapping(&rollback);
         return Err(state_error(error));
     }
+    let mapping = state
+        .logical
+        .commit_publication(prepared_publication)
+        .expect("validated publication cannot conflict while mapped state is exclusively locked");
     if existing.is_none() {
         state.resident.insert(
             mapping.id,
@@ -1140,7 +1168,7 @@ mod tests {
                 .unwrap();
         let model = model();
         let first = engine
-            .generate_collected(test_request(&model, &"a".repeat(40), 2, &[]))
+            .generate_collected(test_request(&model, "a".repeat(40), 2, &[]))
             .unwrap();
         let second = engine
             .generate_collected(test_request(&model, "z", 1, &first.successor_tokens))
@@ -1150,8 +1178,60 @@ mod tests {
         assert_eq!(metrics.requests, 2);
         assert_eq!(metrics.cache_hits, 1);
         assert!(metrics.cached_tokens >= 32);
-        assert_eq!(metrics.activation_bytes_copied, 0);
+        assert_eq!(metrics.graph_recaptures, None);
         assert!(metrics.reference_switches >= 2);
+    }
+
+    #[test]
+    fn unrelated_requests_start_from_the_root_mapping() {
+        let shared =
+            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+                .unwrap();
+        let fresh =
+            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+                .unwrap();
+        let model = model();
+        shared
+            .generate_collected(test_request(&model, "first unrelated prompt", 2, &[]))
+            .unwrap();
+        let reused =
+            shared.generate_collected(test_request(&model, "second prompt", 2, &[])).unwrap();
+        let baseline =
+            fresh.generate_collected(test_request(&model, "second prompt", 2, &[])).unwrap();
+        assert_eq!(reused.pieces, baseline.pieces);
+        assert_eq!(reused.successor_tokens, baseline.successor_tokens);
+        assert_eq!(reused.cached_tokens, 0);
+    }
+
+    #[test]
+    fn dropping_unpublished_session_reactivates_root_mapping() {
+        let engine =
+            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+                .unwrap();
+        let root_identity = engine.state.lock().root.identity();
+        let mut session = engine
+            .start_session(test_request(&model(), "cancel before publication", 2, &[]))
+            .unwrap();
+        assert!(matches!(session.step().unwrap(), SessionStep::Progress(_)));
+        drop(session);
+        let state = engine.state.lock();
+        assert_eq!(
+            state.executor.mapping_metrics().active_identity,
+            root_identity
+        );
+    }
+
+    #[test]
+    fn linear_publication_snapshots_do_not_switch_the_active_branch() {
+        let engine =
+            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+                .unwrap();
+        engine
+            .generate_collected(test_request(&model(), "a".repeat(160), 2, &[]))
+            .unwrap();
+        let metrics = engine.metrics();
+        assert!(metrics.published_blocks >= 5);
+        assert_eq!(metrics.reference_switches, 2);
     }
 
     #[test]
@@ -1199,16 +1279,16 @@ mod tests {
         .unwrap();
         let model = model();
         let first = engine
-            .generate_collected(test_request(&model, &"a".repeat(40), 2, &[]))
+            .generate_collected(test_request(&model, "a".repeat(40), 2, &[]))
             .unwrap();
         engine
-            .generate_collected(test_request(&model, &"b".repeat(40), 1, &[]))
+            .generate_collected(test_request(&model, "b".repeat(40), 1, &[]))
             .unwrap();
         let control =
             MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
                 .unwrap();
         let control_first = control
-            .generate_collected(test_request(&model, &"a".repeat(40), 2, &[]))
+            .generate_collected(test_request(&model, "a".repeat(40), 2, &[]))
             .unwrap();
         let baseline = control
             .generate_collected(test_request(
@@ -1237,7 +1317,7 @@ mod tests {
             MappedEngine::open("gemma4", "mock://deterministic", 64, 0, 1 << 20, 1 << 20).unwrap();
         let model = model();
         let error = engine
-            .generate_collected(test_request(&model, &"x".repeat(65), 1, &[]))
+            .generate_collected(test_request(&model, "x".repeat(65), 1, &[]))
             .unwrap_err();
         assert!(error.to_string().contains("context capacity"));
         assert_eq!(engine.metrics(), MappedMetrics::default());
@@ -1250,11 +1330,11 @@ mod tests {
                 .unwrap();
         let model = model();
         let first = engine
-            .generate_collected(test_request(&model, &"a".repeat(40), 1, &[]))
+            .generate_collected(test_request(&model, "a".repeat(40), 1, &[]))
             .unwrap();
         let failed = engine.generate_collected(test_request(
             &model,
-            &"b".repeat(25),
+            "b".repeat(25),
             1,
             &first.successor_tokens,
         ));
@@ -1274,7 +1354,7 @@ mod tests {
                 .unwrap();
         let model = model();
         let primed = engine
-            .generate_collected(test_request(&model, &"p".repeat(32), 0, &[]))
+            .generate_collected(test_request(&model, "p".repeat(32), 0, &[]))
             .unwrap();
         let resumed = engine
             .generate_collected(test_request(&model, "", 1, &primed.successor_tokens))

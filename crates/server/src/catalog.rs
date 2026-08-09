@@ -44,6 +44,34 @@ pub struct UserModels {
     pub models: Vec<UserModelConfig>,
 }
 
+const PUBLISH_MODEL_SQL: &str = "INSERT INTO models(id,revision,path,sha256,family,size_bytes,epoch,aliases_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,path=excluded.path,sha256=excluded.sha256,family=excluded.family,size_bytes=excluded.size_bytes,epoch=excluded.epoch,aliases_json=excluded.aliases_json";
+
+fn publish_model(connection: &Connection, model: &ModelRecord) -> Result<(), CatalogError> {
+    if model.epoch == 0 {
+        return Err(CatalogError::Data("model epoch must be nonzero".into()));
+    }
+    let aliases = serde_json::to_string(&model.aliases)
+        .map_err(|error| CatalogError::Data(error.to_string()))?;
+    let size = i64::try_from(model.size_bytes)
+        .map_err(|_| CatalogError::Data("model size exceeds SQLite integer".into()))?;
+    let epoch = i64::try_from(model.epoch)
+        .map_err(|_| CatalogError::Data("model epoch exceeds SQLite integer".into()))?;
+    connection.execute(
+        PUBLISH_MODEL_SQL,
+        params![
+            model.id,
+            model.revision,
+            model.path.to_string_lossy(),
+            model.sha256,
+            model.family,
+            size,
+            epoch,
+            aliases
+        ],
+    )?;
+    Ok(())
+}
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up("CREATE TABLE models (id TEXT PRIMARY KEY NOT NULL, revision TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, family TEXT NOT NULL, size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0), epoch INTEGER NOT NULL CHECK(epoch > 0), aliases_json TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT (unixepoch())); CREATE UNIQUE INDEX model_path_revision ON models(path, revision); CREATE TABLE lifecycle_operations (id TEXT PRIMARY KEY NOT NULL, model_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('running','complete','failed','cancelled')), detail TEXT, started_at INTEGER NOT NULL DEFAULT (unixepoch()), finished_at INTEGER);")
@@ -114,16 +142,26 @@ impl ModelCatalog {
     }
 
     pub fn publish(&self, model: &ModelRecord) -> Result<(), CatalogError> {
-        if model.epoch == 0 {
-            return Err(CatalogError::Data("model epoch must be nonzero".into()));
+        publish_model(&self.connection.lock(), model)
+    }
+    pub fn publish_and_finish_operation(
+        &self,
+        model: &ModelRecord,
+        operation: &str,
+    ) -> Result<(), CatalogError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        publish_model(&transaction, model)?;
+        let changed = transaction.execute(
+            "UPDATE lifecycle_operations SET status='complete', detail=NULL, finished_at=unixepoch() WHERE id=?1 AND status='running'",
+            [operation],
+        )?;
+        if changed != 1 {
+            return Err(CatalogError::Data(format!(
+                "operation {operation} is absent or terminal"
+            )));
         }
-        let aliases = serde_json::to_string(&model.aliases)
-            .map_err(|error| CatalogError::Data(error.to_string()))?;
-        let size = i64::try_from(model.size_bytes)
-            .map_err(|_| CatalogError::Data("model size exceeds SQLite integer".into()))?;
-        let epoch = i64::try_from(model.epoch)
-            .map_err(|_| CatalogError::Data("model epoch exceeds SQLite integer".into()))?;
-        self.connection.lock().execute("INSERT INTO models(id,revision,path,sha256,family,size_bytes,epoch,aliases_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,path=excluded.path,sha256=excluded.sha256,family=excluded.family,size_bytes=excluded.size_bytes,epoch=excluded.epoch,aliases_json=excluded.aliases_json", params![model.id, model.revision, model.path.to_string_lossy(), model.sha256, model.family, size, epoch, aliases])?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -232,6 +270,33 @@ mod tests {
         assert_eq!(
             reopened.operation_status("op").unwrap().as_deref(),
             Some("failed")
+        );
+        let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn model_publication_and_operation_completion_are_atomic() {
+        let (path, catalog) = database();
+        let model = ModelRecord {
+            id: "m".into(),
+            revision: "r".into(),
+            path: "/model.gguf".into(),
+            sha256: "abc".into(),
+            aliases: vec![],
+            family: "gemma".into(),
+            size_bytes: 7,
+            epoch: 1,
+        };
+        assert!(matches!(
+            catalog.publish_and_finish_operation(&model, "absent"),
+            Err(CatalogError::Data(_))
+        ));
+        assert_eq!(catalog.model("m").unwrap(), None);
+        catalog.begin_operation("op", "m", "pull").unwrap();
+        catalog.publish_and_finish_operation(&model, "op").unwrap();
+        assert_eq!(catalog.model("m").unwrap(), Some(model));
+        assert_eq!(
+            catalog.operation_status("op").unwrap().as_deref(),
+            Some("complete")
         );
         let _ = fs::remove_file(path);
     }

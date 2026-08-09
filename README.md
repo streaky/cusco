@@ -53,19 +53,54 @@ The workspace is split into focused crates:
   HTTP adapters;
 - `cli` provides proof, model-management, and serving commands.
 
-## Run the mapped-execution proof
+## Run the acceptance gates
+
+The canonical GPU-less contract gate is:
+
+```sh
+docker compose -f compose.test.yaml run --rm acceptance-model-free
+```
+
+The canonical real-model/GPU gate is:
+
+```sh
+docker compose -f compose.test.yaml run --rm acceptance
+```
+
+Both replay the versioned test set in `config/acceptance.json`. The real gate
+runs executor continuation, mapped publication, representation scaling,
+sustained scheduler, and API smoke workloads, then writes a provenance-indexed
+`results/acceptance-report.json`. Focused proof services remain useful
+diagnostics, but do not replace the complete gate.
+
+## Run the representation measurement proof
 
 With the validation GGUF and NVIDIA runtime available, run:
 
 ```sh
-docker compose -f compose.test.yaml run --rm mapped-proof
+docker compose -f compose.test.yaml run --rm representation-proof
 ```
 
-The command forks four device-resident llama sequence mappings, activates and
-continues each one with identical results, and writes a staged-versus-mapped
-comparison under `results/`. It exercises the sequence-mapping path rather
-than claiming kernel-level graph or cache reuse, which llama.cpp's public API
-does not expose.
+The versioned workload in `config/representation-workload.json` crosses several
+represented-prefix boundaries. The proof requires exact source-versus-successor
+tokens and logits before reporting publication latency and payload-copy deltas
+for each boundary. It also verifies export/import continuation and records graph
+recapture telemetry as unsupported when the backend exposes no truthful signal.
+The reusable correctness and performance artifact is written to
+`results/representation-proof.json`.
+
+The narrower `mapped-proof` service remains available as a staged-restore versus
+mapped-activation diagnostic. It writes `results/mapped-proof.json` and does not claim
+kernel-level graph or cache reuse.
+
+All real-model gates share one cached artifact:
+`hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf`.
+Fetch it once with `docker compose -f compose.test.yaml run --rm model-fetch`.
+Proof services accept the `hf://` identity directly, and the smoke gate installs
+that identity through the model-management API. The registry resolves and
+validates the cached local artifact internally; tests do not depend on cache
+layout or create copied, hard-linked, or symlinked paths. The model supports
+vision and tool use and is the standard fixture for both capability gates.
 
 
 ## Run the unified API smoke report

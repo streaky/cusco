@@ -10,6 +10,17 @@ services:
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
       - cargo-target:/work/target
+  acceptance-model-free:
+    build: *test-build
+    command: ["python3", "tools/acceptance-report.py", "--mode", "model-free"]
+    environment:
+      CUSCO_RESULT_DIR: "/results"
+    volumes:
+      - "${CUSCO_RESULT_DIR:-./results}:/results"
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
+
   model-fetch:
     build: *test-build
     command:
@@ -19,11 +30,9 @@ services:
       - cusco
       - --
       - fetch
-      - hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf
+      - hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf
       - --cache
       - /models/cache
-      - --output
-      - /models/gemma-4-e2b-it.gguf
     volumes:
       - "${CUSCO_MODEL_DIR:-./models}:/models"
       - cargo-registry:/root/.cargo/registry
@@ -31,7 +40,7 @@ services:
       - cargo-target:/work/target
   executor-proof:
     build: *test-build
-    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid --format=csv,noheader && cargo run -p cusco -- proof /models/gemma-4-e2b-it.gguf --sha256 740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8"]
+    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid --format=csv,noheader && cargo run -p cusco -- proof 'hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf'"]
     environment:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
@@ -44,12 +53,51 @@ services:
     deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
   mapped-proof:
     build: *test-build
-    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader > /results/phase5-gpu.csv && cargo run -p cusco -- mapped-proof /models/gemma-4-e2b-it.gguf"]
+    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader > /results/mapped-proof-gpu.csv && cargo run -p cusco -- mapped-proof 'hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf'"]
     environment:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
     volumes:
       - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_RESULT_DIR:-./results}:/results"
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
+  representation-proof:
+    build: *test-build
+    command: ["sh", "-c", "nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader > /results/representation-proof-gpu.csv && cargo run -p cusco -- representation-proof 'hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf'"]
+    environment:
+      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
+      LD_LIBRARY_PATH: "/opt/llama-build/bin"
+    volumes:
+      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_RESULT_DIR:-./results}:/results"
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - cargo-target:/work/target
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, device_ids: ["${CUSCO_GPU_DEVICE_ID:-1}"], capabilities: [gpu] }] } } }
+
+
+  acceptance:
+    depends_on:
+      model-fetch:
+        condition: service_completed_successfully
+    build: *test-build
+    command:
+      - python3
+      - tools/acceptance-report.py
+      - --mode
+      - real-model
+      - --model
+      - hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf
+    environment:
+      CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
+      CUSCO_RESULT_DIR: "/results"
+      LD_LIBRARY_PATH: "/opt/llama-build/bin"
+    volumes:
+      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_MODEL_DIR:-./models}/cache:/data/models"
       - "${CUSCO_RESULT_DIR:-./results}:/results"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
@@ -66,7 +114,7 @@ services:
       - -c
       - >-
         mkdir -p /data/db /data/spill /data/user-models /data/models &&
-        printf 'models:\n  - {name: gemma-4-e2b-it, path: gemma-4-e2b-it.gguf}\n' > /data/user.yaml &&
+        printf 'models: []\n' > /data/user.yaml &&
         CUSCO_BEARER_TOKEN=smoke-report-token cargo run -p cusco -- serve
         --config /work/config/config.yaml &
         server=$$!; trap 'kill $$server' EXIT;
@@ -79,11 +127,9 @@ services:
     environment:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
-      CUSCO_BEARER_TOKEN: smoke-report-token
     volumes:
       - "${CUSCO_MODEL_DIR:-./models}:/data/user-models"
-      - "${CUSCO_MODEL_DIR:-./models}:/data/models"
-      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_MODEL_DIR:-./models}/cache:/data/models"
       - "${CUSCO_RESULT_DIR:-./results}:/results"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git

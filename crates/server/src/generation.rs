@@ -265,7 +265,9 @@ mod tests {
 
     #[test]
     fn classifies_token_cross_token_and_intra_token_stops() {
-        let fixtures: &[(&[(&[u8], bool)], StopAlignment, &str)] = &[
+        type Fixture<'a> = (&'a [(&'a [u8], bool)], StopAlignment, &'a str);
+
+        let fixtures: &[Fixture<'_>] = &[
             (
                 &[(b"answer", false), (b"END", false)],
                 StopAlignment::TokenAligned,
