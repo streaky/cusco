@@ -298,8 +298,16 @@ impl Executor {
     }
 
     pub fn sampler(&mut self, config: SamplingConfig) -> Result<Sampler, Error> {
+        self.sampler_with_grammar(config, None)
+    }
+
+    pub fn sampler_with_grammar(
+        &mut self,
+        config: SamplingConfig,
+        grammar: Option<&str>,
+    ) -> Result<Sampler, Error> {
         Ok(Sampler {
-            raw: ffi::sampler(self.raw, config)?,
+            raw: ffi::sampler(self.raw, config, grammar)?,
         })
     }
 
@@ -455,7 +463,11 @@ struct OwnedDecode {
 mod ffi {
     use super::{Error, OwnedDecode, status};
     use crate::sys;
-    use std::{ffi::CStr, ptr::NonNull, slice};
+    use std::{
+        ffi::{CStr, CString},
+        ptr::NonNull,
+        slice,
+    };
 
     pub(super) fn open(
         path: &CStr,
@@ -569,15 +581,23 @@ mod ffi {
     pub(super) fn sampler(
         raw: NonNull<sys::CuscoExecutor>,
         config: crate::SamplingConfig,
+        grammar: Option<&str>,
     ) -> Result<NonNull<sys::CuscoSampler>, Error> {
+        let grammar = grammar
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| Error::Backend(sys::INVALID))?;
         let mut sampler = std::ptr::null_mut();
         let config = sys::SamplerConfig {
             temperature: config.temperature,
             top_p: config.top_p,
             seed: config.seed,
+            grammar: grammar
+                .as_ref()
+                .map_or(std::ptr::null(), |value| value.as_ptr()),
         };
-        // SAFETY: raw is live, config is borrowed for the call, and the output
-        // points to writable storage.
+        // SAFETY: raw is live, config and its optional grammar are borrowed for
+        // the call, and the output points to writable storage.
         status(unsafe { sys::cusco_sampler_create(raw.as_ptr(), &config, &mut sampler) })?;
         NonNull::new(sampler).ok_or(Error::Backend(3))
     }
@@ -589,12 +609,7 @@ mod ffi {
         let mut token = 0;
         // SAFETY: the sampler is live and logits is borrowed for the call.
         status(unsafe {
-            sys::cusco_sampler_sample(
-                sampler.as_ptr(),
-                logits.as_ptr(),
-                logits.len(),
-                &mut token,
-            )
+            sys::cusco_sampler_sample(sampler.as_ptr(), logits.as_ptr(), logits.len(), &mut token)
         })?;
         Ok(token)
     }

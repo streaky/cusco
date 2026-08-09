@@ -126,7 +126,8 @@ Proof services accept the `hf://` identity directly, and the smoke gate installs
 that identity through the model-management API. The registry resolves and
 validates the cached local artifact internally; tests do not depend on cache
 layout or create copied, hard-linked, or symlinked paths. The model supports
-vision and tool use and is the standard fixture for both capability gates.
+vision and tool use, but the current executor gate exercises tool use only;
+image projection remains unavailable until the native projector path lands.
 
 
 ## Run the unified API smoke report
@@ -135,12 +136,13 @@ vision and tool use and is the standard fixture for both capability gates.
 CUSCO_GPU_DEVICE_ID=0 docker compose -f compose.test.yaml run --rm api-smoke
 ```
 
-This deterministic, model-backed smoke suite exercises buffered OpenAI
-generation plus the primary Cusco context, compaction, and status APIs against
-the standard Gemma test model. It writes `results/smoke-report.json` with
-per-scenario status and latency, request/token totals, and aggregate
-min/median/max latency. The executor and mapped-execution Compose proofs are
-available as lower-level engineering diagnostics.
+This deterministic, model-backed smoke suite exercises buffered and streaming
+OpenAI generation, strict structured output, required tool calls, response
+lifecycle operations, and the primary Cusco context, compaction, and status APIs
+against the standard Gemma test model. It writes `results/smoke-report.json`
+with per-scenario status and latency, request/token totals, semantic-compaction
+evidence, and aggregate min/median/max latency. The executor and
+mapped-execution Compose proofs remain lower-level engineering diagnostics.
 
 ## Run the production Compose service
 

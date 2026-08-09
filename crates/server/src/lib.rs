@@ -40,6 +40,7 @@ mod residency;
 pub mod response_store;
 pub mod responses;
 mod scheduler;
+mod structured;
 mod vision;
 pub use catalog::{ModelCatalog, load_user_models};
 pub use config::{DaemonConfig, OpenApiConfig, VisionConfig};
@@ -190,6 +191,8 @@ pub struct InferRequest {
     pub compaction: Option<CompactionRequest>,
     #[serde(skip, default)]
     pub sampling: SamplingConfig,
+    #[serde(skip, default)]
+    pub grammar: Option<String>,
     #[serde(skip, default)]
     pub scheduling: SchedulingMetadata,
 }
@@ -748,6 +751,7 @@ pub struct EngineRequest {
     pub max_tokens: usize,
     pub prior_tokens: Vec<i32>,
     pub sampling: SamplingConfig,
+    pub grammar: Option<String>,
     pub control: Arc<RequestControl>,
     pub scheduling: SchedulingMetadata,
     pub prefill_chunk_tokens: usize,
@@ -1800,30 +1804,33 @@ impl Server {
                 )
                 .map_err(Error::BadRequest)?;
                 control.check()?;
-                let prepared = self.engine.generate(
-                    EngineRequest {
-                        model: model.clone(),
-                        prompt: proposal.resulting_tokens.join(" "),
-                        max_tokens: 0,
-                        prior_tokens: Vec::new(),
-                        sampling: req.sampling,
-                        control: control.clone(),
-                        scheduling: req.scheduling.clone(),
-                        prefill_chunk_tokens: 32,
-                    },
-                    &mut |_, _, _| {
-                        Err(Error::State(
-                            "compaction preparation unexpectedly generated output".into(),
-                        ))
-                    },
-                )?;
-                control.check()?;
                 let mut result = proposal.result;
                 result.selected_strategy_id = Some(deterministic_strategy_id(&selected));
                 result.resulting_context_epoch = source.revision.saturating_add(1);
+                if proposal.resulting_tokens != logical_context_tokens {
+                    let prepared = self.engine.generate(
+                        EngineRequest {
+                            model: model.clone(),
+                            prompt: proposal.resulting_tokens.join(" "),
+                            max_tokens: 0,
+                            prior_tokens: Vec::new(),
+                            sampling: req.sampling,
+                            grammar: req.grammar.clone(),
+                            control: control.clone(),
+                            scheduling: req.scheduling.clone(),
+                            prefill_chunk_tokens: 32,
+                        },
+                        &mut |_, _, _| {
+                            Err(Error::State(
+                                "compaction preparation unexpectedly generated output".into(),
+                            ))
+                        },
+                    )?;
+                    control.check()?;
+                    logical_context_tokens = proposal.resulting_tokens;
+                    prior_tokens = prepared.successor_tokens;
+                }
                 compaction_result = Some(result);
-                logical_context_tokens = proposal.resulting_tokens;
-                prior_tokens = prepared.successor_tokens;
             }
         }
         let mut delta_index = 0;
@@ -1834,6 +1841,7 @@ impl Server {
                 max_tokens: req.max_tokens,
                 prior_tokens,
                 sampling: req.sampling,
+                grammar: req.grammar,
                 control: control.clone(),
                 scheduling: req.scheduling.clone(),
                 prefill_chunk_tokens: 32,
@@ -2052,10 +2060,40 @@ enum ReasoningEffort {
     High,
     Max,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResponseFormat {
     r#type: String,
+    #[serde(default)]
+    json_schema: Option<JsonSchemaDefinition>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonSchemaDefinition {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    schema: Value,
+    #[serde(default)]
+    strict: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesTextConfig {
+    format: ResponsesTextFormat,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesTextFormat {
+    r#type: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    schema: Option<Value>,
+    #[serde(default)]
+    strict: bool,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2184,10 +2222,13 @@ fn validate_controls(
             }
         }
     }
-    if response_format.is_some_and(|format| format.r#type != "text") {
-        return Err(Error::BadRequest(
-            "unsupported_capability: structured output requires grammar support".into(),
-        ));
+    if response_format.is_some_and(|format| {
+        !matches!(
+            format.r#type.as_str(),
+            "text" | "json_object" | "json_schema"
+        )
+    }) {
+        return Err(Error::BadRequest("unsupported response_format type".into()));
     }
     if reasoning.is_some_and(|effort| !matches!(effort, ReasoningEffort::None)) {
         return Err(Error::BadRequest(
@@ -2195,6 +2236,53 @@ fn validate_controls(
         ));
     }
     Ok(())
+}
+fn response_format_grammar(format: Option<&ResponseFormat>) -> Result<Option<String>, Error> {
+    let Some(format) = format else {
+        return Ok(None);
+    };
+    match format.r#type.as_str() {
+        "text" => Ok(None),
+        "json_object" => Ok(Some(structured::json_grammar())),
+        "json_schema" => {
+            let definition = format.json_schema.as_ref().ok_or_else(|| {
+                Error::BadRequest("response_format.json_schema is required".into())
+            })?;
+            let _ = (&definition.name, &definition.description, definition.strict);
+            structured::schema_grammar(&definition.schema)
+                .map(structured::finish_schema_grammar)
+                .map(Some)
+                .map_err(|error| Error::BadRequest(error.to_string()))
+        }
+        _ => Err(Error::BadRequest("unsupported response_format type".into())),
+    }
+}
+
+fn responses_text_grammar(text: Option<&ResponsesTextConfig>) -> Result<Option<String>, Error> {
+    let Some(format) = text.map(|text| &text.format) else {
+        return Ok(None);
+    };
+    match format.r#type.as_str() {
+        "text" => Ok(None),
+        "json_object" => Ok(Some(structured::json_grammar())),
+        "json_schema" => {
+            let schema = format
+                .schema
+                .as_ref()
+                .ok_or_else(|| Error::BadRequest("text.format.schema is required".into()))?;
+            if format.name.as_deref().is_none_or(str::is_empty) {
+                return Err(Error::BadRequest(
+                    "text.format.name is required for json_schema".into(),
+                ));
+            }
+            let _ = (&format.description, format.strict);
+            structured::schema_grammar(schema)
+                .map(structured::finish_schema_grammar)
+                .map(Some)
+                .map_err(|error| Error::BadRequest(error.to_string()))
+        }
+        _ => Err(Error::BadRequest("unsupported text.format type".into())),
+    }
 }
 fn sampling_config(
     temperature: Option<f32>,
@@ -2525,6 +2613,7 @@ async fn completion(
         prompt: r.prompt,
         max_tokens: r.max_tokens,
         sampling,
+        grammar: None,
         compaction: r.compaction,
         include_usage,
         streaming: r.stream,
@@ -2558,6 +2647,7 @@ async fn chat(
         r.reasoning_effort.as_ref(),
     )?;
     let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
+    let grammar = response_format_grammar(r.response_format.as_ref())?;
     let include_usage = r
         .stream_options
         .as_ref()
@@ -2570,6 +2660,7 @@ async fn chat(
         prompt,
         max_tokens: r.max_tokens,
         sampling,
+        grammar,
         compaction: r.compaction,
         include_usage,
         streaming: r.stream,
@@ -2617,7 +2708,9 @@ enum ResponsesContent {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ResponsesContentPart {
-    InputText { text: String },
+    InputText {
+        text: String,
+    },
     InputImage {
         image_url: String,
         #[serde(default, rename = "detail")]
@@ -2690,6 +2783,8 @@ struct ResponsesRequest {
     #[serde(default)]
     response_format: Option<ResponseFormat>,
     #[serde(default)]
+    text: Option<ResponsesTextConfig>,
+    #[serde(default)]
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     tool_choice: Option<ResponsesToolChoice>,
@@ -2714,6 +2809,15 @@ async fn responses(
     if let Some(tool_choice) = &r.tool_choice {
         tool_choice.validate(&r.tools)?;
     }
+    let grammar = match (&r.text, &r.response_format) {
+        (Some(_), Some(_)) => {
+            return Err(Error::BadRequest(
+                "text and response_format cannot both be supplied".into(),
+            ));
+        }
+        (Some(text), None) => responses_text_grammar(Some(text))?,
+        (None, format) => response_format_grammar(format.as_ref())?,
+    };
     let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
     let model = s.model(&r.model)?;
     let mut input_ledger = Vec::new();
@@ -2833,6 +2937,7 @@ async fn responses(
         prompt,
         max_tokens: r.max_output_tokens,
         sampling,
+        grammar,
         compaction: r.compaction,
         include_usage: true,
         streaming: r.stream,
@@ -3260,6 +3365,7 @@ struct InferResponseRequest {
     prompt: String,
     max_tokens: Option<usize>,
     sampling: SamplingConfig,
+    grammar: Option<String>,
     compaction: Option<CompactionRequest>,
     include_usage: bool,
     streaming: bool,
@@ -3457,6 +3563,7 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
         prompt,
         max_tokens,
         sampling,
+        grammar,
         compaction,
         include_usage,
         streaming,
@@ -3508,6 +3615,7 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
         prompt,
         max_tokens: max_tokens.unwrap_or(config.default_output_tokens),
         sampling,
+        grammar,
         context_id,
         deadline_ms: Some(
             u64::try_from(wall_remaining.as_millis())
@@ -4056,6 +4164,21 @@ mod tests {
     }
 
     #[test]
+    fn response_format_accepts_json_schema() {
+        let format: ResponseFormat = serde_json::from_value(json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "smoke_result",
+                "strict": true,
+                "schema": {"type": "object"}
+            }
+        }))
+        .unwrap();
+        assert_eq!(format.r#type, "json_schema");
+        assert_eq!(format.json_schema.unwrap().name, "smoke_result");
+    }
+
+    #[test]
     fn gemma_effective_stops_include_terminal_markers() {
         let (server, directory) = setup(Arc::new(AnonymousAdmin));
         let request = InferRequest {
@@ -4069,6 +4192,7 @@ mod tests {
             stop: vec!["custom".into()],
             raw_continuation: false,
             sampling: SamplingConfig::default(),
+            grammar: None,
         };
 
         assert_eq!(
@@ -4250,6 +4374,7 @@ mod tests {
             stop: vec![],
             raw_continuation: false,
             sampling: SamplingConfig::default(),
+            grammar: None,
         };
         let (out, events) = s.infer("r", req).unwrap();
         assert_eq!(out.text, "two one");
@@ -4271,6 +4396,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                 },
             )
             .unwrap_err();
@@ -4290,6 +4416,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                 }
             ),
             Err(Error::Deadline)
@@ -4309,6 +4436,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                 },
             ),
             Err(Error::Busy)
@@ -4335,6 +4463,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                 }
             ),
             Err(Error::State(_))
@@ -4455,7 +4584,6 @@ mod tests {
         assert_eq!(body["output"][0]["type"], "message");
         assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
         assert!(
-
             body["output"][0]["content"][0]["text"]
                 .as_str()
                 .is_some_and(|text| !text.is_empty())
@@ -4487,17 +4615,18 @@ mod tests {
             }),
             false,
         );
-        assert!(prompt.contains(
-            "You must call the `lookup` function.<end_of_turn>\n<start_of_turn>model\n"
-        ));
+        assert!(
+            prompt.contains(
+                "You must call the `lookup` function.<end_of_turn>\n<start_of_turn>model\n"
+            )
+        );
         assert!(!prompt.ends_with("function."));
     }
     #[test]
     fn responses_tool_result_instructions_prevent_duplicate_calls() {
-        let mut prompt =
-            "<start_of_turn>user\nTool result for call_1: blue<end_of_turn>\n\
+        let mut prompt = "<start_of_turn>user\nTool result for call_1: blue<end_of_turn>\n\
              <start_of_turn>model\n"
-                .to_string();
+            .to_string();
         append_tool_instructions(
             &mut prompt,
             &[ToolDefinition::Flat(FlatToolDefinition {
@@ -4510,9 +4639,11 @@ mod tests {
             None,
             true,
         );
-        assert!(prompt.contains(
-            "Use it to answer the user; do not repeat a completed call.<end_of_turn>"
-        ));
+        assert!(
+            prompt.contains(
+                "Use it to answer the user; do not repeat a completed call.<end_of_turn>"
+            )
+        );
     }
     #[test]
     fn responses_tool_choice_is_typed_and_capability_checked() {
@@ -5190,6 +5321,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                     scheduling: SchedulingMetadata::default(),
                 },
                 admission,
@@ -5239,6 +5371,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                     scheduling: SchedulingMetadata::default(),
                 },
                 admission,
@@ -5300,6 +5433,7 @@ mod tests {
                         stop: vec![],
                         raw_continuation: false,
                         sampling: SamplingConfig::default(),
+                        grammar: None,
                         scheduling: SchedulingMetadata::default(),
                     },
                 )
@@ -5322,6 +5456,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                     scheduling: SchedulingMetadata::default(),
                 },
             ),
@@ -6379,6 +6514,7 @@ mod tests {
             stop: vec![],
             raw_continuation: false,
             sampling: SamplingConfig::default(),
+            grammar: None,
             scheduling: SchedulingMetadata::default(),
         }
     }

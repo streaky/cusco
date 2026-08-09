@@ -1244,6 +1244,7 @@ mod tests {
             max_tokens: 2,
             prior_tokens: vec![],
             sampling: Default::default(),
+            grammar: None,
             control: Arc::new(RequestControl::new()),
             scheduling: crate::SchedulingMetadata {
                 class,

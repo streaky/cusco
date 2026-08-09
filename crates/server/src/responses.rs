@@ -1,12 +1,12 @@
 use crate::response_store::{ResponseResourceStore, StoreError};
 use crate::{FinishReason, StreamEvent, Usage};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
     time::{SystemTime, UNIX_EPOCH},
 };
-use parking_lot::Mutex;
 use uuid::Uuid;
 
 pub const RESPONSE_SCHEMA_VERSION: u32 = 1;
@@ -202,7 +202,9 @@ impl ResponseService {
         self.retrieve(id, owner)?;
         let mut transient = self.transient.lock();
         if transient.resources.remove(id).is_some() {
-            transient.insertion_order.retain(|candidate| candidate != id);
+            transient
+                .insertion_order
+                .retain(|candidate| candidate != id);
             return Ok(());
         }
         drop(transient);

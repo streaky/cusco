@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define CUSCO_EXECUTOR_ABI_VERSION 12u
+#define CUSCO_EXECUTOR_ABI_VERSION 13u
 
 typedef struct cusco_executor cusco_executor;
 typedef struct cusco_representation cusco_representation;
@@ -43,6 +43,8 @@ typedef struct {
     float temperature;
     float top_p;
     uint32_t seed;
+    /* Optional UTF-8 GBNF grammar. NULL selects unconstrained sampling. */
+    const char * grammar;
 } cusco_sampler_config;
 
 

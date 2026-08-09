@@ -473,7 +473,7 @@ impl MappedSession {
             self.sampler = Some(
                 state
                     .executor
-                    .sampler(self.request.sampling)
+                    .sampler_with_grammar(self.request.sampling, self.request.grammar.as_deref())
                     .map_err(state_error)?,
             );
             self.stage = MappedStage::Decode;
@@ -1075,6 +1075,7 @@ mod tests {
             max_tokens,
             prior_tokens: prior_tokens.to_vec(),
             sampling: Default::default(),
+            grammar: None,
             control: Arc::new(RequestControl::new()),
             scheduling: SchedulingMetadata::default(),
             prefill_chunk_tokens: 32,
@@ -1361,6 +1362,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: Default::default(),
+                    grammar: None,
                 },
             )
             .unwrap()
@@ -1381,6 +1383,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: Default::default(),
+                    grammar: None,
                 },
             )
             .unwrap()

@@ -393,34 +393,45 @@ cusco_status cusco_sampler_create(
     *out = nullptr;
     llama_sampler * raw = nullptr;
     if (!is_mock(executor)) {
-        if (config->temperature <= 0.0F) {
+        const bool constrained = config->grammar && config->grammar[0] != '\0';
+        if (!constrained && config->temperature <= 0.0F) {
             raw = llama_sampler_init_greedy();
         } else {
             raw = llama_sampler_chain_init(llama_sampler_chain_default_params());
             if (!raw) {
                 return CUSCO_NOMEM;
             }
-            auto * top_p = llama_sampler_init_top_p(config->top_p, 1);
-            if (!top_p) {
-                llama_sampler_free(raw);
-                return CUSCO_NOMEM;
+            if (constrained) {
+                auto * grammar = llama_sampler_init_grammar(
+                    executor->vocab, config->grammar, "root");
+                if (!grammar) {
+                    llama_sampler_free(raw);
+                    return CUSCO_INVALID;
+                }
+                llama_sampler_chain_add(raw, grammar);
             }
-            auto * temp = llama_sampler_init_temp(config->temperature);
-            if (!temp) {
-                llama_sampler_free(top_p);
-                llama_sampler_free(raw);
-                return CUSCO_NOMEM;
+            if (config->temperature <= 0.0F) {
+                auto * greedy = llama_sampler_init_greedy();
+                if (!greedy) {
+                    llama_sampler_free(raw);
+                    return CUSCO_NOMEM;
+                }
+                llama_sampler_chain_add(raw, greedy);
+            } else {
+                auto * top_p = llama_sampler_init_top_p(config->top_p, 1);
+                auto * temp = llama_sampler_init_temp(config->temperature);
+                auto * dist = llama_sampler_init_dist(config->seed);
+                if (!top_p || !temp || !dist) {
+                    llama_sampler_free(top_p);
+                    llama_sampler_free(temp);
+                    llama_sampler_free(dist);
+                    llama_sampler_free(raw);
+                    return CUSCO_NOMEM;
+                }
+                llama_sampler_chain_add(raw, top_p);
+                llama_sampler_chain_add(raw, temp);
+                llama_sampler_chain_add(raw, dist);
             }
-            auto * dist = llama_sampler_init_dist(config->seed);
-            if (!dist) {
-                llama_sampler_free(temp);
-                llama_sampler_free(top_p);
-                llama_sampler_free(raw);
-                return CUSCO_NOMEM;
-            }
-            llama_sampler_chain_add(raw, top_p);
-            llama_sampler_chain_add(raw, temp);
-            llama_sampler_chain_add(raw, dist);
         }
     }
     if (!is_mock(executor) && !raw) {

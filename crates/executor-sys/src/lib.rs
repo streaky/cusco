@@ -63,6 +63,7 @@ pub struct SamplerConfig {
     pub temperature: f32,
     pub top_p: f32,
     pub seed: c_uint,
+    pub grammar: *const c_char,
 }
 
 #[repr(C)]
@@ -72,6 +73,7 @@ pub struct DecodeResult {
     pub token: i32,
 }
 pub const OK: i32 = 0;
+pub const INVALID: i32 = 1;
 pub const CANCELLED: i32 = 4;
 pub const INCOMPATIBLE: i32 = 5;
 pub const ROLLBACK_FAILED: i32 = 6;

@@ -738,6 +738,7 @@ mod tests {
             max_tokens,
             prior_tokens: vec![],
             sampling: Default::default(),
+            grammar: None,
             control,
             scheduling: SchedulingMetadata::default(),
             prefill_chunk_tokens: 32,

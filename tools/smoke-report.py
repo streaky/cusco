@@ -28,6 +28,93 @@ OPENAI = OpenAI(
     timeout=120.0,
 )
 
+STRUCTURED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string", "enum": ["smoke-ok"]},
+        "count": {"type": "integer", "enum": [1]},
+    },
+    "required": ["answer", "count"],
+    "additionalProperties": False,
+}
+
+
+def structured_value(text):
+    value = json.loads(text)
+    assert value == {"answer": "smoke-ok", "count": 1}, (
+        f"unexpected structured value: {value!r}"
+    )
+    return value
+
+
+def chat_structured(status, body):
+    status_ok(status)
+    choices = body.get("choices") if isinstance(body, dict) else None
+    assert isinstance(choices, list) and choices, "missing chat choices"
+    content = choices[0].get("message", {}).get("content")
+    assert isinstance(content, str), "missing structured chat content"
+    structured_value(content)
+    return True
+
+
+def response_output_text(body):
+    output = body.get("output") if isinstance(body, dict) else None
+    assert isinstance(output, list), "missing Responses output"
+    return "".join(
+        part.get("text", "")
+        for item in output
+        if isinstance(item, dict)
+        for part in item.get("content", [])
+        if isinstance(part, dict) and part.get("type") == "output_text"
+    )
+
+
+def responses_structured(status, body):
+    status_ok(status)
+    structured_value(response_output_text(body))
+    return True
+
+
+def required_tool_call(status, body):
+    status_ok(status)
+    output = body.get("output") if isinstance(body, dict) else None
+    assert isinstance(output, list), "missing Responses output"
+    calls = [
+        item for item in output
+        if isinstance(item, dict) and item.get("type") == "function_call"
+    ]
+    assert len(calls) == 1, f"expected one function call, got {calls!r}"
+    call = calls[0]
+    assert call.get("name") == "lookup_weather", f"unexpected tool name: {call!r}"
+    assert json.loads(call.get("arguments", "")) == {"city": "Paris"}, (
+        f"unexpected tool arguments: {call!r}"
+    )
+    return True
+
+
+def chat_structured_stream(events):
+    text = "".join(
+        (choice.get("delta") or {}).get("content") or ""
+        for event in events
+        for choice in event.get("choices", [])
+        if isinstance(choice, dict)
+    )
+    structured_value(text)
+    return any(
+        any(choice.get("finish_reason") is not None for choice in event.get("choices", []))
+        for event in events
+    )
+
+
+def responses_structured_stream(events):
+    text = "".join(
+        event.get("delta", "")
+        for event in events
+        if event.get("type") == "response.output_text.delta"
+    )
+    structured_value(text)
+    return any(event.get("type") == "response.completed" for event in events)
+
 
 def sdk_body(response):
     parsed = response.parse()
@@ -170,8 +257,22 @@ def response_lifecycle():
 def stream_chat_completion(payload):
     payload = dict(payload)
     payload.pop("stream", None)
-    return [chunk.model_dump(mode="json") for chunk in OPENAI.chat.completions.create(**payload, stream=True)]
-
+    extra_body = {}
+    if response_format := payload.pop("response_format", None):
+        extra_body["response_format"] = response_format
+    try:
+        return [
+            chunk.model_dump(mode="json")
+            for chunk in OPENAI.chat.completions.create(
+                **payload,
+                stream=True,
+                extra_body=extra_body or None,
+            )
+        ]
+    except APIStatusError as exc:
+        raise RuntimeError(
+            f"{exc}; request={exc.request.content.decode('utf-8')}"
+        ) from exc
 
 def stream_response(payload):
     payload = dict(payload)
@@ -527,6 +628,34 @@ def run():
             lambda status, body: list_field(status, body, "choices"),
         ),
         (
+            "chat_structured_output",
+            "POST",
+            "/openai/v1/chat/completions",
+            lambda: create_chat_completion(
+                {
+                    "model": MODEL,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Return the requested JSON object.",
+                        }
+                    ],
+                    "max_tokens": 64,
+                    "temperature": 0,
+                    "seed": 10,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "smoke_result",
+                            "strict": True,
+                            "schema": STRUCTURED_SCHEMA,
+                        },
+                    },
+                }
+            ),
+            chat_structured,
+        ),
+        (
             "responses",
             "POST",
             "/openai/v1/responses",
@@ -550,6 +679,66 @@ def run():
                 }
             ),
             lambda status, body: has(status, body, "output"),
+        ),
+        (
+            "responses_structured_output",
+            "POST",
+            "/openai/v1/responses",
+            lambda: create_response(
+                {
+                    "model": MODEL,
+                    "input": "Return the requested JSON object.",
+                    "max_output_tokens": 64,
+                    "temperature": 0,
+                    "seed": 10,
+                    "store": False,
+                    "text": {
+                        "format": {
+                            "type": "json_schema",
+                            "name": "smoke_result",
+                            "strict": True,
+                            "schema": STRUCTURED_SCHEMA,
+                        }
+                    },
+                }
+            ),
+            responses_structured,
+        ),
+        (
+            "responses_required_tool_call",
+            "POST",
+            "/openai/v1/responses",
+            lambda: create_response(
+                {
+                    "model": MODEL,
+                    "input": "Call lookup_weather with city Paris.",
+                    "max_output_tokens": 64,
+                    "temperature": 0,
+                    "seed": 10,
+                    "store": False,
+                    "tool_choice": "required",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "lookup_weather",
+                            "description": "Look up weather for a city.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "city": {
+                                        "type": "string",
+                                        "enum": ["Paris"],
+                                    }
+                                },
+                                "required": ["city"],
+                                "additionalProperties": False,
+                            },
+                            "strict": True,
+                        }
+                    ],
+                }
+            ),
+            required_tool_call,
         ),
         (
             "responses_sdk_lifecycle",
@@ -826,6 +1015,33 @@ def run():
             ),
         ),
         (
+            "chat_structured_output_sse",
+            stream_chat_completion,
+            {
+                "model": MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Return the requested JSON object.",
+                    }
+                ],
+                "max_tokens": 64,
+                "temperature": 0,
+                "seed": 10,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "smoke_result",
+                        "strict": True,
+                        "schema": STRUCTURED_SCHEMA,
+                    },
+                },
+            },
+            chat_structured_stream,
+        ),
+        (
             "responses_sse_reconstruction",
             stream_response,
             {
@@ -841,6 +1057,27 @@ def run():
                 and isinstance(event.get("response", {}).get("usage"), dict)
                 for event in events
             ),
+        ),
+        (
+            "responses_structured_output_sse",
+            stream_response,
+            {
+                "model": MODEL,
+                "input": "Return the requested JSON object.",
+                "max_output_tokens": 64,
+                "temperature": 0,
+                "seed": 10,
+                "stream": True,
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "smoke_result",
+                        "strict": True,
+                        "schema": STRUCTURED_SCHEMA,
+                    }
+                },
+            },
+            responses_structured_stream,
         ),
     ]
     for name, request_stream, payload, terminal_check in stream_cases:

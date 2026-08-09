@@ -607,6 +607,7 @@ fn run_scheduler_proof_case(
             max_tokens: case.max_tokens,
             prior_tokens: Vec::new(),
             sampling: Default::default(),
+            grammar: None,
             control,
             scheduling: SchedulingMetadata {
                 class: case.class,
