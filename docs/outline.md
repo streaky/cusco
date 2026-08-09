@@ -852,6 +852,60 @@ struct NativeOperatingPoint {
 
 Native code is authoritative for architecture-specific geometry and must either provide a conservative bound, execute within a fixed preallocated pool, or expose a bounded paging and trimming contract. If routing-dependent or backend allocation cannot be bounded for a configuration, that configuration is not admissible. “Competent” remains operator policy informed by executor-provided placements and measurements; selection is expressed through explicit latency and placement objectives rather than hidden constants.
 
+The daemon configuration may provide a global maximum GPU-offload layer count
+as a fallback, but that value is an absolute, model-relative cap rather than a
+percentage or a semantic “all”: the effective placement cannot exceed the
+selected model's offloadable layers, and the same cap may fully offload one
+model while only partially offloading a deeper model. Model lifecycle
+configuration should therefore support an optional per-model placement
+override, resolved after the global fallback and before native operating-point
+selection. The override should ultimately express semantic policy such as
+automatic, full, or an explicit maximum layer count rather than requiring
+operators to choose a large numeric sentinel. The resolved placement remains
+subject to capacity admission and the native executor's reported feasible
+operating points.
+
+Device policy should likewise become an explicit top-level configuration
+section rather than extending the current daemon-wide `device_capacity`
+scalar. A deployment must be able to include or disable discovered devices and
+assign capacity independently, for example:
+
+```yaml
+gpu:
+  devices:
+    - id: 0
+      disabled: true
+    - id: 1
+      device_capacity: 10 GiB
+```
+
+The device identifier is a backend device selector, not a claim that capacity
+or topology is uniform across devices. Cusco should discover each device and
+its physical memory capacity through the native backend. A configured
+`device_capacity` is an optional upper bound on the capacity Cusco may use,
+not the source of the device's physical capacity and never a way to increase
+it; when omitted, policy derives the usable budget from detected capacity
+after allocator, driver, and operator-reserved headroom. Admission must track
+that budget independently per device and never pool capacities into a single
+fungible total. Model placement policy may select one device or a declared
+device set, and per-model placement overrides are resolved against the
+selected devices. Configuration validation must reject duplicate or unknown
+selectors, caps above detected physical capacity, and model assignments that
+reference disabled devices. Omitting the section may retain a documented
+single-device autodiscovery fallback for simple deployments, but an explicit
+section is authoritative for device enablement and configured caps.
+
+These per-device budgets are inputs to model packing and request steering, not
+just startup validation. The residency controller must choose placements from
+the model's native operating-point requirements, each device's remaining
+budget, topology and backend compatibility, and the execution and context
+reserves already committed there. Loading a model, creating a replica, or
+moving execution between devices must reserve the destination before changing
+the active route; concurrent placement decisions must not independently spend
+the same residual capacity. Request steering should then account for model
+residency and reusable context locality as well as queue pressure, so that
+balancing work does not routinely discard the state it is intended to reuse.
+
 Let:
 
 - $C$ be usable device capacity after non-Cusco driver overhead and allocator headroom;

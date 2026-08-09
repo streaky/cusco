@@ -102,12 +102,12 @@ pub struct DaemonConfig {
 #[serde(deny_unknown_fields)]
 pub struct OpenApiConfig {
     #[serde(default)]
-    pub ui: OpenApiUiConfig,
+    pub docs_ui: OpenApiDocsUiConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct OpenApiUiConfig {
+pub struct OpenApiDocsUiConfig {
     #[serde(default)]
     pub enabled: bool,
 }
@@ -362,6 +362,18 @@ mod tests {
         let mut config = valid();
         config.vision.retention_capacity = ByteSize(1);
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+    #[test]
+    fn documented_example_is_complete_and_valid() {
+        let config: DaemonConfig =
+            serde_yaml::from_str(include_str!("../../../config.example.yaml")).unwrap();
+        config.validate().unwrap();
+    }
+    #[test]
+    fn test_configuration_is_complete_and_valid() {
+        let config: DaemonConfig =
+            serde_yaml::from_str(include_str!("../../../config/test.yaml")).unwrap();
+        config.validate().unwrap();
     }
     #[test]
     fn loads_round_tripped_configuration_and_rejects_bad_sizes() {

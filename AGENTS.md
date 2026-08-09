@@ -38,6 +38,7 @@ The server dynamically admits and reuses multiple model epochs within configured
 - Keep llama.cpp changes behind the versioned C ABI in `native/include/cusco_executor.h` (currently ABI version 9). Rust should not depend directly on unstable llama.cpp internals.
 - Model files and generated proof results are local artifacts and must not be committed.
 - Files matched by `.gitignore` are intentionally local artifacts. Never force-add, stage, or commit them; if an ignored artifact contains durable project guidance, move that guidance into an appropriate tracked document instead.
+- `config.example.yaml` is the exhaustive, documented operator configuration template. Keep it synchronized with every supported configuration field and update its comments and sensible deployment defaults whenever the schema or behavior changes; `config.yaml` is the ignored operator-local copy mounted by production Compose. Verification services and harnesses must use the tracked `config/test.yaml`, whose test-specific limits and feature choices must not leak into the operator example.
 
 A normal local image build is:
 

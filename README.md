@@ -136,20 +136,21 @@ available as lower-level engineering diagnostics.
 
 ## Run the production Compose service
 
-Copy `config/config.yaml` to an operator-owned location, configure
-`config/user.yaml` with local model declarations, provide an authentication
-token, and start the release service:
+Copy the fully documented `config.example.yaml` to the ignored root
+`config.yaml`, configure `config/user.yaml` with local model declarations,
+provide an authentication token, and start the release service:
 
 ```sh
-mkdir -p data/models data/state data/spill data/user-models
+cp config.example.yaml config.yaml
+mkdir -p data/models data/db data/spill data/user-models
 CUSCO_BEARER_TOKEN='replace-with-a-secret' docker compose up --build -d server
 ```
 
-The production definition mounts the versioned daemon configuration read-only,
-listens on `127.0.0.1:8080` by default, persists the migrated SQLite catalog
-under `data/state`, and uses bounded storage under `data/spill`. The typed
-Responses lifecycle has a file-backed resource store under
-`data/state/responses`; current `store: false` requests do not publish there,
+The production definition mounts the root `config.yaml` read-only, listens on
+`127.0.0.1:8080` by default, persists the migrated SQLite catalog under
+`data/db`, and uses bounded storage under `data/spill`. The typed Responses
+lifecycle has a file-backed resource store beside the database under
+`data/db/responses`; current `store: false` requests do not publish there,
 while the store provides atomic-write and deterministic-recovery foundations
 for durable response resources. Override `CUSCO_LISTEN_ADDRESS`, `CUSCO_PORT`,
 and `CUSCO_GPU_DEVICE_ID` as needed.
@@ -161,7 +162,7 @@ contexts.
 The daemon accepts one versioned configuration path:
 
 ```sh
-cargo run -p cusco -- serve --config ./config/config.yaml
+cargo run -p cusco -- serve --config ./config.yaml
 ```
 
 Unknown, missing, invalid, or unsupported-version configuration is rejected

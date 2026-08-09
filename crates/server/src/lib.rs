@@ -1152,8 +1152,8 @@ impl Server {
     pub fn configure_openapi(&self, config: OpenApiConfig) {
         *self.openapi.lock() = config;
     }
-    fn openapi_ui_enabled(&self) -> bool {
-        self.openapi.lock().ui.enabled
+    fn api_docs_ui_enabled(&self) -> bool {
+        self.openapi.lock().docs_ui.enabled
     }
     fn vision_config(&self) -> VisionConfig {
         self.vision.lock().clone()
@@ -2320,7 +2320,7 @@ fn routes(server: Server) -> Router {
             delete(revoke_compaction_declaration),
         )
         .route("/cusco/v1/contexts/{id}/branches", post(branch_context));
-    let app = if server.openapi_ui_enabled() {
+    let app = if server.api_docs_ui_enabled() {
         app.route("/openapi/ui", get(swagger_ui))
     } else {
         app
@@ -4334,7 +4334,7 @@ mod tests {
     async fn swagger_combined_spec_and_ui_smoke() {
         let (server, directory) = setup(Arc::new(AnonymousAdmin));
         server.configure_openapi(OpenApiConfig {
-            ui: crate::config::OpenApiUiConfig { enabled: true },
+            docs_ui: crate::config::OpenApiDocsUiConfig { enabled: true },
         });
         let app = router(server);
         let response = app

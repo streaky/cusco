@@ -116,7 +116,7 @@ services:
         mkdir -p /data/db /data/spill /data/user-models /data/models &&
         printf 'models: []\n' > /data/user.yaml &&
         CUSCO_BEARER_TOKEN=smoke-report-token cargo run -p cusco -- serve
-        --config /work/config/config.yaml &
+        --config /work/config/test.yaml &
         server=$$!; trap 'kill $$server' EXIT;
         until curl -sf -H 'Authorization: Bearer smoke-report-token'
         http://127.0.0.1:8080/cusco/v1/status >/dev/null; do

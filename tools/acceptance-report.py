@@ -154,7 +154,7 @@ def api_smoke_gate(semantic_workload):
     env = os.environ.copy()
     env["CUSCO_BEARER_TOKEN"] = "smoke-report-token"
     server = subprocess.Popen(
-        ["cargo", "run", "-p", "cusco", "--", "serve", "--config", "/work/config/config.yaml"],
+        ["cargo", "run", "-p", "cusco", "--", "serve", "--config", "/work/config/test.yaml"],
         cwd=ROOT,
         env=env,
     )
