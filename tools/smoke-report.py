@@ -7,6 +7,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from openai import APIStatusError, OpenAI
 BASE = os.environ.get("CUSCO_SMOKE_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
 TOKEN = os.environ.get("CUSCO_SMOKE_TOKEN", "smoke-report-token")
 OUT = Path(os.environ.get("CUSCO_SMOKE_OUTPUT", "/results/smoke-report.json"))
@@ -20,9 +21,92 @@ SEMANTIC_WORKLOAD = Path(
         "/work/config/phase10-semantic-workload.json",
     )
 )
+OPENAI = OpenAI(
+    api_key=TOKEN,
+    base_url=f"{BASE}/openai/v1",
+    max_retries=0,
+    timeout=120.0,
+)
+
+
+def sdk_body(response):
+    parsed = response.parse()
+    return parsed.model_dump(mode="json") if hasattr(parsed, "model_dump") else parsed
+
+
+def openai_call(path, payload):
+    payload = dict(payload or {})
+    if path == "/openai/v1/models":
+        response = OPENAI.models.with_raw_response.list()
+    elif path == "/openai/v1/completions":
+        extra_body = {
+            key: payload.pop(key)
+            for key in ("context_id", "compaction")
+            if key in payload
+        }
+        response = OPENAI.completions.with_raw_response.create(
+            **payload,
+            extra_body=extra_body or None,
+        )
+    elif path == "/openai/v1/chat/completions":
+        extra_body = {
+            key: payload.pop(key)
+            for key in ("context_id", "compaction")
+            if key in payload
+        }
+        response = OPENAI.chat.completions.with_raw_response.create(
+            **payload,
+            extra_body=extra_body or None,
+        )
+    elif path == "/openai/v1/responses":
+        extra_body = {
+            key: payload.pop(key)
+            for key in ("seed", "context_id", "compaction")
+            if key in payload
+        }
+        response = OPENAI.responses.with_raw_response.create(
+            **payload,
+            extra_body=extra_body or None,
+        )
+    else:
+        raise ValueError(f"unsupported OpenAI SDK path: {path}")
+    return response.status_code, response.headers.get("content-type", ""), sdk_body(response)
+
+
+def openai_stream_call(path, payload):
+    payload = dict(payload)
+    payload.pop("stream", None)
+    if path == "/openai/v1/chat/completions":
+        stream = OPENAI.chat.completions.create(**payload, stream=True)
+    elif path == "/openai/v1/responses":
+        extra_body = {"seed": payload.pop("seed")} if "seed" in payload else None
+        stream = OPENAI.responses.create(
+            **payload,
+            stream=True,
+            extra_body=extra_body,
+        )
+    else:
+        raise ValueError(f"unsupported OpenAI SDK stream path: {path}")
+    return [event.model_dump(mode="json") for event in stream]
 
 
 def call(method, path, payload=None):
+    if path != "/openai/v1/openapi.json" and path.startswith("/openai/v1/"):
+        started = time.perf_counter_ns()
+        try:
+            status, content_type, body = openai_call(path, payload)
+        except APIStatusError as exc:
+            status = exc.status_code
+            content_type = exc.response.headers.get("content-type", "")
+            try:
+                body = exc.response.json()
+            except ValueError:
+                body = exc.response.text
+        except Exception as exc:
+            elapsed = (time.perf_counter_ns() - started) / 1_000_000
+            return 0, "application/json", {"error": str(exc)}, elapsed
+        elapsed = (time.perf_counter_ns() - started) / 1_000_000
+        return status, content_type, body, elapsed
     data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
     headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
     if data is not None:
@@ -54,33 +138,11 @@ def call(method, path, payload=None):
     return status, content_type, body, elapsed
 
 def stream_call(path, payload, accept):
-    data = json.dumps(payload, separators=(",", ":")).encode()
-    request = urllib.request.Request(
-        BASE + path,
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {TOKEN}",
-            "Accept": accept,
-            "Content-Type": "application/json",
-        },
-    )
+    assert accept == "text/event-stream"
     started = time.perf_counter_ns()
-    with urllib.request.urlopen(request, timeout=120) as response:
-        raw = response.read().decode("utf-8")
-        status = response.status
-        content_type = response.headers.get("content-type", "")
+    events = openai_stream_call(path, payload)
     elapsed = (time.perf_counter_ns() - started) / 1_000_000
-    if accept == "text/event-stream":
-        events = []
-        for block in raw.replace("\r\n", "\n").split("\n\n"):
-            data_rows = [line[6:] for line in block.splitlines() if line.startswith("data: ")]
-            if not data_rows or data_rows == ["[DONE]"]:
-                continue
-            events.append(json.loads("\n".join(data_rows)))
-    else:
-        events = [json.loads(line) for line in raw.splitlines() if line.strip()]
-    return status, content_type, events, elapsed
+    return 200, "text/event-stream", events, elapsed
 
 
 def stable_stream_ids(events):
