@@ -2052,6 +2052,8 @@ struct FunctionTool {
     name: String,
     description: Option<String>,
     parameters: Value,
+    #[serde(default)]
+    strict: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2066,6 +2068,8 @@ struct FlatToolDefinition {
     name: String,
     description: Option<String>,
     parameters: Value,
+    #[serde(default)]
+    strict: bool,
 }
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -2078,12 +2082,13 @@ impl ToolDefinition {
     fn valid_function(&self) -> bool {
         match self {
             Self::Nested(tool) => {
+                let _ = tool.function.strict;
                 tool.r#type == "function"
                     && !tool.function.name.is_empty()
                     && tool.function.parameters.is_object()
             }
             Self::Flat(tool) => {
-                let _ = &tool.description;
+                let _ = (&tool.description, tool.strict);
                 tool.r#type == "function" && !tool.name.is_empty() && tool.parameters.is_object()
             }
         }
@@ -2551,6 +2556,41 @@ enum ResponsesContentPart {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResponsesToolChoiceMode {
+    Auto,
+    None,
+    Required,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ResponsesToolChoice {
+    Mode(ResponsesToolChoiceMode),
+    Function { r#type: String, name: String },
+}
+
+impl ResponsesToolChoice {
+    fn validate(&self) -> Result<(), Error> {
+        match self {
+            Self::Mode(ResponsesToolChoiceMode::Auto | ResponsesToolChoiceMode::None) => Ok(()),
+            Self::Mode(ResponsesToolChoiceMode::Required) => Err(Error::BadRequest(
+                "tool_choice `required` is unsupported because this model does not advertise tool calling"
+                    .into(),
+            )),
+            Self::Function { r#type, name } if r#type == "function" && !name.is_empty() => {
+                Err(Error::BadRequest(format!(
+                    "tool_choice function `{name}` is unsupported because this model does not advertise tool calling"
+                )))
+            }
+            Self::Function { .. } => Err(Error::BadRequest(
+                "tool_choice function must have type `function` and a non-empty name".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResponsesRequest {
     model: String,
@@ -2574,6 +2614,8 @@ struct ResponsesRequest {
     response_format: Option<ResponseFormat>,
     #[serde(default)]
     reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    tool_choice: Option<ResponsesToolChoice>,
 }
 async fn responses(
     State(s): State<Server>,
@@ -2598,6 +2640,9 @@ async fn responses(
         r.response_format.as_ref(),
         r.reasoning_effort.as_ref(),
     )?;
+    if let Some(tool_choice) = &r.tool_choice {
+        tool_choice.validate()?;
+    }
     let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
     let model = s.model(&r.model)?;
     let input = match r.input {
@@ -3002,43 +3047,162 @@ fn sse_rows<const N: usize>(values: [Value; N]) -> String {
     })
 }
 
-fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
-    if matches!(protocol, WireProtocol::Responses) {
-        match event {
-            StreamEvent::Started {
-                request_id,
-                correlation_id,
-                inference_id,
-                execution_session_id,
-                ..
-            } => {
-                return sse_rows([
-                    json!({"type":"response.created","response":{"id":request_id,"status":"in_progress","metadata":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}}}),
-                    json!({"type":"response.output_item.added","item":{"id":"msg_0","type":"message","role":"assistant","status":"in_progress"},"output_index":0}),
-                    json!({"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
-                ]);
-            }
-            StreamEvent::Token { token, index } => {
-                return format!(
-                    "data: {}\n\n",
-                    json!({"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":token,"sequence_number":index})
-                );
-            }
-            StreamEvent::Finished { reason, usage } => {
-                return sse_rows([
-                    json!({"type":"response.output_text.done","item_id":"msg_0","output_index":0,"content_index":0,"text":""}),
-                    json!({"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":0}),
-                    json!({"type":"response.output_item.done","item":{"id":"msg_0","type":"message","role":"assistant","status":"completed"},"output_index":0}),
-                    json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}}),
-                ]);
-            }
-            StreamEvent::Error { message } => {
-                return format!(
-                    "data: {}\n\n",
-                    json!({"type":"error","error":{"message":message,"type":"server_error"}})
-                );
-            }
+struct ResponsesStreamState {
+    model: String,
+    response_id: Option<String>,
+    created_at: u64,
+    text: String,
+    sequence_number: usize,
+    metadata: Value,
+}
+
+impl ResponsesStreamState {
+    fn new(model: String) -> Self {
+        Self {
+            model,
+            response_id: None,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs()),
+            text: String::new(),
+            sequence_number: 0,
+            metadata: json!({}),
         }
+    }
+
+    fn sequence_number(&mut self) -> usize {
+        let current = self.sequence_number;
+        self.sequence_number += 1;
+        current
+    }
+
+    fn message(&self, status: &str) -> Value {
+        json!({
+            "id": "msg_0",
+            "type": "message",
+            "role": "assistant",
+            "status": status,
+            "content": [{
+                "type": "output_text",
+                "text": self.text,
+                "annotations": [],
+                "logprobs": []
+            }]
+        })
+    }
+
+    fn response(&self, status: &str, output: Value, usage: Value) -> Value {
+        json!({
+            "id": self.response_id.as_deref().unwrap_or_default(),
+            "object": "response",
+            "created_at": self.created_at,
+            "status": status,
+            "background": false,
+            "error": null,
+            "incomplete_details": null,
+            "instructions": null,
+            "max_output_tokens": null,
+            "metadata": self.metadata,
+            "model": self.model,
+            "output": output,
+            "parallel_tool_calls": true,
+            "previous_response_id": null,
+            "prompt_cache_key": null,
+            "reasoning": null,
+            "safety_identifier": null,
+            "service_tier": "default",
+            "store": false,
+            "temperature": 1.0,
+            "text": {"format": {"type": "text"}, "verbosity": "medium"},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_logprobs": 0,
+            "top_p": 1.0,
+            "truncation": "disabled",
+            "usage": usage
+        })
+    }
+}
+
+fn responses_stream_row(state: &mut ResponsesStreamState, event: StreamEvent) -> String {
+    match event {
+        StreamEvent::Started {
+            request_id,
+            correlation_id,
+            inference_id,
+            execution_session_id,
+            ..
+        } => {
+            state.response_id = Some(request_id);
+            state.metadata = json!({
+                "correlation_id": correlation_id,
+                "inference_id": inference_id,
+                "execution_session_id": execution_session_id
+            });
+            let created = state.sequence_number();
+            let item_added = state.sequence_number();
+            let part_added = state.sequence_number();
+            sse_rows([
+                json!({"type":"response.created","sequence_number":created,"response":state.response("in_progress", json!([]), Value::Null)}),
+                json!({"type":"response.output_item.added","sequence_number":item_added,"item":state.message("in_progress"),"output_index":0}),
+                json!({"type":"response.content_part.added","sequence_number":part_added,"item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}}),
+            ])
+        }
+        StreamEvent::Token { token, .. } => {
+            state.text.push_str(&token);
+            let sequence_number = state.sequence_number();
+            format!(
+                "data: {}\n\n",
+                json!({"type":"response.output_text.delta","sequence_number":sequence_number,"item_id":"msg_0","output_index":0,"content_index":0,"delta":token,"logprobs":[]})
+            )
+        }
+        StreamEvent::Finished { reason, usage } => {
+            let text_done = state.sequence_number();
+            let part_done = state.sequence_number();
+            let item_done = state.sequence_number();
+            let completed = state.sequence_number();
+            let part = json!({
+                "type": "output_text",
+                "text": state.text,
+                "annotations": [],
+                "logprobs": []
+            });
+            let message = state.message("completed");
+            let response_usage = json!({
+                "input_tokens": usage.input_tokens,
+                "input_tokens_details": {"cached_tokens": usage.cached_tokens},
+                "output_tokens": usage.generated_tokens,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": usage.input_tokens + usage.generated_tokens
+            });
+            let mut response =
+                state.response("completed", json!([message.clone()]), response_usage);
+            response["finish_reason"] = json!(reason);
+            sse_rows([
+                json!({"type":"response.output_text.done","sequence_number":text_done,"item_id":"msg_0","output_index":0,"content_index":0,"text":state.text,"logprobs":[]}),
+                json!({"type":"response.content_part.done","sequence_number":part_done,"item_id":"msg_0","output_index":0,"content_index":0,"part":part}),
+                json!({"type":"response.output_item.done","sequence_number":item_done,"item":message,"output_index":0}),
+                json!({"type":"response.completed","sequence_number":completed,"response":response}),
+            ])
+        }
+        StreamEvent::Error { message } => {
+            let sequence_number = state.sequence_number();
+            format!(
+                "data: {}\n\n",
+                json!({"type":"error","sequence_number":sequence_number,"code":"server_error","message":message,"param":null})
+            )
+        }
+    }
+}
+
+fn stream_row_with_state(
+    protocol: WireProtocol,
+    event: StreamEvent,
+    include_usage: bool,
+    responses_state: &mut ResponsesStreamState,
+) -> String {
+    if matches!(protocol, WireProtocol::Responses) {
+        return responses_stream_row(responses_state, event);
     }
     let value = match (protocol, event) {
         (WireProtocol::Completion, StreamEvent::Token { token, .. }) => {
@@ -3046,9 +3210,6 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
         }
         (WireProtocol::Chat, StreamEvent::Token { token, .. }) => {
             json!({"object":"chat.completion.chunk","choices":[{"delta":{"content":token},"index":0,"finish_reason":null}]})
-        }
-        (WireProtocol::Responses, StreamEvent::Token { token, .. }) => {
-            json!({"type":"response.output_text.delta","delta":token})
         }
         (
             WireProtocol::Completion | WireProtocol::Chat,
@@ -3059,9 +3220,6 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
                 value["usage"] = json!({"prompt_tokens":usage.input_tokens,"completion_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens});
             }
             value
-        }
-        (WireProtocol::Responses, StreamEvent::Finished { reason, usage }) => {
-            json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}})
         }
         (_, StreamEvent::Error { message }) => {
             json!({"error":{"message":message,"type":"server_error"}})
@@ -3090,13 +3248,10 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
         ) => {
             json!({"id":request_id,"object":"text_completion","choices":[],"cusco":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}})
         }
-        (WireProtocol::Responses, StreamEvent::Started { request_id, .. }) => {
-            json!({"type":"response.created","response":{"id":request_id,"status":"in_progress"}})
-        }
+        (WireProtocol::Responses, _) => unreachable!("Responses events return above"),
     };
     let row = format!("data: {value}\n\n");
-    if matches!(protocol, WireProtocol::Completion | WireProtocol::Chat)
-        && value["choices"]
+    if value["choices"]
         .as_array()
         .and_then(|choices| choices.first())
         .is_some_and(|choice| !choice["finish_reason"].is_null())
@@ -3150,7 +3305,26 @@ fn completed_response(
             json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
         WireProtocol::Responses => {
-            json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"finish_reason":finish_reason,"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens},"cusco":cusco})
+            let mut state = ResponsesStreamState::new(response.usage.model.clone());
+            state.response_id = Some(response.id.clone());
+            state.text = response.text.clone();
+            state.metadata = json!({
+                "correlation_id": response.usage.correlation_id,
+                "inference_id": response.usage.inference_id,
+                "execution_session_id": response.usage.execution_session_id
+            });
+            let message = state.message("completed");
+            let response_usage = json!({
+                "input_tokens": response.usage.input_tokens,
+                "input_tokens_details": {"cached_tokens": response.usage.cached_tokens},
+                "output_tokens": response.usage.generated_tokens,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": response.usage.input_tokens + response.usage.generated_tokens
+            });
+            let mut value = state.response("completed", json!([message]), response_usage);
+            value["finish_reason"] = json!(finish_reason);
+            value["cusco"] = cusco;
+            value
         }
     }
 }
@@ -3205,6 +3379,7 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
         Duration::from_millis(config.active_time_ms),
     );
     let inference_id = Uuid::new_v4().to_string();
+    let response_model = model.clone();
     let request = InferRequest {
         model,
         prompt,
@@ -3243,9 +3418,15 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
                 }
             },
         );
-        let rows = first
-            .chain(rest)
-            .map(move |event| Ok::<_, Infallible>(stream_row(protocol, event, include_usage)));
+        let mut responses_state = ResponsesStreamState::new(response_model);
+        let rows = first.chain(rest).map(move |event| {
+            Ok::<_, Infallible>(stream_row_with_state(
+                protocol,
+                event,
+                include_usage,
+                &mut responses_state,
+            ))
+        });
         let content_type = "text/event-stream";
         let mut response = Response::new(Body::from_stream(rows));
         response.headers_mut().insert(
@@ -3999,6 +4180,7 @@ mod tests {
                 "type": "function",
                 "name": "get_current_timestamp",
                 "description": "Get the current Unix timestamp.",
+                "strict": true,
                 "parameters": {"type": "object", "properties": {}}
             }]
         }))
@@ -4021,6 +4203,7 @@ mod tests {
                 "function": {
                     "name": "get_current_timestamp",
                     "description": "Get the current Unix timestamp.",
+                    "strict": true,
                     "parameters": {"type": "object", "properties": {}}
                 }
             }]
@@ -4028,6 +4211,38 @@ mod tests {
         .unwrap();
         assert!(chat.tools[0].valid_function());
         assert!(matches!(chat.tools.as_slice(), [ToolDefinition::Nested(_)]));
+    }
+    #[test]
+    fn responses_tool_choice_is_typed_and_capability_checked() {
+        let automatic: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hello",
+            "tool_choice": "auto"
+        }))
+        .unwrap();
+        automatic.tool_choice.unwrap().validate().unwrap();
+
+        let required: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hello",
+            "tool_choice": "required"
+        }))
+        .unwrap();
+        assert!(matches!(
+            required.tool_choice.unwrap().validate(),
+            Err(Error::BadRequest(message)) if message.contains("does not advertise tool calling")
+        ));
+
+        let selected: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hello",
+            "tool_choice": {"type": "function", "name": "lookup"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            selected.tool_choice.unwrap().validate(),
+            Err(Error::BadRequest(message)) if message.contains("function `lookup`")
+        ));
     }
     #[test]
     fn accepts_canonical_responses_message_input() {
@@ -5405,13 +5620,24 @@ mod tests {
                 }),
             ))
             .await
-
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(body["output"][0]["status"], "completed");
+        assert!(body["output"][0]["id"].as_str().is_some());
+        assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
+        assert!(body["output"][0]["content"][0]["annotations"].is_array());
+        assert!(body["output"][0]["content"][0]["logprobs"].is_array());
+        assert_eq!(body["usage"]["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(
+            body["usage"]["output_tokens_details"]["reasoning_tokens"],
+            0
+        );
         fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
@@ -5452,11 +5678,18 @@ mod tests {
             serde_json::from_slice(&to_bytes(rejected.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["error"]["code"], "invalid_request");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("`store: true` is unsupported"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("`store: true` is unsupported")
+        );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
+        let mut state = ResponsesStreamState::new("m".into());
+        stream_row_with_state(protocol, event, include_usage, &mut state)
     }
 
     #[test]
@@ -5742,11 +5975,7 @@ mod tests {
         let (response, _) = server
             .infer("compact-replay", compacting_request(source.id))
             .unwrap();
-        let payload = completed_response(
-            WireProtocol::Completion,
-            response,
-            FinishReason::Length,
-        );
+        let payload = completed_response(WireProtocol::Completion, response, FinishReason::Length);
         assert_eq!(
             payload["cusco"]["compaction_result"]["selected_strategy_id"],
             "window_tail:v1"
@@ -5873,7 +6102,8 @@ mod tests {
 
     fn assert_semantic_fixture(name: &str) {
         let fixtures: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/semantic_compaction.json")).unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/semantic_compaction.json"))
+                .unwrap();
         let fixture = &fixtures[name];
         let tokens = fixture["tokens"]
             .as_array()
@@ -5933,5 +6163,53 @@ mod tests {
         assert!(row.contains("\"correlation_id\":\"correlation\""));
         assert!(row.contains("\"inference_id\":\"inference\""));
         assert!(row.contains("\"execution_session_id\":\"session\""));
+
+        let mut state = ResponsesStreamState::new("m".into());
+        let started = responses_stream_row(
+            &mut state,
+            StreamEvent::Started {
+                request_id: "response".into(),
+                context_id: ContextId::new(),
+                correlation_id: "correlation".into(),
+                inference_id: "inference".into(),
+                execution_session_id: "session".into(),
+            },
+        );
+        let delta = responses_stream_row(
+            &mut state,
+            StreamEvent::Token {
+                token: "hello".into(),
+                index: 0,
+            },
+        );
+        let done = responses_stream_row(
+            &mut state,
+            StreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: Box::new(Usage {
+                    input_tokens: 2,
+                    generated_tokens: 1,
+                    evaluated_tokens: 2,
+                    cached_tokens: 0,
+                    prefill: PrefillMetrics::default(),
+                    model: "m".into(),
+                    model_revision: "r".into(),
+                    context_id: ContextId::new(),
+                    compaction_result: None,
+                    latency_ms: 1,
+                    status: "completed".into(),
+                    correlation_id: "correlation".into(),
+                    inference_id: "inference".into(),
+                    execution_session_id: "session".into(),
+                }),
+            },
+        );
+        assert!(started.contains("\"sequence_number\":0"));
+        assert!(started.contains("\"sequence_number\":2"));
+        assert!(delta.contains("\"sequence_number\":3"));
+        assert!(done.contains("\"sequence_number\":4"));
+        assert!(done.contains("\"sequence_number\":7"));
+        assert!(done.contains("\"text\":\"hello\""));
+        assert!(done.contains("\"id\":\"response\""));
     }
 }
