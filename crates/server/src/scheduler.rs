@@ -756,7 +756,8 @@ fn spawn_slot(
                     return;
                 }
                 let started = Instant::now();
-                let (result, session) = match task.action {
+            let (result, session) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match task.action {
                     SlotAction::Start(request) => match inner.start_session(*request) {
                         Ok(session) => (
                             Ok(SessionStep::Progress(QuantumObservation::model_free(
@@ -775,8 +776,15 @@ fn spawn_slot(
                         let result = session.finish().map(SessionStep::Finished);
                         (result, None)
                     }
-                    SlotAction::Shutdown => unreachable!(),
-                };
+                    SlotAction::Shutdown => unreachable!("shutdown tasks exit before execution"),
+                }
+            }))
+            .unwrap_or_else(|_| {
+                (
+                    Err(Error::State("model slot worker panicked".into())),
+                    None,
+                )
+            });
                 if events
                     .send(SchedulerEvent::SlotCompleted(Box::new(SlotCompletion {
                         id: task.id,
@@ -1198,6 +1206,25 @@ mod tests {
             Ok(self.output.clone())
         }
     }
+
+    #[derive(Default)]
+    struct PanicOnceEngine {
+        panicked: std::sync::atomic::AtomicBool,
+    }
+
+    impl InferenceEngine for PanicOnceEngine {
+        fn start_session(
+            &self,
+            _request: EngineRequest,
+        ) -> Result<Box<dyn ExecutionSession>, Error> {
+            if !self.panicked.swap(true, Ordering::AcqRel) {
+                panic!("intentional slot panic");
+            }
+            Ok(Box::new(ImmediateSession {
+                output: EngineOutput::default(),
+            }))
+        }
+    }
     use parking_lot::Mutex;
     use std::{path::PathBuf, time::Duration};
 
@@ -1339,6 +1366,29 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(scheduler.status().metrics.waiting_for_consumer, 0);
+    }
+
+    #[test]
+    fn slot_panics_fail_one_job_without_disabling_the_model() {
+        let scheduler = WorkloadScheduler::new(
+            Arc::new(PanicOnceEngine::default()),
+            SchedulerPolicyConfig::default(),
+        )
+        .unwrap();
+        let mut failed = scheduler
+            .start_session(request(SchedulingClass::Standard, "first", 1))
+            .unwrap();
+        assert!(matches!(
+            failed.step(),
+            Err(Error::State(message)) if message == "model slot worker panicked"
+        ));
+        let mut recovered = scheduler
+            .start_session(request(SchedulingClass::Standard, "second", 1))
+            .unwrap();
+        assert!(matches!(
+            recovered.step().unwrap(),
+            SessionStep::Finished(_)
+        ));
     }
 
     #[test]
