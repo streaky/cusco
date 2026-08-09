@@ -16,7 +16,6 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -336,10 +335,7 @@ impl MappedEngine {
             if state.spill_bytes.saturating_add(mapping.bytes.len()) > self.spill_capacity {
                 continue;
             }
-            let name = id.0.iter().fold(String::new(), |mut name, byte| {
-                write!(name, "{byte:02x}").expect("writing to a String cannot fail");
-                name
-            });
+            let name = hex::encode(id.0);
             let path = spill_dir.join(format!("{name}.seq"));
             let temporary = path.with_extension("seq.tmp");
             fs::write(&temporary, &mapping.bytes).map_err(state_error)?;
