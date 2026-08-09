@@ -175,6 +175,7 @@ struct SpilledMapping {
 
 struct MappedState {
     executor: Executor,
+    root: RepresentationHandle,
     logical: ContextStore,
     physical: PhysicalManager,
     model_epoch: ModelEpoch,
@@ -265,7 +266,7 @@ impl MappedEngine {
             .to_str()
             .ok_or_else(|| Error::State("model path is not UTF-8".into()))?
             .to_owned();
-        let executor = Executor::open(&model_path, n_ctx, gpu_layers).map_err(state_error)?;
+        let mut executor = Executor::open(&model_path, n_ctx, gpu_layers).map_err(state_error)?;
         let capabilities = executor.capabilities();
         if !capabilities.mapped_execution
             || !capabilities.global_kv
@@ -276,6 +277,7 @@ impl MappedEngine {
                 "executor does not satisfy the Gemma execution profile".into(),
             ));
         }
+        let root = executor.active_representation().map_err(state_error)?;
 
         Ok(Arc::new(Self {
             profile,
@@ -285,6 +287,7 @@ impl MappedEngine {
             spill_capacity,
             state: Arc::new(Mutex::new(MappedState {
                 executor,
+                root,
                 logical: ContextStore::default(),
                 physical: PhysicalManager::new(Capacity {
                     device_bytes,
@@ -788,6 +791,10 @@ fn activate_prefix(
     prefix: Option<&cusco_context_store::EvaluatedPrefix>,
 ) -> Result<(), Error> {
     let Some(prefix) = prefix else {
+        state
+            .executor
+            .activate_mapping(&state.root)
+            .map_err(state_error)?;
         return Ok(());
     };
     let resident = state
@@ -1178,6 +1185,27 @@ mod tests {
         assert!(metrics.cached_tokens >= 32);
         assert_eq!(metrics.graph_recaptures, None);
         assert!(metrics.reference_switches >= 2);
+    }
+
+    #[test]
+    fn unrelated_requests_start_from_the_root_mapping() {
+        let shared =
+            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+                .unwrap();
+        let fresh =
+            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+                .unwrap();
+        let model = model();
+        shared
+            .generate_collected(test_request(&model, "first unrelated prompt", 2, &[]))
+            .unwrap();
+        let reused =
+            shared.generate_collected(test_request(&model, "second prompt", 2, &[])).unwrap();
+        let baseline =
+            fresh.generate_collected(test_request(&model, "second prompt", 2, &[])).unwrap();
+        assert_eq!(reused.pieces, baseline.pieces);
+        assert_eq!(reused.successor_tokens, baseline.successor_tokens);
+        assert_eq!(reused.cached_tokens, 0);
     }
 
     #[test]
