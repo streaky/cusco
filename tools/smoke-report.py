@@ -34,79 +34,97 @@ def sdk_body(response):
     return parsed.model_dump(mode="json") if hasattr(parsed, "model_dump") else parsed
 
 
-def openai_call(path, payload):
-    payload = dict(payload or {})
-    if path == "/openai/v1/models":
-        response = OPENAI.models.with_raw_response.list()
-    elif path == "/openai/v1/completions":
-        extra_body = {
-            key: payload.pop(key)
-            for key in ("context_id", "compaction")
-            if key in payload
-        }
-        response = OPENAI.completions.with_raw_response.create(
-            **payload,
-            extra_body=extra_body or None,
-        )
-    elif path == "/openai/v1/chat/completions":
-        extra_body = {
-            key: payload.pop(key)
-            for key in ("context_id", "compaction")
-            if key in payload
-        }
-        response = OPENAI.chat.completions.with_raw_response.create(
-            **payload,
-            extra_body=extra_body or None,
-        )
-    elif path == "/openai/v1/responses":
-        extra_body = {
-            key: payload.pop(key)
-            for key in ("seed", "context_id", "compaction")
-            if key in payload
-        }
-        response = OPENAI.responses.with_raw_response.create(
-            **payload,
-            extra_body=extra_body or None,
-        )
-    else:
-        raise ValueError(f"unsupported OpenAI SDK path: {path}")
-    return response.status_code, response.headers.get("content-type", ""), sdk_body(response)
+def sdk_call(request):
+    started = time.perf_counter_ns()
+    try:
+        response = request()
+        status = response.status_code
+        content_type = response.headers.get("content-type", "")
+        body = sdk_body(response)
+    except APIStatusError as exc:
+        status = exc.status_code
+        content_type = exc.response.headers.get("content-type", "")
+        try:
+            body = exc.response.json()
+        except ValueError:
+            body = exc.response.text
+    except Exception as exc:
+        elapsed = (time.perf_counter_ns() - started) / 1_000_000
+        return 0, "application/json", {"error": str(exc)}, elapsed
+    elapsed = (time.perf_counter_ns() - started) / 1_000_000
+    return status, content_type, body, elapsed
 
 
-def openai_stream_call(path, payload):
+def list_models():
+    return sdk_call(OPENAI.models.with_raw_response.list)
+
+
+def create_completion(payload):
+    payload = dict(payload)
+    extra_body = {
+        key: payload.pop(key)
+        for key in ("context_id", "compaction")
+        if key in payload
+    }
+    return sdk_call(
+        lambda: OPENAI.completions.with_raw_response.create(
+            **payload,
+            extra_body=extra_body or None,
+        )
+    )
+
+
+def create_chat_completion(payload):
+    payload = dict(payload)
+    extra_body = {
+        key: payload.pop(key)
+        for key in ("context_id", "compaction")
+        if key in payload
+    }
+    return sdk_call(
+        lambda: OPENAI.chat.completions.with_raw_response.create(
+            **payload,
+            extra_body=extra_body or None,
+        )
+    )
+
+
+def create_response(payload):
+    payload = dict(payload)
+    extra_body = {
+        key: payload.pop(key)
+        for key in ("seed", "context_id", "compaction")
+        if key in payload
+    }
+    return sdk_call(
+        lambda: OPENAI.responses.with_raw_response.create(
+            **payload,
+            extra_body=extra_body or None,
+        )
+    )
+
+
+def stream_chat_completion(payload):
     payload = dict(payload)
     payload.pop("stream", None)
-    if path == "/openai/v1/chat/completions":
-        stream = OPENAI.chat.completions.create(**payload, stream=True)
-    elif path == "/openai/v1/responses":
-        extra_body = {"seed": payload.pop("seed")} if "seed" in payload else None
-        stream = OPENAI.responses.create(
+    return [chunk.model_dump(mode="json") for chunk in OPENAI.chat.completions.create(**payload, stream=True)]
+
+
+def stream_response(payload):
+    payload = dict(payload)
+    payload.pop("stream", None)
+    extra_body = {"seed": payload.pop("seed")} if "seed" in payload else None
+    return [
+        event.model_dump(mode="json")
+        for event in OPENAI.responses.create(
             **payload,
             stream=True,
             extra_body=extra_body,
         )
-    else:
-        raise ValueError(f"unsupported OpenAI SDK stream path: {path}")
-    return [event.model_dump(mode="json") for event in stream]
+    ]
 
 
 def call(method, path, payload=None):
-    if path != "/openai/v1/openapi.json" and path.startswith("/openai/v1/"):
-        started = time.perf_counter_ns()
-        try:
-            status, content_type, body = openai_call(path, payload)
-        except APIStatusError as exc:
-            status = exc.status_code
-            content_type = exc.response.headers.get("content-type", "")
-            try:
-                body = exc.response.json()
-            except ValueError:
-                body = exc.response.text
-        except Exception as exc:
-            elapsed = (time.perf_counter_ns() - started) / 1_000_000
-            return 0, "application/json", {"error": str(exc)}, elapsed
-        elapsed = (time.perf_counter_ns() - started) / 1_000_000
-        return status, content_type, body, elapsed
     data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
     headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
     if data is not None:
@@ -137,10 +155,9 @@ def call(method, path, payload=None):
         body = raw.decode("utf-8", "replace")
     return status, content_type, body, elapsed
 
-def stream_call(path, payload, accept):
-    assert accept == "text/event-stream"
+def stream_call(request):
     started = time.perf_counter_ns()
-    events = openai_stream_call(path, payload)
+    events = request()
     elapsed = (time.perf_counter_ns() - started) / 1_000_000
     return 200, "text/event-stream", events, elapsed
 
@@ -300,9 +317,7 @@ def run_semantic_comparisons(stats, latencies):
                 else None
             )
             for seed_prompt in case["seed_prompts"]:
-                seed_status, _, seed_body, seed_elapsed_ms = call(
-                    "POST",
-                    "/openai/v1/chat/completions",
+                seed_status, _, seed_body, seed_elapsed_ms = create_chat_completion(
                     {
                         "model": MODEL,
                         "messages": [{"role": "user", "content": seed_prompt}],
@@ -310,7 +325,7 @@ def run_semantic_comparisons(stats, latencies):
                         "max_tokens": 1,
                         "temperature": 0,
                         "seed": 10,
-                    },
+                    }
                 )
                 latencies.append(seed_elapsed_ms)
                 stats["requests"] += 1
@@ -318,10 +333,8 @@ def run_semantic_comparisons(stats, latencies):
                 if seed_status != 200:
                     context_id = None
                     break
-            status, _, body, elapsed_ms = call(
-                "POST",
-                "/openai/v1/chat/completions",
-                semantic_request(case, context_id, compact),
+            status, _, body, elapsed_ms = create_chat_completion(
+                semantic_request(case, context_id, compact)
             )
             latencies.append(elapsed_ms)
             stats["requests"] += 1
@@ -409,60 +422,90 @@ def run():
             "model_pull",
             "POST",
             "/cusco/v1/api/pull",
-            {"model": MODEL, "stream": False},
+            lambda: call("POST", "/cusco/v1/api/pull", {"model": MODEL, "stream": False}),
             lambda status, body: has(status, body, "status"),
         ),
-        ("openapi", "GET", "/openai/v1/openapi.json", None, lambda status, body: has(status, body, "paths")),
-        ("models", "GET", "/openai/v1/models", None, lambda status, body: list_field(status, body, "data")),
+        (
+            "openapi",
+            "GET",
+            "/openai/v1/openapi.json",
+            lambda: call("GET", "/openai/v1/openapi.json"),
+            lambda status, body: has(status, body, "paths"),
+        ),
+        ("models", "GET", "/openai/v1/models", list_models, lambda status, body: list_field(status, body, "data")),
         (
             "completion",
             "POST",
             "/openai/v1/completions",
-            {
-                "model": MODEL,
-                "prompt": "Reply with exactly: smoke-ok",
-                "max_tokens": 4,
-                "temperature": 0,
-                "seed": 10,
-            },
+            lambda: create_completion(
+                {
+                    "model": MODEL,
+                    "prompt": "Reply with exactly: smoke-ok",
+                    "max_tokens": 4,
+                    "temperature": 0,
+                    "seed": 10,
+                }
+            ),
             lambda status, body: list_field(status, body, "choices"),
         ),
         (
             "chat",
             "POST",
             "/openai/v1/chat/completions",
-            {
-                "model": MODEL,
-                "messages": [{"role": "user", "content": "Reply with exactly: smoke-ok"}],
-                "max_tokens": 4,
-                "temperature": 0,
-                "seed": 10,
-            },
+            lambda: create_chat_completion(
+                {
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": "Reply with exactly: smoke-ok"}],
+                    "max_tokens": 4,
+                    "temperature": 0,
+                    "seed": 10,
+                }
+            ),
             lambda status, body: list_field(status, body, "choices"),
         ),
         (
             "responses",
             "POST",
             "/openai/v1/responses",
-            {
-                "model": MODEL,
-                "input": "Reply with exactly: smoke-ok",
-                "max_output_tokens": 4,
-                "temperature": 0,
-                "seed": 10,
-            },
+            lambda: create_response(
+                {
+                    "model": MODEL,
+                    "input": "Reply with exactly: smoke-ok",
+                    "max_output_tokens": 4,
+                    "temperature": 0,
+                    "seed": 10,
+                }
+            ),
             lambda status, body: has(status, body, "output"),
         ),
-        ("context_create", "POST", "/cusco/v1/contexts", {}, lambda status, body: has(status, body, "id")),
-        ("context_import", "POST", "/cusco/v1/contexts/import", {"tokens": ["smoke", "context"]}, imported),
+        (
+            "context_create",
+            "POST",
+            "/cusco/v1/contexts",
+            lambda: call("POST", "/cusco/v1/contexts", {}),
+            lambda status, body: has(status, body, "id"),
+        ),
+        (
+            "context_import",
+            "POST",
+            "/cusco/v1/contexts/import",
+            lambda: call("POST", "/cusco/v1/contexts/import", {"tokens": ["smoke", "context"]}),
+            imported,
+        ),
         (
             "compaction_strategies",
             "GET",
             "/cusco/v1/compaction/strategies",
-            None,
+            lambda: call("GET", "/cusco/v1/compaction/strategies"),
             lambda status, body: list_field(status, body, "strategies"),
         ),
-        ("status", "GET", "/cusco/v1/status", None, lambda status, body: has(status, body, "residency")),
+        (
+            "status",
+            "GET",
+            "/cusco/v1/status",
+            lambda: call("GET", "/cusco/v1/status"),
+            lambda status, body: has(status, body, "residency"),
+        ),
     ]
 
     results = []
@@ -481,8 +524,8 @@ def run():
         "prefill_uncached_tokens": 0,
     }
 
-    for name, method, path, payload, check in cases:
-        status, _, body, elapsed_ms = call(method, path, payload)
+    for name, method, path, request, check in cases:
+        status, _, body, elapsed_ms = request()
         latencies.append(elapsed_ms)
         stats["requests"] += 1
         error = None
@@ -520,9 +563,7 @@ def run():
         results.append(entry)
 
     if context_id is not None:
-        status, _, body, elapsed_ms = call(
-            "POST",
-            "/openai/v1/completions",
+        status, _, body, elapsed_ms = create_completion(
             {
                 "model": MODEL,
                 "prompt": "This is a short context-seed paragraph used only for cache-reuse smoke checks. "
@@ -531,7 +572,7 @@ def run():
                 "max_tokens": 1,
                 "temperature": 0,
                 "seed": 10,
-            },
+            }
         )
         latencies.append(elapsed_ms)
         stats["requests"] += 1
@@ -561,9 +602,7 @@ def run():
                 entry["cusco_usage"] = compact_cusco_usage(body["cusco"])
         results.append(entry)
 
-        status, _, body, elapsed_ms = call(
-            "POST",
-            "/openai/v1/completions",
+        status, _, body, elapsed_ms = create_completion(
             {
                 "model": MODEL,
                 "prompt": "Repeat the same point in one short sentence.",
@@ -571,7 +610,7 @@ def run():
                 "max_tokens": 1,
                 "temperature": 0,
                 "seed": 10,
-            },
+            }
         )
         latencies.append(elapsed_ms)
         stats["requests"] += 1
@@ -602,9 +641,7 @@ def run():
         results.append(entry)
 
     if context_id is not None:
-        status, _, body, elapsed_ms = call(
-            "POST",
-            "/openai/v1/completions",
+        status, _, body, elapsed_ms = create_completion(
             {
                 "model": MODEL,
                 "prompt": "compact this context",
@@ -616,7 +653,7 @@ def run():
                     "strategy_preferences": ["window_tail"],
                     "target_tokens": 1,
                 },
-            },
+            }
         )
         latencies.append(elapsed_ms)
         stats["requests"] += 1
@@ -649,9 +686,7 @@ def run():
                 entry["cusco_usage"] = compact_cusco_usage(body["cusco"])
         results.append(entry)
 
-        status, _, body, elapsed_ms = call(
-            "POST",
-            "/openai/v1/completions",
+        status, _, body, elapsed_ms = create_completion(
             {
                 "model": MODEL,
                 "prompt": "continue after compaction",
@@ -659,7 +694,7 @@ def run():
                 "max_tokens": 1,
                 "temperature": 0,
                 "seed": 10,
-            },
+            }
         )
         latencies.append(elapsed_ms)
         stats["requests"] += 1
@@ -694,7 +729,7 @@ def run():
     stream_cases = [
         (
             "chat_sse_reconstruction",
-            "/openai/v1/chat/completions",
+            stream_chat_completion,
             {
                 "model": MODEL,
                 "messages": [{"role": "user", "content": "Reply with exactly: stream-ok"}],
@@ -712,7 +747,7 @@ def run():
         ),
         (
             "responses_sse_reconstruction",
-            "/openai/v1/responses",
+            stream_response,
             {
                 "model": MODEL,
                 "input": "Reply with exactly: stream-ok",
@@ -728,11 +763,13 @@ def run():
             ),
         ),
     ]
-    for name, path, payload, terminal_check in stream_cases:
+    for name, request_stream, payload, terminal_check in stream_cases:
         started = time.perf_counter_ns()
         status = 0
         try:
-            status, content_type, events, elapsed_ms = stream_call(path, payload, "text/event-stream")
+            status, content_type, events, elapsed_ms = stream_call(
+                lambda: request_stream(payload)
+            )
             status_ok(status)
             assert "text/event-stream" in content_type, f"unexpected stream content type: {content_type}"
             ids = stable_stream_ids(events)
