@@ -2555,6 +2555,8 @@ enum ResponsesContentPart {
 struct ResponsesRequest {
     model: String,
     input: ResponsesInput,
+    #[serde(default)]
+    store: bool,
     max_output_tokens: Option<usize>,
     #[serde(default)]
     compaction: Option<CompactionRequest>,
@@ -2583,6 +2585,12 @@ async fn responses(
     }: PrequeueJson<ResponsesRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
+    if r.store {
+        return Err(Error::BadRequest(
+            "`store: true` is unsupported; Cusco only supports stateless Responses with `store: false`"
+                .into(),
+        ));
+    }
     validate_controls(
         r.temperature,
         r.top_p,
@@ -3534,7 +3542,7 @@ pub fn openapi_document() -> Value {
                 "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "max_tokens": {"type": "integer", "minimum": 0}, "stream": {"type": "boolean"}, "temperature": {"type": "number", "minimum": 0, "maximum": 2}, "top_p": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}, "seed": {"type": "integer", "minimum": 0}}
             },
             "ChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}}},
-            "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"oneOf": [{"type": "string"}, {"type": "array"}]}, "stream": {"type": "boolean"}, "tools": {"type": "array", "items": {"$ref": "#/components/schemas/ResponsesFunctionTool"}}}},
+            "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"oneOf": [{"type": "string"}, {"type": "array"}]}, "store": {"type": "boolean", "enum": [false], "default": false, "description": "Cusco Responses are stateless; true is rejected."}, "stream": {"type": "boolean"}, "tools": {"type": "array", "items": {"$ref": "#/components/schemas/ResponsesFunctionTool"}}}},
             "ResponsesFunctionTool": {"type": "object", "additionalProperties": false, "required": ["type", "name", "parameters"], "properties": {"type": {"const": "function"}, "name": {"type": "string", "minLength": 1}, "description": {"type": "string"}, "parameters": {"type": "object"}}},
             "OllamaModelRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["model"]}, {"required": ["name"]}], "properties": {"model": {"type": "string"}, "name": {"type": "string"}}},
             "OllamaPullRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["name"]}, {"required": ["model"]}], "properties": {"name": {"type": "string"}, "model": {"type": "string"}, "sha256": {"type": "string"}, "insecure": {"type": "boolean"}, "stream": {"type": "boolean"}}},
@@ -5397,12 +5405,57 @@ mod tests {
                 }),
             ))
             .await
+
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["object"], "response");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn responses_accept_store_false_and_reject_store_true() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let app = router(server);
+        let accepted = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({
+                    "model": "m",
+                    "input": "hello",
+                    "max_output_tokens": 1,
+                    "store": false
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+
+        let rejected = app
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({
+                    "model": "m",
+                    "input": "hello",
+                    "max_output_tokens": 1,
+                    "store": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(rejected.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`store: true` is unsupported"));
         fs::remove_dir_all(dir).unwrap();
     }
 
