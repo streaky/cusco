@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_STOP_SEQUENCES: usize = 4;
 pub const MAX_STOP_BYTES: usize = 256;
-const MAX_EFFECTIVE_STOP_SEQUENCES: usize = MAX_STOP_SEQUENCES + 2;
+const MAX_EFFECTIVE_STOP_SEQUENCES: usize = MAX_STOP_SEQUENCES + 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,7 +48,7 @@ pub struct GenerationFrontier {
 impl GenerationFrontier {
     pub fn new(stops: &[String], raw_continuation: bool) -> Result<Self, &'static str> {
         if stops.len() > MAX_EFFECTIVE_STOP_SEQUENCES {
-            return Err("at most six effective stop sequences are supported");
+            return Err("at most seven effective stop sequences are supported");
         }
         if stops
             .iter()
@@ -331,6 +331,28 @@ mod tests {
         );
         assert_eq!(deltas.concat(), "answer ");
         assert_eq!(result.text, "answer ");
+        assert_eq!(result.finish_reason, FinishReason::Stop);
+        assert_eq!(result.stop_alignment, Some(StopAlignment::TokenAligned));
+    }
+
+    #[test]
+    fn suppresses_split_gemma_closing_start_of_turn_marker() {
+        let (result, deltas) = run(
+            &[
+                (b"hey", false),
+                (b"</start", false),
+                (b"_", false),
+                (b"of", false),
+                (b"_", false),
+                (b"turn", false),
+                (b">", false),
+                (b"\n", false),
+            ],
+            &["</start_of_turn>"],
+            false,
+        );
+        assert_eq!(deltas.concat(), "hey");
+        assert_eq!(result.text, "hey");
         assert_eq!(result.finish_reason, FinishReason::Stop);
         assert_eq!(result.stop_alignment, Some(StopAlignment::TokenAligned));
     }

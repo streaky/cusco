@@ -1386,7 +1386,7 @@ impl Server {
         let mut stops = req.stop.clone();
         let model = self.model(&req.model)?;
         if model.family == "gemma4" {
-            for marker in ["<end_of_turn>", "</end_of_turn>"] {
+            for marker in ["<end_of_turn>", "</end_of_turn>", "</start_of_turn>"] {
                 if !stops.iter().any(|stop| stop == marker) {
                     stops.push(marker.into());
                 }
@@ -3713,6 +3713,34 @@ mod tests {
         })
         .unwrap();
         (s, d)
+    }
+
+    #[test]
+    fn gemma_effective_stops_include_terminal_markers() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let request = InferRequest {
+            model: "m".into(),
+            prompt: "hello".into(),
+            max_tokens: 1,
+            context_id: None,
+            compaction: None,
+            deadline_ms: None,
+            scheduling: SchedulingMetadata::default(),
+            stop: vec!["custom".into()],
+            raw_continuation: false,
+            sampling: SamplingConfig::default(),
+        };
+
+        assert_eq!(
+            server.effective_stop_sequences(&request).unwrap(),
+            vec![
+                "custom",
+                "<end_of_turn>",
+                "</end_of_turn>",
+                "</start_of_turn>",
+            ]
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     struct CompactionProofEngine;
