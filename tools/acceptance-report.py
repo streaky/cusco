@@ -80,6 +80,9 @@ def provenance(manifest, model=None):
         workload = item.get("workload")
         if workload:
             value.setdefault("workloads", []).append(digest(workload))
+    semantic_workload = manifest.get("semantic_workload")
+    if semantic_workload:
+        value.setdefault("workloads", []).append(digest(semantic_workload))
     if model:
         resolved = Path(model)
         if resolved.is_file():
@@ -116,7 +119,7 @@ def model_free(manifest):
         if not gates[-1]["passed"]:
             break
     return write_report("model-free", manifest, gates)
-def api_smoke_gate():
+def api_smoke_gate(semantic_workload):
     for directory in (Path("/data/db"), Path("/data/spill"), Path("/data/user-models"), Path("/data/models")):
         directory.mkdir(parents=True, exist_ok=True)
     Path("/data/user.yaml").write_text("models: []\n")
@@ -155,12 +158,14 @@ def api_smoke_gate():
             "CUSCO_SMOKE_BASE_URL": "http://127.0.0.1:8080",
             "CUSCO_SMOKE_OUTPUT": str(RESULTS / "smoke-report.json"),
             "CUSCO_SMOKE_TOKEN": "smoke-report-token",
+            "CUSCO_SEMANTIC_WORKLOAD": semantic_workload,
         }
         return run_gate(
             "api-smoke",
             ["python3", "tools/smoke-report.py"],
-            "real-model API, streaming, continuation, and compaction",
+            "real-model API, streaming, continuation, compaction, and semantic fidelity",
             str(RESULTS / "smoke-report.json"),
+            workload=semantic_workload,
             env=smoke_env,
         )
     finally:
@@ -182,7 +187,7 @@ def real_model(manifest, model):
         if not gates[-1]["passed"]:
             break
     if len(gates) == len(manifest["real_model"]):
-        gates.append(api_smoke_gate())
+        gates.append(api_smoke_gate(manifest["semantic_workload"]))
     return write_report("real-model", manifest, gates, model)
 
 

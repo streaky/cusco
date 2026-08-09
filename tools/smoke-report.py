@@ -14,6 +14,12 @@ MODEL = os.environ.get(
     "CUSCO_SMOKE_MODEL",
     "hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf",
 )
+SEMANTIC_WORKLOAD = Path(
+    os.environ.get(
+        "CUSCO_SEMANTIC_WORKLOAD",
+        "/work/config/phase10-semantic-workload.json",
+    )
+)
 
 
 def call(method, path, payload=None):
@@ -169,6 +175,170 @@ def compact_openai_usage(usage):
         "completion_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
         "total_tokens": usage.get("total_tokens", 0),
     }
+def response_text(body):
+    if not isinstance(body, dict):
+        return ""
+    output = body.get("output", [])
+    text = "".join(
+        part.get("text", "")
+        for item in output
+        if isinstance(item, dict)
+        for part in item.get("content", [])
+        if isinstance(part, dict) and part.get("type") == "output_text"
+    )
+    if text:
+        return text
+    return "".join(
+        choice.get("text", "")
+        or choice.get("message", {}).get("content", "")
+        for choice in body.get("choices", [])
+        if isinstance(choice, dict)
+    )
+
+
+def normalized_text(text):
+    return " ".join(text.strip().split())
+
+
+def semantic_request(case, context_id, compact):
+    payload = {
+        "model": MODEL,
+        "messages": case["messages"],
+        "max_tokens": 16,
+        "temperature": 0,
+        "seed": 10,
+        "context_id": context_id,
+    }
+    if compact:
+        payload["compaction"] = {
+            "strategy_preferences": ["window_tail"],
+            "target_tokens": case["target_tokens"],
+        }
+    return payload
+
+
+def run_semantic_comparisons(stats, latencies):
+    workload = json.loads(SEMANTIC_WORKLOAD.read_text())
+    comparisons = []
+    for case in workload["cases"]:
+        variants = {}
+        passed = True
+        error = None
+        for variant, compact in (("control", False), ("compacted", True)):
+            import_status, _, import_body, import_elapsed_ms = call(
+                "POST",
+                "/cusco/v1/contexts/import",
+                {"tokens": case.get("tokens", [])},
+            )
+            latencies.append(import_elapsed_ms)
+            stats["requests"] += 1
+            context_id = (
+                import_body.get("id")
+                if import_status == 200 and isinstance(import_body, dict)
+                else None
+            )
+            for seed_prompt in case["seed_prompts"]:
+                seed_status, _, seed_body, seed_elapsed_ms = call(
+                    "POST",
+                    "/openai/v1/chat/completions",
+                    {
+                        "model": MODEL,
+                        "messages": [{"role": "user", "content": seed_prompt}],
+                        "context_id": context_id,
+                        "max_tokens": 1,
+                        "temperature": 0,
+                        "seed": 10,
+                    },
+                )
+                latencies.append(seed_elapsed_ms)
+                stats["requests"] += 1
+                merge_usage_fields(stats, seed_body)
+                if seed_status != 200:
+                    context_id = None
+                    break
+            status, _, body, elapsed_ms = call(
+                "POST",
+                "/openai/v1/chat/completions",
+                semantic_request(case, context_id, compact),
+            )
+            latencies.append(elapsed_ms)
+            stats["requests"] += 1
+            merge_usage_fields(stats, body)
+            text = response_text(body)
+            normalized = normalized_text(text)
+            fragments = case.get("required_fragments", [])
+            variant_passed = (
+                status == 200
+                and bool(normalized)
+                and all(
+                    fragment.casefold() in normalized.casefold()
+                    for fragment in fragments
+                )
+            )
+            if "exact_normalized" in case:
+                variant_passed = (
+                    variant_passed and normalized == case["exact_normalized"]
+                )
+            compaction_result = (
+                body.get("cusco", {}).get("compaction_result")
+                if isinstance(body, dict)
+                else None
+            )
+            if compact:
+                variant_passed = (
+                    variant_passed
+                    and isinstance(compaction_result, dict)
+                    and compaction_result.get("success") is True
+                    and compaction_result.get("selected_strategy_id") == "window_tail:v1"
+                )
+            variants[variant] = {
+                "status": status,
+                "latency_ms": round(elapsed_ms, 3),
+                "text": text,
+                "normalized_text": normalized,
+                "passed": variant_passed,
+                "openai_usage": compact_openai_usage(
+                    body.get("usage") if isinstance(body, dict) else None
+                ),
+                "cusco_usage": compact_cusco_usage(
+                    body.get("cusco") if isinstance(body, dict) else None
+                ),
+                "compaction_result": compaction_result,
+                "response_error": (
+                    body.get("error") if isinstance(body, dict) else None
+                ),
+            }
+            if context_id is not None:
+                call("DELETE", f"/cusco/v1/contexts/{context_id}")
+            if not variant_passed:
+                passed = False
+                error = f"{variant} failed observable semantic assertions"
+        if passed and (
+            variants["control"]["normalized_text"]
+            != variants["compacted"]["normalized_text"]
+        ):
+            passed = False
+            error = "compacted output diverged from the uncompacted control"
+        stats["passed" if passed else "failed"] += 1
+        comparisons.append(
+            {
+                "name": case["name"],
+                "required_fragments": case.get("required_fragments", []),
+                "exact_normalized": case.get("exact_normalized"),
+                "passed": passed,
+                "error": error,
+                "variants": variants,
+            }
+        )
+    return {
+        "schema_version": workload["schema_version"],
+        "workload_version": workload["workload_version"],
+        "workload": str(SEMANTIC_WORKLOAD),
+        "comparisons": comparisons,
+        "passed": all(comparison["passed"] for comparison in comparisons),
+    }
+
+
 
 
 def run():
@@ -189,8 +359,9 @@ def run():
             {
                 "model": MODEL,
                 "prompt": "Reply with exactly: smoke-ok",
-                "max_tokens": 8,
+                "max_tokens": 4,
                 "temperature": 0,
+                "seed": 10,
             },
             lambda status, body: list_field(status, body, "choices"),
         ),
@@ -201,8 +372,9 @@ def run():
             {
                 "model": MODEL,
                 "messages": [{"role": "user", "content": "Reply with exactly: smoke-ok"}],
-                "max_tokens": 8,
+                "max_tokens": 4,
                 "temperature": 0,
+                "seed": 10,
             },
             lambda status, body: list_field(status, body, "choices"),
         ),
@@ -213,7 +385,9 @@ def run():
             {
                 "model": MODEL,
                 "input": "Reply with exactly: smoke-ok",
-                "max_output_tokens": 8,
+                "max_output_tokens": 4,
+                "temperature": 0,
+                "seed": 10,
             },
             lambda status, body: has(status, body, "output"),
         ),
@@ -232,6 +406,7 @@ def run():
     results = []
     latencies = []
     context_id = None
+    created_context_ids = set()
     stats = {
         "requests": 0,
         "passed": 0,
@@ -255,8 +430,12 @@ def run():
             check(status, body)
             passed = True
             stats["passed"] += 1
-            if name == "context_import" and isinstance(body, dict):
-                context_id = body.get("id")
+            if name in {"context_create", "context_import"} and isinstance(body, dict):
+                created_id = body.get("id")
+                if created_id is not None:
+                    created_context_ids.add(created_id)
+                if name == "context_import":
+                    context_id = created_id
         except AssertionError as exc:
             passed = False
             error = str(exc)
@@ -288,6 +467,8 @@ def run():
                           "It discusses determinism, admission control, and residency with deterministic behavior.",
                 "context_id": context_id,
                 "max_tokens": 1,
+                "temperature": 0,
+                "seed": 10,
             },
         )
         latencies.append(elapsed_ms)
@@ -326,6 +507,8 @@ def run():
                 "prompt": "Repeat the same point in one short sentence.",
                 "context_id": context_id,
                 "max_tokens": 1,
+                "temperature": 0,
+                "seed": 10,
             },
         )
         latencies.append(elapsed_ms)
@@ -365,6 +548,8 @@ def run():
                 "prompt": "compact this context",
                 "context_id": context_id,
                 "max_tokens": 1,
+                "temperature": 0,
+                "seed": 10,
                 "compaction": {
                     "strategy_preferences": ["window_tail"],
                     "target_tokens": 1,
@@ -410,6 +595,8 @@ def run():
                 "prompt": "continue after compaction",
                 "context_id": context_id,
                 "max_tokens": 1,
+                "temperature": 0,
+                "seed": 10,
             },
         )
         latencies.append(elapsed_ms)
@@ -449,8 +636,9 @@ def run():
             {
                 "model": MODEL,
                 "messages": [{"role": "user", "content": "Reply with exactly: stream-ok"}],
-                "max_tokens": 8,
+                "max_tokens": 4,
                 "temperature": 0,
+                "seed": 10,
                 "stream": True,
                 "stream_options": {"include_usage": True},
             },
@@ -466,8 +654,9 @@ def run():
             {
                 "model": MODEL,
                 "input": "Reply with exactly: stream-ok",
-                "max_output_tokens": 8,
+                "max_output_tokens": 4,
                 "temperature": 0,
+                "seed": 10,
                 "stream": True,
             },
             lambda events: any(
@@ -509,6 +698,18 @@ def run():
                 "stable_ids": ids,
             }
         )
+    for created_id in created_context_ids:
+        call("DELETE", f"/cusco/v1/contexts/{created_id}")
+    call("DELETE", "/cusco/v1/api/delete", {"model": MODEL})
+    reload_status, _, _, _ = call(
+        "POST",
+        "/cusco/v1/api/pull",
+        {"model": MODEL, "stream": False},
+    )
+    if reload_status != 200:
+        stats["failed"] += 1
+    if "semantic_evidence" not in locals():
+        semantic_evidence = run_semantic_comparisons(stats, latencies)
     total_prefill_work = stats["prefill_cached_tokens"] + stats["prefill_uncached_tokens"]
     if total_prefill_work:
         stats["cache_ratio"] = round(stats["prefill_cached_tokens"] / total_prefill_work, 6)
@@ -528,6 +729,7 @@ def run():
         "base_url": BASE,
         "scenarios": results,
         "stats": stats,
+        "semantic_evidence": semantic_evidence,
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(report, indent=2) + "\n")

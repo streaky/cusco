@@ -2,6 +2,7 @@
   "schema_version": 1,
   "test_set_version": "cusco-acceptance-v1",
   "model": "hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf",
+  "semantic_workload": "/work/config/phase10-semantic-workload.json",
   "model_free": [
     {"crate": "cusco-context-store", "test": "publication_is_atomic_and_epoch_changes_invalidate_mappings", "contract": "logical publication and epoch invalidation"},
     {"crate": "cusco-context-store", "test": "publication_revision_rejects_aba_binding_changes", "contract": "publication ABA rollback"},

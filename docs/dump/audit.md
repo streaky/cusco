@@ -25,8 +25,8 @@ It is not accurate, however, to say that Phases 1–10 are complete **as fully a
 3. **Logical context scaling has been remediated.** Token storage uses immutable chunks and evaluated mappings retain shared sequence boundaries instead of full-prefix token copies.
 4. **Residency admission is based on estimates rather than trustworthy native capacity.** The native operating point proportionally assigns model bytes by layer count and treats serialized state size as context memory. The pre-load estimator is coarser still. The scheduler therefore cannot prove the capacity guarantees the outline requires.
 5. **Phase 9 persistence and lifecycle boundaries are now remediated.** Runtime contexts are discarded on restart; SQLite is the sole model/lifecycle authority; model publication and pull completion share one SQLite transaction; and fetch/probe/prepare/publication runs off Tokio in a protocol-neutral lifecycle service.
-6. **The checked-in acceptance story has regressed.** The Phase 6/7/8 report scripts and Compose gates named by the outline no longer exist. The unified real-model smoke gate is useful but does not replace their mixed-load, streaming, management-lifecycle-fault, correlation, or transactional checks.
-7. **Phase 10's mechanism is present, but its declared semantic and end-to-end acceptance matrix is not.** The fixture tree named by the outline is absent, semantic tests are structural token-retention checks rather than model-output regression checks, and the unified smoke does not exercise streaming ID correlation.
+6. **The checked-in acceptance stack has been rebuilt.** One versioned manifest now drives model-free contracts and real-model executor, mapped-publication, representation, scheduler, streaming, compaction, and API gates with machine-readable provenance.
+7. **Phase 10 now has observable semantic and stream-correlation evidence.** The real-model smoke compares uncompacted and `window_tail` outputs from identical logical histories, requires non-empty deterministic output and exact normalized equivalence, records usage/compaction evidence, and reconstructs Responses streams while checking stable transport, correlation, inference, and execution-session IDs.
 
 These are architecture issues worth resolving before adding multi-GPU placement, external compaction workers, more model families, or substantially higher concurrency. Those features would otherwise harden assumptions that currently need to change.
 
@@ -41,9 +41,9 @@ These are architecture issues worth resolving before adding multi-GPU placement,
 | **5. Mapped execution** | **Exact native-mapping proof complete; historical block-table claim not implemented** | `mapped-proof` and `results/phase5.json` compare staged and mapped paths. Native mappings use llama sequence IDs and can switch references, but the historical physical-block-table/kernel-resolution design is not present and current publication performs sequence copies. The selected Approach A remediation no longer treats a Rust-owned block table as the immediate completion criterion: it requires truthful opaque native ownership, copy-free linear publication, stable graph reuse, and meaningful copy telemetry. Native-allocated shared blocks remain the conditional B1 evolution. |
 | **6. Live execution integration** | **Functional path present; capacity and transaction gates incomplete** | One-model mapped execution, bounded admission, incremental output, request-owned sampling/frontier state, stops, cancellation, deadlines, and shutdown machinery exist. The prior Phase 6 artifacts remain under `results/`. The current physical publication sequence can leave logical and physical state divergent, and capacity is based on fictitious representation sizes. The documented `tools/phase6c-report.sh` gate no longer exists. |
 | **7. Residency and lifecycle scheduling** | **Dynamic lifecycle and independent execution implemented; capacity incomplete** | Dynamic epochs, load/reuse/reload/remove/retire behavior, spill paths, status, transactional SQLite lifecycle publication, and restart behavior exist. Per-model-epoch workers allow distinct resident models to overlap while preserving same-model serialization. Admission still does not use authoritative allocator operating points, and the documented Phase 7 report gate no longer exists. |
-| **8. Workload scheduling and hardening** | **Fairness and independent execution implemented; acceptance incomplete** | Priority-aware deficit round robin, FIFO equivalence, monotonic promotion, bounded prefill/decode quanta, IDs, diagnostics, per-model-epoch workers, and focused overlap/serialization tests exist. Historical Phase 8 artifacts remain, but the report script/service named in the outline is gone and unified smoke has no sustained mixed-load or fault workload. |
+| **8. Workload scheduling and hardening** | **Fairness, independent execution, and acceptance implemented** | Priority-aware deficit round robin, FIFO equivalence, monotonic promotion, bounded prefill/decode quanta, IDs, diagnostics, per-model-epoch workers, focused overlap/serialization tests, and sustained scheduler proof workloads are all included in the canonical acceptance stack. |
 | **9. Compatibility, persistence, packaging** | **Broadly implemented; vision remains incomplete** | The clean surface consists of OpenAI-compatible inference under `/openai/v1/*` and the Cusco control plane under `/cusco/v1/*`, including bounded Ollama-compatible model management under `/cusco/v1/api/*`. SQLite is the sole durable model/lifecycle authority, contexts are disposable on restart, publication is transactional, and blocking pull lifecycle work runs outside Tokio through `ModelLifecycleService`. Images are bounded and decoded but rejected because no projector execution path exists. |
-| **10. Semantic context compaction** | **Baseline mechanism implemented; acceptance overclaimed** | The registry, deterministic `window_tail`, declarations, bounded workers, successor preparation/publication, replay metadata, terminal-sequence suppression, and compaction smoke scenarios exist. The named semantic-quality and end-to-end stream-correlation fixtures/tests in the outline do not. Current evidence proves deterministic trimming and continuation, not the full semantic quality/correlation matrix. |
+| **10. Semantic context compaction** | **Baseline mechanism and current acceptance contract implemented** | The registry, deterministic `window_tail`, declarations, bounded workers, successor preparation/publication, replay metadata, terminal-sequence suppression, and compaction smoke scenarios exist. The real-model gate now compares compacted output with an uncompacted control from the same imported history, requires exact normalized equivalence, records semantic/usage/compaction evidence, and verifies end-to-end Responses stream ID correlation. |
 
 ## Critical structural and performance findings
 
@@ -174,31 +174,37 @@ semantics, atomic publication/operation completion, catalog recovery, and
 lifecycle rollback. A future durable-context profile still requires a
 purpose-built versioned persistence contract rather than reviving JSON snapshots.
 
-### H4. Historical acceptance gates are no longer runnable as documented
+### H4. Acceptance evidence is reproducible again
 
-`docs/outline.md` names:
+`config/acceptance.json` is the single versioned test-set manifest.
+`acceptance-model-free` runs the deterministic logical, physical, scheduler,
+lifecycle, streaming, and rollback contracts. `acceptance` adds the real
+executor, mapped-publication, representation-scaling, sustained scheduler, and
+API smoke workloads. `tools/acceptance-report.py` records per-gate outcomes,
+durations, artifact hashes, workload hashes, source state, toolchains, CUDA
+configuration, model identity, and GPU provenance in
+`results/acceptance-report.json`.
 
-- `tools/phase6c-report.sh` (`outline.md:1543`),
-- `tools/phase7-report.sh` (`outline.md:1629`),
-- `tools/phase8-report.sh` (`outline.md:1733`).
+The API runner reconstructs Chat Completions and Responses streams, validates
+stable request/correlation/inference/execution-session identities, and checks
+terminal usage events. The old phase-numbered artifacts remain useful
+diagnostics, but are no longer the release contract.
 
-None exists. `docker compose -f compose.test.yaml config --services` currently exposes only `model-fetch`, `test`, `api-smoke`, `executor-proof`, and `mapped-proof`. Historical Phase 6–8 JSON artifacts remain under `results/`, but there is no current reproducible command that regenerates their complete gates.
+### H5. Phase 10 semantic and correlation evidence is executable
 
-The unified `tools/smoke-report.py` currently exercises OpenAPI, model listing, buffered completion/chat/Responses, context operations, status, reuse, compaction, and successor continuation. The post-cutover real-model run passed all 13 scenarios. It does not exercise streaming, the Ollama-compatible management lifecycle, mixed multi-model load, lifecycle races/faults, cancellation/deadline storms, diagnostic overflow, or capacity recovery. It is therefore a useful high-level smoke, not a replacement for Phases 6–8 acceptance.
+`config/phase10-semantic-workload.json` defines a deterministic reusable
+real-model comparison. The smoke runner imports the same logical history for an
+uncompacted control and a `window_tail` successor, requires both answers to be
+non-empty and exactly equal after whitespace normalization, and requires the
+compacted response to report a successful `window_tail:v1` result. The report
+retains both outputs, OpenAI and Cusco usage, compaction metadata, latency, and
+the workload identity.
 
-**Recommended direction**
-
-Reintroduce the missing acceptance workloads as reusable test-set wrappers under the current harness, or explicitly revise the outline and Compose contract to point to equivalent maintained commands. Keep a fast deterministic semantic gate and a separately recorded real-GPU performance/fault gate. Do not infer current completion from stale artifacts.
-
-### H5. Phase 10 acceptance evidence does not match its checklist
-
-The outline declares fixture-backed tests for semantic pronoun continuity, instruction retention, tool-call consistency, follow-up fidelity, cancellation/disconnect races, and end-to-end Responses stream ID correlation (`docs/outline.md:1864-1901`). No `phase10/fixtures/...` tree or equivalent YAML/JSONL fixtures exists.
-
-Current `context_strategy.rs` tests prove anchor retention, supported anchor formats, and deterministic output. The server tests cover declarations, worker isolation, successor commit, replay payload, and rollback. These are valuable mechanics tests, but they do not run the real model against semantic controls. The smoke report checks a buffered `window_tail` result and a continuation, not streaming lifecycle reconstruction or distinct transport/inference/session ID propagation.
-
-**Recommended direction**
-
-Implement the named fixtures as deterministic reusable scenarios. Run semantic cases against both uncompacted controls and compacted successors; make pass/fail assertions about the observable answer or structured output, not retained source strings. Add an actual streamed Responses reconstruction test that observes all lifecycle event types and verifies distinct, stable IDs end to end.
+This contract deliberately measures semantic preservation relative to the
+uncompacted model output rather than asserting that a small generative model
+obeys a particular natural-language answer. Separately, the Responses SSE gate
+reconstructs the lifecycle and verifies stable, distinct transport,
+correlation, inference, and execution-session IDs through completion.
 
 ## Medium-severity findings
 
@@ -380,11 +386,14 @@ available, source state, toolchains, CUDA configuration, and GPU identity.
 Focused phase-numbered proofs remain diagnostics rather than competing release
 gates.
 
-### 9. Close Phase 10 semantic evidence on top of the stable execution path
+### 9. Close Phase 10 semantic evidence on top of the stable execution path — implemented
 
-Finally add the named semantic-quality fixtures, follow-up fidelity checks, and end-to-end Responses stream-correlation coverage. Compaction depends on context representation, publication, scheduling, persistence policy, and telemetry; completing its broader evidence before those foundations settle would create fixtures and measurements that need immediate migration.
-
-The deterministic `window_tail` mechanism can remain available throughout the remediation. The sequencing recommendation is only to defer claims about complete semantic and operational acceptance until the underlying execution path is stable.
+The versioned semantic workload now compares a compacted successor with an
+uncompacted control from the same imported logical history. The acceptance
+report captures both observable outputs, exact normalized equivalence, usage,
+compaction provenance, latency, workload hashes, and model/runtime provenance.
+The Responses streaming gate separately reconstructs the lifecycle and verifies
+stable transport, correlation, inference, and execution-session identities.
 
 ### Parallel work that will not create much rework
 
