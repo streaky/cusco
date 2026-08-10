@@ -414,10 +414,21 @@ impl ResidentEngine {
                 return Err(error);
             }
         };
-        self.publish_profile(model, point)?;
-        let point = OperatingPoint {
-            device_bytes: point.device_bytes.saturating_add(point.device_bytes / 20),
+        // A backend-wide free-memory delta can include unrelated devices and
+        // concurrent allocations. Never let it weaken the conservative
+        // admission estimate derived before loading.
+        let measured_point = OperatingPoint {
+            model_bytes: point.model_bytes.max(estimate.model_bytes),
+            context_bytes: point.context_bytes.max(estimate.context_bytes),
+            device_bytes: point.device_bytes.max(estimate.device_bytes),
+            host_bytes: point.host_bytes.max(estimate.host_bytes),
             ..point
+        };
+        let point = OperatingPoint {
+            device_bytes: measured_point
+                .device_bytes
+                .saturating_add(measured_point.device_bytes / 20),
+            ..measured_point
         };
         if let Some(control) = control {
             if let Err(error) = control.check() {
@@ -453,6 +464,10 @@ impl ResidentEngine {
             return Err(Error::State(
                 "measured operating point exceeds residency capacity".into(),
             ));
+        }
+        if let Err(error) = self.publish_profile(model, measured_point) {
+            state.metrics.load_failures += 1;
+            return Err(error);
         }
         for victim in candidate_victims {
             let victim_key = (victim.record.id.clone(), victim.record.epoch);
@@ -919,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_profile_is_reused_before_model_admission() {
+    fn persisted_profile_cannot_weaken_conservative_admission() {
         let database = std::env::temp_dir().join(format!(
             "cusco-residency-profile-{}.sqlite",
             uuid::Uuid::new_v4()
@@ -938,7 +953,10 @@ mod tests {
 
         let reused = ResidentEngine::with_loader(config(20), loader);
         reused.attach_catalog(catalog);
-        reused.prepare_model(&large_declaration).unwrap();
+        assert!(matches!(
+            reused.prepare_model(&large_declaration),
+            Err(Error::State(message)) if message == "residency capacity is exhausted"
+        ));
 
         let _ = fs::remove_file(database);
     }
