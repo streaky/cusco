@@ -185,6 +185,7 @@ fn run(command: Command) -> Result<()> {
                 Some(token) => Arc::new(BearerAuth::new(token)),
                 None => Arc::new(AnonymousAdmin),
             };
+            let catalog = ModelCatalog::open(&config.paths.database)?;
             let engine = ResidentEngine::open_with_spill(
                 ResidencyConfig {
                     device_bytes: config.execution.device_capacity.0,
@@ -197,6 +198,7 @@ fn run(command: Command) -> Result<()> {
                 },
                 &config.paths.spill,
             )?;
+            engine.attach_catalog(catalog.clone());
             let engine = WorkloadScheduler::new(engine, config.scheduler)?;
             let transient_state = config.paths.database.with_extension("runtime.json");
             if transient_state.exists() {
@@ -208,7 +210,6 @@ fn run(command: Command) -> Result<()> {
             server.configure(config.server)?;
             server.configure_vision(config.vision);
             server.configure_openapi(config.openapi);
-            let catalog = ModelCatalog::open(&config.paths.database)?;
             server.attach_catalog(catalog.clone(), config.paths.models.clone());
             for model in catalog.models()? {
                 server.register_catalog_model(model)?;

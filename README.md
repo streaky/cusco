@@ -239,8 +239,10 @@ second inference API.
   native KV and recurrent-state blocks.
 - Context records currently use whole-state JSON persistence rather than the
   SQLite catalog used for installed models and lifecycle operations.
-- The bundled execution profile targets the standard Gemma validation model;
-  broader architecture support requires explicit compatible profiles.
+- Native model/context allocation is measured for each immutable model,
+  executor configuration, accelerator identity, and runtime provenance, then
+  persisted in the SQLite catalog and reused for admission. The first load of a
+  new profile still requires a conservative bootstrap reservation.
 
 The detailed design is documented in `docs/outline.md`. A source-grounded
 assessment of architectural and performance constraints is available in

@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define CUSCO_EXECUTOR_ABI_VERSION 13u
+#define CUSCO_EXECUTOR_ABI_VERSION 14u
 
 typedef struct cusco_executor cusco_executor;
 typedef struct cusco_representation cusco_representation;
@@ -28,8 +28,9 @@ typedef struct {
     uint32_t training_context_tokens;
 } cusco_capabilities;
 
-/* Executor-reported operating point selected at open. Byte counts are the
- * conservative capacity envelope used by the Rust residency scheduler. */
+/* Executor-reported operating point selected at open. Device bytes are the
+ * observed accelerator allocation delta across model and context creation;
+ * host bytes remain a conservative capacity envelope. */
 typedef struct {
     uint64_t model_bytes;
     uint64_t context_bytes;

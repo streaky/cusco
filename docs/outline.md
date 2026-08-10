@@ -938,6 +938,105 @@ The residency controller selects among native-reported operating points, perform
 
 This supports the premium deployment mode: when the selected competent model placement and maximum admitted execution use only part of a device, spare VRAM can retain additional branch blocks. Those blocks accelerate revisits without endangering execution, and they are not displaced merely because the model could use more memory as an optional acceleration.
 
+### Measured execution profiles and leased native sequences
+
+Cusco must preserve the core execution semantics of a correctly configured
+standalone llama.cpp context. Logical branch multiplicity must not be expressed
+by increasing `n_seq_max` when that partitions `n_ctx` or otherwise reduces the
+usable context of an executing request. In particular, a configured context
+length is the capacity of the active execution slot, not an aggregate divided
+among every retained logical branch.
+
+Persistent logical branches, tiered physical representations, and native
+execution sequences are separate resources:
+
+- a logical branch owns tokens, ancestry, and stable API identity independently
+  of native residency;
+- its physical model state may have device, host, storage-backed, or
+  reconstructible representations managed by the normal tier policy;
+- a native sequence is a bounded execution lease held only while a
+  representation is bound to an executor slot.
+
+The initial single-slot profile therefore configures one full-capacity native
+sequence per resident model. Inactive mappings retain an exact host-backed
+sequence image and any independently tiered context representation needed to
+resume them. Activating a mapping prepares restoration into the leased native
+sequence, validates it, and publishes the new binding only after restoration
+succeeds. Suspending or switching first captures the prior sequence image
+behind its completion fence. Native sequence identifiers are recyclable
+execution-local names and must never become permanent logical mapping IDs.
+This clean separation may initially copy a complete llama sequence image; later
+block-addressable representations can eliminate those copies without changing
+the ownership contract.
+
+Every resident model must receive an execution reservation before context-cache
+capacity is admitted. No request that satisfies its declared geometry may
+discover during native execution that reusable context state consumed graph,
+scratch, recurrent-state, output, staging, publication, or rollback memory
+required by llama.cpp. On the first load of an execution configuration, the
+executor measures allocation deltas and high-water marks available from the
+backend while constructing the model and context and exercising any bounded
+lazy-allocation paths. The result is a small, versioned
+`MeasuredExecutionProfile`, including at least:
+
+```rust
+struct MeasuredExecutionProfile {
+    schema_major: u16,
+    schema_minor: u16,
+    model_bytes: u64,
+    device_model_bytes: u64,
+    host_model_bytes: u64,
+    context_state_bytes: u64,
+    device_execution_reserve_bytes: u64,
+    host_staging_bytes: u64,
+    allocator_headroom_bytes: u64,
+    measurement_source: MeasurementSource,
+}
+```
+
+The required device floor is the measured competent model placement plus the
+maximum measured execution reserve and explicit allocator headroom. Only bytes
+above that floor are eligible for hot context caching or elastic native
+acceleration. A measurement is evidence for admission, not permission for
+unbounded allocation: an execution path exceeding it is an unhealthy operating
+point and a transactional fault.
+
+Measurements are cached in the durable model catalog so unloading a model or
+restarting the daemon does not require repeating an unchanged profile. Entries
+are immutable and selected by:
+
+```text
+(immutable model identity, execution configuration hash, selected GPU id)
+```
+
+The configuration hash covers every input that can change tensor allocation,
+graph shape, placement, or native state format. It includes the
+`llama.cpp-version.txt` release, executor ABI and build/profile identity,
+context length, batch and microbatch geometry, GPU-layer and tensor placement,
+KV and recurrent-state types, flash-attention and graph settings, adapter and
+projector identities, and other allocation-relevant feature flags. A mutable
+model alias or local path is never part of the identity. Changing any covered
+input produces a cache miss rather than mutating or invalidating another
+entry.
+
+The selected GPU identifier is included conservatively in the first
+implementation. The stored provenance also records observable device and
+backend properties, and reuse is rejected if they no longer match. Sharing
+measurements among equivalent devices or multi-device placements requires a
+future explicit compatibility contract; it must not be inferred from matching
+ordinals. Records include `measured_at` and `last_used_at` so a later bounded
+retention policy can remove entries unused for an operator-selected interval.
+Because records are tiny, initial correctness does not depend on eager
+eviction.
+
+If no compatible cached entry exists, admission uses a conservative bootstrap
+reservation large enough to load and measure the requested operating point.
+The measured record is committed only after the bounded profiling operation
+completes successfully. Subsequent loads may reuse it before model allocation,
+but must still validate runtime provenance. Family metadata defines the
+measurement recipe; byte counts belong to the exact immutable model and
+execution configuration, not merely to a model family.
+
 ## Active bindings
 
 Execution slots should be disposable workers. A slot holds a temporary binding to a logical context:

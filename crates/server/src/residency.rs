@@ -1,10 +1,15 @@
 use crate::{
-    EngineRequest, Error, ExecutionSession, InferenceEngine, MappedEngine, ModelRecord, SessionStep,
+    EngineRequest, Error, ExecutionSession, InferenceEngine, MappedEngine, ModelCatalog,
+    ModelRecord, SessionStep,
+    catalog::{
+        MEASURED_EXECUTION_PROFILE_SCHEMA_MAJOR, MeasuredExecutionProfile, MeasurementSource,
+    },
 };
 use cusco_context_store::ModelEpoch;
 use cusco_executor::OperatingPoint;
 use parking_lot::Mutex;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs,
@@ -146,6 +151,7 @@ pub struct ResidentEngine {
     config: ResidencyConfig,
     state: Arc<Mutex<ResidencyState>>,
     loader: Arc<dyn ModelLoader>,
+    catalog: Mutex<Option<ModelCatalog>>,
 }
 
 impl ResidentEngine {
@@ -163,6 +169,7 @@ impl ResidentEngine {
             config: config.validate()?,
             state: Arc::new(Mutex::new(ResidencyState::default())),
             loader: Arc::new(NativeLoader { spill_dir }),
+            catalog: Mutex::new(None),
         }))
     }
 
@@ -172,10 +179,95 @@ impl ResidentEngine {
             config: config.validate().unwrap(),
             state: Arc::new(Mutex::new(ResidencyState::default())),
             loader,
+            catalog: Mutex::new(None),
         })
     }
 
+    pub fn attach_catalog(&self, catalog: ModelCatalog) {
+        *self.catalog.lock() = Some(catalog);
+    }
+
+    fn profile_key(&self, model: &ModelRecord) -> (String, String, String, String) {
+        let model_identity = if model.sha256.is_empty() {
+            format!("{}@{}", model.id, model.revision)
+        } else {
+            model.sha256.clone()
+        };
+        let config = format!(
+            "abi=14;llama={};n_ctx={};n_batch={};gpu_layers={};mapped=true",
+            include_str!("../../../llama.cpp-version.txt").trim(),
+            self.config.n_ctx,
+            self.config.n_ctx,
+            self.config.gpu_layers,
+        );
+        let config_hash = hex::encode(Sha256::digest(config.as_bytes()));
+        let gpu_id = if self.config.gpu_layers > 0 {
+            format!(
+                "configured-gpu:{}",
+                std::env::var("CUSCO_GPU_DEVICE_ID").unwrap_or_else(|_| "unspecified".into())
+            )
+        } else {
+            "cpu".into()
+        };
+        let provenance = format!(
+            "executor-abi=14;llama={}",
+            include_str!("../../../llama.cpp-version.txt").trim()
+        );
+        (model_identity, config_hash, gpu_id, provenance)
+    }
+
+    fn cached_profile(&self, model: &ModelRecord) -> Result<Option<OperatingPoint>, Error> {
+        let Some(catalog) = self.catalog.lock().clone() else {
+            return Ok(None);
+        };
+        let (model_identity, config_hash, gpu_id, provenance) = self.profile_key(model);
+        let record = catalog
+            .measured_execution_profile(&model_identity, &config_hash, &gpu_id, &provenance)
+            .map_err(|error| Error::State(error.to_string()))?;
+        Ok(record.map(|record| OperatingPoint {
+            model_bytes: record.profile.model_bytes,
+            context_bytes: record.profile.context_state_bytes,
+            device_bytes: record.profile.device_model_bytes
+                + record.profile.device_execution_reserve_bytes
+                + record.profile.allocator_headroom_bytes,
+            host_bytes: record.profile.host_model_bytes + record.profile.host_staging_bytes,
+            gpu_layers: self.config.gpu_layers,
+            model_layers: 0,
+            competent: self.config.require_competent,
+        }))
+    }
+
+    fn publish_profile(&self, model: &ModelRecord, point: OperatingPoint) -> Result<(), Error> {
+        let Some(catalog) = self.catalog.lock().clone() else {
+            return Ok(());
+        };
+        let (model_identity, config_hash, gpu_id, provenance) = self.profile_key(model);
+        let profile = MeasuredExecutionProfile {
+            schema_major: MEASURED_EXECUTION_PROFILE_SCHEMA_MAJOR,
+            schema_minor: 0,
+            model_bytes: point.model_bytes,
+            device_model_bytes: point.device_bytes,
+            host_model_bytes: point.host_bytes,
+            context_state_bytes: point.context_bytes,
+            device_execution_reserve_bytes: 0,
+            host_staging_bytes: 0,
+            allocator_headroom_bytes: point.device_bytes / 20,
+            measurement_source: if self.config.gpu_layers > 0 {
+                MeasurementSource::BackendAllocator
+            } else {
+                MeasurementSource::ConservativeFallback
+            },
+            provenance,
+        };
+        catalog
+            .publish_measured_execution_profile(&model_identity, &config_hash, &gpu_id, &profile)
+            .map_err(|error| Error::State(error.to_string()))
+    }
+
     fn estimate(&self, model: &ModelRecord) -> Result<OperatingPoint, Error> {
+        if let Some(profile) = self.cached_profile(model)? {
+            return Ok(profile);
+        }
         let model_bytes = if model.size_bytes == 0 {
             fs::metadata(&model.path).map_err(super::state_err)?.len()
         } else {
@@ -321,6 +413,11 @@ impl ResidentEngine {
                 self.state.lock().metrics.load_failures += 1;
                 return Err(error);
             }
+        };
+        self.publish_profile(model, point)?;
+        let point = OperatingPoint {
+            device_bytes: point.device_bytes.saturating_add(point.device_bytes / 20),
+            ..point
         };
         if let Some(control) = control {
             if let Err(error) = control.check() {
@@ -819,6 +916,31 @@ mod tests {
             size_bytes: bytes,
             epoch,
         }
+    }
+
+    #[test]
+    fn persisted_profile_is_reused_before_model_admission() {
+        let database = std::env::temp_dir().join(format!(
+            "cusco-residency-profile-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let catalog = ModelCatalog::open(&database).unwrap();
+        let loader = Arc::new(FixtureLoader {
+            point: point(10),
+            failures: Mutex::new(vec![]),
+            blocker: None,
+        });
+        let measured = ResidentEngine::with_loader(config(110), loader.clone());
+        measured.attach_catalog(catalog.clone());
+        let large_declaration = model("profiled", "checksum", 1, 100);
+        measured.prepare_model(&large_declaration).unwrap();
+        drop(measured);
+
+        let reused = ResidentEngine::with_loader(config(20), loader);
+        reused.attach_catalog(catalog);
+        reused.prepare_model(&large_declaration).unwrap();
+
+        let _ = fs::remove_file(database);
     }
 
     #[test]
