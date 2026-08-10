@@ -329,7 +329,7 @@ fn project_part(part: &ResponseTextPart) -> Value {
 fn project_message(message: &ResponseMessage) -> Value {
     json!({"id":message.id,"type":"message","role":message.role,"status":message.status,"content":message.content.iter().map(project_part).collect::<Vec<_>>()})
 }
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())

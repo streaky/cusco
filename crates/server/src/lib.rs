@@ -7232,7 +7232,7 @@ mod tests {
             id: "resp_base".into(),
             owner: "anonymous-admin".into(),
             model: "m".into(),
-            created_at: 1,
+            created_at: responses::now(),
             status: "completed".into(),
             store: true,
             previous_response_id: None,

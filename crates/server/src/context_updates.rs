@@ -183,7 +183,7 @@ mod tests {
             id: id.into(),
             owner: "owner".into(),
             model: "model".into(),
-            created_at: 1,
+            created_at: crate::responses::now(),
             status: "completed".into(),
             store: true,
             previous_response_id: None,
