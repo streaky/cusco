@@ -93,7 +93,7 @@ impl ExecutionProfile {
             || !required.contains(ComponentMask::RECURRENT)
         {
             return Err(Error::State(
-                "Gemma profile omits a required execution component".into(),
+                "execution profile omits a required component".into(),
             ));
         }
         Ok(())
