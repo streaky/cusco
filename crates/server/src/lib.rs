@@ -2857,6 +2857,11 @@ async fn responses(
                 "previous_response_id uses an incompatible model".into(),
             ));
         }
+        if !predecessor.store {
+            return Err(Error::BadRequest(
+                "previous_response_id requires a stored response".into(),
+            ));
+        }
         lineage_revision = predecessor.lineage_revision.saturating_add(1);
         prompt.push_str(&response_lineage_prompt(
             &s.response_service,
@@ -3136,7 +3141,26 @@ fn response_lineage_prompt(
             }
         }
     }
-    prompt::apply_chat_template(family, messages)
+    prompt::apply_chat_template(family, normalize_response_messages(messages))
+}
+
+fn normalize_response_messages(messages: Vec<prompt::Message>) -> Vec<prompt::Message> {
+    let mut normalized: Vec<prompt::Message> = Vec::with_capacity(messages.len());
+    for message in messages {
+        if normalized
+            .last()
+            .is_some_and(|previous| previous.role == message.role)
+        {
+            let previous = normalized.last_mut().expect("last message was present");
+            if !previous.content.is_empty() && !message.content.is_empty() {
+                previous.content.push('\n');
+            }
+            previous.content.push_str(&message.content);
+        } else {
+            normalized.push(message);
+        }
+    }
+    normalized
 }
 
 fn lineage_has_call(
@@ -5087,6 +5111,65 @@ mod tests {
                 }] if image_url == "data:image/png;base64,AA==" && detail == "low"
             )
         ));
+    }
+    #[test]
+    fn responses_lineage_coalesces_adjacent_assistant_items() {
+        let messages = normalize_response_messages(vec![
+            prompt::Message {
+                role: "user".into(),
+                content: "question".into(),
+            },
+            prompt::Message {
+                role: "assistant".into(),
+                content: "answer".into(),
+            },
+            prompt::Message {
+                role: "assistant".into(),
+                content: r#"{"name":"lookup","arguments":{}}"#.into(),
+            },
+        ]);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(
+            messages[1].content,
+            "answer\n{\"name\":\"lookup\",\"arguments\":{}}"
+        );
+        prompt::apply_chat_template("gemma4", messages).unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_reject_transient_predecessor_before_continuation() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let app = router(server);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({"model": "m", "input": "hello", "store": false}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let predecessor = body["id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({
+                    "model": "m",
+                    "input": "continue",
+                    "previous_response_id": predecessor
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn scheduler_uses_transition_cost_priority_and_wait() {

@@ -991,17 +991,18 @@ cusco_status cusco_executor_import_mapping(
         if (size != 0) memcpy(state.data(), buffer, size);
         executor->mock_mappings.emplace(mapping, std::move(state));
     } else {
-        auto context_params = llama_context_default_params();
-        context_params.n_ctx = llama_n_ctx(executor->ctx);
-        context_params.n_batch = context_params.n_ctx;
-        context_params.n_seq_max = 1;
-        context_params.swa_full = true;
-        llama_context * validation =
-            llama_init_from_model(executor->model, context_params);
-        if (!validation) return CUSCO_NOMEM;
+        std::vector<uint8_t> prior;
+        if (!snapshot_active_sequence(executor, prior)) {
+            return CUSCO_BACKEND;
+        }
+        llama_memory_seq_rm(llama_get_memory(executor->ctx), 0, -1, -1);
         const size_t consumed =
-            llama_state_seq_set_data(validation, buffer, size, 0);
-        llama_free(validation);
+            size == 0 ? 0 : llama_state_seq_set_data(executor->ctx, buffer, size, 0);
+        llama_memory_seq_rm(llama_get_memory(executor->ctx), 0, -1, -1);
+        const bool rolled_back = prior.empty()
+            || llama_state_seq_set_data(
+                executor->ctx, prior.data(), prior.size(), 0) == prior.size();
+        if (!rolled_back) return CUSCO_ROLLBACK_FAILED;
         if (consumed != size) return CUSCO_INCOMPATIBLE;
         imported.resize(size);
         if (size != 0) memcpy(imported.data(), buffer, size);
