@@ -788,6 +788,11 @@ fn representation_proof(
     let imported = executor.import_mapping(&exported)?;
     let import_ns = import_started.elapsed().as_nanos();
     let after_import = executor.mapping_metrics();
+    let import_bytes_copied = after_import.import_bytes_copied - after_export.import_bytes_copied;
+    ensure!(
+        import_bytes_copied > exported.bytes.len() as u64,
+        "mapping import telemetry omitted validation snapshot and restore copies"
+    );
     let movement_token = tokens[cursor];
     executor.activate_mapping(&active)?;
     let resident = executor.decode(&[movement_token])?;
@@ -848,7 +853,7 @@ fn representation_proof(
             "import_ns": import_ns,
             "fork_bytes_copied": metrics.fork_bytes_copied,
             "export_bytes_copied_delta": after_export.export_bytes_copied - movement_before.export_bytes_copied,
-            "import_bytes_copied_delta": after_import.import_bytes_copied - after_export.import_bytes_copied,
+            "import_bytes_copied_delta": import_bytes_copied,
             "total_bytes_copied": metrics.total_bytes_copied,
             "graph_recaptures_supported": metrics.graph_recaptures.is_some(),
             "graph_recaptures": metrics.graph_recaptures

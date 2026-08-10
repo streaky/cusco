@@ -984,28 +984,32 @@ cusco_status cusco_executor_import_mapping(
     reclaim_unreferenced_representations(executor);
     *out = nullptr;
     const uint32_t mapping = executor->next_mapping++;
+    uint64_t bytes_copied = size;
     std::vector<uint8_t> imported;
     if (is_mock(executor)) {
         if (size % sizeof(int32_t) != 0) return CUSCO_INCOMPATIBLE;
         std::vector<int32_t> state(size / sizeof(int32_t));
         if (size != 0) memcpy(state.data(), buffer, size);
         executor->mock_mappings.emplace(mapping, std::move(state));
-    } else {
+    } else if (size != 0) {
         std::vector<uint8_t> prior;
         if (!snapshot_active_sequence(executor, prior)) {
             return CUSCO_BACKEND;
         }
+        bytes_copied += prior.size();
         llama_memory_seq_rm(llama_get_memory(executor->ctx), 0, -1, -1);
         const size_t consumed =
-            size == 0 ? 0 : llama_state_seq_set_data(executor->ctx, buffer, size, 0);
+            llama_state_seq_set_data(executor->ctx, buffer, size, 0);
+        bytes_copied += size;
         llama_memory_seq_rm(llama_get_memory(executor->ctx), 0, -1, -1);
         const bool rolled_back = prior.empty()
             || llama_state_seq_set_data(
                 executor->ctx, prior.data(), prior.size(), 0) == prior.size();
+        bytes_copied += prior.size();
         if (!rolled_back) return CUSCO_ROLLBACK_FAILED;
         if (consumed != size) return CUSCO_INCOMPATIBLE;
         imported.resize(size);
-        if (size != 0) memcpy(imported.data(), buffer, size);
+        memcpy(imported.data(), buffer, size);
     }
     try {
         executor->block_table.emplace(mapping, 0);
@@ -1017,7 +1021,7 @@ cusco_status cusco_executor_import_mapping(
         executor->published_mappings.insert(mapping);
         executor->representations.emplace(mapping, representation.get());
         *out = representation.release();
-        executor->mapping_import_bytes_copied += size;
+        executor->mapping_import_bytes_copied += bytes_copied;
         return CUSCO_OK;
     } catch (...) {
         executor->published_mappings.erase(mapping);
