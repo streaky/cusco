@@ -6471,6 +6471,7 @@ mod tests {
             serde_json::from_slice(&to_bytes(continued.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(continued_body["previous_response_id"], id);
+        let continued_id = continued_body["id"].as_str().unwrap().to_owned();
         let competing = app
             .clone()
             .oneshot(request(
@@ -6517,19 +6518,31 @@ mod tests {
                 .await
                 .unwrap()
                 .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "DELETE",
+                    &format!("/openai/v1/responses/{continued_id}"),
+                    json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
         assert_eq!(
             app.clone()
                 .oneshot(request(
-                    "GET",
+                    "DELETE",
                     &format!("/openai/v1/responses/{id}"),
                     json!({})
                 ))
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::NOT_FOUND
+            StatusCode::OK
         );
         let streamed = app.clone().oneshot(request(
             "POST", "/openai/v1/responses",

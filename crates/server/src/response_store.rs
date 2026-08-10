@@ -138,11 +138,19 @@ impl ResponseResourceStore for FileResponseResourceStore {
             .ok_or_else(|| StoreError::NotFound(id.into()))
     }
     fn delete(&self, id: &str) -> Result<(), StoreError> {
-        if self.recovered.write().remove(id).is_none() {
+        let mut recovered = self.recovered.write();
+        if !recovered.contains_key(id) {
             return Err(StoreError::NotFound(id.into()));
+        }
+        if recovered
+            .values()
+            .any(|candidate| candidate.previous_response_id.as_deref() == Some(id))
+        {
+            return Err(StoreError::Conflict(id.into()));
         }
         fs::remove_file(self.resource_path(id))?;
         fs::File::open(&self.resources)?.sync_all()?;
+        recovered.remove(id);
         Ok(())
     }
 }

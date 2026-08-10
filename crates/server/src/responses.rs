@@ -250,6 +250,13 @@ impl ResponseService {
     pub fn delete(&self, id: &str, owner: &str) -> Result<(), StoreError> {
         self.retrieve(id, owner)?;
         let mut transient = self.transient.lock();
+        if transient
+            .resources
+            .values()
+            .any(|candidate| candidate.previous_response_id.as_deref() == Some(id))
+        {
+            return Err(StoreError::Conflict(id.into()));
+        }
         if transient.resources.remove(id).is_some() {
             transient
                 .insertion_order
