@@ -1394,11 +1394,9 @@ impl Server {
     fn effective_stop_sequences(&self, req: &InferRequest) -> Result<Vec<String>, Error> {
         let mut stops = req.stop.clone();
         let model = self.model(&req.model)?;
-        if model.family == "gemma4" {
-            for marker in ["<end_of_turn>", "</end_of_turn>", "</start_of_turn>"] {
-                if !stops.iter().any(|stop| stop == marker) {
-                    stops.push(marker.into());
-                }
+        for marker in prompt::terminal_markers(&model.family) {
+            if !stops.iter().any(|stop| stop == marker) {
+                stops.push((*marker).into());
             }
         }
         Ok(stops)
@@ -2159,18 +2157,19 @@ fn tool_names(tools: &[ToolDefinition]) -> Vec<String> {
 }
 
 fn append_tool_instructions(
+    family: &str,
     prompt: &mut String,
     tools: &[ToolDefinition],
     choice: Option<&ResponsesToolChoice>,
     has_tool_output: bool,
-) {
+) -> Result<(), Error> {
     if tools.is_empty()
         || matches!(
             choice,
             Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::None))
         )
     {
-        return;
+        return Ok(());
     }
     let definitions = serde_json::to_string(tools).expect("tool definitions serialize");
     let mut instructions = format!(
@@ -2192,12 +2191,7 @@ fn append_tool_instructions(
              do not repeat a completed call.",
         );
     }
-    const GENERATION_SUFFIX: &str = "<end_of_turn>\n<start_of_turn>model\n";
-    if let Some(position) = prompt.rfind(GENERATION_SUFFIX) {
-        prompt.insert_str(position, &instructions);
-    } else {
-        prompt.push_str(&instructions);
-    }
+    prompt::insert_generation_instructions(family, prompt, &instructions)
 }
 
 fn validate_controls(
@@ -2912,7 +2906,11 @@ async fn responses(
                             "arguments": serde_json::from_str::<Value>(&arguments)
                                 .unwrap_or(Value::String(arguments)),
                         });
-                        prompt.push_str(&format!("{call}<end_of_turn>\n"));
+                        prompt::append_assistant_content(
+                            &model.family,
+                            &mut prompt,
+                            &call.to_string(),
+                        )?;
                     }
                     ResponsesInputItem::Message { role, content } => {
                         let raw_text = match &content {
@@ -2977,9 +2975,17 @@ async fn responses(
                             call_id: call_id.clone(),
                             output: output.clone(),
                         });
-                        prompt.push_str(&format!(
-                            "<start_of_turn>user\nTool result for {call_id}: {output}<end_of_turn>\n<start_of_turn>model\n"
-                        ));
+                        let rendered = lower_messages(
+                            &model.family,
+                            vec![ChatMessage {
+                                role: "user".into(),
+                                content: ChatContent::Text(format!(
+                                    "Tool result for {call_id}: {output}"
+                                )),
+                            }],
+                            s.vision_config(),
+                        )?;
+                        prompt::append_rendered(&model.family, &mut prompt, &rendered)?;
                     }
                 }
             }
@@ -2998,11 +3004,12 @@ async fn responses(
         )
     });
     append_tool_instructions(
+        &model.family,
         &mut prompt,
         &r.tools,
         r.tool_choice.as_ref(),
         has_tool_output,
-    );
+    )?;
     let response_options = ResponseRequestOptions {
         store: r.store,
         previous_response_id: r.previous_response_id,
@@ -4807,6 +4814,7 @@ mod tests {
         )
         .unwrap();
         append_tool_instructions(
+            "gemma4",
             &mut prompt,
             &[ToolDefinition::Flat(FlatToolDefinition {
                 r#type: "function".into(),
@@ -4820,7 +4828,8 @@ mod tests {
                 name: "lookup".into(),
             }),
             false,
-        );
+        )
+        .unwrap();
         assert!(
             prompt.contains(
                 "You must call the `lookup` function.<end_of_turn>\n<start_of_turn>model\n"
@@ -4834,6 +4843,7 @@ mod tests {
              <start_of_turn>model\n"
             .to_string();
         append_tool_instructions(
+            "gemma4",
             &mut prompt,
             &[ToolDefinition::Flat(FlatToolDefinition {
                 r#type: "function".into(),
@@ -4844,7 +4854,8 @@ mod tests {
             })],
             None,
             true,
-        );
+        )
+        .unwrap();
         assert!(
             prompt.contains(
                 "Use it to answer the user; do not repeat a completed call.<end_of_turn>"
