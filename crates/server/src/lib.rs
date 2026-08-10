@@ -1512,7 +1512,8 @@ impl Server {
         req: InferRequest,
     ) -> Result<(InferResponse, Vec<StreamEvent>), Error> {
         let stops = self.effective_stop_sequences(&req)?;
-        let frontier = GenerationFrontier::new(&stops, req.raw_continuation).map_err(state_err)?;
+        let frontier =
+            GenerationFrontier::new_effective(&stops, req.raw_continuation).map_err(state_err)?;
         let successor_id = req.context_id.clone().unwrap_or_else(ContextId::new);
         let execution_session_id = req.scheduling.inference_id.clone();
         let mut events = vec![StreamEvent::Started {
@@ -1537,7 +1538,8 @@ impl Server {
         admission: AdmissionGuard,
     ) -> Result<(StreamEvent, tokio::sync::mpsc::Receiver<StreamEvent>), Error> {
         let stops = self.effective_stop_sequences(&req)?;
-        let frontier = GenerationFrontier::new(&stops, req.raw_continuation).map_err(state_err)?;
+        let frontier =
+            GenerationFrontier::new_effective(&stops, req.raw_continuation).map_err(state_err)?;
         let successor_id = req.context_id.clone().unwrap_or_else(ContextId::new);
         let started = StreamEvent::Started {
             request_id: request_id.clone(),

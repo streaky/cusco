@@ -47,8 +47,23 @@ pub struct GenerationFrontier {
 
 impl GenerationFrontier {
     pub fn new(stops: &[String], raw_continuation: bool) -> Result<Self, &'static str> {
-        if stops.len() > MAX_EFFECTIVE_STOP_SEQUENCES {
-            return Err("at most seven effective stop sequences are supported");
+        Self::with_limit(stops, raw_continuation, MAX_STOP_SEQUENCES)
+    }
+
+    pub(crate) fn new_effective(
+        stops: &[String],
+        raw_continuation: bool,
+    ) -> Result<Self, &'static str> {
+        Self::with_limit(stops, raw_continuation, MAX_EFFECTIVE_STOP_SEQUENCES)
+    }
+
+    fn with_limit(
+        stops: &[String],
+        raw_continuation: bool,
+        limit: usize,
+    ) -> Result<Self, &'static str> {
+        if stops.len() > limit {
+            return Err("too many stop sequences");
         }
         if stops
             .iter()
@@ -308,7 +323,9 @@ mod tests {
 
     #[test]
     fn validates_stop_bounds_and_flushes_possible_suffix_at_length() {
-        assert!(GenerationFrontier::new(&vec!["x".into(); 7], false).is_err());
+        assert!(GenerationFrontier::new(&vec!["x".into(); 5], false).is_err());
+        assert!(GenerationFrontier::new_effective(&vec!["x".into(); 7], false).is_ok());
+        assert!(GenerationFrontier::new_effective(&vec!["x".into(); 8], false).is_err());
         assert!(GenerationFrontier::new(&[String::new()], false).is_err());
         assert!(GenerationFrontier::new(&["x".repeat(257)], false).is_err());
         let (result, _) = run(&[(b"possible ST", false)], &["STOP"], false);
