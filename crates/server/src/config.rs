@@ -101,7 +101,7 @@ pub struct DaemonConfig {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenApiConfig {
-    #[serde(default)]
+    #[serde(default, alias = "ui")]
     pub docs_ui: OpenApiDocsUiConfig,
 }
 
@@ -283,6 +283,12 @@ mod tests {
     fn rejects_unknown_configuration_fields() {
         let yaml = "version: 1\nlisten: 127.0.0.1:8080\npaths: {database: db, models: models, spill: spill, user_models: local, user_config: user.yaml}\nexecution: {device_capacity: '1 GiB', host_capacity: '1 GiB', storage_capacity: '2 GiB', context_reserve: '1 GiB', surprise: true}\n";
         assert!(serde_yaml::from_str::<DaemonConfig>(yaml).is_err());
+    }
+
+    #[test]
+    fn accepts_legacy_openapi_ui_name() {
+        let config: OpenApiConfig = serde_yaml::from_str("ui:\n  enabled: true\n").unwrap();
+        assert!(config.docs_ui.enabled);
     }
     fn valid() -> DaemonConfig {
         DaemonConfig {
