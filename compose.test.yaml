@@ -201,6 +201,7 @@ services:
       CANDIDATE_API_KEY: "${CUSCO_OAI_LENS_TOKEN:-smoke-report-token}"
     volumes:
       - ./config/oai-lens.yaml:/config/oai-lens.yaml:ro
+      - ./.tools/oai-lens/fixtures:/app/.venv/lib/python3.12/site-packages/fixtures:ro
       - ./config/oai-lens-expectations.json:/cusco/config/oai-lens-expectations.json:ro
       - ./oai-lens-version.txt:/cusco/oai-lens-version.txt:ro
       - ./tools/oai-lens-gate.py:/cusco/tools/oai-lens-gate.py:ro
