@@ -1,0 +1,147 @@
+# Cusco daemon configuration. Copy this file to ./config.yaml before running
+# Docker Compose, then adjust capacities and paths for the host.
+
+# Configuration schema version. Cusco rejects unsupported versions instead of
+# guessing how an older or newer file should behave.
+version: 1
+
+# Address and port inside the container. The production Compose file publishes
+# this container port through CUSCO_LISTEN_ADDRESS and CUSCO_PORT.
+listen: 0.0.0.0:8080
+
+# Permit unauthenticated access on a non-loopback listener. Leave this false for
+# normal deployments; setting it true deliberately disables the public-listener
+# authentication safety check.
+unsafe_public_unauthenticated: false
+
+# Optional bearer token. Prefer the CUSCO_BEARER_TOKEN environment variable so
+# credentials do not live in this file. A non-null value here is used when the
+# environment does not provide an override.
+bearer_token: null
+
+# HTTP diagnostic logging: off, safe, or full. "safe" records privacy-preserving
+# transport metadata. "full" may expose headers, query values, credentials, and
+# request or response bodies, so enable it only in a controlled environment.
+http_debug: off
+
+openapi:
+  docs_ui:
+    # Serve interactive API documentation backed by the generated OpenAPI
+    # document. This is a documentation browser, not a general-purpose web UI.
+    enabled: false
+
+paths:
+  # SQLite catalog for persistent model identity, aliases, and lifecycle records.
+  database: /data/db/catalog.sqlite
+  # Persistent model registry and immutable Hugging Face artifact cache.
+  models: /data/models
+  # Persistent storage-tier spill area for physical context representations.
+  spill: /data/spill
+  # Read-only directory containing operator-managed local model files.
+  user_models: /data/user-models
+  # Operator-managed declarations for models imported at daemon startup.
+  user_config: /data/user.yaml
+
+execution:
+  # Maximum model and context bytes admitted to GPU/device memory. Set this below
+  # physical VRAM to leave headroom for CUDA, graphs, and transient allocations.
+  device_capacity: 10 GiB
+  # Maximum model and context bytes admitted to system memory.
+  host_capacity: 32 GiB
+  # Maximum bytes admitted to the persistent storage tier.
+  storage_capacity: 64 GiB
+  # Storage capacity reserved for contexts so model artifacts cannot consume the
+  # entire storage budget and prevent context spill or continuation.
+  context_reserve: 4 GiB
+  # Native context window allocated per resident model. This is the hard token
+  # ceiling before request-tied compaction; larger values consume more KV memory.
+  context_tokens: 32768
+  # Maximum model layers requested for GPU offload. This is an absolute,
+  # model-relative cap, not a percentage: values above a model's layer count
+  # effectively request full offload, while deeper models may still be partial.
+  gpu_layers: 99
+  # Require the executor's current "competent" operating point, which presently
+  # means requesting every model layer on the GPU. Leave this false to permit
+  # supported CPU-only and hybrid CPU/GPU execution; capacity limits still apply.
+  require_competent: false
+
+server:
+  # Maximum requests admitted to active execution across the daemon.
+  active_requests: 16
+  # Maximum number of requests waiting in the bounded admission queue.
+  queue_count: 256
+  # Aggregate byte budget for all queued request bodies.
+  queue_bytes: 268435456 # 256 MiB
+  # Maximum decoded request-body size for one request.
+  request_bytes: 33554432 # 32 MiB
+  # Maximum concurrent requests performing work before bounded queue admission.
+  pre_queue_concurrency: 64
+  # Output-token limit used when an adapter omits max_tokens/max_output_tokens.
+  # Agentic clients may legitimately need long reasoning and tool-call turns, so
+  # a small default can truncate otherwise healthy work. Conversely, some agents
+  # omit a limit and can continue generating without a useful stopping bound, as
+  # seen with Codex-style API workloads. Keep this finite, size it for the longest
+  # trusted workload, and require callers to send an explicit per-request limit
+  # when tighter cost or latency control is needed.
+  default_output_tokens: 16384
+  # Maximum aggregate HTTP request-header bytes.
+  header_bytes: 65536 # 64 KiB
+  # Maximum time allowed to receive a request body.
+  body_timeout_ms: 30000
+  # End-to-end deadline from admission through completion, including queue time.
+  wall_time_ms: 600000
+  # Maximum time spent actively executing after queue admission.
+  active_time_ms: 480000
+  # Per-stream event buffer. A full buffer applies backpressure rather than
+  # allowing an unbounded slow-client queue.
+  stream_buffer: 64
+  # Grace period for in-flight work during daemon shutdown.
+  shutdown_grace_ms: 60000
+  # Enable request-tied context compaction when the native context ceiling would
+  # otherwise be exceeded. Compaction deliberately rewrites retained context and
+  # can change model behavior, so the conservative default is off; enable it only
+  # after selecting and validating a strategy against representative workloads.
+  compaction_enabled: false
+  # Concurrent workers allowed to prepare compaction operations.
+  compaction_workers: 4
+  # Maximum live client-created compaction declarations.
+  compaction_declarations: 1024
+  # Per-principal rate limit for creating compaction declarations.
+  compaction_declaration_rate_per_minute: 120
+  # Lifetime of a compaction declaration before it expires.
+  compaction_declaration_lifetime_ms: 3600000
+
+scheduler:
+  # Scheduler policy schema version.
+  version: 1
+  # Relative deficit-round-robin service weight for latency-sensitive traffic.
+  interactive_weight: 4
+  # Relative service weight for ordinary inference traffic.
+  standard_weight: 2
+  # Relative service weight for throughput-oriented batch traffic.
+  batch_weight: 1
+  # Deficit credits added to runnable principals during each refill round.
+  deficit_refill: 1
+  # Maximum prefill tokens executed in one scheduler quantum.
+  prefill_tokens: 64
+  # Waiting rounds before monotonically promoting work to prevent starvation.
+  promotion_rounds: 64
+  # Number of recent scheduler diagnostic events retained in memory.
+  diagnostic_capacity: 4096
+
+vision:
+  # Maximum images admitted by one request.
+  max_images: 8
+  # Maximum combined size of encoded image payloads in one request.
+  max_encoded_bytes: 33554432 # 32 MiB
+  # Maximum combined decoded image bytes in one request.
+  max_decoded_bytes: 25165824 # 24 MiB
+  # Maximum width or height of any admitted image.
+  max_dimension: 8192
+  # Maximum combined pixel count across all images in one request.
+  max_total_pixels: 64000000
+  # Process-wide byte budget for retained, content-addressed decoded images.
+  retention_capacity: 1 GiB
+  # Image metadata keys retained after decoding. The empty list strips all
+  # optional metadata, minimizing privacy exposure and cache variability.
+  metadata_allowlist: []

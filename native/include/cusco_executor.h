@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define CUSCO_EXECUTOR_ABI_VERSION 9u
+#define CUSCO_EXECUTOR_ABI_VERSION 14u
 
 typedef struct cusco_executor cusco_executor;
 typedef struct cusco_representation cusco_representation;
@@ -25,10 +25,12 @@ typedef struct {
     int32_t n_vocab;
     uint32_t has_mapped_execution;
     uint32_t max_mappings;
+    uint32_t training_context_tokens;
 } cusco_capabilities;
 
-/* Executor-reported operating point selected at open. Byte counts are the
- * conservative capacity envelope used by the Rust residency scheduler. */
+/* Executor-reported operating point selected at open. Device bytes are the
+ * observed accelerator allocation delta across model and context creation;
+ * host bytes remain a conservative capacity envelope. */
 typedef struct {
     uint64_t model_bytes;
     uint64_t context_bytes;
@@ -42,6 +44,8 @@ typedef struct {
     float temperature;
     float top_p;
     uint32_t seed;
+    /* Optional UTF-8 GBNF grammar. NULL selects unconstrained sampling. */
+    const char * grammar;
 } cusco_sampler_config;
 
 
@@ -69,6 +73,10 @@ cusco_status cusco_executor_open(const char *, uint32_t, int32_t, cusco_executor
 void cusco_executor_close(cusco_executor *);
 cusco_capabilities cusco_executor_capabilities(const cusco_executor *);
 cusco_operating_point cusco_executor_operating_point(const cusco_executor *);
+/* Returns the GGUF general.architecture value reported by llama.cpp. On
+ * CUSCO_BUFFER_TOO_SMALL, size receives the required capacity. */
+cusco_status cusco_executor_model_architecture(
+    const cusco_executor *, char * buffer, size_t capacity, size_t * size);
 
 /* On success, tokens receives a uniquely owned allocation (or NULL when count is
  * zero). Release it exactly once with cusco_executor_tokens_free. */
@@ -78,13 +86,16 @@ void cusco_executor_tokens_free(int32_t * tokens);
  * CUSCO_BUFFER_TOO_SMALL, size receives the required capacity. */
 cusco_status cusco_executor_render_token(
     cusco_executor *, int32_t token, uint8_t * buffer, size_t capacity, size_t * size);
+/* Returns nonzero when token is model-vocabulary end-of-generation. */
+uint32_t cusco_executor_token_is_eog(const cusco_executor *, int32_t token);
 
 /* A sampler is request-owned and tied to the executor that created it. A
  * non-positive temperature selects exact greedy sampling. */
 cusco_status cusco_sampler_create(
     cusco_executor *, const cusco_sampler_config *, cusco_sampler ** out);
 void cusco_sampler_free(cusco_sampler *);
-cusco_status cusco_sampler_sample(cusco_sampler *, cusco_executor *, int32_t * token);
+cusco_status cusco_sampler_sample(
+    cusco_sampler *, const float * logits, size_t logits_len, int32_t * token);
 /* Mutates executor state. Input tokens are borrowed for the duration of the call. */
 cusco_status cusco_executor_decode(cusco_executor *, const int32_t *, size_t, cusco_decode_result *);
 

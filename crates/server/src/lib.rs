@@ -32,12 +32,16 @@ use uuid::Uuid;
 mod catalog;
 mod config;
 mod context_strategy;
+mod context_updates;
 mod generation;
 mod lifecycle;
 mod mapped;
 mod prompt;
 mod residency;
+pub mod response_store;
+pub mod responses;
 mod scheduler;
+mod structured;
 mod vision;
 pub use catalog::{ModelCatalog, load_user_models};
 pub use config::{DaemonConfig, OpenApiConfig, VisionConfig};
@@ -188,6 +192,8 @@ pub struct InferRequest {
     pub compaction: Option<CompactionRequest>,
     #[serde(skip, default)]
     pub sampling: SamplingConfig,
+    #[serde(skip, default)]
+    pub grammar: Option<String>,
     #[serde(skip, default)]
     pub scheduling: SchedulingMetadata,
 }
@@ -545,6 +551,8 @@ pub enum Error {
     BodyTimeout,
     #[error("invalid request: {0}")]
     BadRequest(String),
+    #[error("lineage conflict: {0}")]
+    Conflict(String),
     #[error("unsafe unauthenticated listener: {0}")]
     UnsafeListener(SocketAddr),
     #[error("state error: {0}")]
@@ -565,6 +573,7 @@ impl Error {
             Self::HeadersTooLarge => "headers_too_large",
             Self::BodyTimeout => "body_timeout",
             Self::BadRequest(_) => "invalid_request",
+            Self::Conflict(_) => "lineage_conflict",
             Self::UnsafeListener(_) => "unsafe_listener",
             Self::State(_) => "state_error",
         }
@@ -578,6 +587,7 @@ impl IntoResponse for Error {
             Self::ModelNotFound(_) | Self::ContextNotFound => StatusCode::NOT_FOUND,
             Self::Deadline | Self::BodyTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::Cancelled | Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Busy => StatusCode::TOO_MANY_REQUESTS,
             Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -746,6 +756,7 @@ pub struct EngineRequest {
     pub max_tokens: usize,
     pub prior_tokens: Vec<i32>,
     pub sampling: SamplingConfig,
+    pub grammar: Option<String>,
     pub control: Arc<RequestControl>,
     pub scheduling: SchedulingMetadata,
     pub prefill_chunk_tokens: usize,
@@ -1080,6 +1091,7 @@ pub struct Server {
     lifecycle: lifecycle::ModelLifecycleService,
     vision: Arc<Mutex<VisionConfig>>,
     openapi: Arc<Mutex<OpenApiConfig>>,
+    response_service: responses::ResponseService,
 }
 struct AdmissionGuard {
     server: Server,
@@ -1099,11 +1111,14 @@ impl Drop for AdmissionGuard {
 }
 impl Server {
     pub fn open(
-        _path: impl AsRef<Path>,
+        path: impl AsRef<Path>,
         auth: Arc<dyn AuthProvider>,
         engine: Arc<dyn InferenceEngine>,
     ) -> Result<Self, Error> {
         let config = ServerConfig::default();
+        let state_root = path.as_ref().parent().unwrap_or_else(|| Path::new("."));
+        let response_store = response_store::FileResponseResourceStore::open(state_root)
+            .map_err(|error| Error::State(error.to_string()))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 durable: RuntimeState {
@@ -1130,6 +1145,7 @@ impl Server {
             engine,
             vision: Arc::new(Mutex::new(VisionConfig::default())),
             openapi: Arc::new(Mutex::new(OpenApiConfig::default())),
+            response_service: responses::ResponseService::new(Arc::new(response_store)),
         })
     }
     pub fn attach_catalog(&self, catalog: ModelCatalog, model_directory: impl Into<PathBuf>) {
@@ -1145,8 +1161,8 @@ impl Server {
     pub fn configure_openapi(&self, config: OpenApiConfig) {
         *self.openapi.lock() = config;
     }
-    fn openapi_ui_enabled(&self) -> bool {
-        self.openapi.lock().ui.enabled
+    fn api_docs_ui_enabled(&self) -> bool {
+        self.openapi.lock().docs_ui.enabled
     }
     fn vision_config(&self) -> VisionConfig {
         self.vision.lock().clone()
@@ -1378,8 +1394,10 @@ impl Server {
     fn effective_stop_sequences(&self, req: &InferRequest) -> Result<Vec<String>, Error> {
         let mut stops = req.stop.clone();
         let model = self.model(&req.model)?;
-        if model.family == "gemma4" && !stops.iter().any(|stop| stop == "<end_of_turn>") {
-            stops.push("<end_of_turn>".into());
+        for marker in prompt::terminal_markers(&model.family) {
+            if !stops.iter().any(|stop| stop == marker) {
+                stops.push((*marker).into());
+            }
         }
         Ok(stops)
     }
@@ -1494,7 +1512,8 @@ impl Server {
         req: InferRequest,
     ) -> Result<(InferResponse, Vec<StreamEvent>), Error> {
         let stops = self.effective_stop_sequences(&req)?;
-        let frontier = GenerationFrontier::new(&stops, req.raw_continuation).map_err(state_err)?;
+        let frontier =
+            GenerationFrontier::new_effective(&stops, req.raw_continuation).map_err(state_err)?;
         let successor_id = req.context_id.clone().unwrap_or_else(ContextId::new);
         let execution_session_id = req.scheduling.inference_id.clone();
         let mut events = vec![StreamEvent::Started {
@@ -1519,7 +1538,8 @@ impl Server {
         admission: AdmissionGuard,
     ) -> Result<(StreamEvent, tokio::sync::mpsc::Receiver<StreamEvent>), Error> {
         let stops = self.effective_stop_sequences(&req)?;
-        let frontier = GenerationFrontier::new(&stops, req.raw_continuation).map_err(state_err)?;
+        let frontier =
+            GenerationFrontier::new_effective(&stops, req.raw_continuation).map_err(state_err)?;
         let successor_id = req.context_id.clone().unwrap_or_else(ContextId::new);
         let started = StreamEvent::Started {
             request_id: request_id.clone(),
@@ -1789,30 +1809,33 @@ impl Server {
                 )
                 .map_err(Error::BadRequest)?;
                 control.check()?;
-                let prepared = self.engine.generate(
-                    EngineRequest {
-                        model: model.clone(),
-                        prompt: proposal.resulting_tokens.join(" "),
-                        max_tokens: 0,
-                        prior_tokens: Vec::new(),
-                        sampling: req.sampling,
-                        control: control.clone(),
-                        scheduling: req.scheduling.clone(),
-                        prefill_chunk_tokens: 32,
-                    },
-                    &mut |_, _, _| {
-                        Err(Error::State(
-                            "compaction preparation unexpectedly generated output".into(),
-                        ))
-                    },
-                )?;
-                control.check()?;
                 let mut result = proposal.result;
                 result.selected_strategy_id = Some(deterministic_strategy_id(&selected));
                 result.resulting_context_epoch = source.revision.saturating_add(1);
+                if proposal.resulting_tokens != logical_context_tokens {
+                    let prepared = self.engine.generate(
+                        EngineRequest {
+                            model: model.clone(),
+                            prompt: proposal.resulting_tokens.join(" "),
+                            max_tokens: 0,
+                            prior_tokens: Vec::new(),
+                            sampling: req.sampling,
+                            grammar: req.grammar.clone(),
+                            control: control.clone(),
+                            scheduling: req.scheduling.clone(),
+                            prefill_chunk_tokens: 32,
+                        },
+                        &mut |_, _, _| {
+                            Err(Error::State(
+                                "compaction preparation unexpectedly generated output".into(),
+                            ))
+                        },
+                    )?;
+                    control.check()?;
+                    logical_context_tokens = proposal.resulting_tokens;
+                    prior_tokens = prepared.successor_tokens;
+                }
                 compaction_result = Some(result);
-                logical_context_tokens = proposal.resulting_tokens;
-                prior_tokens = prepared.successor_tokens;
             }
         }
         let mut delta_index = 0;
@@ -1823,6 +1846,7 @@ impl Server {
                 max_tokens: req.max_tokens,
                 prior_tokens,
                 sampling: req.sampling,
+                grammar: req.grammar,
                 control: control.clone(),
                 scheduling: req.scheduling.clone(),
                 prefill_chunk_tokens: 32,
@@ -2041,33 +2065,67 @@ enum ReasoningEffort {
     High,
     Max,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResponseFormat {
     r#type: String,
+    #[serde(default)]
+    json_schema: Option<JsonSchemaDefinition>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonSchemaDefinition {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    schema: Value,
+    #[serde(default)]
+    strict: bool,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesTextConfig {
+    format: ResponsesTextFormat,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesTextFormat {
+    r#type: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    schema: Option<Value>,
+    #[serde(default)]
+    strict: bool,
+}
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FunctionTool {
     name: String,
     description: Option<String>,
     parameters: Value,
+    #[serde(default)]
+    strict: bool,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct NestedToolDefinition {
     r#type: String,
     function: FunctionTool,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FlatToolDefinition {
     r#type: String,
     name: String,
     description: Option<String>,
     parameters: Value,
+    #[serde(default)]
+    strict: bool,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 enum ToolDefinition {
     Nested(NestedToolDefinition),
@@ -2078,16 +2136,64 @@ impl ToolDefinition {
     fn valid_function(&self) -> bool {
         match self {
             Self::Nested(tool) => {
+                let _ = tool.function.strict;
                 tool.r#type == "function"
                     && !tool.function.name.is_empty()
                     && tool.function.parameters.is_object()
             }
             Self::Flat(tool) => {
-                let _ = &tool.description;
+                let _ = (&tool.description, tool.strict);
                 tool.r#type == "function" && !tool.name.is_empty() && tool.parameters.is_object()
             }
         }
     }
+}
+fn tool_names(tools: &[ToolDefinition]) -> Vec<String> {
+    tools
+        .iter()
+        .map(|tool| match tool {
+            ToolDefinition::Nested(tool) => tool.function.name.clone(),
+            ToolDefinition::Flat(tool) => tool.name.clone(),
+        })
+        .collect()
+}
+
+fn append_tool_instructions(
+    family: &str,
+    prompt: &mut String,
+    tools: &[ToolDefinition],
+    choice: Option<&ResponsesToolChoice>,
+    has_tool_output: bool,
+) -> Result<(), Error> {
+    if tools.is_empty()
+        || matches!(
+            choice,
+            Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::None))
+        )
+    {
+        return Ok(());
+    }
+    let definitions = serde_json::to_string(tools).expect("tool definitions serialize");
+    let mut instructions = format!(
+        "\n\nAvailable tools: {definitions}\nWhen calling a tool, output only JSON in the form \
+         {{\"name\":\"function_name\",\"arguments\":{{...}}}}."
+    );
+    match choice {
+        Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required)) => {
+            instructions.push_str(" You must call a tool.");
+        }
+        Some(ResponsesToolChoice::Function { name, .. }) => {
+            instructions.push_str(&format!(" You must call the `{name}` function."));
+        }
+        _ => {}
+    }
+    if has_tool_output {
+        instructions.push_str(
+            " A tool result is already provided above. Use it to answer the user; \
+             do not repeat a completed call.",
+        );
+    }
+    prompt::insert_generation_instructions(family, prompt, &instructions)
 }
 
 fn validate_controls(
@@ -2116,14 +2222,14 @@ fn validate_controls(
                 let _ = &tool.function.description;
             }
         }
-        return Err(Error::BadRequest(
-            "unsupported_capability: selected model profile does not advertise tool calling".into(),
-        ));
     }
-    if response_format.is_some_and(|format| format.r#type != "text") {
-        return Err(Error::BadRequest(
-            "unsupported_capability: structured output requires grammar support".into(),
-        ));
+    if response_format.is_some_and(|format| {
+        !matches!(
+            format.r#type.as_str(),
+            "text" | "json_object" | "json_schema"
+        )
+    }) {
+        return Err(Error::BadRequest("unsupported response_format type".into()));
     }
     if reasoning.is_some_and(|effort| !matches!(effort, ReasoningEffort::None)) {
         return Err(Error::BadRequest(
@@ -2131,6 +2237,53 @@ fn validate_controls(
         ));
     }
     Ok(())
+}
+fn response_format_grammar(format: Option<&ResponseFormat>) -> Result<Option<String>, Error> {
+    let Some(format) = format else {
+        return Ok(None);
+    };
+    match format.r#type.as_str() {
+        "text" => Ok(None),
+        "json_object" => Ok(Some(structured::json_grammar())),
+        "json_schema" => {
+            let definition = format.json_schema.as_ref().ok_or_else(|| {
+                Error::BadRequest("response_format.json_schema is required".into())
+            })?;
+            let _ = (&definition.name, &definition.description, definition.strict);
+            structured::schema_grammar(&definition.schema)
+                .map(structured::finish_schema_grammar)
+                .map(Some)
+                .map_err(|error| Error::BadRequest(error.to_string()))
+        }
+        _ => Err(Error::BadRequest("unsupported response_format type".into())),
+    }
+}
+
+fn responses_text_grammar(text: Option<&ResponsesTextConfig>) -> Result<Option<String>, Error> {
+    let Some(format) = text.map(|text| &text.format) else {
+        return Ok(None);
+    };
+    match format.r#type.as_str() {
+        "text" => Ok(None),
+        "json_object" => Ok(Some(structured::json_grammar())),
+        "json_schema" => {
+            let schema = format
+                .schema
+                .as_ref()
+                .ok_or_else(|| Error::BadRequest("text.format.schema is required".into()))?;
+            if format.name.as_deref().is_none_or(str::is_empty) {
+                return Err(Error::BadRequest(
+                    "text.format.name is required for json_schema".into(),
+                ));
+            }
+            let _ = (&format.description, format.strict);
+            structured::schema_grammar(schema)
+                .map(structured::finish_schema_grammar)
+                .map(Some)
+                .map_err(|error| Error::BadRequest(error.to_string()))
+        }
+        _ => Err(Error::BadRequest("unsupported text.format type".into())),
+    }
 }
 fn sampling_config(
     temperature: Option<f32>,
@@ -2192,9 +2345,6 @@ struct ChatMessage {
 fn default_user_role() -> String {
     "user".into()
 }
-fn default_message_type() -> String {
-    "message".into()
-}
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ChatContent {
@@ -2234,6 +2384,7 @@ fn lower_messages(
                 for part in parts {
                     match part {
                         ContentPart::Text { text: part } => text.push_str(&part),
+
                         ContentPart::ImageUrl { image_url } => {
                             if message.role != "user" {
                                 return Err(Error::BadRequest(
@@ -2259,6 +2410,19 @@ fn lower_messages(
     }
     prompt::apply_chat_template(family, normalized)
 }
+fn flush_response_messages(
+    prompt: &mut String,
+    family: &str,
+    messages: &mut Vec<ChatMessage>,
+    vision: VisionConfig,
+) -> Result<(), Error> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let rendered = lower_messages(family, std::mem::take(messages), vision)?;
+    prompt::append_rendered(family, prompt, &rendered)?;
+    Ok(())
+}
 pub fn router(server: Server) -> Router {
     routes(server)
 }
@@ -2273,10 +2437,16 @@ fn routes(server: Server) -> Router {
     let app = Router::new()
         .route("/openai/v1/openapi.json", get(openapi))
         .route("/cusco/v1/openapi.json", get(openapi))
+        .route("/cusco/v1/capabilities", get(capabilities))
+        .route("/cusco/v1/context-updates", post(context_update))
         .route("/openai/v1/completions", post(completion))
         .route("/openai/v1/chat/completions", post(chat))
         .route("/openai/v1/models", get(list_models))
         .route("/openai/v1/responses", post(responses))
+        .route(
+            "/openai/v1/responses/{id}",
+            get(get_response).delete(delete_response),
+        )
         .route("/cusco/v1/api/version", get(ollama_version))
         .route("/cusco/v1/api/tags", get(ollama_tags))
         .route("/cusco/v1/api/show", post(ollama_show))
@@ -2308,7 +2478,7 @@ fn routes(server: Server) -> Router {
             delete(revoke_compaction_declaration),
         )
         .route("/cusco/v1/contexts/{id}/branches", post(branch_context));
-    let app = if server.openapi_ui_enabled() {
+    let app = if server.api_docs_ui_enabled() {
         app.route("/openapi/ui", get(swagger_ui))
     } else {
         app
@@ -2460,6 +2630,7 @@ async fn completion(
         prompt: r.prompt,
         max_tokens: r.max_tokens,
         sampling,
+        grammar: None,
         compaction: r.compaction,
         include_usage,
         streaming: r.stream,
@@ -2471,6 +2642,7 @@ async fn completion(
         request_id: request_context.request_id,
         principal: request_context.principal,
         protocol: WireProtocol::Completion,
+        responses: None,
     })
     .await
 }
@@ -2492,6 +2664,7 @@ async fn chat(
         r.reasoning_effort.as_ref(),
     )?;
     let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
+    let grammar = response_format_grammar(r.response_format.as_ref())?;
     let include_usage = r
         .stream_options
         .as_ref()
@@ -2504,6 +2677,7 @@ async fn chat(
         prompt,
         max_tokens: r.max_tokens,
         sampling,
+        grammar,
         compaction: r.compaction,
         include_usage,
         streaming: r.stream,
@@ -2515,6 +2689,7 @@ async fn chat(
         request_id: request_context.request_id,
         principal: request_context.principal,
         protocol: WireProtocol::Chat,
+        responses: None,
     })
     .await
 }
@@ -2527,13 +2702,22 @@ enum ResponsesInput {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ResponsesInputItem {
-    #[serde(default = "default_message_type")]
-    r#type: String,
-    #[serde(default = "default_user_role")]
-    role: String,
-    content: ResponsesContent,
+#[serde(untagged)]
+enum ResponsesInputItem {
+    Message {
+        #[serde(default = "default_user_role")]
+        role: String,
+        content: ResponsesContent,
+    },
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+    },
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -2546,8 +2730,103 @@ enum ResponsesContent {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ResponsesContentPart {
-    InputText { text: String },
-    InputImage { image_url: String },
+    InputText {
+        text: String,
+    },
+    OutputText {
+        text: String,
+    },
+    InputImage {
+        image_url: String,
+        #[serde(default, rename = "detail")]
+        _detail: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ResponsesToolChoiceMode {
+    Auto,
+    None,
+    Required,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+enum ResponsesToolChoice {
+    Mode(ResponsesToolChoiceMode),
+    Function { r#type: String, name: String },
+}
+impl<'de> Deserialize<'de> for ResponsesToolChoice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::String(mode) => match mode.as_str() {
+                "auto" => Ok(Self::Mode(ResponsesToolChoiceMode::Auto)),
+                "none" => Ok(Self::Mode(ResponsesToolChoiceMode::None)),
+                "required" => Ok(Self::Mode(ResponsesToolChoiceMode::Required)),
+                _ => Err(serde::de::Error::custom(format!(
+                    "unsupported tool_choice mode `{mode}`; supported modes are `auto`, `none`, and `required`"
+                ))),
+            },
+            Value::Object(mut fields) => {
+                let r#type = fields
+                    .remove("type")
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "tool_choice object requires a string `type` field",
+                        )
+                    })?;
+                let name = fields
+                    .remove("name")
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "tool_choice object requires a string `name` field",
+                        )
+                    })?;
+                if let Some(field) = fields.keys().next() {
+                    return Err(serde::de::Error::custom(format!(
+                        "tool_choice object contains unsupported field `{field}`"
+                    )));
+                }
+                Ok(Self::Function { r#type, name })
+            }
+            _ => Err(serde::de::Error::custom(
+                "tool_choice must be `auto`, `none`, `required`, or a function choice object",
+            )),
+        }
+    }
+}
+
+impl ResponsesToolChoice {
+    fn validate(&self, tools: &[ToolDefinition]) -> Result<(), Error> {
+        match self {
+            Self::Mode(ResponsesToolChoiceMode::Auto | ResponsesToolChoiceMode::None) => Ok(()),
+            Self::Mode(ResponsesToolChoiceMode::Required) if tools.is_empty() => Err(
+                Error::BadRequest("tool_choice `required` requires at least one tool".into()),
+            ),
+            Self::Mode(ResponsesToolChoiceMode::Required) => Ok(()),
+            Self::Function { r#type, .. } if r#type != "function" => Err(Error::BadRequest(
+                format!("unsupported tool_choice type `{type}`; only `function` is supported"),
+            )),
+            Self::Function { name, .. } if name.is_empty() => Err(Error::BadRequest(
+                "tool_choice function name must not be empty".into(),
+            )),
+            Self::Function { name, .. }
+                if tool_names(tools).iter().any(|candidate| candidate == name) =>
+            {
+                Ok(())
+            }
+            Self::Function { name, .. } => Err(Error::BadRequest(format!(
+                "tool_choice references undeclared function `{name}`"
+            ))),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2555,8 +2834,10 @@ enum ResponsesContentPart {
 struct ResponsesRequest {
     model: String,
     input: ResponsesInput,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     store: bool,
+    #[serde(default)]
+    previous_response_id: Option<String>,
     max_output_tokens: Option<usize>,
     #[serde(default)]
     compaction: Option<CompactionRequest>,
@@ -2573,7 +2854,11 @@ struct ResponsesRequest {
     #[serde(default)]
     response_format: Option<ResponseFormat>,
     #[serde(default)]
+    text: Option<ResponsesTextConfig>,
+    #[serde(default)]
     reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    tool_choice: Option<ResponsesToolChoice>,
 }
 async fn responses(
     State(s): State<Server>,
@@ -2585,12 +2870,6 @@ async fn responses(
     }: PrequeueJson<ResponsesRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
-    if r.store {
-        return Err(Error::BadRequest(
-            "`store: true` is unsupported; Cusco only supports stateless Responses with `store: false`"
-                .into(),
-        ));
-    }
     validate_controls(
         r.temperature,
         r.top_p,
@@ -2598,51 +2877,217 @@ async fn responses(
         r.response_format.as_ref(),
         r.reasoning_effort.as_ref(),
     )?;
+    if let Some(tool_choice) = &r.tool_choice {
+        tool_choice.validate(&r.tools)?;
+    }
+    let grammar = match (&r.text, &r.response_format) {
+        (Some(_), Some(_)) => {
+            return Err(Error::BadRequest(
+                "text and response_format cannot both be supplied".into(),
+            ));
+        }
+        (Some(text), None) => responses_text_grammar(Some(text))?,
+        (None, format) => response_format_grammar(format.as_ref())?,
+    };
     let sampling = sampling_config(r.temperature, r.top_p, r.seed)?;
     let model = s.model(&r.model)?;
-    let input = match r.input {
-        ResponsesInput::Text(text) => text,
-        ResponsesInput::Items(items) => {
-            let mut messages = Vec::with_capacity(items.len());
-            for item in items {
-                if item.r#type != "message" {
-                    return Err(Error::BadRequest(format!(
-                        "unsupported Responses input item type {}",
-                        item.r#type
-                    )));
-                }
-                let content = match item.content {
-                    ResponsesContent::Text(text) => ChatContent::Text(text),
-                    ResponsesContent::Parts(parts) => ChatContent::Parts(
-                        parts
-                            .into_iter()
-                            .map(|part| match part {
-                                ResponsesContentPart::InputText { text } => {
-                                    ContentPart::Text { text }
-                                }
-                                ResponsesContentPart::InputImage { image_url } => {
-                                    ContentPart::ImageUrl {
-                                        image_url: ImageUrlPart { url: image_url },
-                                    }
-                                }
-                            })
-                            .collect(),
-                    ),
-                };
-                messages.push(ChatMessage {
-                    role: item.role,
-                    content,
-                });
-            }
-            lower_messages(&model.family, messages, s.vision_config())?
+    let mut input_ledger = Vec::new();
+    let mut prompt = String::new();
+    let mut lineage_revision = 0;
+    if let Some(previous_id) = &r.previous_response_id {
+        let predecessor = s
+            .response_service
+            .retrieve(previous_id, &request_context.principal)
+            .map_err(response_store_error)?;
+        if predecessor.model != r.model {
+            return Err(Error::BadRequest(
+                "previous_response_id uses an incompatible model".into(),
+            ));
         }
+        if !predecessor.store {
+            return Err(Error::BadRequest(
+                "previous_response_id requires a stored response".into(),
+            ));
+        }
+        lineage_revision = predecessor.lineage_revision.saturating_add(1);
+        prompt.push_str(&response_lineage_prompt(
+            &s.response_service,
+            predecessor,
+            &request_context.principal,
+            &model.family,
+        )?);
+    }
+    match r.input {
+        ResponsesInput::Text(text) => {
+            input_ledger.push(responses::ResponseInputItem::Message {
+                role: "user".into(),
+                text: text.clone(),
+            });
+            let rendered = lower_messages(
+                &model.family,
+                vec![ChatMessage {
+                    role: "user".into(),
+                    content: ChatContent::Text(text),
+                }],
+                s.vision_config(),
+            )?;
+            prompt::append_rendered(&model.family, &mut prompt, &rendered)?;
+        }
+        ResponsesInput::Items(items) => {
+            let mut input_call_ids = HashSet::new();
+            let mut pending_messages = Vec::new();
+            for item in items {
+                match item {
+                    ResponsesInputItem::FunctionCall {
+                        call_id,
+                        name,
+                        arguments,
+                    } => {
+                        flush_response_messages(
+                            &mut prompt,
+                            &model.family,
+                            &mut pending_messages,
+                            s.vision_config(),
+                        )?;
+                        input_call_ids.insert(call_id.clone());
+                        input_ledger.push(responses::ResponseInputItem::FunctionCall {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        });
+                        let call = json!({
+                            "name": name,
+                            "arguments": serde_json::from_str::<Value>(&arguments)
+                                .unwrap_or(Value::String(arguments)),
+                        });
+                        prompt::append_assistant_content(
+                            &model.family,
+                            &mut prompt,
+                            &call.to_string(),
+                        )?;
+                    }
+                    ResponsesInputItem::Message { role, content } => {
+                        let raw_text = match &content {
+                            ResponsesContent::Text(text) => text.clone(),
+                            ResponsesContent::Parts(parts) => parts
+                                .iter()
+                                .filter_map(|part| match part {
+                                    ResponsesContentPart::InputText { text }
+                                    | ResponsesContentPart::OutputText { text } => {
+                                        Some(text.as_str())
+                                    }
+                                    ResponsesContentPart::InputImage { .. } => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join(""),
+                        };
+                        let content = match content {
+                            ResponsesContent::Text(text) => ChatContent::Text(text),
+                            ResponsesContent::Parts(parts) => ChatContent::Parts(
+                                parts
+                                    .into_iter()
+                                    .map(|part| match part {
+                                        ResponsesContentPart::InputText { text }
+                                        | ResponsesContentPart::OutputText { text } => {
+                                            ContentPart::Text { text }
+                                        }
+                                        ResponsesContentPart::InputImage { image_url, .. } => {
+                                            ContentPart::ImageUrl {
+                                                image_url: ImageUrlPart { url: image_url },
+                                            }
+                                        }
+                                    })
+                                    .collect(),
+                            ),
+                        };
+                        input_ledger.push(responses::ResponseInputItem::Message {
+                            role: role.clone(),
+                            text: raw_text,
+                        });
+                        pending_messages.push(ChatMessage { role, content });
+                    }
+                    ResponsesInputItem::FunctionCallOutput { call_id, output } => {
+                        flush_response_messages(
+                            &mut prompt,
+                            &model.family,
+                            &mut pending_messages,
+                            s.vision_config(),
+                        )?;
+                        if !input_call_ids.contains(&call_id)
+                            && !lineage_has_call(
+                                &s.response_service,
+                                r.previous_response_id.as_deref(),
+                                &request_context.principal,
+                                &call_id,
+                            )?
+                        {
+                            return Err(Error::BadRequest(format!(
+                                "function_call_output references unknown call_id `{call_id}`"
+                            )));
+                        }
+                        input_ledger.push(responses::ResponseInputItem::FunctionCallOutput {
+                            call_id: call_id.clone(),
+                            output: output.clone(),
+                        });
+                        let rendered = lower_messages(
+                            &model.family,
+                            vec![ChatMessage {
+                                role: "user".into(),
+                                content: ChatContent::Text(format!(
+                                    "Tool result for {call_id}: {output}"
+                                )),
+                            }],
+                            s.vision_config(),
+                        )?;
+                        prompt::append_rendered(&model.family, &mut prompt, &rendered)?;
+                    }
+                }
+            }
+            flush_response_messages(
+                &mut prompt,
+                &model.family,
+                &mut pending_messages,
+                s.vision_config(),
+            )?;
+        }
+    }
+    let has_tool_output = input_ledger.iter().any(|item| {
+        matches!(
+            item,
+            responses::ResponseInputItem::FunctionCallOutput { .. }
+        )
+    });
+    append_tool_instructions(
+        &model.family,
+        &mut prompt,
+        &r.tools,
+        r.tool_choice.as_ref(),
+        has_tool_output,
+    )?;
+    let response_options = ResponseRequestOptions {
+        store: r.store,
+        previous_response_id: r.previous_response_id,
+        lineage_revision,
+        input: input_ledger,
+        tool_names: tool_names(&r.tools),
+        tools: r
+            .tools
+            .iter()
+            .map(|tool| serde_json::to_value(tool).expect("tool definitions serialize"))
+            .collect(),
+        tool_choice_value: r.tool_choice.as_ref().map_or_else(
+            || json!("auto"),
+            |choice| serde_json::to_value(choice).expect("tool choice serializes"),
+        ),
+        tool_choice: r.tool_choice,
     };
     infer_response(InferResponseRequest {
         server: s,
         model: r.model,
-        prompt: input,
+        prompt,
         max_tokens: r.max_output_tokens,
         sampling,
+        grammar,
         compaction: r.compaction,
         include_usage: true,
         streaming: r.stream,
@@ -2654,10 +3099,136 @@ async fn responses(
         request_id: request_context.request_id,
         principal: request_context.principal,
         protocol: WireProtocol::Responses,
+        responses: Some(response_options),
     })
     .await
 }
 
+pub(crate) fn response_store_error(error: response_store::StoreError) -> Error {
+    match error {
+        response_store::StoreError::NotFound(_) => Error::ContextNotFound,
+        response_store::StoreError::StaleRevision { .. }
+        | response_store::StoreError::Conflict(_) => Error::Conflict(error.to_string()),
+        other => Error::State(other.to_string()),
+    }
+}
+
+fn response_lineage_prompt(
+    service: &responses::ResponseService,
+    mut resource: responses::ResponseResource,
+    owner: &str,
+    family: &str,
+) -> Result<String, Error> {
+    let mut lineage = Vec::new();
+    for _ in 0..1024 {
+        let previous = resource.previous_response_id.clone();
+        lineage.push(resource);
+        let Some(id) = previous else { break };
+        resource = service.retrieve(&id, owner).map_err(response_store_error)?;
+    }
+    if lineage
+        .last()
+        .is_some_and(|resource| resource.previous_response_id.is_some())
+    {
+        return Err(Error::BadRequest(
+            "response lineage exceeds 1024 resources".into(),
+        ));
+    }
+    lineage.reverse();
+    let mut messages = Vec::new();
+    for resource in lineage {
+        for item in resource.input {
+            match item {
+                responses::ResponseInputItem::Message { role, text } => {
+                    messages.push(prompt::Message {
+                        role,
+                        content: text,
+                    });
+                }
+                responses::ResponseInputItem::FunctionCall {
+                    name, arguments, ..
+                } => {
+                    let call = json!({
+                        "name": name,
+                        "arguments": serde_json::from_str::<Value>(&arguments)
+                            .unwrap_or(Value::String(arguments)),
+                    });
+                    messages.push(prompt::Message {
+                        role: "assistant".into(),
+                        content: call.to_string(),
+                    });
+                }
+                responses::ResponseInputItem::FunctionCallOutput { call_id, output } => {
+                    messages.push(prompt::Message {
+                        role: "user".into(),
+                        content: format!("Tool result for {call_id}: {output}"),
+                    });
+                }
+            }
+        }
+        for item in resource.output {
+            match item {
+                responses::ResponseOutputItem::Message(message) => {
+                    messages.push(prompt::Message {
+                        role: "assistant".into(),
+                        content: message.content.into_iter().map(|part| part.text).collect(),
+                    });
+                }
+                responses::ResponseOutputItem::FunctionCall(call) => {
+                    let call = json!({
+                        "name": call.name,
+                        "arguments": serde_json::from_str::<Value>(&call.arguments)
+                            .unwrap_or(Value::String(call.arguments)),
+                    });
+                    messages.push(prompt::Message {
+                        role: "assistant".into(),
+                        content: call.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    prompt::apply_chat_template(family, normalize_response_messages(messages))
+}
+
+fn normalize_response_messages(messages: Vec<prompt::Message>) -> Vec<prompt::Message> {
+    let mut normalized: Vec<prompt::Message> = Vec::with_capacity(messages.len());
+    for message in messages {
+        if normalized
+            .last()
+            .is_some_and(|previous| previous.role == message.role)
+        {
+            let previous = normalized.last_mut().expect("last message was present");
+            if !previous.content.is_empty() && !message.content.is_empty() {
+                previous.content.push('\n');
+            }
+            previous.content.push_str(&message.content);
+        } else {
+            normalized.push(message);
+        }
+    }
+    normalized
+}
+
+fn lineage_has_call(
+    service: &responses::ResponseService,
+    previous: Option<&str>,
+    owner: &str,
+    call_id: &str,
+) -> Result<bool, Error> {
+    let Some(id) = previous else { return Ok(false) };
+    let mut resource = service.retrieve(id, owner).map_err(response_store_error)?;
+    for _ in 0..1024 {
+        if resource.output.iter().any(|item| matches!(item, responses::ResponseOutputItem::FunctionCall(call) if call.call_id == call_id)) { return Ok(true); }
+        let Some(id) = resource.previous_response_id.clone() else {
+            return Ok(false);
+        };
+        resource = service.retrieve(&id, owner).map_err(response_store_error)?;
+    }
+    Err(Error::BadRequest(
+        "response lineage exceeds 1024 resources".into(),
+    ))
+}
 fn default_true() -> bool {
     true
 }
@@ -2974,6 +3545,17 @@ enum WireProtocol {
     Chat,
     Responses,
 }
+#[derive(Clone)]
+struct ResponseRequestOptions {
+    store: bool,
+    previous_response_id: Option<String>,
+    lineage_revision: u64,
+    input: Vec<responses::ResponseInputItem>,
+    tool_names: Vec<String>,
+    tool_choice: Option<ResponsesToolChoice>,
+    tools: Vec<Value>,
+    tool_choice_value: Value,
+}
 
 struct InferResponseRequest {
     server: Server,
@@ -2981,6 +3563,7 @@ struct InferResponseRequest {
     prompt: String,
     max_tokens: Option<usize>,
     sampling: SamplingConfig,
+    grammar: Option<String>,
     compaction: Option<CompactionRequest>,
     include_usage: bool,
     streaming: bool,
@@ -2992,53 +3575,17 @@ struct InferResponseRequest {
     request_id: String,
     principal: String,
     protocol: WireProtocol,
+    responses: Option<ResponseRequestOptions>,
 }
 
-fn sse_rows<const N: usize>(values: [Value; N]) -> String {
-    values.into_iter().fold(String::new(), |mut rows, value| {
-        use std::fmt::Write as _;
-        write!(rows, "data: {value}\n\n").expect("writing to a String cannot fail");
-        rows
-    })
-}
-
-fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
+fn stream_row_with_state(
+    protocol: WireProtocol,
+    event: StreamEvent,
+    include_usage: bool,
+    responses_state: &mut responses::ResponseProjection,
+) -> String {
     if matches!(protocol, WireProtocol::Responses) {
-        match event {
-            StreamEvent::Started {
-                request_id,
-                correlation_id,
-                inference_id,
-                execution_session_id,
-                ..
-            } => {
-                return sse_rows([
-                    json!({"type":"response.created","response":{"id":request_id,"status":"in_progress","metadata":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}}}),
-                    json!({"type":"response.output_item.added","item":{"id":"msg_0","type":"message","role":"assistant","status":"in_progress"},"output_index":0}),
-                    json!({"type":"response.content_part.added","item_id":"msg_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
-                ]);
-            }
-            StreamEvent::Token { token, index } => {
-                return format!(
-                    "data: {}\n\n",
-                    json!({"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":token,"sequence_number":index})
-                );
-            }
-            StreamEvent::Finished { reason, usage } => {
-                return sse_rows([
-                    json!({"type":"response.output_text.done","item_id":"msg_0","output_index":0,"content_index":0,"text":""}),
-                    json!({"type":"response.content_part.done","item_id":"msg_0","output_index":0,"content_index":0}),
-                    json!({"type":"response.output_item.done","item":{"id":"msg_0","type":"message","role":"assistant","status":"completed"},"output_index":0}),
-                    json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}}),
-                ]);
-            }
-            StreamEvent::Error { message } => {
-                return format!(
-                    "data: {}\n\n",
-                    json!({"type":"error","error":{"message":message,"type":"server_error"}})
-                );
-            }
-        }
+        return responses_state.project(event);
     }
     let value = match (protocol, event) {
         (WireProtocol::Completion, StreamEvent::Token { token, .. }) => {
@@ -3046,9 +3593,6 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
         }
         (WireProtocol::Chat, StreamEvent::Token { token, .. }) => {
             json!({"object":"chat.completion.chunk","choices":[{"delta":{"content":token},"index":0,"finish_reason":null}]})
-        }
-        (WireProtocol::Responses, StreamEvent::Token { token, .. }) => {
-            json!({"type":"response.output_text.delta","delta":token})
         }
         (
             WireProtocol::Completion | WireProtocol::Chat,
@@ -3059,9 +3603,6 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
                 value["usage"] = json!({"prompt_tokens":usage.input_tokens,"completion_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens});
             }
             value
-        }
-        (WireProtocol::Responses, StreamEvent::Finished { reason, usage }) => {
-            json!({"type":"response.completed","response":{"status":"completed","finish_reason":reason,"usage":{"input_tokens":usage.input_tokens,"output_tokens":usage.generated_tokens,"total_tokens":usage.input_tokens + usage.generated_tokens}}})
         }
         (_, StreamEvent::Error { message }) => {
             json!({"error":{"message":message,"type":"server_error"}})
@@ -3090,13 +3631,10 @@ fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -
         ) => {
             json!({"id":request_id,"object":"text_completion","choices":[],"cusco":{"correlation_id":correlation_id,"inference_id":inference_id,"execution_session_id":execution_session_id}})
         }
-        (WireProtocol::Responses, StreamEvent::Started { request_id, .. }) => {
-            json!({"type":"response.created","response":{"id":request_id,"status":"in_progress"}})
-        }
+        (WireProtocol::Responses, _) => unreachable!("Responses events return above"),
     };
     let row = format!("data: {value}\n\n");
-    if matches!(protocol, WireProtocol::Completion | WireProtocol::Chat)
-        && value["choices"]
+    if value["choices"]
         .as_array()
         .and_then(|choices| choices.first())
         .is_some_and(|choice| !choice["finish_reason"].is_null())
@@ -3111,38 +3649,23 @@ fn completed_response(
     protocol: WireProtocol,
     response: InferResponse,
     finish_reason: FinishReason,
-) -> Value {
+    response_service: Option<&responses::ResponseService>,
+    owner: &str,
+    options: Option<&ResponseRequestOptions>,
+) -> Result<Value, Error> {
     let usage = json!({"prompt_tokens":response.usage.input_tokens,"completion_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens});
     let prefill = &response.usage.prefill;
-    let cached_ratio = if prefill.total_tokens > 0 {
-        Some((prefill.cached_tokens as f64) / (prefill.total_tokens as f64))
-    } else {
-        None
-    };
+    let cached_ratio = (prefill.total_tokens > 0)
+        .then_some((prefill.cached_tokens as f64) / (prefill.total_tokens as f64));
     let cusco = json!({
         "compaction_result": response.usage.compaction_result,
         "correlation_id": response.usage.correlation_id,
         "inference_id": response.usage.inference_id,
         "execution_session_id": response.usage.execution_session_id,
-        "usage": {
-            "input_tokens": response.usage.input_tokens,
-            "generated_tokens": response.usage.generated_tokens,
-            "evaluated_tokens": response.usage.evaluated_tokens,
-            "cached_tokens": response.usage.cached_tokens,
-            "prefill": {
-                "total_tokens": prefill.total_tokens,
-                "cached_tokens": prefill.cached_tokens,
-                "uncached_tokens": prefill.uncached_tokens,
-                "cached_ratio": cached_ratio,
-                "tokenization_ns": prefill.tokenization_ns,
-                "prefix_lookup_ns": prefill.prefix_lookup_ns,
-                "mapping_activation_ns": prefill.mapping_activation_ns,
-                "uncached_prefill_ns": prefill.uncached_prefill_ns,
-                "total_ns": prefill.total_ns,
-            },
-        },
+        "usage": {"input_tokens":response.usage.input_tokens,"generated_tokens":response.usage.generated_tokens,"evaluated_tokens":response.usage.evaluated_tokens,"cached_tokens":response.usage.cached_tokens,
+            "prefill":{"total_tokens":prefill.total_tokens,"cached_tokens":prefill.cached_tokens,"uncached_tokens":prefill.uncached_tokens,"cached_ratio":cached_ratio,"tokenization_ns":prefill.tokenization_ns,"prefix_lookup_ns":prefill.prefix_lookup_ns,"mapping_activation_ns":prefill.mapping_activation_ns,"uncached_prefill_ns":prefill.uncached_prefill_ns,"total_ns":prefill.total_ns}}
     });
-    match protocol {
+    Ok(match protocol {
         WireProtocol::Completion => {
             json!({"id":response.id,"object":"text_completion","choices":[{"text":response.text,"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
@@ -3150,9 +3673,97 @@ fn completed_response(
             json!({"id":response.id,"object":"chat.completion","choices":[{"message":{"role":"assistant","content":response.text},"index":0,"finish_reason":finish_reason}],"usage":usage,"cusco":cusco})
         }
         WireProtocol::Responses => {
-            json!({"id":response.id,"object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":response.text}]}],"finish_reason":finish_reason,"usage":{"input_tokens":response.usage.input_tokens,"output_tokens":response.usage.generated_tokens,"total_tokens":response.usage.input_tokens + response.usage.generated_tokens},"cusco":cusco})
+            let service =
+                response_service.expect("Responses projection requires the response service");
+            let options = options.expect("Responses projection requires request options");
+            let function_call = parse_function_call(&response.text, options)?;
+            let resource = service.complete(responses::CompleteResponse {
+                id: &response.id,
+                owner,
+                model: &response.usage.model,
+                text: &response.text,
+                reason: finish_reason,
+                usage: &response.usage,
+                store: options.store,
+                previous_response_id: options.previous_response_id.as_deref(),
+                lineage_revision: options.lineage_revision,
+                input: &options.input,
+                tools: &options.tools,
+                tool_choice: &options.tool_choice_value,
+                function_call,
+            });
+            service.remember(&resource).map_err(response_store_error)?;
+            let mut value = responses::project_resource(&resource);
+            value["cusco"] = cusco;
+            value
         }
+    })
+}
+
+fn parse_function_call(
+    text: &str,
+    options: &ResponseRequestOptions,
+) -> Result<Option<responses::ResponseFunctionCall>, Error> {
+    if options.tool_names.is_empty()
+        || matches!(
+            options.tool_choice,
+            Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::None))
+        )
+    {
+        return Ok(None);
     }
+    let parsed = serde_json::from_str::<Value>(text.trim()).ok();
+    let call = parsed
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|object| {
+            let name = object.get("name")?.as_str()?.to_owned();
+            let arguments = object.get("arguments")?;
+            Some((
+                name,
+                if let Some(arguments) = arguments.as_str() {
+                    arguments.to_owned()
+                } else {
+                    arguments.to_string()
+                },
+            ))
+        });
+    if let Some((name, arguments)) = call {
+        if !options.tool_names.contains(&name) {
+            if matches!(
+                options.tool_choice,
+                Some(
+                    ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required)
+                        | ResponsesToolChoice::Function { .. }
+                )
+            ) {
+                return Err(Error::BadRequest(format!(
+                    "model selected undeclared function `{name}`"
+                )));
+            }
+            return Ok(None);
+        }
+        if let Some(ResponsesToolChoice::Function { name: required, .. }) = &options.tool_choice {
+            if &name != required {
+                return Err(Error::BadRequest(format!(
+                    "model selected `{name}` instead of required function `{required}`"
+                )));
+            }
+        }
+        return Ok(Some(responses::new_function_call(name, arguments)));
+    }
+    if matches!(
+        options.tool_choice,
+        Some(
+            ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required)
+                | ResponsesToolChoice::Function { .. }
+        )
+    ) {
+        return Err(Error::BadRequest(
+            "model did not produce the required function call".into(),
+        ));
+    }
+    Ok(None)
 }
 
 async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Error> {
@@ -3162,6 +3773,7 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
         prompt,
         max_tokens,
         sampling,
+        grammar,
         compaction,
         include_usage,
         streaming,
@@ -3173,6 +3785,7 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
         request_id,
         principal,
         protocol,
+        responses,
     } = parameters;
     server.model(&model)?;
     let id = request_id;
@@ -3205,11 +3818,14 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
         Duration::from_millis(config.active_time_ms),
     );
     let inference_id = Uuid::new_v4().to_string();
+    let response_model = model.clone();
+    let response_owner = principal.clone();
     let request = InferRequest {
         model,
         prompt,
         max_tokens: max_tokens.unwrap_or(config.default_output_tokens),
         sampling,
+        grammar,
         context_id,
         deadline_ms: Some(
             u64::try_from(wall_remaining.as_millis())
@@ -3227,6 +3843,7 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
             inference_id,
         },
     };
+    let response_service = server.response_service.clone();
     if streaming {
         let (started, receiver) = server.infer_stream_reserved(id, request, admission).await?;
         let first = stream::once(async move { started });
@@ -3243,9 +3860,47 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
                 }
             },
         );
-        let rows = first
-            .chain(rest)
-            .map(move |event| Ok::<_, Infallible>(stream_row(protocol, event, include_usage)));
+        let mut responses_state = match &responses {
+            Some(options) => response_service.stream_projection(responses::StreamResponse {
+                model: response_model,
+                owner: response_owner,
+                store: options.store,
+                previous_response_id: options.previous_response_id.clone(),
+                input: options.input.clone(),
+                tools: options.tools.clone(),
+                tool_choice: options.tool_choice_value.clone(),
+                buffer_output: !options.tool_names.is_empty(),
+                lineage_revision: options.lineage_revision,
+            }),
+            None => response_service.projection(response_model),
+        };
+        let stream_response_service = response_service.clone();
+        let stream_response_options = responses.clone();
+        let rows = first.chain(rest).map(move |event| {
+            if matches!(event, StreamEvent::Finished { .. }) {
+                if let Some(options) = &stream_response_options {
+                    match parse_function_call(responses_state.generated_text(), options) {
+                        Ok(call) => responses_state.set_function_call(call),
+                        Err(error) => {
+                            return Ok::<_, Infallible>(format!(
+                                "data: {}\n\n",
+                                json!({"type":"error","error":{"message":error.to_string()}})
+                            ));
+                        }
+                    }
+                }
+            }
+            let row = stream_row_with_state(protocol, event, include_usage, &mut responses_state);
+            if let Some(resource) = responses_state.completed_resource() {
+                if let Err(error) = stream_response_service.remember(resource) {
+                    return Ok::<_, Infallible>(format!(
+                        "data: {}\n\n",
+                        json!({"type":"error","error":{"message":error.to_string()}})
+                    ));
+                }
+            }
+            Ok::<_, Infallible>(row)
+        });
         let content_type = "text/event-stream";
         let mut response = Response::new(Body::from_stream(rows));
         response.headers_mut().insert(
@@ -3275,8 +3930,15 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
                 _ => None,
             })
             .ok_or_else(|| Error::State("inference completed without a finish reason".into()))?;
-        let mut response =
-            Json(completed_response(protocol, response, finish_reason)).into_response();
+        let value = completed_response(
+            protocol,
+            response,
+            finish_reason,
+            Some(&response_service),
+            &response_owner,
+            responses.as_ref(),
+        )?;
+        let mut response = Json(value).into_response();
         response.headers_mut().insert(
             "x-request-id",
             HeaderValue::from_str(&correlation_id).expect("UUID is a valid header value"),
@@ -3284,10 +3946,98 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
         Ok(response)
     }
 }
+async fn get_response(
+    State(server): State<Server>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Error> {
+    let context = auth(&server, &headers, Scope::Inference)?;
+    let resource = server
+        .response_service
+        .retrieve(&id, &context.principal)
+        .map_err(response_store_error)?;
+    Ok(Json(responses::project_resource(&resource)))
+}
+
+async fn delete_response(
+    State(server): State<Server>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Error> {
+    let context = auth(&server, &headers, Scope::Inference)?;
+    server
+        .response_service
+        .delete(&id, &context.principal)
+        .map_err(response_store_error)?;
+    Ok(Json(
+        json!({"id":id,"object":"response.deleted","deleted":true}),
+    ))
+}
+
 async fn list_models(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
     auth(&s, &headers, Scope::Inference)?;
     Ok(Json(json!({"data":s.models()})))
 }
+async fn capabilities(
+    State(server): State<Server>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Error> {
+    auth(&server, &headers, Scope::Inference)?;
+    Ok(Json(json!({
+        "object": "cusco.capability_list",
+        "data": [{
+            "id": context_updates::CONTEXT_UPDATE_CAPABILITY,
+            "version": 1,
+            "endpoint": "/cusco/v1/context-updates",
+            "operations": ["fold"],
+            "portable_projection": "openai.response"
+        }]
+    })))
+}
+
+async fn context_update(
+    State(server): State<Server>,
+    PrequeueJson {
+        headers,
+        value: mut request,
+        retained_bytes: _,
+        _permit,
+    }: PrequeueJson<context_updates::ContextUpdateRequest>,
+) -> Result<Response, Error> {
+    let context = auth(&server, &headers, Scope::Inference)?;
+    let correlation_id = Uuid::new_v4().to_string();
+    let operation_id = request
+        .operation_id
+        .get_or_insert_with(|| format!("ctxupd_{}", Uuid::new_v4()))
+        .clone();
+    let control = Arc::new(RequestControl::new());
+    let admission = server.try_admit(&operation_id, control.clone())?;
+    let response_service = server.response_service.clone();
+    let owner = context.principal;
+    let worker_control = control.clone();
+    let mut disconnect = DisconnectGuard::new(control);
+    let result = tokio::task::spawn_blocking(move || {
+        let _prequeue_permit = _permit;
+        let _admission = admission;
+        context_updates::apply(
+            &response_service,
+            &owner,
+            correlation_id,
+            request,
+            &worker_control,
+        )
+    })
+    .await
+    .map_err(state_err)??;
+    disconnect.disarm();
+    let mut response = Json(result).into_response();
+    response.headers_mut().insert(
+        "x-request-id",
+        HeaderValue::from_str(&operation_id).expect("operation id is a valid header value"),
+    );
+    Ok(response)
+}
+
 async fn native_status(
     State(server): State<Server>,
     headers: HeaderMap,
@@ -3448,6 +4198,13 @@ pub fn openapi_document() -> Value {
             Some("ResponsesRequest"),
         ),
         ("/openai/v1/models", "get", "openaiModels", None),
+        ("/cusco/v1/capabilities", "get", "cuscoCapabilities", None),
+        (
+            "/cusco/v1/context-updates",
+            "post",
+            "cuscoContextUpdate",
+            Some("ContextUpdateRequest"),
+        ),
         ("/cusco/v1/api/tags", "get", "ollamaTags", None),
         ("/cusco/v1/api/version", "get", "ollamaVersion", None),
         (
@@ -3542,8 +4299,28 @@ pub fn openapi_document() -> Value {
                 "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "max_tokens": {"type": "integer", "minimum": 0}, "stream": {"type": "boolean"}, "temperature": {"type": "number", "minimum": 0, "maximum": 2}, "top_p": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}, "seed": {"type": "integer", "minimum": 0}}
             },
             "ChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}}},
-            "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"oneOf": [{"type": "string"}, {"type": "array"}]}, "store": {"type": "boolean", "enum": [false], "default": false, "description": "Cusco Responses are stateless; true is rejected."}, "stream": {"type": "boolean"}, "tools": {"type": "array", "items": {"$ref": "#/components/schemas/ResponsesFunctionTool"}}}},
+            "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"oneOf": [{"type": "string"}, {"type": "array"}]}, "store": {"type": "boolean", "default": true, "description": "Persist the response resource for retrieval, continuation, and negotiated context updates."}, "previous_response_id": {"type": "string", "description": "Stored predecessor response used for portable continuation."}, "stream": {"type": "boolean"}, "tools": {"type": "array", "items": {"$ref": "#/components/schemas/ResponsesFunctionTool"}}}},
             "ResponsesFunctionTool": {"type": "object", "additionalProperties": false, "required": ["type", "name", "parameters"], "properties": {"type": {"const": "function"}, "name": {"type": "string", "minLength": 1}, "description": {"type": "string"}, "parameters": {"type": "object"}}},
+            "ContextUpdateRequest": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["base_response_id", "expected_revision", "operation"],
+                "properties": {
+                    "base_response_id": {"type": "string", "minLength": 1},
+                    "expected_revision": {"type": "integer", "minimum": 0},
+                    "operation_id": {"type": "string", "minLength": 1},
+                    "operation": {"$ref": "#/components/schemas/ContextUpdateFold"}
+                }
+            },
+            "ContextUpdateFold": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "items"],
+                "properties": {
+                    "type": {"const": "fold"},
+                    "items": {"type": "array", "minItems": 1, "items": {"type": "object", "description": "Portable OpenAI Responses message input item."}}
+                }
+            },
             "OllamaModelRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["model"]}, {"required": ["name"]}], "properties": {"model": {"type": "string"}, "name": {"type": "string"}}},
             "OllamaPullRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["name"]}, {"required": ["model"]}], "properties": {"name": {"type": "string"}, "model": {"type": "string"}, "sha256": {"type": "string"}, "insecure": {"type": "boolean"}, "stream": {"type": "boolean"}}},
             "OllamaPullProgress": {
@@ -3684,6 +4461,50 @@ mod tests {
         })
         .unwrap();
         (s, d)
+    }
+
+    #[test]
+    fn response_format_accepts_json_schema() {
+        let format: ResponseFormat = serde_json::from_value(json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "smoke_result",
+                "strict": true,
+                "schema": {"type": "object"}
+            }
+        }))
+        .unwrap();
+        assert_eq!(format.r#type, "json_schema");
+        assert_eq!(format.json_schema.unwrap().name, "smoke_result");
+    }
+
+    #[test]
+    fn gemma_effective_stops_include_terminal_markers() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let request = InferRequest {
+            model: "m".into(),
+            prompt: "hello".into(),
+            max_tokens: 1,
+            context_id: None,
+            compaction: None,
+            deadline_ms: None,
+            scheduling: SchedulingMetadata::default(),
+            stop: vec!["custom".into()],
+            raw_continuation: false,
+            sampling: SamplingConfig::default(),
+            grammar: None,
+        };
+
+        assert_eq!(
+            server.effective_stop_sequences(&request).unwrap(),
+            vec![
+                "custom",
+                "<end_of_turn>",
+                "</end_of_turn>",
+                "</start_of_turn>",
+            ]
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     struct CompactionProofEngine;
@@ -3853,6 +4674,7 @@ mod tests {
             stop: vec![],
             raw_continuation: false,
             sampling: SamplingConfig::default(),
+            grammar: None,
         };
         let (out, events) = s.infer("r", req).unwrap();
         assert_eq!(out.text, "two one");
@@ -3874,6 +4696,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                 },
             )
             .unwrap_err();
@@ -3893,6 +4716,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                 }
             ),
             Err(Error::Deadline)
@@ -3912,6 +4736,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                 },
             ),
             Err(Error::Busy)
@@ -3938,6 +4763,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                 }
             ),
             Err(Error::State(_))
@@ -3999,6 +4825,7 @@ mod tests {
                 "type": "function",
                 "name": "get_current_timestamp",
                 "description": "Get the current Unix timestamp.",
+                "strict": true,
                 "parameters": {"type": "object", "properties": {}}
             }]
         }))
@@ -4008,10 +4835,7 @@ mod tests {
             responses.tools.as_slice(),
             [ToolDefinition::Flat(_)]
         ));
-        assert!(matches!(
-            validate_controls(None, None, &responses.tools, None, None),
-            Err(Error::BadRequest(message)) if message.contains("does not advertise tool calling")
-        ));
+        validate_controls(None, None, &responses.tools, None, None).unwrap();
 
         let chat: ChatRequest = serde_json::from_value(json!({
             "model": "m",
@@ -4021,6 +4845,7 @@ mod tests {
                 "function": {
                     "name": "get_current_timestamp",
                     "description": "Get the current Unix timestamp.",
+                    "strict": true,
                     "parameters": {"type": "object", "properties": {}}
                 }
             }]
@@ -4030,15 +4855,396 @@ mod tests {
         assert!(matches!(chat.tools.as_slice(), [ToolDefinition::Nested(_)]));
     }
     #[test]
+    fn responses_tool_choice_modes_parse_and_validate_precisely() {
+        let tools = vec![ToolDefinition::Flat(FlatToolDefinition {
+            r#type: "function".into(),
+            name: "lookup".into(),
+            description: None,
+            parameters: json!({"type": "object"}),
+            strict: false,
+        })];
+
+        for (wire, expected) in [
+            ("auto", ResponsesToolChoiceMode::Auto),
+            ("none", ResponsesToolChoiceMode::None),
+            ("required", ResponsesToolChoiceMode::Required),
+        ] {
+            let choice: ResponsesToolChoice = serde_json::from_value(json!(wire)).unwrap();
+            assert!(matches!(
+                &choice,
+                ResponsesToolChoice::Mode(mode) if *mode == expected
+            ));
+            assert_eq!(serde_json::to_value(&choice).unwrap(), json!(wire));
+            choice.validate(&tools).unwrap();
+        }
+
+        let unsupported =
+            serde_json::from_value::<ResponsesToolChoice>(json!("specific")).unwrap_err();
+        assert_eq!(
+            unsupported.to_string(),
+            "unsupported tool_choice mode `specific`; supported modes are `auto`, `none`, and `required`"
+        );
+
+        let required: ResponsesToolChoice = serde_json::from_value(json!("required")).unwrap();
+        assert!(matches!(
+            required.validate(&[]),
+            Err(Error::BadRequest(message))
+                if message == "tool_choice `required` requires at least one tool"
+        ));
+
+        for (choice, expected) in [
+            (
+                json!({"type": "hosted_tool", "name": "lookup"}),
+                "unsupported tool_choice type `hosted_tool`; only `function` is supported",
+            ),
+            (
+                json!({"type": "function", "name": ""}),
+                "tool_choice function name must not be empty",
+            ),
+            (
+                json!({"type": "function", "name": "missing"}),
+                "tool_choice references undeclared function `missing`",
+            ),
+        ] {
+            let choice: ResponsesToolChoice = serde_json::from_value(choice).unwrap();
+            assert!(matches!(
+                choice.validate(&tools),
+                Err(Error::BadRequest(message)) if message == expected
+            ));
+        }
+
+        let named: ResponsesToolChoice =
+            serde_json::from_value(json!({"type": "function", "name": "lookup"})).unwrap();
+        named.validate(&tools).unwrap();
+    }
+    #[tokio::test]
+    async fn responses_reject_invalid_tool_choice_before_generation() {
+        for (tool_choice, tools, expected) in [
+            (
+                json!("required"),
+                json!([]),
+                "tool_choice `required` requires at least one tool",
+            ),
+            (
+                json!({"type": "function", "name": "missing"}),
+                json!([{
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"}
+                }]),
+                "tool_choice references undeclared function `missing`",
+            ),
+        ] {
+            let (server, directory) = setup(Arc::new(AnonymousAdmin));
+            let response = router(server)
+                .oneshot(request(
+                    "POST",
+                    "/openai/v1/responses",
+                    json!({
+                        "model": "m",
+                        "input": "hello",
+                        "tool_choice": tool_choice,
+                        "tools": tools
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], "invalid_request");
+            assert_eq!(
+                body["error"]["message"],
+                format!("invalid request: {expected}")
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_tools_are_tolerated_as_text_generation() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let response = router(server)
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({
+                    "model": "m",
+                    "input": "hello world",
+                    "max_output_tokens": 1,
+                    "tool_choice": "auto",
+                    "tools": [{
+                        "type": "function",
+                        "name": "lookup",
+                        "description": "Look something up",
+                        "parameters": {"type": "object", "properties": {}}
+                    }]
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
+        assert!(
+            body["output"][0]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn responses_tool_instructions_remain_inside_the_user_turn() {
+        let mut prompt = prompt::apply_chat_template(
+            "gemma4",
+            vec![prompt::Message {
+                role: "user".into(),
+                content: "Use the tool.".into(),
+            }],
+        )
+        .unwrap();
+        append_tool_instructions(
+            "gemma4",
+            &mut prompt,
+            &[ToolDefinition::Flat(FlatToolDefinition {
+                r#type: "function".into(),
+                name: "lookup".into(),
+                description: None,
+                parameters: json!({"type": "object"}),
+                strict: false,
+            })],
+            Some(&ResponsesToolChoice::Function {
+                r#type: "function".into(),
+                name: "lookup".into(),
+            }),
+            false,
+        )
+        .unwrap();
+        assert!(
+            prompt.contains(
+                "You must call the `lookup` function.<end_of_turn>\n<start_of_turn>model\n"
+            )
+        );
+        assert!(!prompt.ends_with("function."));
+    }
+    #[test]
+    fn responses_tool_result_instructions_prevent_duplicate_calls() {
+        let mut prompt = "<start_of_turn>user\nTool result for call_1: blue<end_of_turn>\n\
+             <start_of_turn>model\n"
+            .to_string();
+        append_tool_instructions(
+            "gemma4",
+            &mut prompt,
+            &[ToolDefinition::Flat(FlatToolDefinition {
+                r#type: "function".into(),
+                name: "lookup".into(),
+                description: None,
+                parameters: json!({"type": "object"}),
+                strict: false,
+            })],
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(
+            prompt.contains(
+                "Use it to answer the user; do not repeat a completed call.<end_of_turn>"
+            )
+        );
+    }
+    #[test]
+    fn responses_tool_choice_is_typed_and_capability_checked() {
+        let automatic: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hello",
+            "tool_choice": "auto"
+        }))
+        .unwrap();
+        automatic
+            .tool_choice
+            .unwrap()
+            .validate(&automatic.tools)
+            .unwrap();
+
+        let required: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hello",
+            "tool_choice": "required"
+        }))
+        .unwrap();
+        assert!(matches!(
+            required.tool_choice.unwrap().validate(&required.tools),
+            Err(Error::BadRequest(message)) if message.contains("requires at least one tool")
+        ));
+
+        let selected: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hello",
+            "tool_choice": {"type": "function", "name": "lookup"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            selected.tool_choice.unwrap().validate(&selected.tools),
+            Err(Error::BadRequest(message)) if message.contains("undeclared function `lookup`")
+        ));
+    }
+    #[test]
+    fn undeclared_model_function_is_text_unless_a_call_is_required() {
+        let mut options = ResponseRequestOptions {
+            store: false,
+            previous_response_id: None,
+            lineage_revision: 0,
+            input: Vec::new(),
+            tool_names: vec!["lookup".into()],
+            tool_choice: Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto)),
+            tools: Vec::new(),
+            tool_choice_value: json!("auto"),
+        };
+        let output = r#"{"name":"describe","arguments":{"subject":"function calls"}}"#;
+        assert!(parse_function_call(output, &options).unwrap().is_none());
+
+        options.tool_choice = Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required));
+        assert!(matches!(
+            parse_function_call(output, &options),
+            Err(Error::BadRequest(message))
+                if message.contains("undeclared function `describe`")
+        ));
+    }
+    #[test]
     fn accepts_canonical_responses_message_input() {
         let request: ResponsesRequest = serde_json::from_value(json!({
             "model": "m",
             "input": [{
-                "type": "message",
+                "role": "user",
+                "content": "hey"
+            }]
+        }))
+        .unwrap();
+        let ResponsesInput::Items(items) = request.input else {
+            panic!("canonical message input must parse as items");
+        };
+
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0],
+            ResponsesInputItem::Message {
+                content: ResponsesContent::Text(text),
+                ..
+            } if text == "hey"
+        ));
+    }
+    #[test]
+    fn accepts_assistant_output_text_in_responses_history() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hey"}]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hello!"}]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "How are you?"}]
+                }
+            ]
+        }))
+        .unwrap();
+        let ResponsesInput::Items(items) = request.input else {
+            panic!("Responses history must parse as items");
+        };
+        assert!(matches!(
+            &items[1],
+            ResponsesInputItem::Message {
+                role,
+                content: ResponsesContent::Parts(parts),
+            } if role == "assistant"
+                && matches!(
+                    parts.as_slice(),
+                    [ResponsesContentPart::OutputText { text }] if text == "Hello!"
+                )
+        ));
+    }
+    #[test]
+    fn lowers_responses_history_as_one_conversation() {
+        let mut prompt = String::new();
+        let mut messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: ChatContent::Text("hey".into()),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: ChatContent::Text("Hello!".into()),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: ChatContent::Text("How are you?".into()),
+            },
+        ];
+
+        flush_response_messages(
+            &mut prompt,
+            "gemma4",
+            &mut messages,
+            VisionConfig::default(),
+        )
+        .unwrap();
+
+        assert!(messages.is_empty());
+        assert_eq!(prompt.matches("<start_of_turn>model\n").count(), 2);
+        assert!(prompt.ends_with("<start_of_turn>model\n"));
+    }
+    #[test]
+    fn responses_request_parses_portable_function_call_continuation() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{\"key\":\"value\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "result"
+                }
+            ]
+        }))
+        .unwrap();
+        let ResponsesInput::Items(items) = request.input else {
+            panic!("portable continuation must parse as items");
+        };
+        assert!(matches!(
+            items.as_slice(),
+            [
+                ResponsesInputItem::FunctionCall { call_id, .. },
+                ResponsesInputItem::FunctionCallOutput {
+                    call_id: output_call_id,
+                    ..
+                }
+            ] if call_id == "call_1" && output_call_id == call_id
+        ));
+    }
+    #[test]
+    fn accepts_responses_image_detail_hint() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": [{
                 "role": "user",
                 "content": [{
-                    "type": "input_text",
-                    "text": "hey"
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,AA==",
+                    "detail": "low"
                 }]
             }]
         }))
@@ -4046,15 +5252,78 @@ mod tests {
         let ResponsesInput::Items(items) = request.input else {
             panic!("canonical message input must parse as items");
         };
-        assert_eq!(items.len(), 1);
         assert!(matches!(
-            &items[0].content,
-            ResponsesContent::Parts(parts)
-                if matches!(
-                    parts.as_slice(),
-                    [ResponsesContentPart::InputText { text }] if text == "hey"
-                )
+            &items[0],
+            ResponsesInputItem::Message {
+                content: ResponsesContent::Parts(parts),
+                ..
+            } if matches!(
+                parts.as_slice(),
+                [ResponsesContentPart::InputImage {
+                    image_url,
+                    _detail: Some(detail)
+                }] if image_url == "data:image/png;base64,AA==" && detail == "low"
+            )
         ));
+    }
+    #[test]
+    fn responses_lineage_coalesces_adjacent_assistant_items() {
+        let messages = normalize_response_messages(vec![
+            prompt::Message {
+                role: "user".into(),
+                content: "question".into(),
+            },
+            prompt::Message {
+                role: "assistant".into(),
+                content: "answer".into(),
+            },
+            prompt::Message {
+                role: "assistant".into(),
+                content: r#"{"name":"lookup","arguments":{}}"#.into(),
+            },
+        ]);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(
+            messages[1].content,
+            "answer\n{\"name\":\"lookup\",\"arguments\":{}}"
+        );
+        prompt::apply_chat_template("gemma4", messages).unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_reject_transient_predecessor_before_continuation() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let app = router(server);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({"model": "m", "input": "hello", "store": false}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let predecessor = body["id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({
+                    "model": "m",
+                    "input": "continue",
+                    "previous_response_id": predecessor
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn scheduler_uses_transition_cost_priority_and_wait() {
@@ -4243,6 +5512,12 @@ mod tests {
         assert_eq!(spec["openapi"], "3.1.0");
         assert!(spec["paths"]["/openai/v1/chat/completions"].is_object());
         assert!(spec["paths"]["/cusco/v1/status"].is_object());
+        assert!(spec["paths"]["/cusco/v1/capabilities"].is_object());
+        assert!(spec["paths"]["/cusco/v1/context-updates"].is_object());
+        assert_eq!(
+            spec["components"]["schemas"]["ResponsesRequest"]["properties"]["store"]["default"],
+            true
+        );
         assert!(spec["paths"]["/cusco/v1/api/version"].is_object());
         for path in spec["paths"].as_object().unwrap().values() {
             for operation in path.as_object().unwrap().values() {
@@ -4272,7 +5547,7 @@ mod tests {
     async fn swagger_combined_spec_and_ui_smoke() {
         let (server, directory) = setup(Arc::new(AnonymousAdmin));
         server.configure_openapi(OpenApiConfig {
-            ui: crate::config::OpenApiUiConfig { enabled: true },
+            docs_ui: crate::config::OpenApiDocsUiConfig { enabled: true },
         });
         let app = router(server);
         let response = app
@@ -4643,6 +5918,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                     scheduling: SchedulingMetadata::default(),
                 },
                 admission,
@@ -4692,6 +5968,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                     scheduling: SchedulingMetadata::default(),
                 },
                 admission,
@@ -4753,6 +6030,7 @@ mod tests {
                         stop: vec![],
                         raw_continuation: false,
                         sampling: SamplingConfig::default(),
+                        grammar: None,
                         scheduling: SchedulingMetadata::default(),
                     },
                 )
@@ -4775,6 +6053,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: SamplingConfig::default(),
+                    grammar: None,
                     scheduling: SchedulingMetadata::default(),
                 },
             ),
@@ -5405,58 +6684,261 @@ mod tests {
                 }),
             ))
             .await
-
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(body["output"][0]["status"], "completed");
+        assert!(body["output"][0]["id"].as_str().is_some());
+        assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
+        assert!(body["output"][0]["content"][0]["annotations"].is_array());
+        assert!(body["output"][0]["content"][0]["logprobs"].is_array());
+        assert_eq!(body["usage"]["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(
+            body["usage"]["output_tokens_details"]["reasoning_tokens"],
+            0
+        );
         fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
-    async fn responses_accept_store_false_and_reject_store_true() {
+    async fn responses_store_retrieve_delete_and_stateless_mode() {
         let (server, dir) = setup(Arc::new(AnonymousAdmin));
         let app = router(server);
-        let accepted = app
+        let stored = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({"model":"m","input":"hello","max_output_tokens":1,"store":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(stored.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let id = body["id"].as_str().unwrap();
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "GET",
+                    &format!("/openai/v1/responses/{id}"),
+                    json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let continued = app.clone().oneshot(request(
+            "POST", "/openai/v1/responses",
+            json!({"model":"m","input":"continue","max_output_tokens":1,"store":true,"previous_response_id":id}),
+        )).await.unwrap();
+        assert_eq!(continued.status(), StatusCode::OK);
+        let continued_body: Value =
+            serde_json::from_slice(&to_bytes(continued.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(continued_body["previous_response_id"], id);
+        let continued_id = continued_body["id"].as_str().unwrap().to_owned();
+        let competing = app
             .clone()
             .oneshot(request(
                 "POST",
                 "/openai/v1/responses",
                 json!({
-                    "model": "m",
-                    "input": "hello",
-                    "max_output_tokens": 1,
-                    "store": false
+                    "model":"m",
+                    "input":"competing continuation",
+                    "max_output_tokens":1,
+                    "store":true,
+                    "previous_response_id":id
                 }),
             ))
             .await
             .unwrap();
-        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(competing.status(), StatusCode::CONFLICT);
 
-        let rejected = app
+        let reopened = Server::open(
+            dir.join("state.json"),
+            Arc::new(AnonymousAdmin),
+            Arc::new(DeterministicEngine),
+        )
+        .unwrap();
+        let reopened_app = router(reopened);
+        assert_eq!(
+            reopened_app
+                .oneshot(request(
+                    "GET",
+                    &format!("/openai/v1/responses/{id}"),
+                    json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "DELETE",
+                    &format!("/openai/v1/responses/{id}"),
+                    json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "DELETE",
+                    &format!("/openai/v1/responses/{continued_id}"),
+                    json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "DELETE",
+                    &format!("/openai/v1/responses/{id}"),
+                    json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let streamed = app.clone().oneshot(request(
+            "POST", "/openai/v1/responses",
+            json!({"model":"m","input":"stream","max_output_tokens":1,"store":true,"stream":true}),
+        )).await.unwrap();
+        assert_eq!(streamed.status(), StatusCode::OK);
+        let stream_body = String::from_utf8(
+            to_bytes(streamed.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let completed = stream_body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|row| serde_json::from_str::<Value>(row).ok())
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let stream_id = completed["response"]["id"].as_str().unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "GET",
+                    &format!("/openai/v1/responses/{stream_id}"),
+                    json!({})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let stateless = app
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({"model":"m","input":"hello","max_output_tokens":1,"store":false}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stateless.status(), StatusCode::OK);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_continue_from_persisted_function_calls() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let seed_app = router(server.clone());
+        let seeded = seed_app
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({"model":"m","input":"lookup","max_output_tokens":1,"store":true}),
+            ))
+            .await
+            .unwrap();
+        let seeded_body: Value =
+            serde_json::from_slice(&to_bytes(seeded.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let seeded_id = seeded_body["id"].as_str().unwrap();
+        let mut predecessor = server
+            .response_service
+            .retrieve(seeded_id, "anonymous-admin")
+            .unwrap();
+        predecessor.output = vec![responses::ResponseOutputItem::FunctionCall(
+            responses::new_function_call("lookup".into(), r#"{"key":"value"}"#.into()),
+        )];
+        let call_id = match &predecessor.output[0] {
+            responses::ResponseOutputItem::FunctionCall(call) => call.call_id.clone(),
+            _ => unreachable!(),
+        };
+        server.response_service.persist(&predecessor).unwrap();
+        let app = router(server);
+        let continued = app
+            .clone()
             .oneshot(request(
                 "POST",
                 "/openai/v1/responses",
                 json!({
-                    "model": "m",
-                    "input": "hello",
-                    "max_output_tokens": 1,
-                    "store": true
+                    "model":"m",
+                    "previous_response_id":seeded_id,
+                    "input":[{"type":"function_call_output","call_id":call_id,"output":"result"}],
+                    "max_output_tokens":1,
+                    "store":true
                 }),
             ))
             .await
             .unwrap();
-        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
-        let body: Value =
-            serde_json::from_slice(&to_bytes(rejected.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(body["error"]["code"], "invalid_request");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("`store: true` is unsupported"));
+        assert_eq!(continued.status(), StatusCode::OK);
+        let portable = app
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({
+                    "model":"m",
+                    "input":[
+                        {
+                            "type":"function_call",
+                            "call_id":call_id,
+                            "name":"lookup",
+                            "arguments":"{\"key\":\"value\"}"
+                        },
+                        {
+                            "type":"function_call_output",
+                            "call_id":call_id,
+                            "output":"result"
+                        }
+                    ],
+                    "max_output_tokens":1,
+                    "store":true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(portable.status(), StatusCode::OK);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn stream_row(protocol: WireProtocol, event: StreamEvent, include_usage: bool) -> String {
+        let mut state = responses::ResponseProjection::new("m".into());
+        stream_row_with_state(protocol, event, include_usage, &mut state)
     }
 
     #[test]
@@ -5685,6 +7167,7 @@ mod tests {
             stop: vec![],
             raw_continuation: false,
             sampling: SamplingConfig::default(),
+            grammar: None,
             scheduling: SchedulingMetadata::default(),
         }
     }
@@ -5746,7 +7229,11 @@ mod tests {
             WireProtocol::Completion,
             response,
             FinishReason::Length,
-        );
+            None,
+            "local",
+            None,
+        )
+        .unwrap();
         assert_eq!(
             payload["cusco"]["compaction_result"]["selected_strategy_id"],
             "window_tail:v1"
@@ -5873,7 +7360,8 @@ mod tests {
 
     fn assert_semantic_fixture(name: &str) {
         let fixtures: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/semantic_compaction.json")).unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/semantic_compaction.json"))
+                .unwrap();
         let fixture = &fixtures[name];
         let tokens = fixture["tokens"]
             .as_array()
@@ -5933,5 +7421,141 @@ mod tests {
         assert!(row.contains("\"correlation_id\":\"correlation\""));
         assert!(row.contains("\"inference_id\":\"inference\""));
         assert!(row.contains("\"execution_session_id\":\"session\""));
+
+        let mut state = responses::ResponseProjection::new("m".into());
+        let started = state.project(StreamEvent::Started {
+            request_id: "response".into(),
+            context_id: ContextId::new(),
+            correlation_id: "correlation".into(),
+            inference_id: "inference".into(),
+            execution_session_id: "session".into(),
+        });
+        let delta = state.project(StreamEvent::Token {
+            token: "hello".into(),
+            index: 0,
+        });
+        let done = state.project(StreamEvent::Finished {
+            reason: FinishReason::Stop,
+            usage: Box::new(Usage {
+                input_tokens: 2,
+                generated_tokens: 1,
+                evaluated_tokens: 2,
+                cached_tokens: 0,
+                prefill: PrefillMetrics::default(),
+                model: "m".into(),
+                model_revision: "r".into(),
+                context_id: ContextId::new(),
+                compaction_result: None,
+                latency_ms: 1,
+                status: "completed".into(),
+                correlation_id: "correlation".into(),
+                inference_id: "inference".into(),
+                execution_session_id: "session".into(),
+            }),
+        });
+        assert!(started.contains("\"sequence_number\":0"));
+        assert!(started.contains("\"sequence_number\":2"));
+        assert!(delta.contains("\"sequence_number\":3"));
+        assert!(done.contains("\"sequence_number\":4"));
+        assert!(done.contains("\"sequence_number\":7"));
+        assert!(done.contains("\"text\":\"hello\""));
+        assert!(done.contains("\"id\":\"response\""));
+    }
+    #[tokio::test]
+    async fn context_update_negotiates_commits_and_replays_after_restart() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let base = responses::ResponseResource {
+            schema_version: responses::RESPONSE_SCHEMA_VERSION,
+            id: "resp_base".into(),
+            owner: "anonymous-admin".into(),
+            model: "m".into(),
+            created_at: responses::now(),
+            status: "completed".into(),
+            store: true,
+            previous_response_id: None,
+            input: vec![],
+            output: vec![],
+            tools: vec![],
+            tool_choice: json!("auto"),
+            finish_reason: Some(FinishReason::Stop),
+            usage: None,
+            metadata: responses::ResponseMetadata::default(),
+            lineage_revision: 0,
+            context_update: None,
+        };
+        server.response_service.remember(&base).unwrap();
+        let app = router(server.clone());
+
+        let capability = app
+            .clone()
+            .oneshot(request("GET", "/cusco/v1/capabilities", Value::Null))
+            .await
+            .unwrap();
+        assert_eq!(capability.status(), StatusCode::OK);
+        let capability: Value =
+            serde_json::from_slice(&to_bytes(capability.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            capability["data"][0]["id"],
+            context_updates::CONTEXT_UPDATE_CAPABILITY
+        );
+
+        let updated = app
+            .oneshot(request(
+                "POST",
+                "/cusco/v1/context-updates",
+                json!({
+                    "base_response_id": "resp_base",
+                    "expected_revision": 0,
+                    "operation_id": "ctxupd_http",
+                    "operation": {
+                        "type": "fold",
+                        "items": [{
+                            "type": "message",
+                            "role": "user",
+                            "text": "portable summary"
+                        }]
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        assert_eq!(
+            updated.headers()["x-request-id"].to_str().unwrap(),
+            "ctxupd_http"
+        );
+        let updated: Value =
+            serde_json::from_slice(&to_bytes(updated.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let response_id = updated["response"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(updated["revision"], 1);
+        assert_eq!(
+            updated["response"]["cusco"]["context_update"]["operation"],
+            "fold"
+        );
+
+        drop(server);
+        let reopened = Server::open(
+            directory.join("state.json"),
+            Arc::new(AnonymousAdmin),
+            Arc::new(DeterministicEngine),
+        )
+        .unwrap();
+        let replay = router(reopened)
+            .oneshot(request(
+                "GET",
+                &format!("/openai/v1/responses/{response_id}"),
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: Value =
+            serde_json::from_slice(&to_bytes(replay.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(replay["id"], response_id);
+        assert_eq!(replay["cusco"]["lineage_revision"], 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

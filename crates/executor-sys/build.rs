@@ -1,11 +1,25 @@
 use std::env;
 use std::path::PathBuf;
 
+fn executor_abi_version() -> String {
+    let header = std::fs::read_to_string("../../native/include/cusco_executor.h")
+        .expect("failed to read executor ABI header");
+    header
+        .lines()
+        .find_map(|line| line.strip_prefix("#define CUSCO_EXECUTOR_ABI_VERSION "))
+        .and_then(|value| value.strip_suffix('u'))
+        .expect("executor ABI header has no CUSCO_EXECUTOR_ABI_VERSION")
+        .to_owned()
+}
 fn main() {
     println!("cargo:rerun-if-env-changed=CUSCO_NATIVE_LIB_DIR");
     println!("cargo:rerun-if-env-changed=CUSCO_LLAMA_LIB_DIR");
     println!("cargo:rerun-if-changed=../../native/include/cusco_executor.h");
     println!("cargo:rerun-if-changed=../../native/shim/cusco_executor.cpp");
+    println!(
+        "cargo:rustc-env=CUSCO_EXECUTOR_ABI_VERSION={}",
+        executor_abi_version()
+    );
     if let Ok(dir) = env::var("CUSCO_NATIVE_LIB_DIR") {
         println!("cargo:rustc-link-search=native={dir}");
         println!("cargo:rerun-if-changed={dir}/libcusco_executor.a");

@@ -1,10 +1,15 @@
 use crate::{
-    EngineRequest, Error, ExecutionSession, InferenceEngine, MappedEngine, ModelRecord, SessionStep,
+    EngineRequest, Error, ExecutionSession, InferenceEngine, MappedEngine, ModelCatalog,
+    ModelRecord, SessionStep,
+    catalog::{
+        MEASURED_EXECUTION_PROFILE_SCHEMA_MAJOR, MeasuredExecutionProfile, MeasurementSource,
+    },
 };
 use cusco_context_store::ModelEpoch;
-use cusco_executor::OperatingPoint;
+use cusco_executor::{ABI_VERSION, OperatingPoint};
 use parking_lot::Mutex;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs,
@@ -90,7 +95,6 @@ impl ModelLoader for NativeLoader {
     ) -> Result<(Arc<dyn InferenceEngine>, OperatingPoint), Error> {
         let spill_dir = self.spill_dir.join(format!("{}-{}", model.id, model.epoch));
         let engine = MappedEngine::open_at_epoch_with_spill(
-            &model.family,
             &model.path,
             config.n_ctx,
             config.gpu_layers,
@@ -103,6 +107,13 @@ impl ModelLoader for NativeLoader {
             usize::try_from(config.context_reserve_bytes)
                 .map_err(|_| Error::State("context reserve exceeds address space".into()))?,
         )?;
+        if engine.model_architecture() != model.family {
+            return Err(Error::State(format!(
+                "catalog model family {} does not match native architecture {}",
+                model.family,
+                engine.model_architecture()
+            )));
+        }
         let mut point = engine.operating_point();
         point.model_bytes = model.size_bytes;
         Ok((engine, point))
@@ -147,6 +158,7 @@ pub struct ResidentEngine {
     config: ResidencyConfig,
     state: Arc<Mutex<ResidencyState>>,
     loader: Arc<dyn ModelLoader>,
+    catalog: Mutex<Option<ModelCatalog>>,
 }
 
 impl ResidentEngine {
@@ -164,6 +176,7 @@ impl ResidentEngine {
             config: config.validate()?,
             state: Arc::new(Mutex::new(ResidencyState::default())),
             loader: Arc::new(NativeLoader { spill_dir }),
+            catalog: Mutex::new(None),
         }))
     }
 
@@ -173,10 +186,106 @@ impl ResidentEngine {
             config: config.validate().unwrap(),
             state: Arc::new(Mutex::new(ResidencyState::default())),
             loader,
+            catalog: Mutex::new(None),
         })
     }
 
+    pub fn attach_catalog(&self, catalog: ModelCatalog) {
+        *self.catalog.lock() = Some(catalog);
+    }
+
+    fn profile_key(&self, model: &ModelRecord) -> (String, String, String, String) {
+        let model_identity = if model.sha256.is_empty() {
+            format!("{}@{}", model.id, model.revision)
+        } else {
+            model.sha256.clone()
+        };
+        let config = format!(
+            "abi={ABI_VERSION};llama={};n_ctx={};n_batch={};gpu_layers={};mapped=true",
+            include_str!("../../../llama.cpp-version.txt").trim(),
+            self.config.n_ctx,
+            self.config.n_ctx,
+            self.config.gpu_layers,
+        );
+        let config_hash = hex::encode(Sha256::digest(config.as_bytes()));
+        let gpu_id = if self.config.gpu_layers > 0 {
+            format!(
+                "configured-gpu:{}",
+                std::env::var("CUSCO_GPU_DEVICE_ID").unwrap_or_else(|_| "unspecified".into())
+            )
+        } else {
+            "cpu".into()
+        };
+        let provenance = format!(
+            "executor-abi={ABI_VERSION};llama={}",
+            include_str!("../../../llama.cpp-version.txt").trim()
+        );
+        (model_identity, config_hash, gpu_id, provenance)
+    }
+
+    fn cached_profile(&self, model: &ModelRecord) -> Result<Option<OperatingPoint>, Error> {
+        // A configured GPU index is not a stable hardware identity across hosts or
+        // device renumbering. Until the executor exposes one, GPU measurements
+        // must be refreshed rather than reused from the durable cache.
+        if self.config.gpu_layers > 0 {
+            return Ok(None);
+        }
+        let Some(catalog) = self.catalog.lock().clone() else {
+            return Ok(None);
+        };
+        let (model_identity, config_hash, gpu_id, provenance) = self.profile_key(model);
+        let record = catalog
+            .measured_execution_profile(&model_identity, &config_hash, &gpu_id, &provenance)
+            .map_err(|error| Error::State(error.to_string()))?;
+        Ok(record.map(|record| OperatingPoint {
+            model_bytes: record.profile.model_bytes,
+            context_bytes: record.profile.context_state_bytes,
+            device_bytes: record.profile.device_model_bytes
+                + record.profile.device_execution_reserve_bytes
+                + record.profile.allocator_headroom_bytes,
+            host_bytes: record.profile.host_model_bytes + record.profile.host_staging_bytes,
+            gpu_layers: self.config.gpu_layers,
+            model_layers: record.profile.model_layers,
+            competent: record.profile.competent,
+        }))
+    }
+
+    fn publish_profile(&self, model: &ModelRecord, point: OperatingPoint) -> Result<(), Error> {
+        if self.config.gpu_layers > 0 {
+            return Ok(());
+        }
+        let Some(catalog) = self.catalog.lock().clone() else {
+            return Ok(());
+        };
+        let (model_identity, config_hash, gpu_id, provenance) = self.profile_key(model);
+        let profile = MeasuredExecutionProfile {
+            schema_major: MEASURED_EXECUTION_PROFILE_SCHEMA_MAJOR,
+            schema_minor: 0,
+            model_bytes: point.model_bytes,
+            device_model_bytes: point.device_bytes,
+            host_model_bytes: point.host_bytes,
+            context_state_bytes: point.context_bytes,
+            device_execution_reserve_bytes: 0,
+            host_staging_bytes: 0,
+            model_layers: point.model_layers,
+            competent: point.competent,
+            allocator_headroom_bytes: point.device_bytes / 20,
+            measurement_source: if self.config.gpu_layers > 0 {
+                MeasurementSource::BackendAllocator
+            } else {
+                MeasurementSource::ConservativeFallback
+            },
+            provenance,
+        };
+        catalog
+            .publish_measured_execution_profile(&model_identity, &config_hash, &gpu_id, &profile)
+            .map_err(|error| Error::State(error.to_string()))
+    }
+
     fn estimate(&self, model: &ModelRecord) -> Result<OperatingPoint, Error> {
+        if let Some(profile) = self.cached_profile(model)? {
+            return Ok(profile);
+        }
         let model_bytes = if model.size_bytes == 0 {
             fs::metadata(&model.path).map_err(super::state_err)?.len()
         } else {
@@ -323,6 +432,22 @@ impl ResidentEngine {
                 return Err(error);
             }
         };
+        // A backend-wide free-memory delta can include unrelated devices and
+        // concurrent allocations. Never let it weaken the conservative
+        // admission estimate derived before loading.
+        let measured_point = OperatingPoint {
+            model_bytes: point.model_bytes.max(estimate.model_bytes),
+            context_bytes: point.context_bytes.max(estimate.context_bytes),
+            device_bytes: point.device_bytes.max(estimate.device_bytes),
+            host_bytes: point.host_bytes.max(estimate.host_bytes),
+            ..point
+        };
+        let point = OperatingPoint {
+            device_bytes: measured_point
+                .device_bytes
+                .saturating_add(measured_point.device_bytes / 20),
+            ..measured_point
+        };
         if let Some(control) = control {
             if let Err(error) = control.check() {
                 self.state.lock().metrics.load_failures += 1;
@@ -357,6 +482,10 @@ impl ResidentEngine {
             return Err(Error::State(
                 "measured operating point exceeds residency capacity".into(),
             ));
+        }
+        if let Err(error) = self.publish_profile(model, measured_point) {
+            state.metrics.load_failures += 1;
+            return Err(error);
         }
         for victim in candidate_victims {
             let victim_key = (victim.record.id.clone(), victim.record.epoch);
@@ -739,6 +868,7 @@ mod tests {
             max_tokens,
             prior_tokens: vec![],
             sampling: Default::default(),
+            grammar: None,
             control,
             scheduling: SchedulingMetadata::default(),
             prefill_chunk_tokens: 32,
@@ -819,6 +949,76 @@ mod tests {
             size_bytes: bytes,
             epoch,
         }
+    }
+
+    #[test]
+    fn persisted_profile_cannot_weaken_conservative_admission() {
+        let database = std::env::temp_dir().join(format!(
+            "cusco-residency-profile-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let catalog = ModelCatalog::open(&database).unwrap();
+        let loader = Arc::new(FixtureLoader {
+            point: point(10),
+            failures: Mutex::new(vec![]),
+            blocker: None,
+        });
+        let mut measured_config = config(110);
+        measured_config.gpu_layers = 0;
+        let measured = ResidentEngine::with_loader(measured_config, loader.clone());
+        measured.attach_catalog(catalog.clone());
+        let large_declaration = model("profiled", "checksum", 1, 100);
+        measured.prepare_model(&large_declaration).unwrap();
+        drop(measured);
+
+        let mut reused_config = config(20);
+        reused_config.gpu_layers = 0;
+        let reused = ResidentEngine::with_loader(reused_config, loader);
+        reused.attach_catalog(catalog);
+        assert!(matches!(
+            reused.prepare_model(&large_declaration),
+            Err(Error::State(message)) if message == "residency capacity is exhausted"
+        ));
+
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn persisted_profile_preserves_measured_competence() {
+        let database = std::env::temp_dir().join(format!(
+            "cusco-residency-competence-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let catalog = ModelCatalog::open(&database).unwrap();
+        let loader = Arc::new(FixtureLoader {
+            point: OperatingPoint {
+                competent: false,
+                ..point(10)
+            },
+            failures: Mutex::new(vec![]),
+            blocker: None,
+        });
+        let mut permissive = config(100);
+        permissive.gpu_layers = 0;
+        permissive.require_competent = false;
+        let measured = ResidentEngine::with_loader(permissive, loader.clone());
+        measured.attach_catalog(catalog.clone());
+        let record = model("profiled", "checksum", 1, 10);
+        measured.prepare_model(&record).unwrap();
+        drop(measured);
+
+        let mut required = config(100);
+        required.gpu_layers = 0;
+        required.require_competent = true;
+        let reused = ResidentEngine::with_loader(required, loader);
+        reused.attach_catalog(catalog);
+        assert!(matches!(
+            reused.prepare_model(&record),
+            Err(Error::State(message))
+                if message == "executor operating point is below the competent floor"
+        ));
+
+        let _ = fs::remove_file(database);
     }
 
     #[test]

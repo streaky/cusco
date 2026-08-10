@@ -26,7 +26,7 @@ services:
     ports:
       - "${CUSCO_LISTEN_ADDRESS:-127.0.0.1}:${CUSCO_PORT:-11443}:8080"
     volumes:
-      - ./config/config.yaml:/data/config.yaml:ro
+      - ./config.yaml:/data/config.yaml:ro
       - ./config/user.yaml:/data/user.yaml:ro
       - ./data/user-models:/data/user-models:ro
       - ./data/models:/data/models

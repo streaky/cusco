@@ -44,6 +44,43 @@ pub struct UserModels {
     pub models: Vec<UserModelConfig>,
 }
 
+pub const MEASURED_EXECUTION_PROFILE_SCHEMA_MAJOR: u16 = 1;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasurementSource {
+    BackendAllocator,
+    ConservativeFallback,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MeasuredExecutionProfile {
+    pub schema_major: u16,
+    pub schema_minor: u16,
+    pub model_bytes: u64,
+    pub device_model_bytes: u64,
+    pub host_model_bytes: u64,
+    pub context_state_bytes: u64,
+    pub device_execution_reserve_bytes: u64,
+    pub host_staging_bytes: u64,
+    pub allocator_headroom_bytes: u64,
+    pub model_layers: i32,
+    pub competent: bool,
+    pub measurement_source: MeasurementSource,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeasuredExecutionProfileRecord {
+    pub model_identity: String,
+    pub config_hash: String,
+    pub gpu_id: String,
+    pub profile: MeasuredExecutionProfile,
+    pub measured_at: i64,
+    pub last_used_at: i64,
+}
+
 const PUBLISH_MODEL_SQL: &str = "INSERT INTO models(id,revision,path,sha256,family,size_bytes,epoch,aliases_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,path=excluded.path,sha256=excluded.sha256,family=excluded.family,size_bytes=excluded.size_bytes,epoch=excluded.epoch,aliases_json=excluded.aliases_json";
 
 fn publish_model(connection: &Connection, model: &ModelRecord) -> Result<(), CatalogError> {
@@ -76,6 +113,8 @@ fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up("CREATE TABLE models (id TEXT PRIMARY KEY NOT NULL, revision TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, family TEXT NOT NULL, size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0), epoch INTEGER NOT NULL CHECK(epoch > 0), aliases_json TEXT NOT NULL, installed_at INTEGER NOT NULL DEFAULT (unixepoch())); CREATE UNIQUE INDEX model_path_revision ON models(path, revision); CREATE TABLE lifecycle_operations (id TEXT PRIMARY KEY NOT NULL, model_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('running','complete','failed','cancelled')), detail TEXT, started_at INTEGER NOT NULL DEFAULT (unixepoch()), finished_at INTEGER);")
             .down("DROP TABLE lifecycle_operations; DROP TABLE models;"),
+        M::up("CREATE TABLE model_execution_profiles (model_identity TEXT NOT NULL, config_hash TEXT NOT NULL, gpu_id TEXT NOT NULL, schema_major INTEGER NOT NULL, measured_data TEXT NOT NULL, measured_at INTEGER NOT NULL DEFAULT (unixepoch()), last_used_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY(model_identity, config_hash, gpu_id));")
+            .down("DROP TABLE model_execution_profiles;"),
     ])
 }
 
@@ -205,6 +244,79 @@ impl ModelCatalog {
             )
             .optional()?)
     }
+
+    pub fn measured_execution_profile(
+        &self,
+        model_identity: &str,
+        config_hash: &str,
+        gpu_id: &str,
+        expected_provenance: &str,
+    ) -> Result<Option<MeasuredExecutionProfileRecord>, CatalogError> {
+        let connection = self.connection.lock();
+        let row = connection
+            .query_row(
+                "SELECT schema_major, measured_data, measured_at, last_used_at FROM model_execution_profiles WHERE model_identity=?1 AND config_hash=?2 AND gpu_id=?3",
+                params![model_identity, config_hash, gpu_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((schema_major, measured_data, measured_at, last_used_at)) = row else {
+            return Ok(None);
+        };
+        if schema_major != i64::from(MEASURED_EXECUTION_PROFILE_SCHEMA_MAJOR) {
+            return Ok(None);
+        }
+        let profile: MeasuredExecutionProfile = serde_json::from_str(&measured_data)
+            .map_err(|error| CatalogError::Data(error.to_string()))?;
+        if profile.schema_major != MEASURED_EXECUTION_PROFILE_SCHEMA_MAJOR
+            || profile.provenance != expected_provenance
+        {
+            return Ok(None);
+        }
+        Ok(Some(MeasuredExecutionProfileRecord {
+            model_identity: model_identity.into(),
+            config_hash: config_hash.into(),
+            gpu_id: gpu_id.into(),
+            profile,
+            measured_at,
+            last_used_at,
+        }))
+    }
+
+    pub fn publish_measured_execution_profile(
+        &self,
+        model_identity: &str,
+        config_hash: &str,
+        gpu_id: &str,
+        profile: &MeasuredExecutionProfile,
+    ) -> Result<(), CatalogError> {
+        if profile.schema_major != MEASURED_EXECUTION_PROFILE_SCHEMA_MAJOR {
+            return Err(CatalogError::Data(format!(
+                "unsupported measured execution profile schema {}",
+                profile.schema_major
+            )));
+        }
+        let measured_data = serde_json::to_string(profile)
+            .map_err(|error| CatalogError::Data(error.to_string()))?;
+        self.connection.lock().execute(
+            "INSERT INTO model_execution_profiles(model_identity,config_hash,gpu_id,schema_major,measured_data) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(model_identity,config_hash,gpu_id) DO UPDATE SET schema_major=excluded.schema_major, measured_data=excluded.measured_data, measured_at=unixepoch(), last_used_at=unixepoch()",
+            params![
+                model_identity,
+                config_hash,
+                gpu_id,
+                i64::from(profile.schema_major),
+                measured_data
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 pub fn load_user_models(
@@ -271,6 +383,74 @@ mod tests {
             reopened.operation_status("op").unwrap().as_deref(),
             Some("failed")
         );
+        let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn measured_execution_profiles_are_keyed_versioned_and_provenance_checked() {
+        let (path, catalog) = database();
+        let profile = MeasuredExecutionProfile {
+            schema_major: MEASURED_EXECUTION_PROFILE_SCHEMA_MAJOR,
+            schema_minor: 0,
+            model_bytes: 11,
+            device_model_bytes: 7,
+            host_model_bytes: 4,
+            context_state_bytes: 13,
+            device_execution_reserve_bytes: 17,
+            host_staging_bytes: 19,
+            allocator_headroom_bytes: 23,
+            model_layers: 29,
+            competent: true,
+            measurement_source: MeasurementSource::BackendAllocator,
+            provenance: "llama=b10273;abi=13;device=sm_61".into(),
+        };
+        catalog
+            .publish_measured_execution_profile("sha256:model", "config-a", "gpu-0", &profile)
+            .unwrap();
+        let stored = catalog
+            .measured_execution_profile(
+                "sha256:model",
+                "config-a",
+                "gpu-0",
+                "llama=b10273;abi=13;device=sm_61",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.profile, profile);
+        assert!(
+            catalog
+                .measured_execution_profile(
+                    "sha256:model",
+                    "config-b",
+                    "gpu-0",
+                    "llama=b10273;abi=13;device=sm_61",
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            catalog
+                .measured_execution_profile(
+                    "sha256:model",
+                    "config-a",
+                    "gpu-0",
+                    "llama=changed;abi=13;device=sm_61",
+                )
+                .unwrap()
+                .is_none()
+        );
+        let incompatible = MeasuredExecutionProfile {
+            schema_major: 99,
+            ..profile
+        };
+        assert!(matches!(
+            catalog.publish_measured_execution_profile(
+                "sha256:model",
+                "config-c",
+                "gpu-0",
+                &incompatible,
+            ),
+            Err(CatalogError::Data(_))
+        ));
         let _ = fs::remove_file(path);
     }
     #[test]

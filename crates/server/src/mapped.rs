@@ -35,16 +35,9 @@ struct ProfileCatalog {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionProfile {
-    pub id: String,
     pub architecture: String,
-    pub model_type: String,
     pub block_size: usize,
-    pub recurrent_checkpoint_interval: usize,
-    pub context_limit: usize,
     required_components: Vec<ProfileComponent>,
-    tokenizer: TokenizerProfile,
-    terminal_tokens: Vec<i32>,
-    sampler: SamplerProfile,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -55,20 +48,8 @@ enum ProfileComponent {
     Recurrent,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct TokenizerProfile {
-    add_bos: bool,
-    parse_special: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct SamplerProfile {
-    kind: String,
-}
 impl ExecutionProfile {
-    pub fn bundled_gemma() -> Result<Self, Error> {
+    pub fn bundled_for_architecture(architecture: &str) -> Result<Self, Error> {
         let catalog_source = include_str!("../../../config/model-families.yaml");
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../../config/model-families.schema.json"))
@@ -86,26 +67,25 @@ impl ExecutionProfile {
             )));
         }
         let catalog: ProfileCatalog = serde_json::from_value(catalog_value).map_err(state_error)?;
-        if catalog.families.len() != 1 {
-            return Err(Error::State("unsupported model-family catalog".into()));
+        let mut matches = catalog
+            .families
+            .into_iter()
+            .filter(|profile| profile.architecture == architecture);
+        let profile = matches.next().ok_or_else(|| {
+            Error::State(format!("unsupported model architecture: {architecture}"))
+        })?;
+        if matches.next().is_some() {
+            return Err(Error::State(format!(
+                "multiple execution profiles for model architecture: {architecture}"
+            )));
         }
-        let profile = catalog.families.into_iter().next().unwrap();
         profile.validate()?;
         Ok(profile)
     }
 
     fn validate(&self) -> Result<(), Error> {
-        if self.id.is_empty()
-            || self.architecture != "gemma4"
-            || self.model_type != "gemma4_text"
-            || self.block_size == 0
-            || self.recurrent_checkpoint_interval == 0
-            || self.context_limit < self.block_size
-            || self.sampler.kind != "greedy"
-            || !self.tokenizer.add_bos
-            || !self.tokenizer.parse_special
-        {
-            return Err(Error::State("invalid Gemma execution profile".into()));
+        if self.architecture.is_empty() || self.block_size == 0 {
+            return Err(Error::State("invalid execution profile".into()));
         }
         let required = self.required_mask();
         if !required.contains(ComponentMask::GLOBAL_KV)
@@ -113,7 +93,7 @@ impl ExecutionProfile {
             || !required.contains(ComponentMask::RECURRENT)
         {
             return Err(Error::State(
-                "Gemma profile omits a required execution component".into(),
+                "execution profile omits a required component".into(),
             ));
         }
         Ok(())
@@ -193,8 +173,10 @@ pub struct MappedEngine {
 }
 
 impl MappedEngine {
+    pub(crate) fn model_architecture(&self) -> &str {
+        &self.profile.architecture
+    }
     pub fn open(
-        model_family_id: &str,
         model_path: impl AsRef<Path>,
         n_ctx: u32,
         gpu_layers: i32,
@@ -202,7 +184,6 @@ impl MappedEngine {
         host_bytes: usize,
     ) -> Result<Arc<Self>, Error> {
         Self::open_at_epoch(
-            model_family_id,
             model_path,
             n_ctx,
             gpu_layers,
@@ -213,7 +194,6 @@ impl MappedEngine {
     }
 
     pub fn open_at_epoch(
-        model_family_id: &str,
         model_path: impl AsRef<Path>,
         n_ctx: u32,
         gpu_layers: i32,
@@ -222,7 +202,6 @@ impl MappedEngine {
         model_epoch: ModelEpoch,
     ) -> Result<Arc<Self>, Error> {
         Self::open_at_epoch_with_spill(
-            model_family_id,
             model_path,
             n_ctx,
             gpu_layers,
@@ -236,7 +215,6 @@ impl MappedEngine {
 
     #[allow(clippy::too_many_arguments)]
     pub fn open_at_epoch_with_spill(
-        model_family_id: &str,
         model_path: impl AsRef<Path>,
         n_ctx: u32,
         gpu_layers: i32,
@@ -246,17 +224,6 @@ impl MappedEngine {
         spill_dir: Option<PathBuf>,
         spill_capacity: usize,
     ) -> Result<Arc<Self>, Error> {
-        let profile = ExecutionProfile::bundled_gemma()?;
-        if model_family_id != profile.id {
-            return Err(Error::State(format!(
-                "unsupported model family: {model_family_id}"
-            )));
-        }
-        if n_ctx as usize > profile.context_limit {
-            return Err(Error::State(
-                "configured context exceeds the Gemma profile limit".into(),
-            ));
-        }
         if let Some(path) = &spill_dir {
             reset_spill_directory(path)?;
         }
@@ -266,6 +233,8 @@ impl MappedEngine {
             .ok_or_else(|| Error::State("model path is not UTF-8".into()))?
             .to_owned();
         let mut executor = Executor::open(&model_path, n_ctx, gpu_layers).map_err(state_error)?;
+        let architecture = executor.model_architecture().map_err(state_error)?;
+        let profile = ExecutionProfile::bundled_for_architecture(&architecture)?;
         let capabilities = executor.capabilities();
         if !capabilities.mapped_execution
             || !capabilities.global_kv
@@ -273,7 +242,12 @@ impl MappedEngine {
             || !capabilities.recurrent
         {
             return Err(Error::State(
-                "executor does not satisfy the Gemma execution profile".into(),
+                "executor does not satisfy the execution profile".into(),
+            ));
+        }
+        if capabilities.training_context_tokens == 0 {
+            return Err(Error::State(
+                "executor did not report the model context capacity".into(),
             ));
         }
         let root = executor.active_representation().map_err(state_error)?;
@@ -381,6 +355,7 @@ impl MappedEngine {
 
 struct MappedSession {
     profile: ExecutionProfile,
+    context_capacity: usize,
     state: Arc<Mutex<MappedState>>,
     request: EngineRequest,
     prompt_started: Instant,
@@ -433,7 +408,7 @@ impl MappedSession {
             .checked_add(prompt.len())
             .and_then(|value| value.checked_add(self.request.max_tokens))
             .ok_or_else(|| Error::State("request token count overflow".into()))?;
-        if total > self.profile.context_limit {
+        if total > self.context_capacity {
             return Err(Error::State(
                 "request exceeds model context capacity".into(),
             ));
@@ -495,7 +470,7 @@ impl MappedSession {
             self.sampler = Some(
                 state
                     .executor
-                    .sampler(self.request.sampling)
+                    .sampler_with_grammar(self.request.sampling, self.request.grammar.as_deref())
                     .map_err(state_error)?,
             );
             self.stage = MappedStage::Decode;
@@ -580,9 +555,9 @@ impl MappedSession {
             .sampler
             .as_mut()
             .expect("decode owns sampler")
-            .sample(&mut state.executor)
+            .sample(self.next.as_ref().expect("decode owns next-token logits"))
             .map_err(state_error)?;
-        let terminal_or_control = self.profile.terminal_tokens.contains(&sampled);
+        let terminal_or_control = state.executor.token_is_eog(sampled);
         let mut piece = Vec::with_capacity(32);
         if !terminal_or_control {
             state
@@ -750,11 +725,10 @@ impl InferenceEngine for MappedEngine {
                 "mapped execution admits only a resident process-owned model".into(),
             ));
         }
-        let context_limit = self.context_capacity.min(self.profile.context_limit);
-        let mut profile = self.profile.clone();
-        profile.context_limit = context_limit;
+        let profile = self.profile.clone();
         Ok(Box::new(MappedSession {
             profile,
+            context_capacity: self.context_capacity,
             state: self.state.clone(),
             request,
             prompt_started: Instant::now(),
@@ -904,9 +878,18 @@ fn publish_block(
     continuation: &Decode,
 ) -> Result<EvaluatedPrefixId, Error> {
     let required = profile.required_mask();
-    let bytes_per_component = represented_end.saturating_mul(1024);
+    let serialized_bytes = state
+        .executor
+        .describe_representation(&native)
+        .map_err(state_error)?
+        .serialized_bytes;
+    let component_count = profile.required_components.len();
+    let bytes_per_component = serialized_bytes
+        .checked_add(component_count.saturating_sub(1))
+        .and_then(|bytes| bytes.checked_div(component_count))
+        .ok_or_else(|| Error::State("representation size overflow".into()))?;
     let required_bytes = bytes_per_component
-        .checked_mul(profile.required_components.len())
+        .checked_mul(component_count)
         .ok_or_else(|| Error::State("representation size overflow".into()))?;
     let capacity = state.physical.metrics();
     let unavailable = capacity
@@ -1098,6 +1081,7 @@ mod tests {
             max_tokens,
             prior_tokens: prior_tokens.to_vec(),
             sampling: Default::default(),
+            grammar: None,
             control: Arc::new(RequestControl::new()),
             scheduling: SchedulingMetadata::default(),
             prefill_chunk_tokens: 32,
@@ -1133,9 +1117,8 @@ mod tests {
 
     #[test]
     fn bundled_profile_is_strict_and_complete() {
-        let profile = ExecutionProfile::bundled_gemma().unwrap();
+        let profile = ExecutionProfile::bundled_for_architecture("gemma4").unwrap();
         assert_eq!(profile.block_size, 32);
-        assert_eq!(profile.recurrent_checkpoint_interval, 8);
         assert!(profile.required_mask().contains(ComponentMask::RECURRENT));
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../../config/model-families.schema.json"))
@@ -1144,8 +1127,17 @@ mod tests {
     }
 
     #[test]
+    fn profile_selection_rejects_unknown_native_architecture() {
+        assert!(matches!(
+            ExecutionProfile::bundled_for_architecture("unknown"),
+            Err(Error::State(message))
+                if message == "unsupported model architecture: unknown"
+        ));
+    }
+
+    #[test]
     fn profile_rejects_missing_global_kv() {
-        let mut missing_kv = ExecutionProfile::bundled_gemma().unwrap();
+        let mut missing_kv = ExecutionProfile::bundled_for_architecture("gemma4").unwrap();
         missing_kv
             .required_components
             .retain(|component| *component != ProfileComponent::Kv);
@@ -1163,9 +1155,7 @@ mod tests {
 
     #[test]
     fn mapped_state_is_reused_without_activation_copying() {
-        let engine =
-            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
-                .unwrap();
+        let engine = MappedEngine::open("mock://deterministic", 4096, 0, 1 << 30, 1 << 30).unwrap();
         let model = model();
         let first = engine
             .generate_collected(test_request(&model, "a".repeat(40), 2, &[]))
@@ -1184,30 +1174,78 @@ mod tests {
 
     #[test]
     fn unrelated_requests_start_from_the_root_mapping() {
-        let shared =
-            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
-                .unwrap();
-        let fresh =
-            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
-                .unwrap();
+        let shared = MappedEngine::open("mock://deterministic", 4096, 0, 1 << 30, 1 << 30).unwrap();
+        let fresh = MappedEngine::open("mock://deterministic", 4096, 0, 1 << 30, 1 << 30).unwrap();
         let model = model();
         shared
             .generate_collected(test_request(&model, "first unrelated prompt", 2, &[]))
             .unwrap();
-        let reused =
-            shared.generate_collected(test_request(&model, "second prompt", 2, &[])).unwrap();
-        let baseline =
-            fresh.generate_collected(test_request(&model, "second prompt", 2, &[])).unwrap();
+        let reused = shared
+            .generate_collected(test_request(&model, "second prompt", 2, &[]))
+            .unwrap();
+        let baseline = fresh
+            .generate_collected(test_request(&model, "second prompt", 2, &[]))
+            .unwrap();
         assert_eq!(reused.pieces, baseline.pieces);
         assert_eq!(reused.successor_tokens, baseline.successor_tokens);
         assert_eq!(reused.cached_tokens, 0);
     }
 
     #[test]
-    fn dropping_unpublished_session_reactivates_root_mapping() {
-        let engine =
-            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
+    fn repeated_identical_requests_reuse_an_immutable_prefix() {
+        let engine = MappedEngine::open("mock://deterministic", 4096, 0, 1 << 30, 1 << 30).unwrap();
+        let model = model();
+        let prompt = "tool schema and request payload ".repeat(96);
+        let cold = engine
+            .generate_collected(test_request(&model, &prompt, 8, &[]))
+            .unwrap();
+        let mut expected_cached = None;
+        for _ in 0..3 {
+            let reused = engine
+                .generate_collected(test_request(&model, &prompt, 8, &[]))
                 .unwrap();
+            assert_eq!(reused.pieces, cold.pieces);
+            assert_eq!(reused.successor_tokens, cold.successor_tokens);
+            assert!(reused.cached_tokens > 0);
+            assert_eq!(
+                *expected_cached.get_or_insert(reused.cached_tokens),
+                reused.cached_tokens
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the pinned external Gemma GGUF"]
+    fn repeated_real_model_requests_reuse_an_immutable_prefix() {
+        let model_path =
+            std::env::var("CUSCO_TEST_MODEL").expect("CUSCO_TEST_MODEL must name the Gemma GGUF");
+        let engine = MappedEngine::open(&model_path, 8192, 99, 1 << 40, 1 << 40).unwrap();
+        let model = ModelRecord {
+            path: PathBuf::from(&model_path),
+            ..model()
+        };
+        let prompt = "tool schema and request payload ".repeat(768);
+        let cold = engine
+            .generate_collected(test_request(&model, &prompt, 8, &[]))
+            .unwrap();
+        let mut expected_cached = None;
+        for _ in 0..3 {
+            let reused = engine
+                .generate_collected(test_request(&model, &prompt, 8, &[]))
+                .unwrap();
+            assert_eq!(reused.pieces, cold.pieces);
+            assert_eq!(reused.successor_tokens, cold.successor_tokens);
+            assert!(reused.cached_tokens > 0);
+            assert_eq!(
+                *expected_cached.get_or_insert(reused.cached_tokens),
+                reused.cached_tokens
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_unpublished_session_reactivates_root_mapping() {
+        let engine = MappedEngine::open("mock://deterministic", 4096, 0, 1 << 30, 1 << 30).unwrap();
         let root_identity = engine.state.lock().root.identity();
         let mut session = engine
             .start_session(test_request(&model(), "cancel before publication", 2, &[]))
@@ -1223,9 +1261,7 @@ mod tests {
 
     #[test]
     fn linear_publication_snapshots_do_not_switch_the_active_branch() {
-        let engine =
-            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
-                .unwrap();
+        let engine = MappedEngine::open("mock://deterministic", 4096, 0, 1 << 30, 1 << 30).unwrap();
         engine
             .generate_collected(test_request(&model(), "a".repeat(160), 2, &[]))
             .unwrap();
@@ -1244,7 +1280,6 @@ mod tests {
         fs::write(spill_dir.join("operator-note"), b"keep").unwrap();
 
         let _engine = MappedEngine::open_at_epoch_with_spill(
-            "gemma4",
             "mock://deterministic",
             4096,
             0,
@@ -1266,7 +1301,6 @@ mod tests {
     fn spilled_mapping_restores_exact_continuation() {
         let spill_dir = std::env::temp_dir().join(format!("cusco-spill-{}", uuid::Uuid::new_v4()));
         let engine = MappedEngine::open_at_epoch_with_spill(
-            "gemma4",
             "mock://deterministic",
             4096,
             0,
@@ -1285,8 +1319,7 @@ mod tests {
             .generate_collected(test_request(&model, "b".repeat(40), 1, &[]))
             .unwrap();
         let control =
-            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
-                .unwrap();
+            MappedEngine::open("mock://deterministic", 4096, 0, 1 << 30, 1 << 30).unwrap();
         let control_first = control
             .generate_collected(test_request(&model, "a".repeat(40), 2, &[]))
             .unwrap();
@@ -1313,8 +1346,7 @@ mod tests {
 
     #[test]
     fn capacity_rejection_precedes_decode_and_preserves_metrics() {
-        let engine =
-            MappedEngine::open("gemma4", "mock://deterministic", 64, 0, 1 << 20, 1 << 20).unwrap();
+        let engine = MappedEngine::open("mock://deterministic", 64, 0, 1 << 20, 1 << 20).unwrap();
         let model = model();
         let error = engine
             .generate_collected(test_request(&model, "x".repeat(65), 1, &[]))
@@ -1325,9 +1357,7 @@ mod tests {
 
     #[test]
     fn publication_failure_keeps_the_prior_mapping_reusable() {
-        let engine =
-            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 250_000, 1 << 20)
-                .unwrap();
+        let engine = MappedEngine::open("mock://deterministic", 4096, 0, 250_000, 1 << 20).unwrap();
         let model = model();
         let first = engine
             .generate_collected(test_request(&model, "a".repeat(40), 1, &[]))
@@ -1349,9 +1379,7 @@ mod tests {
 
     #[test]
     fn exact_cached_prefix_resumes_from_its_saved_logits() {
-        let engine =
-            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
-                .unwrap();
+        let engine = MappedEngine::open("mock://deterministic", 4096, 0, 1 << 30, 1 << 30).unwrap();
         let model = model();
         let primed = engine
             .generate_collected(test_request(&model, "p".repeat(32), 0, &[]))
@@ -1370,9 +1398,7 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("cusco-mapped-server-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
-        let engine =
-            MappedEngine::open("gemma4", "mock://deterministic", 4096, 0, 1 << 30, 1 << 30)
-                .unwrap();
+        let engine = MappedEngine::open("mock://deterministic", 4096, 0, 1 << 30, 1 << 30).unwrap();
         let server = Server::open(
             directory.join("state.json"),
             Arc::new(AnonymousAdmin),
@@ -1394,6 +1420,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: Default::default(),
+                    grammar: None,
                 },
             )
             .unwrap()
@@ -1414,6 +1441,7 @@ mod tests {
                     stop: vec![],
                     raw_continuation: false,
                     sampling: Default::default(),
+                    grammar: None,
                 },
             )
             .unwrap()

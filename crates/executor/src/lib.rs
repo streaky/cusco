@@ -3,6 +3,8 @@ use serde::Serialize;
 use std::{ffi::CString, ptr::NonNull, sync::Arc};
 use thiserror::Error;
 
+pub const ABI_VERSION: &str = sys::ABI_VERSION;
+
 #[derive(Debug, Error, PartialEq)]
 pub enum Error {
     #[error("invalid path")]
@@ -36,6 +38,7 @@ pub struct Capabilities {
     pub vocabulary: i32,
     pub mapped_execution: bool,
     pub max_mappings: u32,
+    pub training_context_tokens: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -199,11 +202,12 @@ pub struct PreparedMapping {
 /// A request-owned native sampler. Sampling requires the executor that created it.
 pub struct Sampler {
     raw: NonNull<sys::CuscoSampler>,
+    _lifetime: Arc<ExecutorLifetime>,
 }
 
-// SAFETY: a sampler is request-owned and all access still requires an exclusive
-// borrow of the executor that created it. Moving a suspended request between
-// scheduler threads does not permit concurrent native sampler access.
+// SAFETY: a sampler is request-owned, keeps its executor allocation alive, and
+// all access requires an exclusive borrow of the sampler. Moving a suspended
+// request between scheduler threads does not permit concurrent native access.
 unsafe impl Send for Sampler {}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -243,7 +247,12 @@ impl Executor {
             vocabulary: c.n_vocab,
             mapped_execution: c.has_mapped_execution != 0,
             max_mappings: c.max_mappings,
+            training_context_tokens: c.training_context_tokens,
         }
+    }
+    pub fn model_architecture(&self) -> Result<String, Error> {
+        let bytes = ffi::model_architecture(self.raw)?;
+        String::from_utf8(bytes).map_err(|_| Error::Backend(sys::INCOMPATIBLE))
     }
     pub fn operating_point(&self) -> OperatingPoint {
         let point = unsafe { sys::cusco_executor_operating_point(self.raw.as_ptr()) };
@@ -280,6 +289,11 @@ impl Executor {
         Ok(buffer)
     }
 
+    pub fn token_is_eog(&self, token: i32) -> bool {
+        // SAFETY: raw is live for the duration of the call.
+        unsafe { sys::cusco_executor_token_is_eog(self.raw.as_ptr(), token) != 0 }
+    }
+
     pub fn token_to_piece(&mut self, token: i32) -> Result<String, Error> {
         let mut buffer = Vec::with_capacity(32);
         self.render_token(token, &mut buffer)?;
@@ -287,8 +301,17 @@ impl Executor {
     }
 
     pub fn sampler(&mut self, config: SamplingConfig) -> Result<Sampler, Error> {
+        self.sampler_with_grammar(config, None)
+    }
+
+    pub fn sampler_with_grammar(
+        &mut self,
+        config: SamplingConfig,
+        grammar: Option<&str>,
+    ) -> Result<Sampler, Error> {
         Ok(Sampler {
-            raw: ffi::sampler(self.raw, config)?,
+            raw: ffi::sampler(self.raw, config, grammar)?,
+            _lifetime: self.lifetime.clone(),
         })
     }
 
@@ -405,8 +428,8 @@ impl Executor {
 }
 
 impl Sampler {
-    pub fn sample(&mut self, executor: &mut Executor) -> Result<i32, Error> {
-        ffi::sample(self.raw, executor.raw)
+    pub fn sample(&mut self, decode: &Decode) -> Result<i32, Error> {
+        ffi::sample(self.raw, &decode.logits)
     }
 }
 
@@ -444,7 +467,11 @@ struct OwnedDecode {
 mod ffi {
     use super::{Error, OwnedDecode, status};
     use crate::sys;
-    use std::{ffi::CStr, ptr::NonNull, slice};
+    use std::{
+        ffi::{CStr, CString},
+        ptr::NonNull,
+        slice,
+    };
 
     pub(super) fn open(
         path: &CStr,
@@ -465,6 +492,35 @@ mod ffi {
     pub(super) fn capabilities(raw: NonNull<sys::CuscoExecutor>) -> sys::Capabilities {
         // SAFETY: raw is live for the duration of the call.
         unsafe { sys::cusco_executor_capabilities(raw.as_ptr()) }
+    }
+
+    pub(super) fn model_architecture(raw: NonNull<sys::CuscoExecutor>) -> Result<Vec<u8>, Error> {
+        let mut buffer = vec![0; 32];
+        let mut size = 0;
+        // SAFETY: raw is live and buffer is initialized writable storage.
+        let mut code = unsafe {
+            sys::cusco_executor_model_architecture(
+                raw.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut size,
+            )
+        };
+        if code == sys::BUFFER_TOO_SMALL {
+            buffer.resize(size, 0);
+            // SAFETY: resizing provides the capacity requested by the ABI.
+            code = unsafe {
+                sys::cusco_executor_model_architecture(
+                    raw.as_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut size,
+                )
+            };
+        }
+        status(code)?;
+        buffer.truncate(size);
+        Ok(buffer)
     }
 
     pub(super) fn tokenize(
@@ -529,27 +585,35 @@ mod ffi {
     pub(super) fn sampler(
         raw: NonNull<sys::CuscoExecutor>,
         config: crate::SamplingConfig,
+        grammar: Option<&str>,
     ) -> Result<NonNull<sys::CuscoSampler>, Error> {
+        let grammar = grammar
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| Error::Backend(sys::INVALID))?;
         let mut sampler = std::ptr::null_mut();
         let config = sys::SamplerConfig {
             temperature: config.temperature,
             top_p: config.top_p,
             seed: config.seed,
+            grammar: grammar
+                .as_ref()
+                .map_or(std::ptr::null(), |value| value.as_ptr()),
         };
-        // SAFETY: raw is live, config is borrowed for the call, and the output
-        // points to writable storage.
+        // SAFETY: raw is live, config and its optional grammar are borrowed for
+        // the call, and the output points to writable storage.
         status(unsafe { sys::cusco_sampler_create(raw.as_ptr(), &config, &mut sampler) })?;
         NonNull::new(sampler).ok_or(Error::Backend(3))
     }
 
     pub(super) fn sample(
         sampler: NonNull<sys::CuscoSampler>,
-        executor: NonNull<sys::CuscoExecutor>,
+        logits: &[f32],
     ) -> Result<i32, Error> {
         let mut token = 0;
-        // SAFETY: both uniquely owned handles are live for the call.
+        // SAFETY: the sampler is live and logits is borrowed for the call.
         status(unsafe {
-            sys::cusco_sampler_sample(sampler.as_ptr(), executor.as_ptr(), &mut token)
+            sys::cusco_sampler_sample(sampler.as_ptr(), logits.as_ptr(), logits.len(), &mut token)
         })?;
         Ok(token)
     }
@@ -842,6 +906,11 @@ mod tests {
         let mut executor = Executor::open("mock://deterministic", 128, 0).unwrap();
         let capabilities = executor.capabilities();
         assert!(capabilities.global_kv && capabilities.swa && capabilities.recurrent);
+        assert_eq!(capabilities.training_context_tokens, u32::MAX);
+        assert_eq!(executor.model_architecture().unwrap(), "gemma4");
+        assert!(executor.token_is_eog(1));
+        assert!(executor.token_is_eog(106));
+        assert!(!executor.token_is_eog(42));
         let prefix = executor.tokenize("prefix").unwrap();
         assert_eq!(executor.token_to_piece(42).unwrap(), "42");
         executor.replace_state_for_proof(&prefix).unwrap();
@@ -898,7 +967,7 @@ mod tests {
         let mut executor = Executor::open("mock://deterministic", 128, 0).unwrap();
         let decoded = executor.decode(&[11]).unwrap();
         let mut sampler = executor.sampler(SamplingConfig::default()).unwrap();
-        assert_eq!(sampler.sample(&mut executor).unwrap(), decoded.token);
+        assert_eq!(sampler.sample(&decoded).unwrap(), decoded.token);
 
         let mut piece = Vec::with_capacity(32);
         executor.render_token(decoded.token, &mut piece).unwrap();
@@ -909,9 +978,19 @@ mod tests {
         assert_eq!(piece.as_ptr(), allocation);
 
         let mut other = Executor::open("mock://deterministic", 128, 0).unwrap();
-        other.decode(&[11]).unwrap();
-        assert_eq!(sampler.sample(&mut other), Err(Error::Backend(1)));
+        let other_decoded = other.decode(&[12]).unwrap();
+        assert_eq!(sampler.sample(&other_decoded).unwrap(), other_decoded.token);
     }
+    #[test]
+    fn sampler_keeps_its_executor_alive() {
+        let mut executor = Executor::open("mock://deterministic", 128, 0).unwrap();
+        let decode = executor.decode(&[42]).unwrap();
+        let mut sampler = executor.sampler(SamplingConfig::default()).unwrap();
+        drop(executor);
+
+        assert_eq!(sampler.sample(&decode).unwrap(), decode.token);
+    }
+
     #[test]
     fn mapped_forks_publish_transactionally_and_switch_by_reference() {
         let mut executor = Executor::open("mock://deterministic", 128, 0).unwrap();

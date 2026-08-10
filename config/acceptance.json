@@ -20,7 +20,9 @@
     {"crate": "cusco-server", "test": "model_publication_and_operation_completion_are_atomic", "contract": "catalog failure atomicity"},
     {"crate": "cusco-server", "test": "contexts_are_disposable_across_restart", "contract": "lifecycle restart boundary"},
     {"crate": "cusco-server", "test": "namespaced_chat_streaming_and_context_routes", "contract": "streaming IDs and context routes"},
-    {"crate": "cusco-server", "test": "prepared_compaction_rolls_back_when_continuation_fails", "contract": "compaction continuation rollback"}
+    {"crate": "cusco-server", "test": "prepared_compaction_rolls_back_when_continuation_fails", "contract": "compaction continuation rollback"},
+    {"crate": "cusco-server", "test": "responses_store_retrieve_delete_and_stateless_mode", "contract": "durable Responses lifecycle and continuation"},
+    {"crate": "cusco-server", "test": "responses_continue_from_persisted_function_calls", "contract": "typed function result continuation"}
   ],
   "real_model": [
     {"name": "executor", "command": ["cargo", "run", "-p", "cusco", "--", "proof", "{model}"], "artifact": "/results/executor-proof.json"},

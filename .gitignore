@@ -18,4 +18,10 @@ results/
 docs/dump/
 data/
 
+# Project-local external test tools
+.tools/
+
 .env
+
+# Operator-local daemon configuration copied from config.example.yaml
+config.yaml

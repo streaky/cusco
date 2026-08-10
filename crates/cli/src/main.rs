@@ -185,6 +185,7 @@ fn run(command: Command) -> Result<()> {
                 Some(token) => Arc::new(BearerAuth::new(token)),
                 None => Arc::new(AnonymousAdmin),
             };
+            let catalog = ModelCatalog::open(&config.paths.database)?;
             let engine = ResidentEngine::open_with_spill(
                 ResidencyConfig {
                     device_bytes: config.execution.device_capacity.0,
@@ -197,6 +198,7 @@ fn run(command: Command) -> Result<()> {
                 },
                 &config.paths.spill,
             )?;
+            engine.attach_catalog(catalog.clone());
             let engine = WorkloadScheduler::new(engine, config.scheduler)?;
             let transient_state = config.paths.database.with_extension("runtime.json");
             if transient_state.exists() {
@@ -208,7 +210,6 @@ fn run(command: Command) -> Result<()> {
             server.configure(config.server)?;
             server.configure_vision(config.vision);
             server.configure_openapi(config.openapi);
-            let catalog = ModelCatalog::open(&config.paths.database)?;
             server.attach_catalog(catalog.clone(), config.paths.models.clone());
             for model in catalog.models()? {
                 server.register_catalog_model(model)?;
@@ -389,15 +390,8 @@ fn scheduler_proof(
             .with_context(|| format!("stat model {}", model_path.display()))?
             .len()
     };
-    let engine = MappedEngine::open(
-        &workload.model_family,
-        &model_path,
-        n_ctx,
-        gpu_layers,
-        device_bytes,
-        host_bytes,
-    )
-    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let engine = MappedEngine::open(&model_path, n_ctx, gpu_layers, device_bytes, host_bytes)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let model = cusco_server::ModelRecord {
         id: "scheduler-proof-model".into(),
         revision: "proof".into(),
@@ -614,6 +608,7 @@ fn run_scheduler_proof_case(
             max_tokens: case.max_tokens,
             prior_tokens: Vec::new(),
             sampling: Default::default(),
+            grammar: None,
             control,
             scheduling: SchedulingMetadata {
                 class: case.class,
@@ -793,6 +788,11 @@ fn representation_proof(
     let imported = executor.import_mapping(&exported)?;
     let import_ns = import_started.elapsed().as_nanos();
     let after_import = executor.mapping_metrics();
+    let import_bytes_copied = after_import.import_bytes_copied - after_export.import_bytes_copied;
+    ensure!(
+        import_bytes_copied > exported.bytes.len() as u64,
+        "mapping import telemetry omitted validation snapshot and restore copies"
+    );
     let movement_token = tokens[cursor];
     executor.activate_mapping(&active)?;
     let resident = executor.decode(&[movement_token])?;
@@ -853,7 +853,7 @@ fn representation_proof(
             "import_ns": import_ns,
             "fork_bytes_copied": metrics.fork_bytes_copied,
             "export_bytes_copied_delta": after_export.export_bytes_copied - movement_before.export_bytes_copied,
-            "import_bytes_copied_delta": after_import.import_bytes_copied - after_export.import_bytes_copied,
+            "import_bytes_copied_delta": import_bytes_copied,
             "total_bytes_copied": metrics.total_bytes_copied,
             "graph_recaptures_supported": metrics.graph_recaptures.is_some(),
             "graph_recaptures": metrics.graph_recaptures
@@ -987,6 +987,11 @@ fn proof(options: ProofOptions) -> Result<()> {
         .context("resolved model path is not UTF-8")?;
     let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
     let capabilities = executor.capabilities();
+    let architecture = executor.model_architecture()?;
+    ensure!(
+        architecture == "gemma4",
+        "reference model reported unsupported architecture {architecture}"
+    );
     ensure!(
         capabilities.global_kv && capabilities.swa && capabilities.recurrent,
         "model lacks a complete composite checkpoint capability"
@@ -1062,7 +1067,7 @@ fn proof(options: ProofOptions) -> Result<()> {
         failed_promotion_preserved,
         "failed promotion changed the active binding"
     );
-    let artifact = json!({"model":record,"capabilities":capabilities,"contexts":comparisons,"host_round_trip":true,"cancellation_preserved_binding":cancellation_preserved,"failed_promotion_preserved_binding":failed_promotion_preserved,"elapsed_ms":started.elapsed().as_millis()});
+    let artifact = json!({"model":record,"architecture":architecture,"capabilities":capabilities,"contexts":comparisons,"host_round_trip":true,"cancellation_preserved_binding":cancellation_preserved,"failed_promotion_preserved_binding":failed_promotion_preserved,"elapsed_ms":started.elapsed().as_millis()});
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?
     }

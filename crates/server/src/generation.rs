@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_STOP_SEQUENCES: usize = 4;
 pub const MAX_STOP_BYTES: usize = 256;
+const MAX_EFFECTIVE_STOP_SEQUENCES: usize = MAX_STOP_SEQUENCES + 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,8 +47,23 @@ pub struct GenerationFrontier {
 
 impl GenerationFrontier {
     pub fn new(stops: &[String], raw_continuation: bool) -> Result<Self, &'static str> {
-        if stops.len() > MAX_STOP_SEQUENCES {
-            return Err("at most four stop sequences are supported");
+        Self::with_limit(stops, raw_continuation, MAX_STOP_SEQUENCES)
+    }
+
+    pub(crate) fn new_effective(
+        stops: &[String],
+        raw_continuation: bool,
+    ) -> Result<Self, &'static str> {
+        Self::with_limit(stops, raw_continuation, MAX_EFFECTIVE_STOP_SEQUENCES)
+    }
+
+    fn with_limit(
+        stops: &[String],
+        raw_continuation: bool,
+        limit: usize,
+    ) -> Result<Self, &'static str> {
+        if stops.len() > limit {
+            return Err("too many stop sequences");
         }
         if stops
             .iter()
@@ -308,10 +324,53 @@ mod tests {
     #[test]
     fn validates_stop_bounds_and_flushes_possible_suffix_at_length() {
         assert!(GenerationFrontier::new(&vec!["x".into(); 5], false).is_err());
+        assert!(GenerationFrontier::new_effective(&vec!["x".into(); 7], false).is_ok());
+        assert!(GenerationFrontier::new_effective(&vec!["x".into(); 8], false).is_err());
         assert!(GenerationFrontier::new(&[String::new()], false).is_err());
         assert!(GenerationFrontier::new(&["x".repeat(257)], false).is_err());
         let (result, _) = run(&[(b"possible ST", false)], &["STOP"], false);
         assert_eq!(result.text, "possible ST");
         assert_eq!(result.finish_reason, FinishReason::Length);
+    }
+
+    #[test]
+    fn suppresses_split_gemma_closing_end_of_turn_marker() {
+        let (result, deltas) = run(
+            &[
+                (b"answer ", false),
+                (b"</", false),
+                (b"end", false),
+                (b"_of_", false),
+                (b"turn>", false),
+            ],
+            &["</end_of_turn>"],
+            false,
+        );
+        assert_eq!(deltas.concat(), "answer ");
+        assert_eq!(result.text, "answer ");
+        assert_eq!(result.finish_reason, FinishReason::Stop);
+        assert_eq!(result.stop_alignment, Some(StopAlignment::TokenAligned));
+    }
+
+    #[test]
+    fn suppresses_split_gemma_closing_start_of_turn_marker() {
+        let (result, deltas) = run(
+            &[
+                (b"hey", false),
+                (b"</start", false),
+                (b"_", false),
+                (b"of", false),
+                (b"_", false),
+                (b"turn", false),
+                (b">", false),
+                (b"\n", false),
+            ],
+            &["</start_of_turn>"],
+            false,
+        );
+        assert_eq!(deltas.concat(), "hey");
+        assert_eq!(result.text, "hey");
+        assert_eq!(result.finish_reason, FinishReason::Stop);
+        assert_eq!(result.stop_alignment, Some(StopAlignment::TokenAligned));
     }
 }

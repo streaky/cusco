@@ -15,6 +15,9 @@ RUN cmake -S native -B /opt/cusco-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DL
  && cmake --build /opt/cusco-native --target install
 RUN ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
 COPY . .
+# Refresh copied build inputs so persistent Cargo target volumes never reuse stale artifacts.
+RUN touch Cargo.toml native/include/*.h native/shim/*.cpp \
+ && find crates -type f \( -name Cargo.toml -o -name build.rs -o -name '*.rs' \) -exec touch {} +
 ENV CUSCO_NATIVE_LIB_DIR=/opt/cusco-install/lib CUSCO_LLAMA_LIB_DIR=/opt/llama-build/bin LD_LIBRARY_PATH=/opt/llama-build/bin:/usr/local/cuda/lib64/stubs
 FROM development AS production
 RUN cargo build --release -p cusco

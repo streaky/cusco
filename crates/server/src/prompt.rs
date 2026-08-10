@@ -14,6 +14,83 @@ pub(crate) fn apply_chat_template(family: &str, messages: Vec<Message>) -> Resul
         ))),
     }
 }
+pub(crate) fn append_rendered(
+    family: &str,
+    prompt: &mut String,
+    continuation: &str,
+) -> Result<(), Error> {
+    if prompt.is_empty() {
+        prompt.push_str(continuation);
+        return Ok(());
+    }
+    match family {
+        "gemma4" => {
+            const GENERATION_PROMPT: &str = "<start_of_turn>model\n";
+            if !prompt.ends_with(GENERATION_PROMPT) {
+                return Err(Error::State(
+                    "rendered Gemma conversation lacks its generation prompt".into(),
+                ));
+            }
+            prompt.truncate(prompt.len() - GENERATION_PROMPT.len());
+            prompt.push_str(continuation);
+            Ok(())
+        }
+        _ => Err(Error::BadRequest(format!(
+            "unsupported_capability: model family {family} has no chat template"
+        ))),
+    }
+}
+pub(crate) fn append_assistant_content(
+    family: &str,
+    prompt: &mut String,
+    content: &str,
+) -> Result<(), Error> {
+    match family {
+        "gemma4" => {
+            const GENERATION_PROMPT: &str = "<start_of_turn>model\n";
+            if !prompt.ends_with(GENERATION_PROMPT) {
+                return Err(Error::State(
+                    "rendered Gemma conversation lacks its generation prompt".into(),
+                ));
+            }
+            prompt.push_str(content);
+            prompt.push_str("<end_of_turn>\n");
+            prompt.push_str(GENERATION_PROMPT);
+            Ok(())
+        }
+        _ => Err(Error::BadRequest(format!(
+            "unsupported_capability: model family {family} has no chat template"
+        ))),
+    }
+}
+
+pub(crate) fn insert_generation_instructions(
+    family: &str,
+    prompt: &mut String,
+    instructions: &str,
+) -> Result<(), Error> {
+    match family {
+        "gemma4" => {
+            const GENERATION_SUFFIX: &str = "<end_of_turn>\n<start_of_turn>model\n";
+            let Some(position) = prompt.rfind(GENERATION_SUFFIX) else {
+                return Err(Error::State(
+                    "rendered Gemma conversation lacks its generation suffix".into(),
+                ));
+            };
+            prompt.insert_str(position, instructions);
+            Ok(())
+        }
+        _ => Err(Error::BadRequest(format!(
+            "unsupported_capability: model family {family} has no chat template"
+        ))),
+    }
+}
+pub(crate) fn terminal_markers(family: &str) -> &'static [&'static str] {
+    match family {
+        "gemma4" => &["<end_of_turn>", "</end_of_turn>", "</start_of_turn>"],
+        _ => &[],
+    }
+}
 
 fn gemma4(mut messages: Vec<Message>) -> Result<String, Error> {
     if messages.is_empty() {

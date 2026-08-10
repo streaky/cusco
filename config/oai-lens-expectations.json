@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "runner_revision": "1d145321ded86a1cfc7c2852667854957c57c5fb",
+  "profile": "openai_api",
+  "probes": {
+    "chat.core.messages": "pass",
+    "chat.streaming.lifecycle": "pass",
+    "responses.core.message_input": "fail",
+    "responses.core.simple_text": "fail",
+    "responses.streaming.lifecycle": "fail",
+    "tools.call_result_continuation": "fail",
+    "vision.data_url": "fail"
+  }
+}

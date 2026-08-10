@@ -18,12 +18,16 @@ details and optimized kernels.
   retirement, and removal.
 - Priority-aware request scheduling with bounded admission, cancellation,
   deadlines, output backpressure, and diagnostic records.
-- OpenAI-compatible completions, chat completions, and Responses APIs.
+- OpenAI-compatible completions, chat completions, and durable Responses APIs,
+  including stored-resource retrieval, deletion, and `previous_response_id`
+  continuation.
 - An Ollama-compatible model-management profile for discovery, inspection,
   pulling, aliases, deletion, and residency reporting.
-- Cusco-native context, compaction, lifecycle, status, and OpenAPI endpoints.
+- Cusco-native context, compaction, lifecycle, status, OpenAPI, capability
+  discovery, and transactional context-update endpoints.
 - Buffered and streaming generation, deterministic sampling controls, stop
-  handling, structured-output constraints, and tool-call normalization.
+  handling, request-shape validation, typed function-call/result continuation,
+  and `tool_choice` controls for `auto`, `none`, `required`, and named functions.
 - Deterministic `window_tail` context compaction with transactional successor
   publication and replay metadata.
 - Versioned YAML configuration, bearer authentication, transport diagnostics,
@@ -41,6 +45,16 @@ keeps logical context records in its local JSON state. Native executor mappings,
 active requests, queues, and spill contents are process-local and are rebuilt
 or discarded after restart.
 
+Stored Responses are projected as ordinary OpenAI response resources and remain
+replayable after restart. Extension-aware clients can discover
+`cusco.context_update.v1` at `GET /cusco/v1/capabilities` and submit a typed
+`fold` to `POST /cusco/v1/context-updates`. A successful fold atomically
+publishes a new stored response with a monotonic lineage revision and portable
+message output; stale revisions and competing successors return `409`, while
+validation or cancellation before commit leaves the base resource unchanged.
+Clients that do not negotiate the extension continue to use standard stored
+Responses and `previous_response_id`.
+
 The workspace is split into focused crates:
 
 - `context-store` provides immutable token branches and evaluated-prefix
@@ -52,6 +66,12 @@ The workspace is split into focused crates:
 - `server` contains inference services, scheduling, residency, persistence, and
   HTTP adapters;
 - `cli` provides proof, model-management, and serving commands.
+
+## Platform support
+
+Cusco currently targets Linux. Native Windows and macOS support is not
+currently planned; development, packaging, and verification assume a Linux
+host and the documented Docker Compose workflow.
 
 ## Run the acceptance gates
 
@@ -72,6 +92,24 @@ runs executor continuation, mapped publication, representation scaling,
 sustained scheduler, and API smoke workloads, then writes a provenance-indexed
 `results/acceptance-report.json`. Focused proof services remain useful
 diagnostics, but do not replace the complete gate.
+
+## Run the OpenAI SDK conformance gate
+
+Bootstrap the exact reviewed `oai-lens` revision, then run it against a Cusco
+server listening on the configured host port:
+
+```sh
+tools/fetch-oai-lens.sh
+CUSCO_OAI_LENS_TOKEN=your-token \
+  docker compose -f compose.test.yaml run --rm oai-lens
+```
+
+The runner source remains in the ignored `.tools/oai-lens/` checkout. The
+complete upstream exchange report is written to `results/oai-lens-report.json`;
+`results/oai-lens-gate.json` records its digest, runner provenance, probe
+counts, and changes from `config/oai-lens-expectations.json`. Probe failures
+are initially advisory and leave the gate successful. A runner, configuration,
+reporting, or artifact failure is a blocking harness failure.
 
 ## Run the representation measurement proof
 
@@ -100,7 +138,8 @@ Proof services accept the `hf://` identity directly, and the smoke gate installs
 that identity through the model-management API. The registry resolves and
 validates the cached local artifact internally; tests do not depend on cache
 layout or create copied, hard-linked, or symlinked paths. The model supports
-vision and tool use and is the standard fixture for both capability gates.
+vision and tool use, but the current executor gate exercises tool use only;
+image projection remains unavailable until the native projector path lands.
 
 
 ## Run the unified API smoke report
@@ -109,28 +148,35 @@ vision and tool use and is the standard fixture for both capability gates.
 CUSCO_GPU_DEVICE_ID=0 docker compose -f compose.test.yaml run --rm api-smoke
 ```
 
-This deterministic, model-backed smoke suite exercises buffered OpenAI
-generation plus the primary Cusco context, compaction, and status APIs against
-the standard Gemma test model. It writes `results/smoke-report.json` with
-per-scenario status and latency, request/token totals, and aggregate
-min/median/max latency. The executor and mapped-execution Compose proofs are
-available as lower-level engineering diagnostics.
+This deterministic, model-backed smoke suite exercises buffered and streaming
+OpenAI generation, strict structured output, required tool calls, response
+lifecycle operations, and the primary Cusco context, compaction, and status APIs
+against the standard Gemma test model. It writes `results/smoke-report.json`
+with per-scenario status and latency, request/token totals, semantic-compaction
+evidence, and aggregate min/median/max latency. The executor and
+mapped-execution Compose proofs remain lower-level engineering diagnostics.
 
 ## Run the production Compose service
 
-Copy `config/config.yaml` to an operator-owned location, configure
-`config/user.yaml` with local model declarations, provide an authentication
-token, and start the release service:
+Copy the fully documented `config.example.yaml` to the ignored root
+`config.yaml`, configure `config/user.yaml` with local model declarations,
+provide an authentication token, and start the release service:
 
 ```sh
-mkdir -p data/models data/state data/spill data/user-models
+cp config.example.yaml config.yaml
+mkdir -p data/models data/db data/spill data/user-models
 CUSCO_BEARER_TOKEN='replace-with-a-secret' docker compose up --build -d server
 ```
 
-The production definition mounts the versioned daemon configuration read-only,
-listens on `127.0.0.1:8080` by default, persists the migrated SQLite catalog
-under `data/state`, and uses bounded storage under `data/spill`. Override
-`CUSCO_LISTEN_ADDRESS`, `CUSCO_PORT`, and `CUSCO_GPU_DEVICE_ID` as needed.
+The production definition mounts the root `config.yaml` read-only, listens on
+`127.0.0.1:8080` by default, persists the migrated SQLite catalog under
+`data/db`, and uses bounded storage under `data/spill`. Responses with
+`store: true` are atomically published in the file-backed resource store under
+`data/db/responses` and survive daemon restart; retrieval, deletion,
+`previous_response_id` replay, and typed function-call output continuation use
+those resources. Requests with `store: false` remain stateless and do not
+publish there. Override `CUSCO_LISTEN_ADDRESS`, `CUSCO_PORT`, and
+`CUSCO_GPU_DEVICE_ID` as needed.
 The entire `data/` tree is ignored by Git and excluded from image build
 contexts.
 
@@ -139,7 +185,7 @@ contexts.
 The daemon accepts one versioned configuration path:
 
 ```sh
-cargo run -p cusco -- serve --config ./config/config.yaml
+cargo run -p cusco -- serve --config ./config.yaml
 ```
 
 Unknown, missing, invalid, or unsupported-version configuration is rejected
@@ -192,8 +238,10 @@ second inference API.
   native KV and recurrent-state blocks.
 - Context records currently use whole-state JSON persistence rather than the
   SQLite catalog used for installed models and lifecycle operations.
-- The bundled execution profile targets the standard Gemma validation model;
-  broader architecture support requires explicit compatible profiles.
+- Native model/context allocation is measured for each immutable model,
+  executor configuration, accelerator identity, and runtime provenance, then
+  persisted in the SQLite catalog and reused for admission. The first load of a
+  new profile still requires a conservative bootstrap reservation.
 
 The detailed design is documented in `docs/outline.md`. A source-grounded
 assessment of architectural and performance constraints is available in

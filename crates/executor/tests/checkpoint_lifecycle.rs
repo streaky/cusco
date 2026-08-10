@@ -1,4 +1,4 @@
-use cusco_executor::{Error, Executor, logits_identical};
+use cusco_executor::{Error, Executor, MappingState, logits_identical};
 
 #[test]
 #[ignore = "requires the pinned external Gemma GGUF"]
@@ -43,4 +43,60 @@ fn displaced_host_round_trip_is_exact_and_transactional() {
     let prepared = executor.prepare_restore(&prior, prior.checksum).unwrap();
     executor.commit_restore(prepared).unwrap();
     assert!(executor.decode(&[replacement[0]]).is_ok());
+}
+
+#[test]
+#[ignore = "requires the pinned external Gemma GGUF"]
+fn mapping_import_rejects_corruption_without_changing_active_state() {
+    let model = std::env::var("CUSCO_TEST_MODEL")
+        .expect("CUSCO_TEST_MODEL must name the pinned Gemma GGUF");
+    let mut executor = Executor::open(&model, 4096, 99).unwrap();
+    let prefix = executor.tokenize("transactional mapping import").unwrap();
+    executor.decode(&prefix).unwrap();
+    let root = executor.active_representation().unwrap();
+    let prepared = executor.prepare_mapping_fork(&root).unwrap();
+    let branch = executor.commit_mapping(prepared).unwrap();
+    let valid = executor.export_mapping(&branch).unwrap();
+    let mut corrupted = valid.clone();
+    corrupted.bytes.truncate(corrupted.bytes.len() / 2);
+    assert_eq!(
+        executor.import_mapping(&MappingState {
+            bytes: corrupted.bytes,
+            position: corrupted.position,
+        }),
+        Err(Error::Incompatible)
+    );
+    assert_eq!(executor.export_mapping(&branch).unwrap(), valid);
+}
+
+#[test]
+#[ignore = "requires the pinned external Gemma GGUF"]
+fn mapped_fork_chain_can_use_the_full_configured_context() {
+    let model = std::env::var("CUSCO_TEST_MODEL")
+        .expect("CUSCO_TEST_MODEL must name the pinned Gemma GGUF");
+    let mut executor = Executor::open(&model, 4096, 99).unwrap();
+    let tokens = executor
+        .tokenize(&"mapped context capacity ".repeat(256))
+        .unwrap();
+    assert!(tokens.len() > 512);
+
+    let mut source = executor.active_representation().unwrap();
+    let mut retained = Vec::new();
+    for chunk in tokens[..512].chunks(32) {
+        let prepared = executor.prepare_mapping_fork(&source).unwrap();
+        let successor = executor.commit_mapping(prepared).unwrap();
+        executor.activate_mapping(&successor).unwrap();
+        executor.decode(chunk).unwrap();
+        retained.push(source);
+        source = successor;
+    }
+
+    assert_eq!(
+        executor
+            .describe_representation(&source)
+            .unwrap()
+            .represented_position,
+        512
+    );
+    assert_eq!(retained.len(), 16);
 }

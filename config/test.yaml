@@ -3,7 +3,7 @@ listen: 0.0.0.0:8080
 unsafe_public_unauthenticated: false
 http_debug: off
 openapi:
-  ui:
+  docs_ui:
     enabled: false
 paths:
   database: /data/db/catalog.sqlite

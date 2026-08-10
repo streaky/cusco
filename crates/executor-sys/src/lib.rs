@@ -1,5 +1,7 @@
 use std::ffi::{c_char, c_int, c_uint, c_ulonglong};
 
+pub const ABI_VERSION: &str = env!("CUSCO_EXECUTOR_ABI_VERSION");
+
 #[repr(C)]
 pub struct CuscoExecutor {
     _private: [u8; 0],
@@ -34,6 +36,7 @@ pub struct Capabilities {
     pub n_vocab: c_int,
     pub has_mapped_execution: c_uint,
     pub max_mappings: c_uint,
+    pub training_context_tokens: c_uint,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -62,6 +65,7 @@ pub struct SamplerConfig {
     pub temperature: f32,
     pub top_p: f32,
     pub seed: c_uint,
+    pub grammar: *const c_char,
 }
 
 #[repr(C)]
@@ -71,6 +75,7 @@ pub struct DecodeResult {
     pub token: i32,
 }
 pub const OK: i32 = 0;
+pub const INVALID: i32 = 1;
 pub const CANCELLED: i32 = 4;
 pub const INCOMPATIBLE: i32 = 5;
 pub const ROLLBACK_FAILED: i32 = 6;
@@ -86,6 +91,12 @@ unsafe extern "C" {
     pub fn cusco_executor_close(executor: *mut CuscoExecutor);
     pub fn cusco_executor_capabilities(executor: *const CuscoExecutor) -> Capabilities;
     pub fn cusco_executor_operating_point(executor: *const CuscoExecutor) -> OperatingPoint;
+    pub fn cusco_executor_model_architecture(
+        executor: *const CuscoExecutor,
+        buffer: *mut c_char,
+        capacity: usize,
+        size: *mut usize,
+    ) -> c_int;
     pub fn cusco_executor_tokenize(
         executor: *mut CuscoExecutor,
         text: *const c_char,
@@ -100,6 +111,7 @@ unsafe extern "C" {
         capacity: usize,
         size: *mut usize,
     ) -> c_int;
+    pub fn cusco_executor_token_is_eog(executor: *const CuscoExecutor, token: i32) -> c_uint;
     pub fn cusco_sampler_create(
         executor: *mut CuscoExecutor,
         config: *const SamplerConfig,
@@ -108,7 +120,8 @@ unsafe extern "C" {
     pub fn cusco_sampler_free(sampler: *mut CuscoSampler);
     pub fn cusco_sampler_sample(
         sampler: *mut CuscoSampler,
-        executor: *mut CuscoExecutor,
+        logits: *const f32,
+        logits_len: usize,
         token: *mut i32,
     ) -> c_int;
     pub fn cusco_executor_decode(

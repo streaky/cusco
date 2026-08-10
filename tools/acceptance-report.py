@@ -91,6 +91,33 @@ def provenance(manifest, model=None):
             value["model"] = {"identity": manifest["model"], "path": model}
     return value
 
+def advisory_evidence():
+    gate_path = RESULTS / "oai-lens-gate.json"
+    upstream_path = RESULTS / "oai-lens-report.json"
+    if not gate_path.is_file():
+        return {"oai_lens": {"classification": "not_run"}}
+    try:
+        gate = json.loads(gate_path.read_text())
+        evidence = {
+            "classification": gate["classification"],
+            "runner_revision": gate["runner_revision"],
+            "probe_counts": gate.get("probe_counts"),
+            "deltas": gate.get("deltas"),
+            "gate_report": digest(gate_path),
+        }
+        if upstream_path.is_file():
+            evidence["upstream_report"] = digest(upstream_path)
+        return {"oai_lens": evidence}
+    except (KeyError, OSError, ValueError) as error:
+        return {
+            "oai_lens": {
+                "classification": "invalid_artifact",
+                "error": str(error),
+                "gate_report": digest(gate_path),
+            }
+        }
+
+
 
 def write_report(mode, manifest, gates, model=None):
     report = {
@@ -101,6 +128,7 @@ def write_report(mode, manifest, gates, model=None):
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "provenance": provenance(manifest, model),
         "gates": gates,
+        "advisory_evidence": advisory_evidence(),
     }
     RESULTS.mkdir(parents=True, exist_ok=True)
     output = RESULTS / f"acceptance-{mode}-report.json"
@@ -126,7 +154,7 @@ def api_smoke_gate(semantic_workload):
     env = os.environ.copy()
     env["CUSCO_BEARER_TOKEN"] = "smoke-report-token"
     server = subprocess.Popen(
-        ["cargo", "run", "-p", "cusco", "--", "serve", "--config", "/work/config/config.yaml"],
+        ["cargo", "run", "-p", "cusco", "--", "serve", "--config", "/work/config/test.yaml"],
         cwd=ROOT,
         env=env,
     )
