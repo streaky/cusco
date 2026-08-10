@@ -173,6 +173,9 @@ pub struct MappedEngine {
 }
 
 impl MappedEngine {
+    pub(crate) fn model_architecture(&self) -> &str {
+        &self.profile.architecture
+    }
     pub fn open(
         model_path: impl AsRef<Path>,
         n_ctx: u32,

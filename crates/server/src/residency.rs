@@ -107,6 +107,13 @@ impl ModelLoader for NativeLoader {
             usize::try_from(config.context_reserve_bytes)
                 .map_err(|_| Error::State("context reserve exceeds address space".into()))?,
         )?;
+        if engine.model_architecture() != model.family {
+            return Err(Error::State(format!(
+                "catalog model family {} does not match native architecture {}",
+                model.family,
+                engine.model_architecture()
+            )));
+        }
         let mut point = engine.operating_point();
         point.model_bytes = model.size_bytes;
         Ok((engine, point))
