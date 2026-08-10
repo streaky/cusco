@@ -216,9 +216,10 @@ impl ResponseService {
             .resources
             .insert(resource.id.clone(), resource.clone());
         while transient.resources.len() > TRANSIENT_RESPONSE_CAPACITY {
-            if let Some(id) = transient.insertion_order.pop_front() {
-                transient.resources.remove(&id);
-            }
+            let Some(id) = transient.insertion_order.pop_front() else {
+                break;
+            };
+            transient.resources.remove(&id);
         }
         Ok(())
     }
