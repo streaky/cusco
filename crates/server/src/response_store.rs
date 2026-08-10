@@ -5,8 +5,22 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
+
+const RESPONSE_RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn expired(resource: &ResponseResource, timestamp: u64) -> bool {
+    timestamp.saturating_sub(resource.created_at) >= RESPONSE_RETENTION_SECONDS
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -67,6 +81,10 @@ impl FileResponseResourceStore {
                     resource.id
                 )));
             }
+            if expired(&resource, now()) {
+                fs::remove_file(path)?;
+                continue;
+            }
             recovered.insert(resource.id.clone(), resource);
         }
         Ok(Self {
@@ -94,10 +112,29 @@ impl FileResponseResourceStore {
         fs::File::open(&self.resources)?.sync_all()?;
         Ok(())
     }
+
+    fn prune_expired(&self) -> Result<(), StoreError> {
+        let timestamp = now();
+        let mut recovered = self.recovered.write();
+        let expired_ids = recovered
+            .values()
+            .filter(|resource| expired(resource, timestamp))
+            .map(|resource| resource.id.clone())
+            .collect::<Vec<_>>();
+        for id in &expired_ids {
+            fs::remove_file(self.resource_path(id))?;
+            recovered.remove(id);
+        }
+        if !expired_ids.is_empty() {
+            fs::File::open(&self.resources)?.sync_all()?;
+        }
+        Ok(())
+    }
 }
 
 impl ResponseResourceStore for FileResponseResourceStore {
     fn put(&self, resource: &ResponseResource) -> Result<(), StoreError> {
+        self.prune_expired()?;
         self.write_resource(resource)?;
         self.recovered
             .write()
@@ -110,6 +147,7 @@ impl ResponseResourceStore for FileResponseResourceStore {
         expected_revision: u64,
         resource: &ResponseResource,
     ) -> Result<(), StoreError> {
+        self.prune_expired()?;
         let mut recovered = self.recovered.write();
         let base = recovered
             .get(base_id)
@@ -166,7 +204,7 @@ mod tests {
             id: id.into(),
             owner: "owner".into(),
             model: "m".into(),
-            created_at: 1,
+            created_at: now(),
             status: "completed".into(),
             store: true,
             previous_response_id: None,
@@ -190,6 +228,23 @@ mod tests {
         fs::write(store.temporary.join("interrupted.tmp"), b"incomplete").unwrap();
         let reopened = FileResponseResourceStore::open(&dir).unwrap();
         assert_eq!(reopened.get("resp_1").unwrap().id, "resp_1");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn expired_resources_are_pruned_on_recovery() {
+        let dir = std::env::temp_dir().join(format!("cusco-response-expiry-{}", Uuid::new_v4()));
+        let store = FileResponseResourceStore::open(&dir).unwrap();
+        let mut expired = resource("resp_expired");
+        expired.created_at = now().saturating_sub(RESPONSE_RETENTION_SECONDS);
+        store.put(&expired).unwrap();
+
+        let reopened = FileResponseResourceStore::open(&dir).unwrap();
+        assert!(matches!(
+            reopened.get("resp_expired"),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(!reopened.resource_path("resp_expired").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
