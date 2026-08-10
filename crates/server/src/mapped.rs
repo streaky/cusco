@@ -85,7 +85,7 @@ impl ExecutionProfile {
 
     fn validate(&self) -> Result<(), Error> {
         if self.architecture.is_empty() || self.block_size == 0 {
-            return Err(Error::State("invalid Gemma execution profile".into()));
+            return Err(Error::State("invalid execution profile".into()));
         }
         let required = self.required_mask();
         if !required.contains(ComponentMask::GLOBAL_KV)
@@ -242,7 +242,7 @@ impl MappedEngine {
             || !capabilities.recurrent
         {
             return Err(Error::State(
-                "executor does not satisfy the Gemma execution profile".into(),
+                "executor does not satisfy the execution profile".into(),
             ));
         }
         if capabilities.training_context_tokens == 0 {
