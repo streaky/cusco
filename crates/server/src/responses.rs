@@ -8,7 +8,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
-
 pub const RESPONSE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -38,8 +37,19 @@ pub struct ResponseFunctionCall {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseInputItem {
-    Message { role: String, text: String },
-    FunctionCallOutput { call_id: String, output: String },
+    Message {
+        role: String,
+        text: String,
+    },
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+    },
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -62,6 +72,10 @@ pub struct ResponseResource {
     pub previous_response_id: Option<String>,
     pub input: Vec<ResponseInputItem>,
     pub output: Vec<ResponseOutputItem>,
+    #[serde(default)]
+    pub tools: Vec<Value>,
+    #[serde(default = "default_tool_choice")]
+    pub tool_choice: Value,
     pub finish_reason: Option<FinishReason>,
     pub usage: Option<ResponseUsage>,
     pub metadata: ResponseMetadata,
@@ -73,6 +87,10 @@ pub struct ResponseResource {
 
 fn schema_version() -> u32 {
     RESPONSE_SCHEMA_VERSION
+}
+
+fn default_tool_choice() -> Value {
+    Value::String("auto".into())
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -112,6 +130,8 @@ pub struct StreamResponse {
     pub store: bool,
     pub previous_response_id: Option<String>,
     pub input: Vec<ResponseInputItem>,
+    pub tools: Vec<Value>,
+    pub tool_choice: Value,
     pub buffer_output: bool,
     pub lineage_revision: u64,
 }
@@ -133,14 +153,7 @@ impl ResponseService {
         ResponseProjection::new(model)
     }
     pub fn stream_projection(&self, request: StreamResponse) -> ResponseProjection {
-        ResponseProjection::new(request.model).with_request(
-            request.owner,
-            request.store,
-            request.previous_response_id,
-            request.input,
-            request.buffer_output,
-            request.lineage_revision,
-        )
+        ResponseProjection::new(request.model.clone()).with_request(request)
     }
 
     pub fn complete(&self, params: CompleteResponse<'_>) -> ResponseResource {
@@ -169,6 +182,8 @@ impl ResponseService {
             store: params.store,
             previous_response_id: params.previous_response_id.map(str::to_owned),
             input: params.input.to_vec(),
+            tools: params.tools.to_vec(),
+            tool_choice: params.tool_choice.clone(),
             output,
             finish_reason: Some(params.reason),
             usage: Some(ResponseUsage::from(params.usage)),
@@ -248,6 +263,8 @@ pub struct CompleteResponse<'a> {
     pub usage: &'a Usage,
     pub store: bool,
     pub previous_response_id: Option<&'a str>,
+    pub tools: &'a [Value],
+    pub tool_choice: &'a Value,
     pub lineage_revision: u64,
     pub input: &'a [ResponseInputItem],
     pub function_call: Option<ResponseFunctionCall>,
@@ -280,7 +297,7 @@ pub fn project_resource(resource: &ResponseResource) -> Value {
         .iter()
         .map(project_output_item)
         .collect::<Vec<_>>();
-    json!({"id":resource.id,"object":"response","created_at":resource.created_at,"status":resource.status,"background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"metadata":resource.metadata,"model":resource.model,"output":output,"parallel_tool_calls":true,"previous_response_id":resource.previous_response_id,"prompt_cache_key":null,"reasoning":null,"safety_identifier":null,"service_tier":"default","store":resource.store,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":usage,"finish_reason":resource.finish_reason,"cusco":{"lineage_revision":resource.lineage_revision,"context_update":resource.context_update}})
+    json!({"id":resource.id,"object":"response","created_at":resource.created_at,"status":resource.status,"background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"metadata":resource.metadata,"model":resource.model,"output":output,"parallel_tool_calls":true,"previous_response_id":resource.previous_response_id,"prompt_cache_key":null,"reasoning":null,"safety_identifier":null,"service_tier":"default","store":resource.store,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":resource.tool_choice,"tools":resource.tools,"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":usage,"finish_reason":resource.finish_reason,"cusco":{"lineage_revision":resource.lineage_revision,"context_update":resource.context_update}})
 }
 
 fn project_output_item(item: &ResponseOutputItem) -> Value {
@@ -338,6 +355,8 @@ impl ResponseProjection {
                 previous_response_id: None,
                 input: vec![],
                 output: vec![],
+                tools: vec![],
+                tool_choice: default_tool_choice(),
                 finish_reason: None,
                 usage: None,
                 metadata: ResponseMetadata::default(),
@@ -349,21 +368,15 @@ impl ResponseProjection {
             function_call: None,
         }
     }
-    fn with_request(
-        mut self,
-        owner: String,
-        store: bool,
-        previous_response_id: Option<String>,
-        input: Vec<ResponseInputItem>,
-        buffer_output: bool,
-        lineage_revision: u64,
-    ) -> Self {
-        self.resource.owner = owner;
-        self.resource.store = store;
-        self.resource.previous_response_id = previous_response_id;
-        self.resource.input = input;
-        self.resource.lineage_revision = lineage_revision;
-        self.buffer_output = buffer_output;
+    fn with_request(mut self, request: StreamResponse) -> Self {
+        self.resource.owner = request.owner;
+        self.resource.store = request.store;
+        self.resource.previous_response_id = request.previous_response_id;
+        self.resource.input = request.input;
+        self.resource.tools = request.tools;
+        self.resource.tool_choice = request.tool_choice;
+        self.resource.lineage_revision = request.lineage_revision;
+        self.buffer_output = request.buffer_output;
         self
     }
     pub fn completed_resource(&self) -> Option<&ResponseResource> {
@@ -519,5 +532,48 @@ impl ResponseProjection {
                 json!({"type":"error","sequence_number":n,"code":"server_error","message":message,"param":null})
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_projections_preserve_requested_tools() {
+        let tools = vec![json!({
+            "type": "function",
+            "name": "lookup",
+            "description": "Look something up",
+            "parameters": {"type": "object"}
+        })];
+        let tool_choice = json!({"type": "function", "name": "lookup"});
+        let mut projection = ResponseProjection::new("m".into()).with_request(StreamResponse {
+            model: "m".into(),
+            owner: "owner".into(),
+            store: false,
+            previous_response_id: None,
+            input: vec![],
+            tools: tools.clone(),
+            tool_choice: tool_choice.clone(),
+            buffer_output: false,
+            lineage_revision: 0,
+        });
+
+        let projected = project_resource(&projection.resource);
+        assert_eq!(projected["tools"], json!(tools));
+        assert_eq!(projected["tool_choice"], tool_choice);
+
+        let streamed = projection.project(StreamEvent::Started {
+            request_id: "resp_1".into(),
+            context_id: crate::ContextId::new(),
+            correlation_id: "corr_1".into(),
+            inference_id: "infer_1".into(),
+            execution_session_id: "session_1".into(),
+        });
+        let first_row = streamed.split("\n\n").next().unwrap();
+        let created: Value = serde_json::from_str(first_row.trim_start_matches("data: ")).unwrap();
+        assert_eq!(created["response"]["tools"], json!(tools));
+        assert_eq!(created["response"]["tool_choice"], tool_choice);
     }
 }

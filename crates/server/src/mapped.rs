@@ -1186,6 +1186,58 @@ mod tests {
     }
 
     #[test]
+    fn repeated_identical_requests_reuse_an_immutable_prefix() {
+        let engine = MappedEngine::open("mock://deterministic", 4096, 0, 1 << 30, 1 << 30).unwrap();
+        let model = model();
+        let prompt = "tool schema and request payload ".repeat(96);
+        let cold = engine
+            .generate_collected(test_request(&model, &prompt, 8, &[]))
+            .unwrap();
+        let mut expected_cached = None;
+        for _ in 0..3 {
+            let reused = engine
+                .generate_collected(test_request(&model, &prompt, 8, &[]))
+                .unwrap();
+            assert_eq!(reused.pieces, cold.pieces);
+            assert_eq!(reused.successor_tokens, cold.successor_tokens);
+            assert!(reused.cached_tokens > 0);
+            assert_eq!(
+                *expected_cached.get_or_insert(reused.cached_tokens),
+                reused.cached_tokens
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the pinned external Gemma GGUF"]
+    fn repeated_real_model_requests_reuse_an_immutable_prefix() {
+        let model_path =
+            std::env::var("CUSCO_TEST_MODEL").expect("CUSCO_TEST_MODEL must name the Gemma GGUF");
+        let engine = MappedEngine::open(&model_path, 8192, 99, 1 << 40, 1 << 40).unwrap();
+        let model = ModelRecord {
+            path: PathBuf::from(&model_path),
+            ..model()
+        };
+        let prompt = "tool schema and request payload ".repeat(768);
+        let cold = engine
+            .generate_collected(test_request(&model, &prompt, 8, &[]))
+            .unwrap();
+        let mut expected_cached = None;
+        for _ in 0..3 {
+            let reused = engine
+                .generate_collected(test_request(&model, &prompt, 8, &[]))
+                .unwrap();
+            assert_eq!(reused.pieces, cold.pieces);
+            assert_eq!(reused.successor_tokens, cold.successor_tokens);
+            assert!(reused.cached_tokens > 0);
+            assert_eq!(
+                *expected_cached.get_or_insert(reused.cached_tokens),
+                reused.cached_tokens
+            );
+        }
+    }
+
+    #[test]
     fn dropping_unpublished_session_reactivates_root_mapping() {
         let engine = MappedEngine::open("mock://deterministic", 4096, 0, 1 << 30, 1 << 30).unwrap();
         let root_identity = engine.state.lock().root.identity();

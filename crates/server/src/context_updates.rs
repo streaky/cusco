@@ -110,7 +110,8 @@ pub fn apply(
                     }],
                 })
             }
-            ResponseInputItem::FunctionCallOutput { .. } => unreachable!("validated above"),
+            ResponseInputItem::FunctionCallOutput { .. }
+            | ResponseInputItem::FunctionCall { .. } => unreachable!("validated above"),
         })
         .collect();
     let revision = request.expected_revision.saturating_add(1);
@@ -125,6 +126,8 @@ pub fn apply(
         previous_response_id: Some(request.base_response_id.clone()),
         input: items.to_vec(),
         output,
+        tools: base.tools,
+        tool_choice: base.tool_choice,
         finish_reason: Some(FinishReason::Stop),
         usage: None,
         metadata: ResponseMetadata {
@@ -186,6 +189,8 @@ mod tests {
             previous_response_id: None,
             input: vec![],
             output: vec![],
+            tools: vec![],
+            tool_choice: Value::String("auto".into()),
             finish_reason: Some(FinishReason::Stop),
             usage: Some(ResponseUsage {
                 input_tokens: 1,

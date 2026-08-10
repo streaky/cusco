@@ -2703,6 +2703,11 @@ enum ResponsesInputItem {
         call_id: String,
         output: String,
     },
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -2718,6 +2723,9 @@ enum ResponsesContentPart {
     InputText {
         text: String,
     },
+    OutputText {
+        text: String,
+    },
     InputImage {
         image_url: String,
         #[serde(default, rename = "detail")]
@@ -2725,15 +2733,14 @@ enum ResponsesContentPart {
     },
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 enum ResponsesToolChoiceMode {
     Auto,
     None,
     Required,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 enum ResponsesToolChoice {
     Mode(ResponsesToolChoiceMode),
@@ -2863,8 +2870,27 @@ async fn responses(
             )?);
         }
         ResponsesInput::Items(items) => {
+            let mut input_call_ids = HashSet::new();
             for item in items {
                 match item {
+                    ResponsesInputItem::FunctionCall {
+                        call_id,
+                        name,
+                        arguments,
+                    } => {
+                        input_call_ids.insert(call_id.clone());
+                        input_ledger.push(responses::ResponseInputItem::FunctionCall {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        });
+                        let call = json!({
+                            "name": name,
+                            "arguments": serde_json::from_str::<Value>(&arguments)
+                                .unwrap_or(Value::String(arguments)),
+                        });
+                        prompt.push_str(&format!("{call}<end_of_turn>\n"));
+                    }
                     ResponsesInputItem::Message { role, content } => {
                         let content = match content {
                             ResponsesContent::Text(text) => ChatContent::Text(text),
@@ -2872,7 +2898,8 @@ async fn responses(
                                 parts
                                     .into_iter()
                                     .map(|part| match part {
-                                        ResponsesContentPart::InputText { text } => {
+                                        ResponsesContentPart::InputText { text }
+                                        | ResponsesContentPart::OutputText { text } => {
                                             ContentPart::Text { text }
                                         }
                                         ResponsesContentPart::InputImage { image_url, .. } => {
@@ -2899,12 +2926,14 @@ async fn responses(
                         prompt.push_str(&lowered);
                     }
                     ResponsesInputItem::FunctionCallOutput { call_id, output } => {
-                        if !lineage_has_call(
-                            &s.response_service,
-                            r.previous_response_id.as_deref(),
-                            &request_context.principal,
-                            &call_id,
-                        )? {
+                        if !input_call_ids.contains(&call_id)
+                            && !lineage_has_call(
+                                &s.response_service,
+                                r.previous_response_id.as_deref(),
+                                &request_context.principal,
+                                &call_id,
+                            )?
+                        {
                             return Err(Error::BadRequest(format!(
                                 "function_call_output references unknown call_id `{call_id}`"
                             )));
@@ -2939,6 +2968,15 @@ async fn responses(
         lineage_revision,
         input: input_ledger,
         tool_names: tool_names(&r.tools),
+        tools: r
+            .tools
+            .iter()
+            .map(|tool| serde_json::to_value(tool).expect("tool definitions serialize"))
+            .collect(),
+        tool_choice_value: r.tool_choice.as_ref().map_or_else(
+            || json!("auto"),
+            |choice| serde_json::to_value(choice).expect("tool choice serializes"),
+        ),
         tool_choice: r.tool_choice,
     };
     infer_response(InferResponseRequest {
@@ -3000,6 +3038,16 @@ fn response_lineage_prompt(
             match item {
                 responses::ResponseInputItem::Message { role, text } => {
                     prompt.push_str(&format!("\n{role}: {text}\n"))
+                }
+                responses::ResponseInputItem::FunctionCall {
+                    name, arguments, ..
+                } => {
+                    let call = json!({
+                        "name": name,
+                        "arguments": serde_json::from_str::<Value>(&arguments)
+                            .unwrap_or(Value::String(arguments)),
+                    });
+                    prompt.push_str(&format!("{call}<end_of_turn>\n"));
                 }
                 responses::ResponseInputItem::FunctionCallOutput { call_id, output } => {
                     prompt.push_str(&format!("\ntool {call_id}: {output}\n"))
@@ -3370,6 +3418,8 @@ struct ResponseRequestOptions {
     input: Vec<responses::ResponseInputItem>,
     tool_names: Vec<String>,
     tool_choice: Option<ResponsesToolChoice>,
+    tools: Vec<Value>,
+    tool_choice_value: Value,
 }
 
 struct InferResponseRequest {
@@ -3503,6 +3553,8 @@ fn completed_response(
                 previous_response_id: options.previous_response_id.as_deref(),
                 lineage_revision: options.lineage_revision,
                 input: &options.input,
+                tools: &options.tools,
+                tool_choice: &options.tool_choice_value,
                 function_call,
             });
             service.remember(&resource).map_err(response_store_error)?;
@@ -3671,6 +3723,8 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
                 store: options.store,
                 previous_response_id: options.previous_response_id.clone(),
                 input: options.input.clone(),
+                tools: options.tools.clone(),
+                tool_choice: options.tool_choice_value.clone(),
                 buffer_output: !options.tool_names.is_empty(),
                 lineage_revision: options.lineage_revision,
             }),
@@ -4791,6 +4845,7 @@ mod tests {
         let ResponsesInput::Items(items) = request.input else {
             panic!("canonical message input must parse as items");
         };
+
         assert_eq!(items.len(), 1);
         assert!(matches!(
             &items[0],
@@ -4798,6 +4853,74 @@ mod tests {
                 content: ResponsesContent::Text(text),
                 ..
             } if text == "hey"
+        ));
+    }
+    #[test]
+    fn accepts_assistant_output_text_in_responses_history() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hey"}]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hello!"}]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "How are you?"}]
+                }
+            ]
+        }))
+        .unwrap();
+        let ResponsesInput::Items(items) = request.input else {
+            panic!("Responses history must parse as items");
+        };
+        assert!(matches!(
+            &items[1],
+            ResponsesInputItem::Message {
+                role,
+                content: ResponsesContent::Parts(parts),
+            } if role == "assistant"
+                && matches!(
+                    parts.as_slice(),
+                    [ResponsesContentPart::OutputText { text }] if text == "Hello!"
+                )
+        ));
+    }
+    #[test]
+    fn responses_request_parses_portable_function_call_continuation() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{\"key\":\"value\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "result"
+                }
+            ]
+        }))
+        .unwrap();
+        let ResponsesInput::Items(items) = request.input else {
+            panic!("portable continuation must parse as items");
+        };
+        assert!(matches!(
+            items.as_slice(),
+            [
+                ResponsesInputItem::FunctionCall { call_id, .. },
+                ResponsesInputItem::FunctionCallOutput {
+                    call_id: output_call_id,
+                    ..
+                }
+            ] if call_id == "call_1" && output_call_id == call_id
         ));
     }
     #[test]
@@ -6369,6 +6492,7 @@ mod tests {
         server.response_service.persist(&predecessor).unwrap();
         let app = router(server);
         let continued = app
+            .clone()
             .oneshot(request(
                 "POST",
                 "/openai/v1/responses",
@@ -6383,6 +6507,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(continued.status(), StatusCode::OK);
+        let portable = app
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({
+                    "model":"m",
+                    "input":[
+                        {
+                            "type":"function_call",
+                            "call_id":call_id,
+                            "name":"lookup",
+                            "arguments":"{\"key\":\"value\"}"
+                        },
+                        {
+                            "type":"function_call_output",
+                            "call_id":call_id,
+                            "output":"result"
+                        }
+                    ],
+                    "max_output_tokens":1,
+                    "store":true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(portable.status(), StatusCode::OK);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -6925,6 +7075,8 @@ mod tests {
             previous_response_id: None,
             input: vec![],
             output: vec![],
+            tools: vec![],
+            tool_choice: json!("auto"),
             finish_reason: Some(FinishReason::Stop),
             usage: None,
             metadata: responses::ResponseMetadata::default(),

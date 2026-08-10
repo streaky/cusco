@@ -164,6 +164,8 @@ mod tests {
             previous_response_id: None,
             input: vec![],
             output: vec![],
+            tools: vec![],
+            tool_choice: serde_json::Value::String("auto".into()),
             finish_reason: None,
             usage: None,
             metadata: ResponseMetadata::default(),
