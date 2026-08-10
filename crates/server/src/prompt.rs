@@ -14,6 +14,32 @@ pub(crate) fn apply_chat_template(family: &str, messages: Vec<Message>) -> Resul
         ))),
     }
 }
+pub(crate) fn append_rendered(
+    family: &str,
+    prompt: &mut String,
+    continuation: &str,
+) -> Result<(), Error> {
+    if prompt.is_empty() {
+        prompt.push_str(continuation);
+        return Ok(());
+    }
+    match family {
+        "gemma4" => {
+            const GENERATION_PROMPT: &str = "<start_of_turn>model\n";
+            if !prompt.ends_with(GENERATION_PROMPT) {
+                return Err(Error::State(
+                    "rendered Gemma conversation lacks its generation prompt".into(),
+                ));
+            }
+            prompt.truncate(prompt.len() - GENERATION_PROMPT.len());
+            prompt.push_str(continuation);
+            Ok(())
+        }
+        _ => Err(Error::BadRequest(format!(
+            "unsupported_capability: model family {family} has no chat template"
+        ))),
+    }
+}
 
 fn gemma4(mut messages: Vec<Message>) -> Result<String, Error> {
     if messages.is_empty() {

@@ -2423,7 +2423,8 @@ fn flush_response_messages(
     if messages.is_empty() {
         return Ok(());
     }
-    prompt.push_str(&lower_messages(family, std::mem::take(messages), vision)?);
+    let rendered = lower_messages(family, std::mem::take(messages), vision)?;
+    prompt::append_rendered(family, prompt, &rendered)?;
     Ok(())
 }
 pub fn router(server: Server) -> Router {
@@ -2865,6 +2866,7 @@ async fn responses(
             &s.response_service,
             predecessor,
             &request_context.principal,
+            &model.family,
         )?);
     }
     match r.input {
@@ -2873,14 +2875,15 @@ async fn responses(
                 role: "user".into(),
                 text: text.clone(),
             });
-            prompt.push_str(&lower_messages(
+            let rendered = lower_messages(
                 &model.family,
                 vec![ChatMessage {
                     role: "user".into(),
                     content: ChatContent::Text(text),
                 }],
                 s.vision_config(),
-            )?);
+            )?;
+            prompt::append_rendered(&model.family, &mut prompt, &rendered)?;
         }
         ResponsesInput::Items(items) => {
             let mut input_call_ids = HashSet::new();
@@ -3053,6 +3056,7 @@ fn response_lineage_prompt(
     service: &responses::ResponseService,
     mut resource: responses::ResponseResource,
     owner: &str,
+    family: &str,
 ) -> Result<String, Error> {
     let mut lineage = Vec::new();
     for _ in 0..1024 {
@@ -3070,12 +3074,15 @@ fn response_lineage_prompt(
         ));
     }
     lineage.reverse();
-    let mut prompt = String::new();
+    let mut messages = Vec::new();
     for resource in lineage {
         for item in resource.input {
             match item {
                 responses::ResponseInputItem::Message { role, text } => {
-                    prompt.push_str(&format!("\n{role}: {text}\n"))
+                    messages.push(prompt::Message {
+                        role,
+                        content: text,
+                    });
                 }
                 responses::ResponseInputItem::FunctionCall {
                     name, arguments, ..
@@ -3085,19 +3092,26 @@ fn response_lineage_prompt(
                         "arguments": serde_json::from_str::<Value>(&arguments)
                             .unwrap_or(Value::String(arguments)),
                     });
-                    prompt.push_str(&format!("{call}<end_of_turn>\n"));
+                    messages.push(prompt::Message {
+                        role: "assistant".into(),
+                        content: call.to_string(),
+                    });
                 }
                 responses::ResponseInputItem::FunctionCallOutput { call_id, output } => {
-                    prompt.push_str(&format!("\ntool {call_id}: {output}\n"))
+                    messages.push(prompt::Message {
+                        role: "user".into(),
+                        content: format!("Tool result for {call_id}: {output}"),
+                    });
                 }
             }
         }
         for item in resource.output {
             match item {
                 responses::ResponseOutputItem::Message(message) => {
-                    for part in message.content {
-                        prompt.push_str(&format!("\nassistant: {}\n", part.text));
-                    }
+                    messages.push(prompt::Message {
+                        role: "assistant".into(),
+                        content: message.content.into_iter().map(|part| part.text).collect(),
+                    });
                 }
                 responses::ResponseOutputItem::FunctionCall(call) => {
                     let call = json!({
@@ -3105,12 +3119,15 @@ fn response_lineage_prompt(
                         "arguments": serde_json::from_str::<Value>(&call.arguments)
                             .unwrap_or(Value::String(call.arguments)),
                     });
-                    prompt.push_str(&format!("{call}<end_of_turn>\n"));
+                    messages.push(prompt::Message {
+                        role: "assistant".into(),
+                        content: call.to_string(),
+                    });
                 }
             }
         }
     }
-    Ok(prompt)
+    prompt::apply_chat_template(family, messages)
 }
 
 fn lineage_has_call(
