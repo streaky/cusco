@@ -209,15 +209,28 @@ void cusco_executor_close(cusco_executor * executor) {
     delete executor;
 }
 
-cusco_capabilities cusco_executor_capabilities(const cusco_executor * executor) {
+static uint32_t model_component_mask(const cusco_executor * executor) {
     if (is_mock(executor)) {
-        return {CUSCO_EXECUTOR_ABI_VERSION, 1, 1, 1, 256, 1, 1, UINT32_MAX};
+        return 7;
+    }
+    const bool recurrent = llama_model_is_recurrent(executor->model);
+    const bool hybrid = llama_model_is_hybrid(executor->model);
+    return ((!recurrent || hybrid) ? 1u : 0u)
+        | (llama_model_n_swa(executor->model) > 0 ? 2u : 0u)
+        | (recurrent ? 4u : 0u);
+}
+
+cusco_capabilities cusco_executor_capabilities(const cusco_executor * executor) {
+    const uint32_t components = model_component_mask(executor);
+    if (is_mock(executor)) {
+        return {CUSCO_EXECUTOR_ABI_VERSION, components & 1u, components & 2u,
+            components & 4u, 256, 1, 1, UINT32_MAX};
     }
     return {
         CUSCO_EXECUTOR_ABI_VERSION,
-        1,
-        llama_model_n_swa(executor->model) > 0 ? 1u : 0u,
-        1,
+        components & 1u,
+        components & 2u,
+        components & 4u,
         llama_vocab_n_tokens(executor->vocab),
         1,
         1,
@@ -806,7 +819,7 @@ cusco_status cusco_representation_describe(
     } else {
         bytes = representation->state.size();
     }
-    *out = {representation->identity, 7, 0, position, bytes,
+    *out = {representation->identity, model_component_mask(executor), 0, position, bytes,
         representation->completion_fence};
     return CUSCO_OK;
 }

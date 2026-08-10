@@ -157,6 +157,8 @@ pub struct ExecutionConfig {
     pub context_reserve: ByteSize,
     #[serde(default = "default_context")]
     pub context_tokens: u32,
+    #[serde(default = "default_publication_interval_tokens")]
+    pub publication_interval_tokens: usize,
     #[serde(default = "default_gpu_layers")]
     pub gpu_layers: i32,
     #[serde(default)]
@@ -209,6 +211,9 @@ fn default_listen() -> SocketAddr {
 }
 fn default_context() -> u32 {
     4096
+}
+fn default_publication_interval_tokens() -> usize {
+    32
 }
 fn default_gpu_layers() -> i32 {
     99
@@ -281,9 +286,9 @@ impl DaemonConfig {
                 "context reserve exceeds storage capacity".into(),
             ));
         }
-        if self.execution.context_tokens == 0 {
+        if self.execution.context_tokens == 0 || self.execution.publication_interval_tokens == 0 {
             return Err(ConfigError::Invalid(
-                "context_tokens must be nonzero".into(),
+                "context_tokens and publication_interval_tokens must be nonzero".into(),
             ));
         }
         if self.vision.max_images == 0
@@ -359,13 +364,21 @@ mod tests {
                 storage_capacity: ByteSize(2),
                 context_reserve: ByteSize(1),
                 context_tokens: 1,
+                publication_interval_tokens: 32,
                 gpu_layers: 0,
                 require_competent: false,
             },
             server: ServerConfig::default(),
             scheduler: SchedulerPolicyConfig::default(),
             vision: VisionConfig::default(),
-            hosted_tools: HostedToolsConfig::default(),
+            hosted_tools: HostedToolsConfig {
+                web_search: WebSearchConfig {
+                    timeout_ms: default_web_search_timeout_ms(),
+                    max_results: default_web_search_results(),
+                    max_response_bytes: default_web_search_response_bytes(),
+                    ..WebSearchConfig::default()
+                },
+            },
         }
     }
     #[test]
@@ -391,7 +404,7 @@ mod tests {
 
     #[test]
     fn validates_versions_capacities_and_vision_limits() {
-        assert!(valid().validate().is_ok());
+        valid().validate().unwrap();
         let mut config = valid();
         config.version = 2;
         assert!(matches!(config.validate(), Err(ConfigError::Version(2))));
@@ -410,6 +423,9 @@ mod tests {
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
         let mut config = valid();
         config.execution.context_tokens = 0;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        let mut config = valid();
+        config.execution.publication_interval_tokens = 0;
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
         let mut config = valid();
         config.vision.max_images = 0;

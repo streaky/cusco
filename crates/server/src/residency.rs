@@ -27,6 +27,7 @@ pub struct ResidencyConfig {
     pub storage_bytes: u64,
     pub context_reserve_bytes: u64,
     pub n_ctx: u32,
+    pub publication_interval_tokens: usize,
     pub gpu_layers: i32,
     pub require_competent: bool,
 }
@@ -37,6 +38,7 @@ impl ResidencyConfig {
             || self.host_bytes == 0
             || self.storage_bytes == 0
             || self.n_ctx == 0
+            || self.publication_interval_tokens == 0
         {
             return Err(Error::State(
                 "residency budgets and context size must be nonzero".into(),
@@ -106,14 +108,8 @@ impl ModelLoader for NativeLoader {
             Some(spill_dir),
             usize::try_from(config.context_reserve_bytes)
                 .map_err(|_| Error::State("context reserve exceeds address space".into()))?,
+            config.publication_interval_tokens,
         )?;
-        if engine.model_architecture() != model.family {
-            return Err(Error::State(format!(
-                "catalog model family {} does not match native architecture {}",
-                model.family,
-                engine.model_architecture()
-            )));
-        }
         let mut point = engine.operating_point();
         point.model_bytes = model.size_bytes;
         Ok((engine, point))
@@ -921,6 +917,7 @@ mod tests {
             storage_bytes: capacity,
             context_reserve_bytes: 1,
             n_ctx: 128,
+            publication_interval_tokens: 32,
             gpu_layers: 1,
             require_competent: true,
         }

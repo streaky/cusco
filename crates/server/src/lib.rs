@@ -60,7 +60,7 @@ pub use hosted_tools::{
     DisabledHostedTools, HostedToolError, HostedToolExecutor, SearxngHostedTools, WebSearchPolicy,
     WebSearchRequest, WebSearchResult,
 };
-pub use mapped::{ExecutionProfile, MappedEngine, MappedMetrics};
+pub use mapped::{MappedEngine, MappedMetrics};
 pub use residency::{ResidencyConfig, ResidencyMetrics, ResidentEngine, ResidentModelStatus};
 pub use scheduler::{SchedulerMetrics, SchedulerStatus, WorkloadScheduler};
 pub use vision::{AdmittedImage, ImageAdmission, VisionError};

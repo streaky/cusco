@@ -72,6 +72,9 @@ execution:
   # Native context window allocated per resident model. This is the hard token
   # ceiling before request-tied compaction; larger values consume more KV memory.
   context_tokens: 32768
+  # Publish a reusable evaluated-prefix checkpoint at this token interval.
+  # This is Cusco cache policy, independent of llama.cpp context and KV geometry.
+  publication_interval_tokens: 32
   # Maximum model layers requested for GPU offload. This is an absolute,
   # model-relative cap, not a percentage: values above a model's layer count
   # effectively request full offload, while deeper models may still be partial.

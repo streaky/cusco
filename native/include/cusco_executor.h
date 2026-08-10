@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define CUSCO_EXECUTOR_ABI_VERSION 14u
+#define CUSCO_EXECUTOR_ABI_VERSION 15u
 
 typedef struct cusco_executor cusco_executor;
 typedef struct cusco_representation cusco_representation;

@@ -25,6 +25,7 @@ execution:
   storage_capacity: 64 GiB
   context_reserve: 1 GiB
   context_tokens: 4096
+  publication_interval_tokens: 32
   gpu_layers: 99
   require_competent: false
 server:

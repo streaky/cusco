@@ -4,7 +4,6 @@ use cusco_executor::{Executor, logits_identical};
 use cusco_model_registry::{
     GEMMA_URI, ModelRecord as RegistryModelRecord, fetch_hf, register_local,
 };
-use cusco_server::ExecutionProfile;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -194,6 +193,7 @@ fn run(command: Command) -> Result<()> {
                     storage_bytes: config.execution.storage_capacity.0,
                     context_reserve_bytes: config.execution.context_reserve.0,
                     n_ctx: config.execution.context_tokens,
+                    publication_interval_tokens: config.execution.publication_interval_tokens,
                     gpu_layers: config.execution.gpu_layers,
                     require_competent: config.execution.require_competent,
                 },
@@ -1004,11 +1004,10 @@ fn proof(options: ProofOptions) -> Result<()> {
     let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
     let capabilities = executor.capabilities();
     let architecture = executor.model_architecture()?;
-    let profile = ExecutionProfile::bundled_for_architecture(&architecture)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
     ensure!(
-        profile.supports(&capabilities),
-        "model lacks the checkpoint capabilities required by its execution profile"
+        capabilities.mapped_execution
+            && (capabilities.global_kv || capabilities.swa || capabilities.recurrent),
+        "model lacks the state-component capabilities required for mapped execution"
     );
     let replacement = executor.tokenize(&replacement)?;
     let mut contexts = Vec::new();
