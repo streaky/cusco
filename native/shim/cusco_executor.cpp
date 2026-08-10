@@ -50,7 +50,7 @@ struct cusco_representation {
     uint64_t identity;
     std::atomic_uint32_t references;
     uint64_t completion_fence;
-    std::vector<uint8_t> state;
+    mutable std::vector<uint8_t> state;
 };
 
 struct cusco_prepared_mapping {
@@ -899,6 +899,7 @@ cusco_status cusco_executor_activate_mapping(
     if (is_mock(executor)) {
         executor->mock_mappings[previous] = executor->mock_state;
         executor->mock_state = executor->mock_mappings.at(mapping);
+        executor->mock_mappings.erase(mapping);
     } else {
         std::vector<uint8_t> prior;
         if (!snapshot_active_sequence(executor, prior)) {
@@ -915,6 +916,8 @@ cusco_status cusco_executor_activate_mapping(
                     executor->ctx, prior.data(), prior.size(), 0) == prior.size();
             return rolled_back ? CUSCO_BACKEND : CUSCO_ROLLBACK_FAILED;
         }
+        representation->state.clear();
+        representation->state.shrink_to_fit();
         previous_representation->state = std::move(prior);
     }
     executor->active_mapping = mapping;
