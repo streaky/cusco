@@ -3657,9 +3657,18 @@ fn parse_function_call(
         });
     if let Some((name, arguments)) = call {
         if !options.tool_names.contains(&name) {
-            return Err(Error::BadRequest(format!(
-                "model selected undeclared function `{name}`"
-            )));
+            if matches!(
+                options.tool_choice,
+                Some(
+                    ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required)
+                        | ResponsesToolChoice::Function { .. }
+                )
+            ) {
+                return Err(Error::BadRequest(format!(
+                    "model selected undeclared function `{name}`"
+                )));
+            }
+            return Ok(None);
         }
         if let Some(ResponsesToolChoice::Function { name: required, .. }) = &options.tool_choice {
             if &name != required {
@@ -4896,6 +4905,28 @@ mod tests {
         assert!(matches!(
             selected.tool_choice.unwrap().validate(&selected.tools),
             Err(Error::BadRequest(message)) if message.contains("undeclared function `lookup`")
+        ));
+    }
+    #[test]
+    fn undeclared_model_function_is_text_unless_a_call_is_required() {
+        let mut options = ResponseRequestOptions {
+            store: false,
+            previous_response_id: None,
+            lineage_revision: 0,
+            input: Vec::new(),
+            tool_names: vec!["lookup".into()],
+            tool_choice: Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto)),
+            tools: Vec::new(),
+            tool_choice_value: json!("auto"),
+        };
+        let output = r#"{"name":"describe","arguments":{"subject":"function calls"}}"#;
+        assert!(parse_function_call(output, &options).unwrap().is_none());
+
+        options.tool_choice = Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required));
+        assert!(matches!(
+            parse_function_call(output, &options),
+            Err(Error::BadRequest(message))
+                if message.contains("undeclared function `describe`")
         ));
     }
     #[test]
