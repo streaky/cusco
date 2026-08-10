@@ -202,11 +202,12 @@ pub struct PreparedMapping {
 /// A request-owned native sampler. Sampling requires the executor that created it.
 pub struct Sampler {
     raw: NonNull<sys::CuscoSampler>,
+    _lifetime: Arc<ExecutorLifetime>,
 }
 
-// SAFETY: a sampler is request-owned and all access still requires an exclusive
-// borrow of the executor that created it. Moving a suspended request between
-// scheduler threads does not permit concurrent native sampler access.
+// SAFETY: a sampler is request-owned, keeps its executor allocation alive, and
+// all access requires an exclusive borrow of the sampler. Moving a suspended
+// request between scheduler threads does not permit concurrent native access.
 unsafe impl Send for Sampler {}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -310,6 +311,7 @@ impl Executor {
     ) -> Result<Sampler, Error> {
         Ok(Sampler {
             raw: ffi::sampler(self.raw, config, grammar)?,
+            _lifetime: self.lifetime.clone(),
         })
     }
 
@@ -979,6 +981,16 @@ mod tests {
         let other_decoded = other.decode(&[12]).unwrap();
         assert_eq!(sampler.sample(&other_decoded).unwrap(), other_decoded.token);
     }
+    #[test]
+    fn sampler_keeps_its_executor_alive() {
+        let mut executor = Executor::open("mock://deterministic", 128, 0).unwrap();
+        let decode = executor.decode(&[42]).unwrap();
+        let mut sampler = executor.sampler(SamplingConfig::default()).unwrap();
+        drop(executor);
+
+        assert_eq!(sampler.sample(&decode).unwrap(), decode.token);
+    }
+
     #[test]
     fn mapped_forks_publish_transactionally_and_switch_by_reference() {
         let mut executor = Executor::open("mock://deterministic", 128, 0).unwrap();
