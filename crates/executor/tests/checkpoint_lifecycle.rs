@@ -1,4 +1,4 @@
-use cusco_executor::{Error, Executor, logits_identical};
+use cusco_executor::{Error, Executor, MappingState, logits_identical};
 
 #[test]
 #[ignore = "requires the pinned external Gemma GGUF"]
@@ -43,6 +43,30 @@ fn displaced_host_round_trip_is_exact_and_transactional() {
     let prepared = executor.prepare_restore(&prior, prior.checksum).unwrap();
     executor.commit_restore(prepared).unwrap();
     assert!(executor.decode(&[replacement[0]]).is_ok());
+}
+
+#[test]
+#[ignore = "requires the pinned external Gemma GGUF"]
+fn mapping_import_rejects_corruption_without_changing_active_state() {
+    let model = std::env::var("CUSCO_TEST_MODEL")
+        .expect("CUSCO_TEST_MODEL must name the pinned Gemma GGUF");
+    let mut executor = Executor::open(&model, 4096, 99).unwrap();
+    let prefix = executor.tokenize("transactional mapping import").unwrap();
+    executor.decode(&prefix).unwrap();
+    let root = executor.active_representation().unwrap();
+    let prepared = executor.prepare_mapping_fork(&root).unwrap();
+    let branch = executor.commit_mapping(prepared).unwrap();
+    let valid = executor.export_mapping(&branch).unwrap();
+    let mut corrupted = valid.clone();
+    corrupted.bytes.truncate(corrupted.bytes.len() / 2);
+    assert_eq!(
+        executor.import_mapping(&MappingState {
+            bytes: corrupted.bytes,
+            position: corrupted.position,
+        }),
+        Err(Error::Incompatible)
+    );
+    assert_eq!(executor.export_mapping(&branch).unwrap(), valid);
 }
 
 #[test]
