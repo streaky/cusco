@@ -250,12 +250,6 @@ impl MappedEngine {
                 "executor did not report the model context capacity".into(),
             ));
         }
-        if n_ctx > capabilities.training_context_tokens {
-            return Err(Error::State(format!(
-                "configured context {n_ctx} exceeds model capacity {}",
-                capabilities.training_context_tokens
-            )));
-        }
         let root = executor.active_representation().map_err(state_error)?;
 
         Ok(Arc::new(Self {
