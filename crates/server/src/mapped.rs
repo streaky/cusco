@@ -881,9 +881,14 @@ fn publish_block(
     continuation: &Decode,
 ) -> Result<EvaluatedPrefixId, Error> {
     let required = profile.required_mask();
-    let bytes_per_component = represented_end.saturating_mul(1024);
+    let serialized_bytes = native.describe().map_err(state_error)?.serialized_bytes;
+    let component_count = profile.required_components.len();
+    let bytes_per_component = serialized_bytes
+        .checked_add(component_count.saturating_sub(1))
+        .and_then(|bytes| bytes.checked_div(component_count))
+        .ok_or_else(|| Error::State("representation size overflow".into()))?;
     let required_bytes = bytes_per_component
-        .checked_mul(profile.required_components.len())
+        .checked_mul(component_count)
         .ok_or_else(|| Error::State("representation size overflow".into()))?;
     let capacity = state.physical.metrics();
     let unavailable = capacity
