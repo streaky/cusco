@@ -199,6 +199,13 @@ impl ResponseService {
 
     pub fn remember(&self, resource: &ResponseResource) -> Result<(), StoreError> {
         if resource.store {
+            if let Some(base_id) = resource.previous_response_id.as_deref() {
+                return self.store.put_successor(
+                    base_id,
+                    resource.lineage_revision.saturating_sub(1),
+                    resource,
+                );
+            }
             return self.store.put(resource);
         }
         let mut transient = self.transient.lock();

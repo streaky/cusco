@@ -6471,6 +6471,22 @@ mod tests {
             serde_json::from_slice(&to_bytes(continued.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(continued_body["previous_response_id"], id);
+        let competing = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/openai/v1/responses",
+                json!({
+                    "model":"m",
+                    "input":"competing continuation",
+                    "max_output_tokens":1,
+                    "store":true,
+                    "previous_response_id":id
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(competing.status(), StatusCode::CONFLICT);
 
         let reopened = Server::open(
             dir.join("state.json"),
