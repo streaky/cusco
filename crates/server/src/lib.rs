@@ -2743,18 +2743,64 @@ enum ResponsesContentPart {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum ResponsesToolChoiceMode {
     Auto,
     None,
     Required,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 enum ResponsesToolChoice {
     Mode(ResponsesToolChoiceMode),
     Function { r#type: String, name: String },
+}
+impl<'de> Deserialize<'de> for ResponsesToolChoice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::String(mode) => match mode.as_str() {
+                "auto" => Ok(Self::Mode(ResponsesToolChoiceMode::Auto)),
+                "none" => Ok(Self::Mode(ResponsesToolChoiceMode::None)),
+                "required" => Ok(Self::Mode(ResponsesToolChoiceMode::Required)),
+                _ => Err(serde::de::Error::custom(format!(
+                    "unsupported tool_choice mode `{mode}`; supported modes are `auto`, `none`, and `required`"
+                ))),
+            },
+            Value::Object(mut fields) => {
+                let r#type = fields
+                    .remove("type")
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "tool_choice object requires a string `type` field",
+                        )
+                    })?;
+                let name = fields
+                    .remove("name")
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "tool_choice object requires a string `name` field",
+                        )
+                    })?;
+                if let Some(field) = fields.keys().next() {
+                    return Err(serde::de::Error::custom(format!(
+                        "tool_choice object contains unsupported field `{field}`"
+                    )));
+                }
+                Ok(Self::Function { r#type, name })
+            }
+            _ => Err(serde::de::Error::custom(
+                "tool_choice must be `auto`, `none`, `required`, or a function choice object",
+            )),
+        }
+    }
 }
 
 impl ResponsesToolChoice {
@@ -2765,19 +2811,20 @@ impl ResponsesToolChoice {
                 Error::BadRequest("tool_choice `required` requires at least one tool".into()),
             ),
             Self::Mode(ResponsesToolChoiceMode::Required) => Ok(()),
-            Self::Function { r#type, name }
-                if r#type == "function"
-                    && tool_names(tools).iter().any(|candidate| candidate == name) =>
+            Self::Function { r#type, .. } if r#type != "function" => Err(Error::BadRequest(
+                format!("unsupported tool_choice type `{type}`; only `function` is supported"),
+            )),
+            Self::Function { name, .. } if name.is_empty() => Err(Error::BadRequest(
+                "tool_choice function name must not be empty".into(),
+            )),
+            Self::Function { name, .. }
+                if tool_names(tools).iter().any(|candidate| candidate == name) =>
             {
                 Ok(())
             }
-            Self::Function { r#type, name } if r#type == "function" => Err(Error::BadRequest(
-                format!("tool_choice references undeclared function `{name}`"),
-            )),
-            Self::Function { .. } => Err(Error::BadRequest(
-                "tool_choice function must have type `function` and a declared non-empty name"
-                    .into(),
-            )),
+            Self::Function { name, .. } => Err(Error::BadRequest(format!(
+                "tool_choice references undeclared function `{name}`"
+            ))),
         }
     }
 }
@@ -4806,6 +4853,113 @@ mod tests {
         .unwrap();
         assert!(chat.tools[0].valid_function());
         assert!(matches!(chat.tools.as_slice(), [ToolDefinition::Nested(_)]));
+    }
+    #[test]
+    fn responses_tool_choice_modes_parse_and_validate_precisely() {
+        let tools = vec![ToolDefinition::Flat(FlatToolDefinition {
+            r#type: "function".into(),
+            name: "lookup".into(),
+            description: None,
+            parameters: json!({"type": "object"}),
+            strict: false,
+        })];
+
+        for (wire, expected) in [
+            ("auto", ResponsesToolChoiceMode::Auto),
+            ("none", ResponsesToolChoiceMode::None),
+            ("required", ResponsesToolChoiceMode::Required),
+        ] {
+            let choice: ResponsesToolChoice = serde_json::from_value(json!(wire)).unwrap();
+            assert!(matches!(
+                &choice,
+                ResponsesToolChoice::Mode(mode) if *mode == expected
+            ));
+            assert_eq!(serde_json::to_value(&choice).unwrap(), json!(wire));
+            choice.validate(&tools).unwrap();
+        }
+
+        let unsupported =
+            serde_json::from_value::<ResponsesToolChoice>(json!("specific")).unwrap_err();
+        assert_eq!(
+            unsupported.to_string(),
+            "unsupported tool_choice mode `specific`; supported modes are `auto`, `none`, and `required`"
+        );
+
+        let required: ResponsesToolChoice = serde_json::from_value(json!("required")).unwrap();
+        assert!(matches!(
+            required.validate(&[]),
+            Err(Error::BadRequest(message))
+                if message == "tool_choice `required` requires at least one tool"
+        ));
+
+        for (choice, expected) in [
+            (
+                json!({"type": "hosted_tool", "name": "lookup"}),
+                "unsupported tool_choice type `hosted_tool`; only `function` is supported",
+            ),
+            (
+                json!({"type": "function", "name": ""}),
+                "tool_choice function name must not be empty",
+            ),
+            (
+                json!({"type": "function", "name": "missing"}),
+                "tool_choice references undeclared function `missing`",
+            ),
+        ] {
+            let choice: ResponsesToolChoice = serde_json::from_value(choice).unwrap();
+            assert!(matches!(
+                choice.validate(&tools),
+                Err(Error::BadRequest(message)) if message == expected
+            ));
+        }
+
+        let named: ResponsesToolChoice =
+            serde_json::from_value(json!({"type": "function", "name": "lookup"})).unwrap();
+        named.validate(&tools).unwrap();
+    }
+    #[tokio::test]
+    async fn responses_reject_invalid_tool_choice_before_generation() {
+        for (tool_choice, tools, expected) in [
+            (
+                json!("required"),
+                json!([]),
+                "tool_choice `required` requires at least one tool",
+            ),
+            (
+                json!({"type": "function", "name": "missing"}),
+                json!([{
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"}
+                }]),
+                "tool_choice references undeclared function `missing`",
+            ),
+        ] {
+            let (server, directory) = setup(Arc::new(AnonymousAdmin));
+            let response = router(server)
+                .oneshot(request(
+                    "POST",
+                    "/openai/v1/responses",
+                    json!({
+                        "model": "m",
+                        "input": "hello",
+                        "tool_choice": tool_choice,
+                        "tools": tools
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], "invalid_request");
+            assert_eq!(
+                body["error"]["message"],
+                format!("invalid request: {expected}")
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[tokio::test]
