@@ -4,6 +4,7 @@ use cusco_executor::{Executor, logits_identical};
 use cusco_model_registry::{
     GEMMA_URI, ModelRecord as RegistryModelRecord, fetch_hf, register_local,
 };
+use cusco_server::ExecutionProfile;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -1003,13 +1004,11 @@ fn proof(options: ProofOptions) -> Result<()> {
     let mut executor = Executor::open(model_path, n_ctx, gpu_layers)?;
     let capabilities = executor.capabilities();
     let architecture = executor.model_architecture()?;
+    let profile = ExecutionProfile::bundled_for_architecture(&architecture)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     ensure!(
-        architecture == "gemma4",
-        "reference model reported unsupported architecture {architecture}"
-    );
-    ensure!(
-        capabilities.global_kv && capabilities.swa && capabilities.recurrent,
-        "model lacks a complete composite checkpoint capability"
+        profile.supports(&capabilities),
+        "model lacks the checkpoint capabilities required by its execution profile"
     );
     let replacement = executor.tokenize(&replacement)?;
     let mut contexts = Vec::new();

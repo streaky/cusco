@@ -6,3 +6,8 @@ families:
       - kv
       - swa
       - recurrent
+  - architecture: qwen35moe
+    block_size: 32
+    required_components:
+      - kv
+      - recurrent

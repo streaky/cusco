@@ -12,6 +12,8 @@ Keep this `AGENTS.md` up to date whenever development workflows, architecture, s
 
 Cusco implements exact checkpoint continuation, shared logical branches, tier accounting, transactional mappings, mapped execution, bounded live generation, multi-model residency, resumable execution sessions, and priority-aware deficit round-robin scheduling with monotonic promotion. The public API provides OpenAI-compatible inference under `/openai/v1/*` and a Cusco control plane under `/cusco/v1/*`, including bounded Ollama-compatible model management under `/cusco/v1/api/*`. It also includes strict compatibility controls, native wire streaming, bounded text-plus-image admission, immutable Hub resolution, metadata-driven execution profiles, a SQLite model catalog, versioned daemon configuration, production Compose packaging, request-tied deterministic `window_tail` context compaction with atomic successor publication and OpenAI replay metadata, durable stored Responses continuation, and a negotiated transactional `cusco.context_update.v1` fold operation. Model identity, configuration, aliases, lifecycle operation records, and stored OpenAI Responses resources survive restart in the v1 profile; logical Cusco contexts and native execution state are disposable.
 
+The bundled execution-profile catalog currently supports `gemma4` with KV, sliding-window, and recurrent state and `qwen35moe` with KV and recurrent state. Both families have exact checkpoint-continuation and mapped-execution proof coverage; the canonical acceptance fixture remains Gemma.
+
 The repository currently contains:
 
 - `crates/context-store`: Rust logical contexts, structurally shared token sequences, and evaluated-prefix mappings;

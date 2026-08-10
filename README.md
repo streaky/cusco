@@ -14,6 +14,9 @@ details and optimized kernels.
 - Persistent logical contexts with branching and evaluated-prefix reuse.
 - Device, host, and storage residency accounting with mapped llama sequence
   activation and local spill support.
+- Declarative execution profiles for Gemma 4 (`gemma4`) and Qwen 3.5 MoE
+  (`qwen35moe`), with architecture-specific KV, sliding-window, and recurrent
+  state requirements validated against the native executor.
 - Dynamic model registration, immutable revisions, aliases, loading, reloading,
   retirement, and removal.
 - Priority-aware request scheduling with bounded admission, cancellation,

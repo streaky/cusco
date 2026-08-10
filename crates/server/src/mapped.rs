@@ -7,7 +7,7 @@ use cusco_context_store::{
     PersistentTokenSequence,
 };
 use cusco_executor::{
-    Decode, Executor, MappingState, OperatingPoint, RepresentationHandle, Sampler,
+    Capabilities, Decode, Executor, MappingState, OperatingPoint, RepresentationHandle, Sampler,
 };
 use cusco_physical_manager::{
     Capacity, Component, PhysicalManager, PhysicalRepresentationId, Tier,
@@ -84,19 +84,21 @@ impl ExecutionProfile {
     }
 
     fn validate(&self) -> Result<(), Error> {
-        if self.architecture.is_empty() || self.block_size == 0 {
+        if self.architecture.is_empty()
+            || self.block_size == 0
+            || self.required_components.is_empty()
+        {
             return Err(Error::State("invalid execution profile".into()));
         }
-        let required = self.required_mask();
-        if !required.contains(ComponentMask::GLOBAL_KV)
-            || !required.contains(ComponentMask::SWA)
-            || !required.contains(ComponentMask::RECURRENT)
-        {
-            return Err(Error::State(
-                "execution profile omits a required component".into(),
-            ));
-        }
         Ok(())
+    }
+
+    pub fn supports(&self, capabilities: &Capabilities) -> bool {
+        let required = self.required_mask();
+        capabilities.mapped_execution
+            && (!required.contains(ComponentMask::GLOBAL_KV) || capabilities.global_kv)
+            && (!required.contains(ComponentMask::SWA) || capabilities.swa)
+            && (!required.contains(ComponentMask::RECURRENT) || capabilities.recurrent)
     }
 
     fn required_mask(&self) -> ComponentMask {
@@ -236,11 +238,7 @@ impl MappedEngine {
         let architecture = executor.model_architecture().map_err(state_error)?;
         let profile = ExecutionProfile::bundled_for_architecture(&architecture)?;
         let capabilities = executor.capabilities();
-        if !capabilities.mapped_execution
-            || !capabilities.global_kv
-            || !capabilities.swa
-            || !capabilities.recurrent
-        {
+        if !profile.supports(&capabilities) {
             return Err(Error::State(
                 "executor does not satisfy the execution profile".into(),
             ));
@@ -1116,10 +1114,16 @@ mod tests {
     }
 
     #[test]
-    fn bundled_profile_is_strict_and_complete() {
-        let profile = ExecutionProfile::bundled_for_architecture("gemma4").unwrap();
-        assert_eq!(profile.block_size, 32);
-        assert!(profile.required_mask().contains(ComponentMask::RECURRENT));
+    fn bundled_profiles_are_strict_and_architecture_specific() {
+        let gemma = ExecutionProfile::bundled_for_architecture("gemma4").unwrap();
+        assert_eq!(gemma.block_size, 32);
+        assert!(gemma.required_mask().contains(ComponentMask::SWA));
+        assert!(gemma.required_mask().contains(ComponentMask::RECURRENT));
+        let qwen = ExecutionProfile::bundled_for_architecture("qwen35moe").unwrap();
+        assert_eq!(qwen.block_size, 32);
+        assert!(qwen.required_mask().contains(ComponentMask::GLOBAL_KV));
+        assert!(!qwen.required_mask().contains(ComponentMask::SWA));
+        assert!(qwen.required_mask().contains(ComponentMask::RECURRENT));
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../../config/model-families.schema.json"))
                 .unwrap();
@@ -1136,21 +1140,13 @@ mod tests {
     }
 
     #[test]
-    fn profile_rejects_missing_global_kv() {
-        let mut missing_kv = ExecutionProfile::bundled_for_architecture("gemma4").unwrap();
-        missing_kv
-            .required_components
-            .retain(|component| *component != ProfileComponent::Kv);
-        assert!(
-            !missing_kv
-                .required_mask()
-                .contains(ComponentMask::GLOBAL_KV)
-        );
-        assert!(matches!(
-            missing_kv.validate(),
-            Err(Error::State(message))
-                if message == "Gemma profile omits a required execution component"
-        ));
+    fn profile_accepts_architecture_specific_component_sets() {
+        let profile = ExecutionProfile::bundled_for_architecture("qwen35moe").unwrap();
+        assert!(profile.validate().is_ok());
+        let executor = Executor::open("mock://deterministic", 128, 0).unwrap();
+        let mut capabilities = executor.capabilities();
+        capabilities.swa = false;
+        assert!(profile.supports(&capabilities));
     }
 
     #[test]
