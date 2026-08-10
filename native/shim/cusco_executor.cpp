@@ -891,6 +891,11 @@ cusco_status cusco_executor_activate_mapping(
         return CUSCO_OK;
     }
     const uint32_t previous = executor->active_mapping;
+    const auto previous_it = executor->representations.find(previous);
+    if (previous_it == executor->representations.end()) {
+        return CUSCO_BACKEND;
+    }
+    auto * previous_representation = previous_it->second;
     if (is_mock(executor)) {
         executor->mock_mappings[previous] = executor->mock_state;
         executor->mock_state = executor->mock_mappings.at(mapping);
@@ -910,11 +915,11 @@ cusco_status cusco_executor_activate_mapping(
                     executor->ctx, prior.data(), prior.size(), 0) == prior.size();
             return rolled_back ? CUSCO_BACKEND : CUSCO_ROLLBACK_FAILED;
         }
-        executor->representations.at(previous)->state = std::move(prior);
+        previous_representation->state = std::move(prior);
     }
     executor->active_mapping = mapping;
     executor->reference_switches++;
-    auto * prior = executor->representations.at(previous);
+    auto * prior = previous_representation;
     if (previous != 0 && prior->references.load(std::memory_order_acquire) == 0) {
         reclaim_representation(executor, prior);
     }
