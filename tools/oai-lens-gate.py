@@ -124,10 +124,17 @@ def main() -> int:
             "added": [name for name in names if name not in expected],
             "missing": [name for name in names if name not in observed],
         }
+        newly_failing = deltas["newly_failing"]
         failed = sorted(name for name, status in observed.items() if status == "fail")
         base.update(
             {
-                "classification": "runner_completed_with_probe_failures" if failed else "runner_passed",
+                "classification": (
+                    "regression"
+                    if newly_failing
+                    else "runner_completed_with_probe_failures"
+                    if failed
+                    else "runner_passed"
+                ),
                 "profile": profile,
                 "probe_counts": {"total": len(observed), "passed": len(observed) - len(failed), "failed": len(failed)},
                 "deltas": deltas,
@@ -137,7 +144,7 @@ def main() -> int:
         )
         write_json_atomic(args.gate_report, base)
         print(json.dumps(base, indent=2, sort_keys=True))
-        return 0
+        return 1 if newly_failing else 0
     except (OSError, ValueError, json.JSONDecodeError) as error:
         base.update(
             {

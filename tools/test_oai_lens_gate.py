@@ -84,6 +84,28 @@ class OaiLensGateTest(unittest.TestCase):
         self.assertEqual(gate["deltas"]["newly_failing"], [])
         self.assertIn("upstream_report_sha256", gate)
 
+    def test_newly_failing_probe_is_a_regression(self) -> None:
+        report = {
+            "version": 1,
+            "profile": "openai_api",
+            "results": [
+                {"name": "chat.core.messages", "status": "fail"},
+                {"name": "responses.core.simple_text", "status": "fail"},
+            ],
+        }
+        producer = (
+            "import json,sys;"
+            f"json.dump({report!r}, open(sys.argv[1], 'w'));"
+            "raise SystemExit(1)"
+        )
+
+        completed = self.invoke([sys.executable, "-c", producer, str(self.report)])
+
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        gate = json.loads(self.gate_report.read_text(encoding="utf-8"))
+        self.assertEqual(gate["classification"], "regression")
+        self.assertEqual(gate["deltas"]["newly_failing"], ["chat.core.messages"])
+
     def test_missing_report_is_a_harness_failure(self) -> None:
         completed = self.invoke([sys.executable, "-c", "raise SystemExit(1)"])
 
