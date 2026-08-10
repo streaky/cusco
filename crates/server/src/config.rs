@@ -96,6 +96,8 @@ pub struct DaemonConfig {
     pub scheduler: SchedulerPolicyConfig,
     #[serde(default)]
     pub vision: VisionConfig,
+    #[serde(default)]
+    pub hosted_tools: HostedToolsConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -110,6 +112,30 @@ pub struct OpenApiConfig {
 pub struct OpenApiDocsUiConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedToolsConfig {
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default = "default_web_search_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_web_search_results")]
+    pub max_results: usize,
+    #[serde(default = "default_web_search_response_bytes")]
+    pub max_response_bytes: usize,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -168,6 +194,15 @@ impl Default for VisionConfig {
             metadata_allowlist: vec![],
         }
     }
+}
+fn default_web_search_timeout_ms() -> u64 {
+    10_000
+}
+fn default_web_search_results() -> usize {
+    8
+}
+fn default_web_search_response_bytes() -> usize {
+    1 << 20
 }
 fn default_listen() -> SocketAddr {
     "127.0.0.1:8080".parse().expect("static address")
@@ -264,6 +299,19 @@ impl DaemonConfig {
                 "vision retention capacity is smaller than one decoded image limit".into(),
             ));
         }
+        if self.hosted_tools.web_search.enabled && self.hosted_tools.web_search.endpoint.is_none() {
+            return Err(ConfigError::Invalid(
+                "hosted_tools.web_search.endpoint is required when web search is enabled".into(),
+            ));
+        }
+        if self.hosted_tools.web_search.timeout_ms == 0
+            || self.hosted_tools.web_search.max_results == 0
+            || self.hosted_tools.web_search.max_response_bytes == 0
+        {
+            return Err(ConfigError::Invalid(
+                "hosted web-search limits must be nonzero".into(),
+            ));
+        }
         Ok(self)
     }
 }
@@ -317,6 +365,7 @@ mod tests {
             server: ServerConfig::default(),
             scheduler: SchedulerPolicyConfig::default(),
             vision: VisionConfig::default(),
+            hosted_tools: HostedToolsConfig::default(),
         }
     }
     #[test]

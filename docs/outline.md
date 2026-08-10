@@ -258,7 +258,7 @@ External compatibility is a shim layer over a protocol-neutral application API, 
 
 The first-class external surfaces are an explicitly versioned local-inference profile of the OpenAI-compatible API under `/openai/v1/*` and the Cusco control plane under `/cusco/v1/*`. The control plane includes a bounded Ollama-compatible model-management profile under `/cusco/v1/api/*`; it intentionally does not provide Ollama chat or generation, and no standalone `/ollama/*` routes exist. Both surfaces must be described by the generated, checked OpenAPI document and must normalize into protocol-neutral services. Compatibility clients must accept a configured subdirectory base URL. Open WebUI is configured with `/openai/v1` as its normally enabled OpenAI inference connection and `/cusco/v1` as a normally disabled Ollama management connection; operators enable the latter only for model administration, then disable it and refresh the model list.
 
-The supported OpenAI profile is a tested behavioral contract. It includes model discovery, text and chat completion, streaming, deterministic and commonly used sampling controls, stop handling, structured output, typed client-executed function-call/result loops, explicit `tool_choice` controls, and durable Responses resources. Responses support retrieval, deletion, cancellation, restart recovery, `previous_response_id` continuation, SDK-reconstructable streaming events, and late resolution of omitted output limits against real context headroom. Embeddings remain unavailable until the executor exposes them. Compatibility covers request defaults and validation, model-name resolution, chat-template application, terminal-token suppression, whitespace semantics, finish and stop reasons, usage accounting, error envelopes, cancellation, and streaming-native rather than JSON-shaped chunks. Conversations, hosted tools, detached background execution, the broader reasoning/item taxonomy, and real image projection are outside the current profile.
+The supported OpenAI profile is a tested behavioral contract. It includes model discovery, text and chat completion, streaming, deterministic and commonly used sampling controls, stop handling, structured output, typed client-executed function-call/result loops, explicit `tool_choice` controls, operator-enabled and policy-bounded hosted web search, and durable Responses resources. Hosted search is an explicit server capability: request declarations select it but cannot enable it, the provider transport is isolated behind a narrow adapter, externally supplied search-result URLs are validated against network and domain policy, and responses expose standard `web_search_call` items plus URL citations. Responses support retrieval, deletion, cancellation, restart recovery, `previous_response_id` continuation, SDK-reconstructable streaming events, and late resolution of omitted output limits against real context headroom. Embeddings remain unavailable until the executor exposes them. Compatibility covers request defaults and validation, model-name resolution, chat-template application, terminal-token suppression, whitespace semantics, tool-call continuation, response persistence, and streaming lifecycle.
 
 The label "OpenAI-compatible" does not identify one uniform wire contract. Cusco must treat the public OpenAI API and the Codex backend as two explicit, independently tested compatibility profiles rather than assuming that Codex is a subset of the public Responses API. Their material differences include:
 
@@ -1299,6 +1299,22 @@ A candidate slot score may include:
 - request priority and waiting time;
 - expected decode duration;
 - NUMA or device affinity in multi-GPU deployments.
+
+The OpenAI `service_tier` request field is a possible standard-facing input to
+this priority policy. This is potentially more useful on a contended local or
+shared deployment than as a compatibility-only field: `flex` can express
+background throughput work, while `priority` or `scale` can express
+latency-sensitive or reserved-capacity intent. The OpenAI adapter should resolve
+the requested tier through operator and principal policy into a
+protocol-neutral Cusco scheduling class rather than exposing OpenAI product
+semantics inside the scheduler. The response must report the effective tier
+actually used, and elevated treatment must not be available merely because an
+untrusted client requested it. Any mapping should preserve per-principal
+fairness, bounded admission, and guaranteed progress for lower-priority work;
+it conveys a local scheduling hint, not OpenAI billing, capacity, or
+service-level guarantees. Initially mapping multiple recognized tiers to the
+same internal class remains valid until distinct behavior is implemented and
+measured.
 
 
 Semantic compaction adds a second, lower-priority scheduling path. A terminal response may update deterministic eligibility facts, but it must not by itself predict another turn or launch speculative strategy work. An accepted predictive-compaction declaration enqueues the eligibility check. Eligibility combines the context's configured trigger, next-turn fit, exact source-head identity, strategy availability, declaration lifetime, and speculative resource budget. The scheduler should begin eligible work as capacity permits; it may delay or preempt it for interactive traffic or guarded capacity, but it should not override the declaration merely because an internal predictor disagrees. If the next request arrives before publication, it continues from the original context unless that request explicitly accepts waiting for the in-flight successor.

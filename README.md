@@ -21,6 +21,13 @@ details and optimized kernels.
 - OpenAI-compatible completions, chat completions, and durable Responses APIs,
   including stored-resource retrieval, deletion, and `previous_response_id`
   continuation.
+  Chat Completions supports the current `max_completion_tokens` total-generation
+  limit and the deprecated `max_tokens` field for legacy clients; if both are
+  supplied, their values must match.
+  Chat Completions and Responses accept OpenAI service-tier requests but
+  currently normalize every supported tier to the neutral `default` tier
+  without changing scheduler priority. Responses report the actual tier as
+  `default`; tier-aware HTTP admission may map this field to queue policy later.
 - An Ollama-compatible model-management profile for discovery, inspection,
   pulling, aliases, deletion, and residency reporting.
 - Cusco-native context, compaction, lifecycle, status, OpenAPI, capability
@@ -28,6 +35,9 @@ details and optimized kernels.
 - Buffered and streaming generation, deterministic sampling controls, stop
   handling, request-shape validation, typed function-call/result continuation,
   and `tool_choice` controls for `auto`, `none`, `required`, and named functions.
+  Responses can also execute an operator-enabled, policy-bounded `web_search`
+  tool through a configured SearXNG-compatible provider; it is disabled by
+  default and returns standard search-call items and URL citations.
 - Deterministic `window_tail` context compaction with transactional successor
   publication and replay metadata.
 - Versioned YAML configuration, bearer authentication, transport diagnostics,
@@ -233,6 +243,9 @@ second inference API.
   workload scheduler serializes native quanta across the process.
 - Image inputs are validated and bounded, but inference rejects them because
   the executor does not yet expose a compatible vision-projector path.
+- Hosted web search currently supports a SearXNG-compatible JSON backend only.
+  Shell/container execution, page retrieval, file search, code interpretation,
+  vector stores, and other server-executed tools are not available.
 - Embeddings are not available until the executor exposes embedding output.
 - Physical tier accounting does not yet correspond to independently movable
   native KV and recurrent-state blocks.

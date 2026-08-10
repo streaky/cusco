@@ -169,8 +169,8 @@ fn run(command: Command) -> Result<()> {
         Command::Serve { config, http_debug } => {
             use cusco_server::{
                 AnonymousAdmin, AuthProvider, BearerAuth, DaemonConfig, HttpDebugLevel,
-                ModelCatalog, ModelRecord, ResidencyConfig, ResidentEngine, Server,
-                WorkloadScheduler, load_user_models,
+                ModelCatalog, ModelRecord, ResidencyConfig, ResidentEngine, SearxngHostedTools,
+                Server, WebSearchPolicy, WorkloadScheduler, load_user_models,
             };
             let config = DaemonConfig::load(config)?;
             let http_debug = config.resolve_http_debug(
@@ -210,6 +210,21 @@ fn run(command: Command) -> Result<()> {
             server.configure(config.server)?;
             server.configure_vision(config.vision);
             server.configure_openapi(config.openapi);
+            if config.hosted_tools.web_search.enabled {
+                let search = &config.hosted_tools.web_search;
+                server.configure_hosted_tools(Arc::new(SearxngHostedTools::new(
+                    WebSearchPolicy {
+                        endpoint: search
+                            .endpoint
+                            .clone()
+                            .expect("validated enabled web-search endpoint"),
+                        timeout: Duration::from_millis(search.timeout_ms),
+                        max_results: search.max_results,
+                        max_response_bytes: search.max_response_bytes,
+                        allowed_domains: search.allowed_domains.clone(),
+                    },
+                )?));
+            }
             server.attach_catalog(catalog.clone(), config.paths.models.clone());
             for model in catalog.models()? {
                 server.register_catalog_model(model)?;

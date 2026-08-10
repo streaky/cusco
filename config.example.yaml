@@ -30,6 +30,22 @@ openapi:
     # document. This is a documentation browser, not a general-purpose web UI.
     enabled: false
 
+# Server-executed tools. Every capability is disabled until an operator selects
+# and bounds a provider; request tool declarations cannot enable capabilities.
+hosted_tools:
+  web_search:
+    enabled: false
+    # SearXNG JSON search endpoint. Required when enabled. Keep credentials out
+    # of this file and place authenticated providers behind an operator-managed
+    # gateway when necessary.
+    endpoint: null
+    timeout_ms: 10000
+    max_results: 8
+    max_response_bytes: 1048576 # 1 MiB
+    # Empty permits any result domain. A non-empty list is an operator ceiling;
+    # request-level allowed_domains may narrow but never expand it.
+    allowed_domains: []
+
 paths:
   # SQLite catalog for persistent model identity, aliases, and lifecycle records.
   database: /data/db/catalog.sqlite

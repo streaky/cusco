@@ -35,6 +35,26 @@ pub struct ResponseFunctionCall {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResponseWebSearchSource {
+    pub r#type: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResponseWebSearchAction {
+    pub r#type: String,
+    pub query: String,
+    pub sources: Vec<ResponseWebSearchSource>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResponseWebSearchCall {
+    pub id: String,
+    pub status: String,
+    pub action: ResponseWebSearchAction,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseInputItem {
     Message {
@@ -57,6 +77,7 @@ pub enum ResponseInputItem {
 pub enum ResponseOutputItem {
     Message(ResponseMessage),
     FunctionCall(ResponseFunctionCall),
+    WebSearchCall(ResponseWebSearchCall),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -133,6 +154,7 @@ pub struct StreamResponse {
     pub tools: Vec<Value>,
     pub tool_choice: Value,
     pub buffer_output: bool,
+    pub web_search_call: Option<ResponseWebSearchCall>,
     pub lineage_revision: u64,
 }
 
@@ -157,21 +179,43 @@ impl ResponseService {
     }
 
     pub fn complete(&self, params: CompleteResponse<'_>) -> ResponseResource {
-        let output = params.function_call.map_or_else(
-            || {
-                vec![ResponseOutputItem::Message(ResponseMessage {
-                    id: "msg_0".into(),
-                    role: "assistant".into(),
-                    status: "completed".into(),
-                    content: vec![ResponseTextPart {
-                        text: params.text.into(),
-                        annotations: vec![],
-                        logprobs: vec![],
-                    }],
-                })]
-            },
-            |call| vec![ResponseOutputItem::FunctionCall(call)],
-        );
+        let message = || {
+            let annotations = params.web_search_call.map_or_else(Vec::new, |call| {
+                call.action
+                    .sources
+                    .iter()
+                    .filter_map(|source| {
+                        let byte_start = params.text.find(&source.url)?;
+                        let start_index = params.text[..byte_start].chars().count();
+                        let end_index = start_index + source.url.chars().count();
+                        Some(json!({
+                            "type": "url_citation",
+                            "url": source.url,
+                            "title": source.url,
+                            "start_index": start_index,
+                            "end_index": end_index
+                        }))
+                    })
+                    .collect()
+            });
+            ResponseOutputItem::Message(ResponseMessage {
+                id: "msg_0".into(),
+                role: "assistant".into(),
+                status: "completed".into(),
+                content: vec![ResponseTextPart {
+                    text: params.text.into(),
+                    annotations,
+                    logprobs: vec![],
+                }],
+            })
+        };
+        let output = if let Some(call) = params.function_call {
+            vec![ResponseOutputItem::FunctionCall(call)]
+        } else if let Some(call) = params.web_search_call {
+            vec![ResponseOutputItem::WebSearchCall(call.clone()), message()]
+        } else {
+            vec![message()]
+        };
         ResponseResource {
             schema_version: RESPONSE_SCHEMA_VERSION,
             id: params.id.into(),
@@ -283,6 +327,7 @@ pub struct CompleteResponse<'a> {
     pub lineage_revision: u64,
     pub input: &'a [ResponseInputItem],
     pub function_call: Option<ResponseFunctionCall>,
+    pub web_search_call: Option<&'a ResponseWebSearchCall>,
 }
 
 impl From<&Usage> for ResponseUsage {
@@ -305,6 +350,27 @@ pub fn new_function_call(name: String, arguments: String) -> ResponseFunctionCal
     }
 }
 
+pub fn new_web_search_call(
+    query: String,
+    urls: impl IntoIterator<Item = String>,
+) -> ResponseWebSearchCall {
+    ResponseWebSearchCall {
+        id: format!("ws_{}", Uuid::new_v4()),
+        status: "completed".into(),
+        action: ResponseWebSearchAction {
+            r#type: "search".into(),
+            query,
+            sources: urls
+                .into_iter()
+                .map(|url| ResponseWebSearchSource {
+                    r#type: "url".into(),
+                    url,
+                })
+                .collect(),
+        },
+    }
+}
+
 pub fn project_resource(resource: &ResponseResource) -> Value {
     let usage = resource.usage.as_ref().map(|u| json!({"input_tokens":u.input_tokens,"input_tokens_details":{"cached_tokens":u.cached_tokens},"output_tokens":u.output_tokens,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":u.input_tokens+u.output_tokens})).unwrap_or(Value::Null);
     let output = resource
@@ -320,6 +386,9 @@ fn project_output_item(item: &ResponseOutputItem) -> Value {
         ResponseOutputItem::Message(message) => project_message(message),
         ResponseOutputItem::FunctionCall(call) => {
             json!({"id":call.id,"type":"function_call","call_id":call.call_id,"name":call.name,"arguments":call.arguments,"status":call.status})
+        }
+        ResponseOutputItem::WebSearchCall(call) => {
+            json!({"id":call.id,"type":"web_search_call","status":call.status,"action":call.action})
         }
     }
 }
@@ -340,12 +409,14 @@ pub enum ResponseEvent {
     Created(ResponseResource),
     OutputItemAdded(ResponseMessage),
     FunctionCallAdded(ResponseFunctionCall),
+    WebSearchCallAdded(ResponseWebSearchCall),
     ContentPartAdded(ResponseTextPart),
     TextDelta(String),
     TextDone(ResponseTextPart),
     ContentPartDone(ResponseTextPart),
     OutputItemDone(ResponseMessage),
     FunctionCallDone(ResponseFunctionCall),
+    WebSearchCallDone(ResponseWebSearchCall),
     Completed(ResponseResource),
     Error(String),
 }
@@ -355,6 +426,7 @@ pub struct ResponseProjection {
     sequence: usize,
     buffer_output: bool,
     function_call: Option<ResponseFunctionCall>,
+    web_search_call: Option<ResponseWebSearchCall>,
 }
 impl ResponseProjection {
     pub fn new(model: String) -> Self {
@@ -381,6 +453,7 @@ impl ResponseProjection {
             sequence: 0,
             buffer_output: false,
             function_call: None,
+            web_search_call: None,
         }
     }
     fn with_request(mut self, request: StreamResponse) -> Self {
@@ -391,6 +464,7 @@ impl ResponseProjection {
         self.resource.tools = request.tools;
         self.resource.tool_choice = request.tool_choice;
         self.resource.lineage_revision = request.lineage_revision;
+        self.web_search_call = request.web_search_call;
         self.buffer_output = request.buffer_output;
         self
     }
@@ -400,8 +474,8 @@ impl ResponseProjection {
     pub fn generated_text(&self) -> &str {
         self.resource
             .output
-            .first()
-            .and_then(|item| match item {
+            .iter()
+            .find_map(|item| match item {
                 ResponseOutputItem::Message(message) => {
                     message.content.first().map(|part| part.text.as_str())
                 }
@@ -413,13 +487,31 @@ impl ResponseProjection {
         self.function_call = call;
     }
     fn message(&self, status: &str) -> ResponseMessage {
+        let text = self.generated_text();
+        let annotations = self.web_search_call.as_ref().map_or_else(Vec::new, |call| {
+            call.action
+                .sources
+                .iter()
+                .filter_map(|source| {
+                    let byte_start = text.find(&source.url)?;
+                    let start_index = text[..byte_start].chars().count();
+                    Some(json!({
+                        "type": "url_citation",
+                        "url": source.url,
+                        "title": source.url,
+                        "start_index": start_index,
+                        "end_index": start_index + source.url.chars().count()
+                    }))
+                })
+                .collect()
+        });
         ResponseMessage {
             id: "msg_0".into(),
             role: "assistant".into(),
             status: status.into(),
             content: vec![ResponseTextPart {
-                text: self.generated_text().into(),
-                annotations: vec![],
+                text: text.into(),
+                annotations,
                 logprobs: vec![],
             }],
         }
@@ -440,7 +532,15 @@ impl ResponseProjection {
                     execution_session_id,
                 };
                 let message = self.message("in_progress");
-                self.resource.output = vec![ResponseOutputItem::Message(message.clone())];
+                self.resource.output = self
+                    .web_search_call
+                    .iter()
+                    .cloned()
+                    .map(ResponseOutputItem::WebSearchCall)
+                    .chain(std::iter::once(ResponseOutputItem::Message(
+                        message.clone(),
+                    )))
+                    .collect();
                 if self.buffer_output {
                     vec![ResponseEvent::Created(self.resource.clone())]
                 } else {
@@ -456,8 +556,10 @@ impl ResponseProjection {
                 }
             }
             StreamEvent::Token { token, .. } => {
-                if let Some(ResponseOutputItem::Message(message)) = self.resource.output.first_mut()
-                {
+                if let Some(message) = self.resource.output.iter_mut().find_map(|item| match item {
+                    ResponseOutputItem::Message(message) => Some(message),
+                    _ => None,
+                }) {
                     message.content[0].text.push_str(&token)
                 }
                 if self.buffer_output {
@@ -479,10 +581,22 @@ impl ResponseProjection {
                     ]
                 } else {
                     let message = self.message("completed");
-                    self.resource.output = vec![ResponseOutputItem::Message(message.clone())];
+                    self.resource.output = self
+                        .web_search_call
+                        .iter()
+                        .cloned()
+                        .map(ResponseOutputItem::WebSearchCall)
+                        .chain(std::iter::once(ResponseOutputItem::Message(
+                            message.clone(),
+                        )))
+                        .collect();
                     let part = message.content[0].clone();
                     let mut events = Vec::new();
                     if self.buffer_output {
+                        if let Some(call) = self.web_search_call.clone() {
+                            events.push(ResponseEvent::WebSearchCallAdded(call.clone()));
+                            events.push(ResponseEvent::WebSearchCallDone(call));
+                        }
                         events.push(ResponseEvent::OutputItemAdded(message.clone()));
                         events.push(ResponseEvent::ContentPartAdded(ResponseTextPart {
                             text: String::new(),
@@ -512,33 +626,40 @@ impl ResponseProjection {
     fn project_event(&mut self, event: ResponseEvent) -> Value {
         let n = self.sequence;
         self.sequence += 1;
+        let message_index = usize::from(self.web_search_call.is_some());
         match event {
             ResponseEvent::Created(r) => {
                 json!({"type":"response.created","sequence_number":n,"response":project_resource(&r)})
             }
             ResponseEvent::OutputItemAdded(m) => {
-                json!({"type":"response.output_item.added","sequence_number":n,"item":project_message(&m),"output_index":0})
+                json!({"type":"response.output_item.added","sequence_number":n,"item":project_message(&m),"output_index":message_index})
             }
             ResponseEvent::FunctionCallAdded(call) => {
                 json!({"type":"response.output_item.added","sequence_number":n,"item":project_output_item(&ResponseOutputItem::FunctionCall(call)),"output_index":0})
             }
+            ResponseEvent::WebSearchCallAdded(call) => {
+                json!({"type":"response.output_item.added","sequence_number":n,"item":project_output_item(&ResponseOutputItem::WebSearchCall(call)),"output_index":0})
+            }
             ResponseEvent::ContentPartAdded(p) => {
-                json!({"type":"response.content_part.added","sequence_number":n,"item_id":"msg_0","output_index":0,"content_index":0,"part":project_part(&p)})
+                json!({"type":"response.content_part.added","sequence_number":n,"item_id":"msg_0","output_index":message_index,"content_index":0,"part":project_part(&p)})
             }
             ResponseEvent::TextDelta(delta) => {
-                json!({"type":"response.output_text.delta","sequence_number":n,"item_id":"msg_0","output_index":0,"content_index":0,"delta":delta,"logprobs":[]})
+                json!({"type":"response.output_text.delta","sequence_number":n,"item_id":"msg_0","output_index":message_index,"content_index":0,"delta":delta,"logprobs":[]})
             }
             ResponseEvent::TextDone(p) => {
-                json!({"type":"response.output_text.done","sequence_number":n,"item_id":"msg_0","output_index":0,"content_index":0,"text":p.text,"logprobs":[]})
+                json!({"type":"response.output_text.done","sequence_number":n,"item_id":"msg_0","output_index":message_index,"content_index":0,"text":p.text,"logprobs":[]})
             }
             ResponseEvent::ContentPartDone(p) => {
-                json!({"type":"response.content_part.done","sequence_number":n,"item_id":"msg_0","output_index":0,"content_index":0,"part":project_part(&p)})
+                json!({"type":"response.content_part.done","sequence_number":n,"item_id":"msg_0","output_index":message_index,"content_index":0,"part":project_part(&p)})
             }
             ResponseEvent::OutputItemDone(m) => {
-                json!({"type":"response.output_item.done","sequence_number":n,"item":project_message(&m),"output_index":0})
+                json!({"type":"response.output_item.done","sequence_number":n,"item":project_message(&m),"output_index":message_index})
             }
             ResponseEvent::FunctionCallDone(call) => {
                 json!({"type":"response.output_item.done","sequence_number":n,"item":project_output_item(&ResponseOutputItem::FunctionCall(call)),"output_index":0})
+            }
+            ResponseEvent::WebSearchCallDone(call) => {
+                json!({"type":"response.output_item.done","sequence_number":n,"item":project_output_item(&ResponseOutputItem::WebSearchCall(call)),"output_index":0})
             }
             ResponseEvent::Completed(r) => {
                 json!({"type":"response.completed","sequence_number":n,"response":project_resource(&r)})
@@ -572,6 +693,7 @@ mod tests {
             tools: tools.clone(),
             tool_choice: tool_choice.clone(),
             buffer_output: false,
+            web_search_call: None,
             lineage_revision: 0,
         });
 
