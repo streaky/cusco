@@ -65,6 +65,8 @@ pub struct MeasuredExecutionProfile {
     pub device_execution_reserve_bytes: u64,
     pub host_staging_bytes: u64,
     pub allocator_headroom_bytes: u64,
+    pub model_layers: i32,
+    pub competent: bool,
     pub measurement_source: MeasurementSource,
     pub provenance: String,
 }
@@ -400,6 +402,8 @@ mod tests {
             device_execution_reserve_bytes: 17,
             host_staging_bytes: 19,
             allocator_headroom_bytes: 23,
+            model_layers: 29,
+            competent: true,
             measurement_source: MeasurementSource::BackendAllocator,
             provenance: "llama=b10273;abi=13;device=sm_61".into(),
         };

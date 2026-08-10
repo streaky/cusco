@@ -232,8 +232,8 @@ impl ResidentEngine {
                 + record.profile.allocator_headroom_bytes,
             host_bytes: record.profile.host_model_bytes + record.profile.host_staging_bytes,
             gpu_layers: self.config.gpu_layers,
-            model_layers: 0,
-            competent: self.config.require_competent,
+            model_layers: record.profile.model_layers,
+            competent: record.profile.competent,
         }))
     }
 
@@ -251,6 +251,8 @@ impl ResidentEngine {
             context_state_bytes: point.context_bytes,
             device_execution_reserve_bytes: 0,
             host_staging_bytes: 0,
+            model_layers: point.model_layers,
+            competent: point.competent,
             allocator_headroom_bytes: point.device_bytes / 20,
             measurement_source: if self.config.gpu_layers > 0 {
                 MeasurementSource::BackendAllocator
@@ -956,6 +958,42 @@ mod tests {
         assert!(matches!(
             reused.prepare_model(&large_declaration),
             Err(Error::State(message)) if message == "residency capacity is exhausted"
+        ));
+
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn persisted_profile_preserves_measured_competence() {
+        let database = std::env::temp_dir().join(format!(
+            "cusco-residency-competence-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let catalog = ModelCatalog::open(&database).unwrap();
+        let loader = Arc::new(FixtureLoader {
+            point: OperatingPoint {
+                competent: false,
+                ..point(10)
+            },
+            failures: Mutex::new(vec![]),
+            blocker: None,
+        });
+        let mut permissive = config(100);
+        permissive.require_competent = false;
+        let measured = ResidentEngine::with_loader(permissive, loader.clone());
+        measured.attach_catalog(catalog.clone());
+        let record = model("profiled", "checksum", 1, 10);
+        measured.prepare_model(&record).unwrap();
+        drop(measured);
+
+        let mut required = config(100);
+        required.require_competent = true;
+        let reused = ResidentEngine::with_loader(required, loader);
+        reused.attach_catalog(catalog);
+        assert!(matches!(
+            reused.prepare_model(&record),
+            Err(Error::State(message))
+                if message == "executor operating point is below the competent floor"
         ));
 
         let _ = fs::remove_file(database);

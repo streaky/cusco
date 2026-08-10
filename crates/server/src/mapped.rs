@@ -881,7 +881,11 @@ fn publish_block(
     continuation: &Decode,
 ) -> Result<EvaluatedPrefixId, Error> {
     let required = profile.required_mask();
-    let serialized_bytes = native.describe().map_err(state_error)?.serialized_bytes;
+    let serialized_bytes = state
+        .executor
+        .describe_representation(&native)
+        .map_err(state_error)?
+        .serialized_bytes;
     let component_count = profile.required_components.len();
     let bytes_per_component = serialized_bytes
         .checked_add(component_count.saturating_sub(1))
