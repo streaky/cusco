@@ -1,5 +1,7 @@
 use std::ffi::{c_char, c_int, c_uint, c_ulonglong};
 
+pub const ABI_VERSION: &str = env!("CUSCO_EXECUTOR_ABI_VERSION");
+
 #[repr(C)]
 pub struct CuscoExecutor {
     _private: [u8; 0],

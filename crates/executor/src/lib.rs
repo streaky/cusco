@@ -3,6 +3,8 @@ use serde::Serialize;
 use std::{ffi::CString, ptr::NonNull, sync::Arc};
 use thiserror::Error;
 
+pub const ABI_VERSION: &str = sys::ABI_VERSION;
+
 #[derive(Debug, Error, PartialEq)]
 pub enum Error {
     #[error("invalid path")]

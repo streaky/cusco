@@ -6,7 +6,7 @@ use crate::{
     },
 };
 use cusco_context_store::ModelEpoch;
-use cusco_executor::OperatingPoint;
+use cusco_executor::{ABI_VERSION, OperatingPoint};
 use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -194,7 +194,7 @@ impl ResidentEngine {
             model.sha256.clone()
         };
         let config = format!(
-            "abi=14;llama={};n_ctx={};n_batch={};gpu_layers={};mapped=true",
+            "abi={ABI_VERSION};llama={};n_ctx={};n_batch={};gpu_layers={};mapped=true",
             include_str!("../../../llama.cpp-version.txt").trim(),
             self.config.n_ctx,
             self.config.n_ctx,
@@ -210,7 +210,7 @@ impl ResidentEngine {
             "cpu".into()
         };
         let provenance = format!(
-            "executor-abi=14;llama={}",
+            "executor-abi={ABI_VERSION};llama={}",
             include_str!("../../../llama.cpp-version.txt").trim()
         );
         (model_identity, config_hash, gpu_id, provenance)
