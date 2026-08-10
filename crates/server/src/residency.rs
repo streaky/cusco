@@ -217,6 +217,12 @@ impl ResidentEngine {
     }
 
     fn cached_profile(&self, model: &ModelRecord) -> Result<Option<OperatingPoint>, Error> {
+        // A configured GPU index is not a stable hardware identity across hosts or
+        // device renumbering. Until the executor exposes one, GPU measurements
+        // must be refreshed rather than reused from the durable cache.
+        if self.config.gpu_layers > 0 {
+            return Ok(None);
+        }
         let Some(catalog) = self.catalog.lock().clone() else {
             return Ok(None);
         };
@@ -238,6 +244,9 @@ impl ResidentEngine {
     }
 
     fn publish_profile(&self, model: &ModelRecord, point: OperatingPoint) -> Result<(), Error> {
+        if self.config.gpu_layers > 0 {
+            return Ok(());
+        }
         let Some(catalog) = self.catalog.lock().clone() else {
             return Ok(());
         };
@@ -947,13 +956,17 @@ mod tests {
             failures: Mutex::new(vec![]),
             blocker: None,
         });
-        let measured = ResidentEngine::with_loader(config(110), loader.clone());
+        let mut measured_config = config(110);
+        measured_config.gpu_layers = 0;
+        let measured = ResidentEngine::with_loader(measured_config, loader.clone());
         measured.attach_catalog(catalog.clone());
         let large_declaration = model("profiled", "checksum", 1, 100);
         measured.prepare_model(&large_declaration).unwrap();
         drop(measured);
 
-        let reused = ResidentEngine::with_loader(config(20), loader);
+        let mut reused_config = config(20);
+        reused_config.gpu_layers = 0;
+        let reused = ResidentEngine::with_loader(reused_config, loader);
         reused.attach_catalog(catalog);
         assert!(matches!(
             reused.prepare_model(&large_declaration),
@@ -979,6 +992,7 @@ mod tests {
             blocker: None,
         });
         let mut permissive = config(100);
+        permissive.gpu_layers = 0;
         permissive.require_competent = false;
         let measured = ResidentEngine::with_loader(permissive, loader.clone());
         measured.attach_catalog(catalog.clone());
@@ -987,6 +1001,7 @@ mod tests {
         drop(measured);
 
         let mut required = config(100);
+        required.gpu_layers = 0;
         required.require_competent = true;
         let reused = ResidentEngine::with_loader(required, loader);
         reused.attach_catalog(catalog);
