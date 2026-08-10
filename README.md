@@ -18,10 +18,13 @@ details and optimized kernels.
   retirement, and removal.
 - Priority-aware request scheduling with bounded admission, cancellation,
   deadlines, output backpressure, and diagnostic records.
-- OpenAI-compatible completions, chat completions, and Responses APIs.
+- OpenAI-compatible completions, chat completions, and durable Responses APIs,
+  including stored-resource retrieval, deletion, and `previous_response_id`
+  continuation.
 - An Ollama-compatible model-management profile for discovery, inspection,
   pulling, aliases, deletion, and residency reporting.
-- Cusco-native context, compaction, lifecycle, status, and OpenAPI endpoints.
+- Cusco-native context, compaction, lifecycle, status, OpenAPI, capability
+  discovery, and transactional context-update endpoints.
 - Buffered and streaming generation, deterministic sampling controls, stop
   handling, and request-shape validation. Optional `auto`/`none` tool
   definitions are accepted for text generation but are not yet passed to the
@@ -42,6 +45,16 @@ The server keeps installed-model and lifecycle metadata in SQLite and currently
 keeps logical context records in its local JSON state. Native executor mappings,
 active requests, queues, and spill contents are process-local and are rebuilt
 or discarded after restart.
+
+Stored Responses are projected as ordinary OpenAI response resources and remain
+replayable after restart. Extension-aware clients can discover
+`cusco.context_update.v1` at `GET /cusco/v1/capabilities` and submit a typed
+`fold` to `POST /cusco/v1/context-updates`. A successful fold atomically
+publishes a new stored response with a monotonic lineage revision and portable
+message output; stale revisions and competing successors return `409`, while
+validation or cancellation before commit leaves the base resource unchanged.
+Clients that do not negotiate the extension continue to use standard stored
+Responses and `previous_response_id`.
 
 The workspace is split into focused crates:
 

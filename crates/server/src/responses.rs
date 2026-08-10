@@ -65,6 +65,10 @@ pub struct ResponseResource {
     pub finish_reason: Option<FinishReason>,
     pub usage: Option<ResponseUsage>,
     pub metadata: ResponseMetadata,
+    #[serde(default)]
+    pub lineage_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_update: Option<ContextUpdateMetadata>,
 }
 
 fn schema_version() -> u32 {
@@ -76,6 +80,15 @@ pub struct ResponseMetadata {
     pub correlation_id: String,
     pub inference_id: String,
     pub execution_session_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ContextUpdateMetadata {
+    pub operation_id: String,
+    pub operation: String,
+    pub base_response_id: String,
+    pub base_revision: u64,
+    pub correlation_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -91,6 +104,16 @@ const TRANSIENT_RESPONSE_CAPACITY: usize = 1024;
 struct TransientResponses {
     resources: HashMap<String, ResponseResource>,
     insertion_order: VecDeque<String>,
+}
+
+pub struct StreamResponse {
+    pub model: String,
+    pub owner: String,
+    pub store: bool,
+    pub previous_response_id: Option<String>,
+    pub input: Vec<ResponseInputItem>,
+    pub buffer_output: bool,
+    pub lineage_revision: u64,
 }
 
 #[derive(Clone)]
@@ -109,21 +132,14 @@ impl ResponseService {
     pub fn projection(&self, model: String) -> ResponseProjection {
         ResponseProjection::new(model)
     }
-    pub fn stream_projection(
-        &self,
-        model: String,
-        owner: String,
-        store: bool,
-        previous_response_id: Option<String>,
-        input: Vec<ResponseInputItem>,
-        buffer_output: bool,
-    ) -> ResponseProjection {
-        ResponseProjection::new(model).with_request(
-            owner,
-            store,
-            previous_response_id,
-            input,
-            buffer_output,
+    pub fn stream_projection(&self, request: StreamResponse) -> ResponseProjection {
+        ResponseProjection::new(request.model).with_request(
+            request.owner,
+            request.store,
+            request.previous_response_id,
+            request.input,
+            request.buffer_output,
+            request.lineage_revision,
         )
     }
 
@@ -161,6 +177,8 @@ impl ResponseService {
                 inference_id: params.usage.inference_id.clone(),
                 execution_session_id: params.usage.execution_session_id.clone(),
             },
+            lineage_revision: params.lineage_revision,
+            context_update: None,
         }
     }
 
@@ -184,6 +202,15 @@ impl ResponseService {
     }
     pub fn persist(&self, resource: &ResponseResource) -> Result<(), StoreError> {
         self.store.put(resource)
+    }
+    pub fn commit_successor(
+        &self,
+        base_id: &str,
+        expected_revision: u64,
+        resource: &ResponseResource,
+    ) -> Result<(), StoreError> {
+        self.store
+            .put_successor(base_id, expected_revision, resource)
     }
     pub fn retrieve(&self, id: &str, owner: &str) -> Result<ResponseResource, StoreError> {
         let resource = self
@@ -221,6 +248,7 @@ pub struct CompleteResponse<'a> {
     pub usage: &'a Usage,
     pub store: bool,
     pub previous_response_id: Option<&'a str>,
+    pub lineage_revision: u64,
     pub input: &'a [ResponseInputItem],
     pub function_call: Option<ResponseFunctionCall>,
 }
@@ -252,7 +280,7 @@ pub fn project_resource(resource: &ResponseResource) -> Value {
         .iter()
         .map(project_output_item)
         .collect::<Vec<_>>();
-    json!({"id":resource.id,"object":"response","created_at":resource.created_at,"status":resource.status,"background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"metadata":resource.metadata,"model":resource.model,"output":output,"parallel_tool_calls":true,"previous_response_id":resource.previous_response_id,"prompt_cache_key":null,"reasoning":null,"safety_identifier":null,"service_tier":"default","store":resource.store,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":usage,"finish_reason":resource.finish_reason})
+    json!({"id":resource.id,"object":"response","created_at":resource.created_at,"status":resource.status,"background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"metadata":resource.metadata,"model":resource.model,"output":output,"parallel_tool_calls":true,"previous_response_id":resource.previous_response_id,"prompt_cache_key":null,"reasoning":null,"safety_identifier":null,"service_tier":"default","store":resource.store,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":usage,"finish_reason":resource.finish_reason,"cusco":{"lineage_revision":resource.lineage_revision,"context_update":resource.context_update}})
 }
 
 fn project_output_item(item: &ResponseOutputItem) -> Value {
@@ -313,6 +341,8 @@ impl ResponseProjection {
                 finish_reason: None,
                 usage: None,
                 metadata: ResponseMetadata::default(),
+                lineage_revision: 0,
+                context_update: None,
             },
             sequence: 0,
             buffer_output: false,
@@ -326,11 +356,13 @@ impl ResponseProjection {
         previous_response_id: Option<String>,
         input: Vec<ResponseInputItem>,
         buffer_output: bool,
+        lineage_revision: u64,
     ) -> Self {
         self.resource.owner = owner;
         self.resource.store = store;
         self.resource.previous_response_id = previous_response_id;
         self.resource.input = input;
+        self.resource.lineage_revision = lineage_revision;
         self.buffer_output = buffer_output;
         self
     }

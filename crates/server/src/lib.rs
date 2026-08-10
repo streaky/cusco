@@ -32,6 +32,7 @@ use uuid::Uuid;
 mod catalog;
 mod config;
 mod context_strategy;
+mod context_updates;
 mod generation;
 mod lifecycle;
 mod mapped;
@@ -550,6 +551,8 @@ pub enum Error {
     BodyTimeout,
     #[error("invalid request: {0}")]
     BadRequest(String),
+    #[error("lineage conflict: {0}")]
+    Conflict(String),
     #[error("unsafe unauthenticated listener: {0}")]
     UnsafeListener(SocketAddr),
     #[error("state error: {0}")]
@@ -570,6 +573,7 @@ impl Error {
             Self::HeadersTooLarge => "headers_too_large",
             Self::BodyTimeout => "body_timeout",
             Self::BadRequest(_) => "invalid_request",
+            Self::Conflict(_) => "lineage_conflict",
             Self::UnsafeListener(_) => "unsafe_listener",
             Self::State(_) => "state_error",
         }
@@ -583,6 +587,7 @@ impl IntoResponse for Error {
             Self::ModelNotFound(_) | Self::ContextNotFound => StatusCode::NOT_FOUND,
             Self::Deadline | Self::BodyTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::Cancelled | Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Busy => StatusCode::TOO_MANY_REQUESTS,
             Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -2422,6 +2427,8 @@ fn routes(server: Server) -> Router {
     let app = Router::new()
         .route("/openai/v1/openapi.json", get(openapi))
         .route("/cusco/v1/openapi.json", get(openapi))
+        .route("/cusco/v1/capabilities", get(capabilities))
+        .route("/cusco/v1/context-updates", post(context_update))
         .route("/openai/v1/completions", post(completion))
         .route("/openai/v1/chat/completions", post(chat))
         .route("/openai/v1/models", get(list_models))
@@ -2822,6 +2829,7 @@ async fn responses(
     let model = s.model(&r.model)?;
     let mut input_ledger = Vec::new();
     let mut prompt = String::new();
+    let mut lineage_revision = 0;
     if let Some(previous_id) = &r.previous_response_id {
         let predecessor = s
             .response_service
@@ -2832,6 +2840,7 @@ async fn responses(
                 "previous_response_id uses an incompatible model".into(),
             ));
         }
+        lineage_revision = predecessor.lineage_revision.saturating_add(1);
         prompt.push_str(&response_lineage_prompt(
             &s.response_service,
             predecessor,
@@ -2927,6 +2936,7 @@ async fn responses(
     let response_options = ResponseRequestOptions {
         store: r.store,
         previous_response_id: r.previous_response_id,
+        lineage_revision,
         input: input_ledger,
         tool_names: tool_names(&r.tools),
         tool_choice: r.tool_choice,
@@ -2954,9 +2964,11 @@ async fn responses(
     .await
 }
 
-fn response_store_error(error: response_store::StoreError) -> Error {
+pub(crate) fn response_store_error(error: response_store::StoreError) -> Error {
     match error {
         response_store::StoreError::NotFound(_) => Error::ContextNotFound,
+        response_store::StoreError::StaleRevision { .. }
+        | response_store::StoreError::Conflict(_) => Error::Conflict(error.to_string()),
         other => Error::State(other.to_string()),
     }
 }
@@ -3354,6 +3366,7 @@ enum WireProtocol {
 struct ResponseRequestOptions {
     store: bool,
     previous_response_id: Option<String>,
+    lineage_revision: u64,
     input: Vec<responses::ResponseInputItem>,
     tool_names: Vec<String>,
     tool_choice: Option<ResponsesToolChoice>,
@@ -3488,6 +3501,7 @@ fn completed_response(
                 usage: &response.usage,
                 store: options.store,
                 previous_response_id: options.previous_response_id.as_deref(),
+                lineage_revision: options.lineage_revision,
                 input: &options.input,
                 function_call,
             });
@@ -3651,14 +3665,15 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
             },
         );
         let mut responses_state = match &responses {
-            Some(options) => response_service.stream_projection(
-                response_model,
-                response_owner,
-                options.store,
-                options.previous_response_id.clone(),
-                options.input.clone(),
-                !options.tool_names.is_empty(),
-            ),
+            Some(options) => response_service.stream_projection(responses::StreamResponse {
+                model: response_model,
+                owner: response_owner,
+                store: options.store,
+                previous_response_id: options.previous_response_id.clone(),
+                input: options.input.clone(),
+                buffer_output: !options.tool_names.is_empty(),
+                lineage_revision: options.lineage_revision,
+            }),
             None => response_service.projection(response_model),
         };
         let stream_response_service = response_service.clone();
@@ -3765,6 +3780,61 @@ async fn list_models(State(s): State<Server>, headers: HeaderMap) -> Result<Json
     auth(&s, &headers, Scope::Inference)?;
     Ok(Json(json!({"data":s.models()})))
 }
+async fn capabilities(
+    State(server): State<Server>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Error> {
+    auth(&server, &headers, Scope::Inference)?;
+    Ok(Json(json!({
+        "object": "cusco.capability_list",
+        "data": [{
+            "id": context_updates::CONTEXT_UPDATE_CAPABILITY,
+            "version": 1,
+            "endpoint": "/cusco/v1/context-updates",
+            "operations": ["fold"],
+            "portable_projection": "openai.response"
+        }]
+    })))
+}
+
+async fn context_update(
+    State(server): State<Server>,
+    headers: HeaderMap,
+    Json(mut request): Json<context_updates::ContextUpdateRequest>,
+) -> Result<Response, Error> {
+    let context = auth(&server, &headers, Scope::Inference)?;
+    let correlation_id = Uuid::new_v4().to_string();
+    let operation_id = request
+        .operation_id
+        .get_or_insert_with(|| format!("ctxupd_{}", Uuid::new_v4()))
+        .clone();
+    let control = Arc::new(RequestControl::new());
+    let admission = server.try_admit(&operation_id, control.clone())?;
+    let response_service = server.response_service.clone();
+    let owner = context.principal;
+    let worker_control = control.clone();
+    let mut disconnect = DisconnectGuard::new(control);
+    let result = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        context_updates::apply(
+            &response_service,
+            &owner,
+            correlation_id,
+            request,
+            &worker_control,
+        )
+    })
+    .await
+    .map_err(state_err)??;
+    disconnect.disarm();
+    let mut response = Json(result).into_response();
+    response.headers_mut().insert(
+        "x-request-id",
+        HeaderValue::from_str(&operation_id).expect("operation id is a valid header value"),
+    );
+    Ok(response)
+}
+
 async fn native_status(
     State(server): State<Server>,
     headers: HeaderMap,
@@ -3925,6 +3995,13 @@ pub fn openapi_document() -> Value {
             Some("ResponsesRequest"),
         ),
         ("/openai/v1/models", "get", "openaiModels", None),
+        ("/cusco/v1/capabilities", "get", "cuscoCapabilities", None),
+        (
+            "/cusco/v1/context-updates",
+            "post",
+            "cuscoContextUpdate",
+            Some("ContextUpdateRequest"),
+        ),
         ("/cusco/v1/api/tags", "get", "ollamaTags", None),
         ("/cusco/v1/api/version", "get", "ollamaVersion", None),
         (
@@ -4019,8 +4096,28 @@ pub fn openapi_document() -> Value {
                 "properties": {"model": {"type": "string"}, "prompt": {"type": "string"}, "max_tokens": {"type": "integer", "minimum": 0}, "stream": {"type": "boolean"}, "temperature": {"type": "number", "minimum": 0, "maximum": 2}, "top_p": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}, "seed": {"type": "integer", "minimum": 0}}
             },
             "ChatRequest": {"type": "object", "additionalProperties": false, "required": ["model", "messages"], "properties": {"model": {"type": "string"}, "messages": {"type": "array"}, "stream": {"type": "boolean"}}},
-            "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"oneOf": [{"type": "string"}, {"type": "array"}]}, "store": {"type": "boolean", "enum": [false], "default": false, "description": "Cusco Responses are stateless; true is rejected."}, "stream": {"type": "boolean"}, "tools": {"type": "array", "items": {"$ref": "#/components/schemas/ResponsesFunctionTool"}}}},
+            "ResponsesRequest": {"type": "object", "additionalProperties": false, "required": ["model", "input"], "properties": {"model": {"type": "string"}, "input": {"oneOf": [{"type": "string"}, {"type": "array"}]}, "store": {"type": "boolean", "default": true, "description": "Persist the response resource for retrieval, continuation, and negotiated context updates."}, "previous_response_id": {"type": "string", "description": "Stored predecessor response used for portable continuation."}, "stream": {"type": "boolean"}, "tools": {"type": "array", "items": {"$ref": "#/components/schemas/ResponsesFunctionTool"}}}},
             "ResponsesFunctionTool": {"type": "object", "additionalProperties": false, "required": ["type", "name", "parameters"], "properties": {"type": {"const": "function"}, "name": {"type": "string", "minLength": 1}, "description": {"type": "string"}, "parameters": {"type": "object"}}},
+            "ContextUpdateRequest": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["base_response_id", "expected_revision", "operation"],
+                "properties": {
+                    "base_response_id": {"type": "string", "minLength": 1},
+                    "expected_revision": {"type": "integer", "minimum": 0},
+                    "operation_id": {"type": "string", "minLength": 1},
+                    "operation": {"$ref": "#/components/schemas/ContextUpdateFold"}
+                }
+            },
+            "ContextUpdateFold": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "items"],
+                "properties": {
+                    "type": {"const": "fold"},
+                    "items": {"type": "array", "minItems": 1, "items": {"type": "object", "description": "Portable OpenAI Responses message input item."}}
+                }
+            },
             "OllamaModelRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["model"]}, {"required": ["name"]}], "properties": {"model": {"type": "string"}, "name": {"type": "string"}}},
             "OllamaPullRequest": {"type": "object", "additionalProperties": false, "anyOf": [{"required": ["name"]}, {"required": ["model"]}], "properties": {"name": {"type": "string"}, "model": {"type": "string"}, "sha256": {"type": "string"}, "insecure": {"type": "boolean"}, "stream": {"type": "boolean"}}},
             "OllamaPullProgress": {
@@ -4921,6 +5018,12 @@ mod tests {
         assert_eq!(spec["openapi"], "3.1.0");
         assert!(spec["paths"]["/openai/v1/chat/completions"].is_object());
         assert!(spec["paths"]["/cusco/v1/status"].is_object());
+        assert!(spec["paths"]["/cusco/v1/capabilities"].is_object());
+        assert!(spec["paths"]["/cusco/v1/context-updates"].is_object());
+        assert_eq!(
+            spec["components"]["schemas"]["ResponsesRequest"]["properties"]["store"]["default"],
+            true
+        );
         assert!(spec["paths"]["/cusco/v1/api/version"].is_object());
         for path in spec["paths"].as_object().unwrap().values() {
             for operation in path.as_object().unwrap().values() {
@@ -6807,5 +6910,100 @@ mod tests {
         assert!(done.contains("\"sequence_number\":7"));
         assert!(done.contains("\"text\":\"hello\""));
         assert!(done.contains("\"id\":\"response\""));
+    }
+    #[tokio::test]
+    async fn context_update_negotiates_commits_and_replays_after_restart() {
+        let (server, directory) = setup(Arc::new(AnonymousAdmin));
+        let base = responses::ResponseResource {
+            schema_version: responses::RESPONSE_SCHEMA_VERSION,
+            id: "resp_base".into(),
+            owner: "anonymous-admin".into(),
+            model: "m".into(),
+            created_at: 1,
+            status: "completed".into(),
+            store: true,
+            previous_response_id: None,
+            input: vec![],
+            output: vec![],
+            finish_reason: Some(FinishReason::Stop),
+            usage: None,
+            metadata: responses::ResponseMetadata::default(),
+            lineage_revision: 0,
+            context_update: None,
+        };
+        server.response_service.remember(&base).unwrap();
+        let app = router(server.clone());
+
+        let capability = app
+            .clone()
+            .oneshot(request("GET", "/cusco/v1/capabilities", Value::Null))
+            .await
+            .unwrap();
+        assert_eq!(capability.status(), StatusCode::OK);
+        let capability: Value =
+            serde_json::from_slice(&to_bytes(capability.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            capability["data"][0]["id"],
+            context_updates::CONTEXT_UPDATE_CAPABILITY
+        );
+
+        let updated = app
+            .oneshot(request(
+                "POST",
+                "/cusco/v1/context-updates",
+                json!({
+                    "base_response_id": "resp_base",
+                    "expected_revision": 0,
+                    "operation_id": "ctxupd_http",
+                    "operation": {
+                        "type": "fold",
+                        "items": [{
+                            "type": "message",
+                            "role": "user",
+                            "text": "portable summary"
+                        }]
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        assert_eq!(
+            updated.headers()["x-request-id"].to_str().unwrap(),
+            "ctxupd_http"
+        );
+        let updated: Value =
+            serde_json::from_slice(&to_bytes(updated.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let response_id = updated["response"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(updated["revision"], 1);
+        assert_eq!(
+            updated["response"]["cusco"]["context_update"]["operation"],
+            "fold"
+        );
+
+        drop(server);
+        let reopened = Server::open(
+            directory.join("state.json"),
+            Arc::new(AnonymousAdmin),
+            Arc::new(DeterministicEngine),
+        )
+        .unwrap();
+        let replay = router(reopened)
+            .oneshot(request(
+                "GET",
+                &format!("/openai/v1/responses/{response_id}"),
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: Value =
+            serde_json::from_slice(&to_bytes(replay.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(replay["id"], response_id);
+        assert_eq!(replay["cusco"]["lineage_revision"], 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

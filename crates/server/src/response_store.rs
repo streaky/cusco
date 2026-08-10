@@ -16,11 +16,21 @@ pub enum StoreError {
     Io(#[from] io::Error),
     #[error("response resource is malformed: {0}")]
     Malformed(String),
+    #[error("response lineage revision is stale: expected {expected}, current {current}")]
+    StaleRevision { expected: u64, current: u64 },
+    #[error("response resource {0} already has a committed successor")]
+    Conflict(String),
 }
 
 pub trait ResponseResourceStore: Send + Sync {
     fn put(&self, resource: &ResponseResource) -> Result<(), StoreError>;
     fn get(&self, id: &str) -> Result<ResponseResource, StoreError>;
+    fn put_successor(
+        &self,
+        base_id: &str,
+        expected_revision: u64,
+        resource: &ResponseResource,
+    ) -> Result<(), StoreError>;
     fn delete(&self, id: &str) -> Result<(), StoreError>;
 }
 
@@ -69,10 +79,8 @@ impl FileResponseResourceStore {
     fn resource_path(&self, id: &str) -> PathBuf {
         self.resources.join(format!("{id}.json"))
     }
-}
 
-impl ResponseResourceStore for FileResponseResourceStore {
-    fn put(&self, resource: &ResponseResource) -> Result<(), StoreError> {
+    fn write_resource(&self, resource: &ResponseResource) -> Result<(), StoreError> {
         let bytes = serde_json::to_vec_pretty(resource)
             .map_err(|error| StoreError::Malformed(error.to_string()))?;
         let temp = self
@@ -84,9 +92,42 @@ impl ResponseResourceStore for FileResponseResourceStore {
         file.sync_all()?;
         fs::rename(&temp, self.resource_path(&resource.id))?;
         fs::File::open(&self.resources)?.sync_all()?;
+        Ok(())
+    }
+}
+
+impl ResponseResourceStore for FileResponseResourceStore {
+    fn put(&self, resource: &ResponseResource) -> Result<(), StoreError> {
+        self.write_resource(resource)?;
         self.recovered
             .write()
             .insert(resource.id.clone(), resource.clone());
+        Ok(())
+    }
+    fn put_successor(
+        &self,
+        base_id: &str,
+        expected_revision: u64,
+        resource: &ResponseResource,
+    ) -> Result<(), StoreError> {
+        let mut recovered = self.recovered.write();
+        let base = recovered
+            .get(base_id)
+            .ok_or_else(|| StoreError::NotFound(base_id.into()))?;
+        if base.lineage_revision != expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: expected_revision,
+                current: base.lineage_revision,
+            });
+        }
+        if recovered
+            .values()
+            .any(|candidate| candidate.previous_response_id.as_deref() == Some(base_id))
+        {
+            return Err(StoreError::Conflict(base_id.into()));
+        }
+        self.write_resource(resource)?;
+        recovered.insert(resource.id.clone(), resource.clone());
         Ok(())
     }
     fn get(&self, id: &str) -> Result<ResponseResource, StoreError> {
@@ -126,6 +167,8 @@ mod tests {
             finish_reason: None,
             usage: None,
             metadata: ResponseMetadata::default(),
+            lineage_revision: 0,
+            context_update: None,
         }
     }
 
