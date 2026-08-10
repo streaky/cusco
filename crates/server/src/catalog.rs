@@ -280,10 +280,6 @@ impl ModelCatalog {
         {
             return Ok(None);
         }
-        connection.execute(
-            "UPDATE model_execution_profiles SET last_used_at=unixepoch() WHERE model_identity=?1 AND config_hash=?2 AND gpu_id=?3",
-            params![model_identity, config_hash, gpu_id],
-        )?;
         Ok(Some(MeasuredExecutionProfileRecord {
             model_identity: model_identity.into(),
             config_hash: config_hash.into(),
