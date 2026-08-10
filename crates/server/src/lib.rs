@@ -3924,8 +3924,12 @@ async fn capabilities(
 
 async fn context_update(
     State(server): State<Server>,
-    headers: HeaderMap,
-    Json(mut request): Json<context_updates::ContextUpdateRequest>,
+    PrequeueJson {
+        headers,
+        value: mut request,
+        retained_bytes: _,
+        _permit,
+    }: PrequeueJson<context_updates::ContextUpdateRequest>,
 ) -> Result<Response, Error> {
     let context = auth(&server, &headers, Scope::Inference)?;
     let correlation_id = Uuid::new_v4().to_string();
@@ -3940,6 +3944,7 @@ async fn context_update(
     let worker_control = control.clone();
     let mut disconnect = DisconnectGuard::new(control);
     let result = tokio::task::spawn_blocking(move || {
+        let _prequeue_permit = _permit;
         let _admission = admission;
         context_updates::apply(
             &response_service,
