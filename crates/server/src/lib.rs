@@ -2388,6 +2388,7 @@ fn lower_messages(
                 for part in parts {
                     match part {
                         ContentPart::Text { text: part } => text.push_str(&part),
+
                         ContentPart::ImageUrl { image_url } => {
                             if message.role != "user" {
                                 return Err(Error::BadRequest(
@@ -2412,6 +2413,18 @@ fn lower_messages(
         });
     }
     prompt::apply_chat_template(family, normalized)
+}
+fn flush_response_messages(
+    prompt: &mut String,
+    family: &str,
+    messages: &mut Vec<ChatMessage>,
+    vision: VisionConfig,
+) -> Result<(), Error> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    prompt.push_str(&lower_messages(family, std::mem::take(messages), vision)?);
+    Ok(())
 }
 pub fn router(server: Server) -> Router {
     routes(server)
@@ -2871,6 +2884,7 @@ async fn responses(
         }
         ResponsesInput::Items(items) => {
             let mut input_call_ids = HashSet::new();
+            let mut pending_messages = Vec::new();
             for item in items {
                 match item {
                     ResponsesInputItem::FunctionCall {
@@ -2878,6 +2892,12 @@ async fn responses(
                         name,
                         arguments,
                     } => {
+                        flush_response_messages(
+                            &mut prompt,
+                            &model.family,
+                            &mut pending_messages,
+                            s.vision_config(),
+                        )?;
                         input_call_ids.insert(call_id.clone());
                         input_ledger.push(responses::ResponseInputItem::FunctionCall {
                             call_id: call_id.clone(),
@@ -2892,6 +2912,20 @@ async fn responses(
                         prompt.push_str(&format!("{call}<end_of_turn>\n"));
                     }
                     ResponsesInputItem::Message { role, content } => {
+                        let raw_text = match &content {
+                            ResponsesContent::Text(text) => text.clone(),
+                            ResponsesContent::Parts(parts) => parts
+                                .iter()
+                                .filter_map(|part| match part {
+                                    ResponsesContentPart::InputText { text }
+                                    | ResponsesContentPart::OutputText { text } => {
+                                        Some(text.as_str())
+                                    }
+                                    ResponsesContentPart::InputImage { .. } => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join(""),
+                        };
                         let content = match content {
                             ResponsesContent::Text(text) => ChatContent::Text(text),
                             ResponsesContent::Parts(parts) => ChatContent::Parts(
@@ -2911,21 +2945,19 @@ async fn responses(
                                     .collect(),
                             ),
                         };
-                        let lowered = lower_messages(
-                            &model.family,
-                            vec![ChatMessage {
-                                role: role.clone(),
-                                content,
-                            }],
-                            s.vision_config(),
-                        )?;
                         input_ledger.push(responses::ResponseInputItem::Message {
-                            role,
-                            text: lowered.clone(),
+                            role: role.clone(),
+                            text: raw_text,
                         });
-                        prompt.push_str(&lowered);
+                        pending_messages.push(ChatMessage { role, content });
                     }
                     ResponsesInputItem::FunctionCallOutput { call_id, output } => {
+                        flush_response_messages(
+                            &mut prompt,
+                            &model.family,
+                            &mut pending_messages,
+                            s.vision_config(),
+                        )?;
                         if !input_call_ids.contains(&call_id)
                             && !lineage_has_call(
                                 &s.response_service,
@@ -2948,6 +2980,12 @@ async fn responses(
                     }
                 }
             }
+            flush_response_messages(
+                &mut prompt,
+                &model.family,
+                &mut pending_messages,
+                s.vision_config(),
+            )?;
         }
     }
     let has_tool_output = input_ledger.iter().any(|item| {
@@ -4889,6 +4927,36 @@ mod tests {
                     [ResponsesContentPart::OutputText { text }] if text == "Hello!"
                 )
         ));
+    }
+    #[test]
+    fn lowers_responses_history_as_one_conversation() {
+        let mut prompt = String::new();
+        let mut messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: ChatContent::Text("hey".into()),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: ChatContent::Text("Hello!".into()),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: ChatContent::Text("How are you?".into()),
+            },
+        ];
+
+        flush_response_messages(
+            &mut prompt,
+            "gemma4",
+            &mut messages,
+            VisionConfig::default(),
+        )
+        .unwrap();
+
+        assert!(messages.is_empty());
+        assert_eq!(prompt.matches("<start_of_turn>model\n").count(), 2);
+        assert!(prompt.ends_with("<start_of_turn>model\n"));
     }
     #[test]
     fn responses_request_parses_portable_function_call_continuation() {
