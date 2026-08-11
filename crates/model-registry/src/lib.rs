@@ -46,6 +46,7 @@ struct CacheStamp {
 pub struct ModelMetadata {
     pub architecture: String,
     pub name: Option<String>,
+    pub block_count: Option<u32>,
 }
 
 fn read_u32(reader: &mut impl Read) -> Result<u32, Error> {
@@ -127,6 +128,7 @@ pub fn probe_gguf(path: impl AsRef<Path>) -> Result<ModelMetadata, Error> {
     }
     let mut architecture = None;
     let mut name = None;
+    let mut block_count = None;
     for _ in 0..metadata_count {
         let key = read_string(&mut reader)?;
         let kind = read_u32(&mut reader)?;
@@ -137,14 +139,30 @@ pub fn probe_gguf(path: impl AsRef<Path>) -> Result<ModelMetadata, Error> {
             } else {
                 name = Some(value);
             }
+        } else if key.ends_with(".block_count") && (kind == 4 || kind == 10) {
+            let value = if kind == 4 {
+                u64::from(read_u32(&mut reader)?)
+            } else {
+                read_u64(&mut reader)?
+            };
+            block_count = Some((key, value));
         } else {
             skip_value(&mut reader, kind)?;
         }
     }
+    let architecture =
+        architecture.ok_or_else(|| Error::InvalidMetadata("general.architecture is absent".into()))?;
+    let block_count = match block_count {
+        Some((key, value)) if key == format!("{architecture}.block_count") => Some(
+            u32::try_from(value)
+                .map_err(|_| Error::InvalidMetadata("block count exceeds u32".into()))?,
+        ),
+        _ => None,
+    };
     Ok(ModelMetadata {
-        architecture: architecture
-            .ok_or_else(|| Error::InvalidMetadata("general.architecture is absent".into()))?,
+        architecture,
         name,
+        block_count,
     })
 }
 fn digest(path: &Path) -> Result<(String, u64), Error> {
@@ -523,14 +541,20 @@ mod tests {
         bytes.extend_from_slice(b"GGUF");
         bytes.extend_from_slice(&3_u32.to_le_bytes());
         bytes.extend_from_slice(&0_u64.to_le_bytes());
-        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
         bytes.extend_from_slice(&20_u64.to_le_bytes());
         bytes.extend_from_slice(b"general.architecture");
         bytes.extend_from_slice(&8_u32.to_le_bytes());
         bytes.extend_from_slice(&6_u64.to_le_bytes());
         bytes.extend_from_slice(b"gemma4");
+        bytes.extend_from_slice(&18_u64.to_le_bytes());
+        bytes.extend_from_slice(b"gemma4.block_count");
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&62_u32.to_le_bytes());
         fs::write(&path, bytes).unwrap();
-        assert_eq!(probe_gguf(&path).unwrap().architecture, "gemma4");
+        let metadata = probe_gguf(&path).unwrap();
+        assert_eq!(metadata.architecture, "gemma4");
+        assert_eq!(metadata.block_count, Some(62));
         fs::remove_file(path).unwrap();
     }
     #[test]

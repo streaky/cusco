@@ -59,8 +59,9 @@ paths:
   user_config: /data/user.yaml
 
 execution:
-  # Maximum model and context bytes admitted to GPU/device memory. Set this below
-  # physical VRAM to leave headroom for CUDA, graphs, and transient allocations.
+  # Maximum model and context bytes admitted to GPU/device memory. This is an
+  # operator ceiling: each load is additionally capped by accelerator memory
+  # currently free, with allocator headroom retained for transient allocations.
   device_capacity: 10 GiB
   # Maximum model and context bytes admitted to system memory.
   host_capacity: 32 GiB

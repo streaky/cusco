@@ -252,6 +252,7 @@ fn run(command: Command) -> Result<()> {
                         aliases: declaration.aliases,
                         family: metadata.architecture,
                         size_bytes: registered.size,
+                        block_count: metadata.block_count.unwrap_or(0),
                         epoch: 0,
                     },
                 )?;
@@ -416,6 +417,7 @@ fn scheduler_proof(
         aliases: Vec::new(),
         family: workload.model_family.clone(),
         size_bytes: model_size,
+        block_count: 0,
         epoch: 1,
     };
     let diagnostics = Arc::new(Mutex::new(Vec::<Value>::new()));

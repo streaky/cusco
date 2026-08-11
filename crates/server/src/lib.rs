@@ -244,6 +244,8 @@ pub struct ModelRecord {
     #[serde(default)]
     pub size_bytes: u64,
     #[serde(default)]
+    pub block_count: u32,
+    #[serde(default)]
     pub epoch: u64,
 }
 #[derive(Clone, Debug)]
@@ -3723,6 +3725,7 @@ async fn perform_ollama_pull(
                     aliases: vec![],
                     family: metadata.architecture,
                     size_bytes: fetched.size,
+                    block_count: metadata.block_count.unwrap_or(0),
                     epoch: 0,
                 },
             )
@@ -4759,6 +4762,7 @@ mod tests {
             aliases: vec!["latest".into()],
             family: "gemma4".into(),
             size_bytes: 5,
+            block_count: 1,
             epoch: 0,
         })
         .unwrap();
@@ -5134,6 +5138,7 @@ mod tests {
             aliases: vec!["latest".into()],
             family: "gemma4".into(),
             size_bytes: 6,
+            block_count: 1,
             epoch: 0,
         })
         .unwrap();
@@ -6904,6 +6909,7 @@ mod tests {
                 aliases: vec![],
                 family: "gemma4".into(),
                 size_bytes: 5,
+                block_count: 1,
                 epoch: 0,
             })
             .unwrap();
@@ -7841,6 +7847,7 @@ mod tests {
                 aliases: Vec::new(),
                 family: "gemma4".into(),
                 size_bytes: 5,
+                block_count: 1,
                 epoch: 0,
             })
             .unwrap();
@@ -7883,6 +7890,7 @@ mod tests {
                 aliases: Vec::new(),
                 family: "gemma4".into(),
                 size_bytes: 5,
+                block_count: 1,
                 epoch: 0,
             })
             .unwrap();

@@ -107,6 +107,11 @@ static bool abort_decode(void * p) {
     return static_cast<cusco_executor *>(p)->cancel.exchange(false);
 }
 
+uint64_t cusco_executor_free_accelerator_bytes(void) {
+    llama_backend_init();
+    return free_accelerator_bytes();
+}
+
 cusco_status cusco_executor_open(
     const char * path,
     uint32_t n_ctx,

@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define CUSCO_EXECUTOR_ABI_VERSION 15u
+#define CUSCO_EXECUTOR_ABI_VERSION 16u
 
 typedef struct cusco_executor cusco_executor;
 typedef struct cusco_representation cusco_representation;
@@ -73,6 +73,8 @@ cusco_status cusco_executor_open(const char *, uint32_t, int32_t, cusco_executor
 void cusco_executor_close(cusco_executor *);
 cusco_capabilities cusco_executor_capabilities(const cusco_executor *);
 cusco_operating_point cusco_executor_operating_point(const cusco_executor *);
+/* Reports currently free memory across visible accelerator devices. */
+uint64_t cusco_executor_free_accelerator_bytes(void);
 /* Returns the GGUF general.architecture value reported by llama.cpp. On
  * CUSCO_BUFFER_TOO_SMALL, size receives the required capacity. */
 cusco_status cusco_executor_model_architecture(

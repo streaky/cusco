@@ -1236,6 +1236,7 @@ mod tests {
                 aliases: vec![],
                 family: "gemma4".into(),
                 size_bytes: 1,
+                block_count: 1,
                 epoch: 1,
             },
             prompt: std::iter::repeat_n("x", words)

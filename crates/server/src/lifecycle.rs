@@ -86,6 +86,7 @@ impl ModelLifecycleService {
                     && existing.sha256 == model.sha256
                     && existing.family == model.family
                     && existing.size_bytes == model.size_bytes
+                    && existing.block_count == model.block_count
             });
         if let Some(existing) = existing {
             return Ok(existing);
@@ -115,10 +116,19 @@ impl ModelLifecycleService {
         Ok(model)
     }
 
-    pub fn register_from_catalog(&self, model: ModelRecord) -> Result<ModelRecord, Error> {
+    pub fn register_from_catalog(&self, mut model: ModelRecord) -> Result<ModelRecord, Error> {
         let _operation = self.operation.lock();
         if model.epoch == 0 {
             return Err(Error::State("catalog model epoch must be nonzero".into()));
+        }
+        if model.block_count == 0 {
+            model.block_count = cusco_model_registry::probe_gguf(&model.path)
+                .map_err(state_err)?
+                .block_count
+                .ok_or_else(|| Error::State("model GGUF metadata has no block count".into()))?;
+            if let Some(catalog) = self.catalog() {
+                catalog.publish(&model).map_err(state_err)?;
+            }
         }
         let previous_epoch = {
             let mut state = self.state.lock();
@@ -226,6 +236,7 @@ mod tests {
             aliases: Vec::new(),
             family: "fixture".into(),
             size_bytes: 10,
+            block_count: 1,
             epoch,
         }
     }
