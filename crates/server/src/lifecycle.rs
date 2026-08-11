@@ -88,7 +88,6 @@ impl ModelLifecycleService {
                     && existing.size_bytes == model.size_bytes
             });
         if let Some(existing) = existing {
-            self.engine.prepare_model(&existing)?;
             return Ok(existing);
         }
         let (epoch, previous_epoch) = {
@@ -99,11 +98,7 @@ impl ModelLifecycleService {
             )
         };
         model.epoch = epoch;
-        self.engine.prepare_model(&model)?;
-        if let Err(error) = publish(&model) {
-            self.engine.retire_model(&model.id, model.epoch);
-            return Err(error);
-        }
+        publish(&model)?;
         {
             let mut state = self.state.lock();
             for existing in state.models.values_mut() {
@@ -125,7 +120,6 @@ impl ModelLifecycleService {
         if model.epoch == 0 {
             return Err(Error::State("catalog model epoch must be nonzero".into()));
         }
-        self.engine.prepare_model(&model)?;
         let previous_epoch = {
             let mut state = self.state.lock();
             let previous = state.models.get(&model.id).map(|record| record.epoch);
@@ -193,5 +187,71 @@ impl ModelLifecycleService {
             digest.update(&buffer[..count]);
         }
         Ok(format!("{:x}", digest.finalize()) == model.sha256)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EngineRequest, ExecutionSession};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct LazyEngine {
+        commits: AtomicUsize,
+    }
+
+    impl InferenceEngine for LazyEngine {
+        fn start_session(
+            &self,
+            _request: EngineRequest,
+        ) -> Result<Box<dyn ExecutionSession>, Error> {
+            Err(Error::State("model load failed".into()))
+        }
+
+        fn prepare_model(&self, _model: &ModelRecord) -> Result<(), Error> {
+            panic!("registration must not prepare model residency")
+        }
+
+        fn commit_model(&self, _model: &ModelRecord, _replaced_epoch: Option<u64>) {
+            self.commits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn model(id: &str, epoch: u64) -> ModelRecord {
+        ModelRecord {
+            id: id.into(),
+            revision: format!("{id}-revision"),
+            path: PathBuf::from(format!("{id}.gguf")),
+            sha256: format!("{id}-sha256"),
+            aliases: Vec::new(),
+            family: "fixture".into(),
+            size_bytes: 10,
+            epoch,
+        }
+    }
+
+    #[test]
+    fn registration_and_catalog_restore_do_not_prepare_residency() {
+        let engine = Arc::new(LazyEngine {
+            commits: AtomicUsize::new(0),
+        });
+        let lifecycle = ModelLifecycleService::new(engine.clone());
+
+        let registered = lifecycle.register(model("installed", 0), |_| Ok(())).unwrap();
+        assert_eq!(registered.epoch, 1);
+        assert_eq!(
+            lifecycle
+                .register(model("installed", 0), |_| Ok(()))
+                .unwrap()
+                .epoch,
+            registered.epoch
+        );
+
+        let restored = lifecycle
+            .register_from_catalog(model("restored", 7))
+            .unwrap();
+        assert_eq!(restored.epoch, 7);
+        assert_eq!(engine.commits.load(Ordering::Relaxed), 2);
+        assert_eq!(lifecycle.models().len(), 2);
     }
 }
