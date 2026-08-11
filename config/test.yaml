@@ -2,6 +2,7 @@ version: 1
 listen: 0.0.0.0:8080
 unsafe_public_unauthenticated: false
 http_debug: off
+native_debug: false
 openapi:
   docs_ui:
     enabled: false
@@ -55,6 +56,7 @@ scheduler:
   deficit_refill: 1
   prefill_tokens: 32
   promotion_rounds: 64
+  diagnostics_enabled: false
   diagnostic_capacity: 1024
 vision:
   max_images: 8

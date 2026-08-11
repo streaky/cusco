@@ -92,6 +92,7 @@ unsafe extern "C" {
     pub fn cusco_executor_capabilities(executor: *const CuscoExecutor) -> Capabilities;
     pub fn cusco_executor_operating_point(executor: *const CuscoExecutor) -> OperatingPoint;
     pub fn cusco_executor_free_accelerator_bytes() -> u64;
+    pub fn cusco_executor_set_debug_logging(enabled: c_int);
     pub fn cusco_executor_model_architecture(
         executor: *const CuscoExecutor,
         buffer: *mut c_char,

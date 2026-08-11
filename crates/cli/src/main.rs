@@ -177,6 +177,7 @@ fn run(command: Command) -> Result<()> {
                 http_debug,
                 std::env::var("CUSCO_HTTP_DEBUG").ok().as_deref(),
             )?;
+            cusco_executor::set_debug_logging(config.native_debug);
             let bearer_token = std::env::var("CUSCO_BEARER_TOKEN")
                 .ok()
                 .or_else(|| config.bearer_token.clone());

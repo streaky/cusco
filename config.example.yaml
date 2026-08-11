@@ -23,6 +23,10 @@ bearer_token: null
 # transport metadata. "full" may expose headers, query values, credentials, and
 # request or response bodies, so enable it only in a controlled environment.
 http_debug: off
+# Emit verbose llama.cpp/GGML executor diagnostics. This includes high-frequency
+# messages such as per-token CUDA graph reuse, so leave it off in normal use.
+native_debug: false
+
 
 openapi:
   docs_ui:
@@ -62,7 +66,7 @@ execution:
   # Maximum model and context bytes admitted to GPU/device memory. This is an
   # operator ceiling: each load is additionally capped by accelerator memory
   # currently free, with allocator headroom retained for transient allocations.
-  device_capacity: 10 GiB
+  device_capacity: 30 GiB
   # Maximum model and context bytes admitted to system memory.
   host_capacity: 32 GiB
   # Maximum bytes admitted to the persistent storage tier.
@@ -146,7 +150,12 @@ scheduler:
   prefill_tokens: 64
   # Waiting rounds before monotonically promoting work to prevent starvation.
   promotion_rounds: 64
-  # Number of recent scheduler diagnostic events retained in memory.
+  # Emit one structured scheduler decision record per execution quantum.
+  # This is intentionally off by default because token generation can produce
+  # many records. Enable it only while diagnosing scheduling and fairness.
+  diagnostics_enabled: false
+  # Maximum number of pending scheduler diagnostic records before new records
+  # are counted as lost. This applies only when diagnostics are enabled.
   diagnostic_capacity: 4096
 
 vision:

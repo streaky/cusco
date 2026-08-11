@@ -315,6 +315,8 @@ pub struct SchedulerPolicyConfig {
     pub deficit_refill: u32,
     pub prefill_tokens: usize,
     pub promotion_rounds: u64,
+    #[serde(default)]
+    pub diagnostics_enabled: bool,
     pub diagnostic_capacity: usize,
 }
 
@@ -328,6 +330,7 @@ impl Default for SchedulerPolicyConfig {
             deficit_refill: 1,
             prefill_tokens: 32,
             promotion_rounds: 64,
+            diagnostics_enabled: false,
             diagnostic_capacity: 1024,
         }
     }
@@ -2809,7 +2812,7 @@ async fn http_debug_middleware(
         .map(str::to_owned);
     let chunk_index = chunk_index.clone();
     let body = Body::new(body.map_frame(move |frame| {
-        if let Some(bytes) = frame.data_ref() {
+        if let Some(bytes) = frame.data_ref().filter(|bytes| !bytes.is_empty()) {
             let mut capture = match debug.level {
                 HttpDebugLevel::Full => HttpBodyCapture::full(),
                 HttpDebugLevel::Safe | HttpDebugLevel::Off => HttpBodyCapture::default(),
@@ -3060,6 +3063,21 @@ impl ResponsesToolChoice {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ResponsesReasoningConfig {
+    #[serde(default)]
+    effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+impl ResponsesReasoningConfig {
+    fn expose_summary(&self) -> bool {
+        self.summary.as_deref().is_some_and(|summary| summary != "none")
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResponsesRequest {
     model: String,
     input: ResponsesInput,
@@ -3089,6 +3107,8 @@ struct ResponsesRequest {
     #[serde(default)]
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
+    reasoning: Option<ResponsesReasoningConfig>,
+    #[serde(default)]
     tool_choice: Option<ResponsesToolChoice>,
 }
 async fn responses(
@@ -3101,12 +3121,21 @@ async fn responses(
     }: PrequeueJson<ResponsesRequest>,
 ) -> Result<Response, Error> {
     let request_context = auth(&s, &headers, Scope::Inference)?;
+    let requested_effort = r
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.effort.as_ref())
+        .or(r.reasoning_effort.as_ref());
     validate_controls(
         r.temperature,
         r.top_p,
         &r.tools,
         r.response_format.as_ref(),
-        r.reasoning_effort.as_ref(),
+        if requested_effort.is_some_and(|effort| matches!(effort, ReasoningEffort::None)) {
+            requested_effort
+        } else {
+            None
+        },
     )?;
     let service_tier = normalize_service_tier(r.service_tier);
     if let Some(tool_choice) = &r.tool_choice {
@@ -3308,6 +3337,11 @@ async fn responses(
         r.tool_choice.as_ref(),
         has_tool_output,
     )?;
+    let strips_native_reasoning = matches!(model.family.as_str(), "qwen35moe" | "qwen3moe");
+    let expose_reasoning = strips_native_reasoning
+        && r.reasoning
+            .as_ref()
+            .is_some_and(ResponsesReasoningConfig::expose_summary);
     let response_options = ResponseRequestOptions {
         store: r.store,
         previous_response_id: r.previous_response_id,
@@ -3325,6 +3359,8 @@ async fn responses(
         ),
         tool_choice: r.tool_choice,
         hosted_search,
+        strips_native_reasoning,
+        expose_reasoning,
     };
     infer_response(InferResponseRequest {
         server: s,
@@ -3432,6 +3468,7 @@ fn response_lineage_prompt(
                     });
                 }
                 responses::ResponseOutputItem::WebSearchCall(_) => {}
+                responses::ResponseOutputItem::Reasoning(_) => {}
             }
         }
     }
@@ -3804,6 +3841,8 @@ struct ResponseRequestOptions {
     tools: Vec<Value>,
     tool_choice_value: Value,
     hosted_search: Option<HostedWebSearchExecution>,
+    strips_native_reasoning: bool,
+    expose_reasoning: bool,
 }
 
 struct InferResponseRequest {
@@ -3950,6 +3989,8 @@ fn completed_response(
                 tools: &options.tools,
                 tool_choice: &options.tool_choice_value,
                 function_call,
+                expose_reasoning: options.expose_reasoning,
+                strip_reasoning: options.strips_native_reasoning,
                 web_search_call: web_search_call.as_ref(),
             });
             service.remember(&resource).map_err(response_store_error)?;
@@ -4133,7 +4174,11 @@ async fn infer_response(parameters: InferResponseRequest) -> Result<Response, Er
                 input: options.input.clone(),
                 tools: options.tools.clone(),
                 tool_choice: options.tool_choice_value.clone(),
-                buffer_output: !options.tool_names.is_empty() || options.hosted_search.is_some(),
+                buffer_output: !options.tool_names.is_empty()
+                    || options.hosted_search.is_some()
+                    || options.strips_native_reasoning,
+                expose_reasoning: options.expose_reasoning,
+                strip_reasoning: options.strips_native_reasoning,
                 web_search_call: options.hosted_search.as_ref().map(|search| {
                     responses::new_web_search_call(
                         search.query.clone(),
@@ -4253,7 +4298,19 @@ async fn delete_response(
 
 async fn list_models(State(s): State<Server>, headers: HeaderMap) -> Result<Json<Value>, Error> {
     auth(&s, &headers, Scope::Inference)?;
-    Ok(Json(json!({"data":s.models()})))
+    let models = s
+        .models()
+        .into_iter()
+        .map(|model| {
+            json!({
+                "id": model.id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "cusco",
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"object":"list","data":models})))
 }
 async fn capabilities(
     State(server): State<Server>,
@@ -5504,6 +5561,8 @@ mod tests {
             tools: Vec::new(),
             tool_choice_value: json!("auto"),
             hosted_search: None,
+            strips_native_reasoning: false,
+            expose_reasoning: false,
         };
         let output = r#"{"name":"describe","arguments":{"subject":"function calls"}}"#;
         assert!(parse_function_call(output, &options).unwrap().is_none());
@@ -5858,6 +5917,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/openai/v1/models")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed: Value =
+            serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            listed,
+            json!({
+                "object": "list",
+                "data": [{
+                    "id": "m",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "cusco",
+                }],
+            })
+        );
         let req = Request::builder()
             .method("POST")
             .uri("/openai/v1/completions")
@@ -7093,6 +7180,52 @@ mod tests {
         let response_body: Value =
             serde_json::from_str(records[2]["body"]["utf8"].as_str().unwrap()).unwrap();
         assert_eq!(response_body["choices"][0]["text"], "prompt private");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_http_debug_skips_empty_streaming_body_frames() {
+        let (server, dir) = setup(Arc::new(AnonymousAdmin));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let app = router_with_http_debug(
+            server,
+            HttpDebug::new(HttpDebugLevel::Full, move |line| {
+                captured.lock().push(line.to_owned())
+            }),
+        );
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/openai/v1/chat/completions",
+                json!({
+                    "model": "m",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 2,
+                    "stream": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let records = records
+            .lock()
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let body_records = records
+            .iter()
+            .filter(|record| record["direction"] == "out_body")
+            .collect::<Vec<_>>();
+        assert!(!body_records.is_empty());
+        assert!(body_records
+            .iter()
+            .all(|record| record["body"]["bytes"].as_u64().unwrap() > 0));
+        assert!(body_records.iter().enumerate().all(|(index, record)| {
+            record["chunk_index"].as_u64().unwrap() == index as u64
+        }));
         fs::remove_dir_all(dir).unwrap();
     }
 

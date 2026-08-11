@@ -18,6 +18,18 @@ pub struct ResponseTextPart {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResponseReasoningSummaryPart {
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResponseReasoning {
+    pub id: String,
+    pub status: String,
+    pub summary: Vec<ResponseReasoningSummaryPart>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ResponseMessage {
     pub id: String,
     pub role: String,
@@ -77,6 +89,7 @@ pub enum ResponseInputItem {
 pub enum ResponseOutputItem {
     Message(ResponseMessage),
     FunctionCall(ResponseFunctionCall),
+    Reasoning(ResponseReasoning),
     WebSearchCall(ResponseWebSearchCall),
 }
 
@@ -135,6 +148,8 @@ pub struct ResponseUsage {
     pub input_tokens: usize,
     pub cached_tokens: usize,
     pub output_tokens: usize,
+    #[serde(default)]
+    pub reasoning_tokens: usize,
 }
 
 const TRANSIENT_RESPONSE_CAPACITY: usize = 1024;
@@ -154,6 +169,8 @@ pub struct StreamResponse {
     pub tools: Vec<Value>,
     pub tool_choice: Value,
     pub buffer_output: bool,
+    pub expose_reasoning: bool,
+    pub strip_reasoning: bool,
     pub web_search_call: Option<ResponseWebSearchCall>,
     pub lineage_revision: u64,
 }
@@ -179,14 +196,19 @@ impl ResponseService {
     }
 
     pub fn complete(&self, params: CompleteResponse<'_>) -> ResponseResource {
+        let (reasoning, text) = if params.strip_reasoning {
+            split_native_reasoning(params.text)
+        } else {
+            (None, params.text)
+        };
         let message = || {
             let annotations = params.web_search_call.map_or_else(Vec::new, |call| {
                 call.action
                     .sources
                     .iter()
                     .filter_map(|source| {
-                        let byte_start = params.text.find(&source.url)?;
-                        let start_index = params.text[..byte_start].chars().count();
+                        let byte_start = text.find(&source.url)?;
+                        let start_index = text[..byte_start].chars().count();
                         let end_index = start_index + source.url.chars().count();
                         Some(json!({
                             "type": "url_citation",
@@ -203,18 +225,31 @@ impl ResponseService {
                 role: "assistant".into(),
                 status: "completed".into(),
                 content: vec![ResponseTextPart {
-                    text: params.text.into(),
+                    text: text.into(),
                     annotations,
                     logprobs: vec![],
                 }],
             })
         };
+        let reasoning_item = || ResponseOutputItem::Reasoning(ResponseReasoning {
+            id: "rs_0".into(),
+            status: "completed".into(),
+            summary: vec![ResponseReasoningSummaryPart {
+                text: reasoning.unwrap_or_default().into(),
+            }],
+        });
         let output = if let Some(call) = params.function_call {
             vec![ResponseOutputItem::FunctionCall(call)]
-        } else if let Some(call) = params.web_search_call {
-            vec![ResponseOutputItem::WebSearchCall(call.clone()), message()]
         } else {
-            vec![message()]
+            let mut output = Vec::new();
+            if params.expose_reasoning && reasoning.is_some() {
+                output.push(reasoning_item());
+            }
+            if let Some(call) = params.web_search_call {
+                output.push(ResponseOutputItem::WebSearchCall(call.clone()));
+            }
+            output.push(message());
+            output
         };
         ResponseResource {
             schema_version: RESPONSE_SCHEMA_VERSION,
@@ -327,6 +362,8 @@ pub struct CompleteResponse<'a> {
     pub lineage_revision: u64,
     pub input: &'a [ResponseInputItem],
     pub function_call: Option<ResponseFunctionCall>,
+    pub expose_reasoning: bool,
+    pub strip_reasoning: bool,
     pub web_search_call: Option<&'a ResponseWebSearchCall>,
 }
 
@@ -336,6 +373,7 @@ impl From<&Usage> for ResponseUsage {
             input_tokens: usage.input_tokens,
             cached_tokens: usage.cached_tokens,
             output_tokens: usage.generated_tokens,
+            reasoning_tokens: 0,
         }
     }
 }
@@ -372,7 +410,7 @@ pub fn new_web_search_call(
 }
 
 pub fn project_resource(resource: &ResponseResource) -> Value {
-    let usage = resource.usage.as_ref().map(|u| json!({"input_tokens":u.input_tokens,"input_tokens_details":{"cached_tokens":u.cached_tokens},"output_tokens":u.output_tokens,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":u.input_tokens+u.output_tokens})).unwrap_or(Value::Null);
+    let usage = resource.usage.as_ref().map(|u| json!({"input_tokens":u.input_tokens,"input_tokens_details":{"cached_tokens":u.cached_tokens},"output_tokens":u.output_tokens,"output_tokens_details":{"reasoning_tokens":u.reasoning_tokens},"total_tokens":u.input_tokens+u.output_tokens})).unwrap_or(Value::Null);
     let output = resource
         .output
         .iter()
@@ -390,6 +428,9 @@ fn project_output_item(item: &ResponseOutputItem) -> Value {
         ResponseOutputItem::WebSearchCall(call) => {
             json!({"id":call.id,"type":"web_search_call","status":call.status,"action":call.action})
         }
+        ResponseOutputItem::Reasoning(reasoning) => {
+            json!({"id":reasoning.id,"type":"reasoning","status":reasoning.status,"summary":reasoning.summary.iter().map(|part| json!({"type":"summary_text","text":part.text})).collect::<Vec<_>>()})
+        }
     }
 }
 fn project_part(part: &ResponseTextPart) -> Value {
@@ -404,12 +445,30 @@ pub(crate) fn now() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
+fn split_native_reasoning(text: &str) -> (Option<&str>, &str) {
+    let trimmed = text.trim_start();
+    let Some(reasoning) = trimmed.strip_prefix("<think>") else {
+        return (None, text);
+    };
+    let separated = match reasoning.split_once("</think>") {
+        Some((reasoning, answer)) => (reasoning, answer.trim_start_matches(['\r', '\n'])),
+        None => (reasoning, ""),
+    };
+    let reasoning = separated.0.trim();
+    ((!reasoning.is_empty()).then_some(reasoning), separated.1)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResponseEvent {
     Created(ResponseResource),
     OutputItemAdded(ResponseMessage),
     FunctionCallAdded(ResponseFunctionCall),
     WebSearchCallAdded(ResponseWebSearchCall),
+    ReasoningAdded(ResponseReasoning),
+    ReasoningSummaryAdded(ResponseReasoningSummaryPart),
+    ReasoningSummaryDelta(String),
+    ReasoningSummaryDone(ResponseReasoningSummaryPart),
+    ReasoningDone(ResponseReasoning),
     ContentPartAdded(ResponseTextPart),
     TextDelta(String),
     TextDone(ResponseTextPart),
@@ -427,6 +486,8 @@ pub struct ResponseProjection {
     buffer_output: bool,
     function_call: Option<ResponseFunctionCall>,
     web_search_call: Option<ResponseWebSearchCall>,
+    expose_reasoning: bool,
+    strip_reasoning: bool,
 }
 impl ResponseProjection {
     pub fn new(model: String) -> Self {
@@ -454,6 +515,8 @@ impl ResponseProjection {
             buffer_output: false,
             function_call: None,
             web_search_call: None,
+            expose_reasoning: false,
+            strip_reasoning: false,
         }
     }
     fn with_request(mut self, request: StreamResponse) -> Self {
@@ -465,7 +528,9 @@ impl ResponseProjection {
         self.resource.tool_choice = request.tool_choice;
         self.resource.lineage_revision = request.lineage_revision;
         self.web_search_call = request.web_search_call;
-        self.buffer_output = request.buffer_output;
+        self.expose_reasoning = request.expose_reasoning;
+        self.strip_reasoning = request.strip_reasoning;
+        self.buffer_output = request.buffer_output || request.expose_reasoning;
         self
     }
     pub fn completed_resource(&self) -> Option<&ResponseResource> {
@@ -580,19 +645,57 @@ impl ResponseProjection {
                         ResponseEvent::Completed(self.resource.clone()),
                     ]
                 } else {
-                    let message = self.message("completed");
-                    self.resource.output = self
-                        .web_search_call
-                        .iter()
-                        .cloned()
-                        .map(ResponseOutputItem::WebSearchCall)
-                        .chain(std::iter::once(ResponseOutputItem::Message(
-                            message.clone(),
-                        )))
-                        .collect();
+                    let raw_text = self.generated_text().to_owned();
+                    let (reasoning, answer) = if self.strip_reasoning {
+                        split_native_reasoning(&raw_text)
+                    } else {
+                        (None, raw_text.as_str())
+                    };
+                    let message = ResponseMessage {
+                        id: "msg_0".into(),
+                        role: "assistant".into(),
+                        status: "completed".into(),
+                        content: vec![ResponseTextPart {
+                            text: answer.into(),
+                            annotations: vec![],
+                            logprobs: vec![],
+                        }],
+                    };
+                    let mut output = Vec::new();
+                    let reasoning_item = reasoning.map(|text| ResponseReasoning {
+                        id: "rs_0".into(),
+                        status: "completed".into(),
+                        summary: vec![ResponseReasoningSummaryPart { text: text.into() }],
+                    });
+                    if self.expose_reasoning {
+                        if let Some(item) = reasoning_item.clone() {
+                            output.push(ResponseOutputItem::Reasoning(item));
+                        }
+                    }
+                    if let Some(call) = self.web_search_call.clone() {
+                        output.push(ResponseOutputItem::WebSearchCall(call));
+                    }
+                    output.push(ResponseOutputItem::Message(message.clone()));
+                    self.resource.output = output;
                     let part = message.content[0].clone();
                     let mut events = Vec::new();
                     if self.buffer_output {
+                        if self.expose_reasoning {
+                            if let Some(item) = reasoning_item {
+                                let summary = item.summary[0].clone();
+                                events.push(ResponseEvent::ReasoningAdded(item.clone()));
+                                events.push(ResponseEvent::ReasoningSummaryAdded(
+                                    ResponseReasoningSummaryPart {
+                                        text: String::new(),
+                                    },
+                                ));
+                                events.push(ResponseEvent::ReasoningSummaryDelta(
+                                    summary.text.clone(),
+                                ));
+                                events.push(ResponseEvent::ReasoningSummaryDone(summary));
+                                events.push(ResponseEvent::ReasoningDone(item));
+                            }
+                        }
                         if let Some(call) = self.web_search_call.clone() {
                             events.push(ResponseEvent::WebSearchCallAdded(call.clone()));
                             events.push(ResponseEvent::WebSearchCallDone(call));
@@ -626,7 +729,15 @@ impl ResponseProjection {
     fn project_event(&mut self, event: ResponseEvent) -> Value {
         let n = self.sequence;
         self.sequence += 1;
-        let message_index = usize::from(self.web_search_call.is_some());
+        let reasoning_offset = usize::from(
+            self.expose_reasoning
+                && self
+                    .resource
+                    .output
+                    .iter()
+                    .any(|item| matches!(item, ResponseOutputItem::Reasoning(_))),
+        );
+        let message_index = usize::from(self.web_search_call.is_some()) + reasoning_offset;
         match event {
             ResponseEvent::Created(r) => {
                 json!({"type":"response.created","sequence_number":n,"response":project_resource(&r)})
@@ -639,6 +750,21 @@ impl ResponseProjection {
             }
             ResponseEvent::WebSearchCallAdded(call) => {
                 json!({"type":"response.output_item.added","sequence_number":n,"item":project_output_item(&ResponseOutputItem::WebSearchCall(call)),"output_index":0})
+            }
+            ResponseEvent::ReasoningAdded(reasoning) => {
+                json!({"type":"response.output_item.added","sequence_number":n,"item":project_output_item(&ResponseOutputItem::Reasoning(reasoning)),"output_index":0})
+            }
+            ResponseEvent::ReasoningSummaryAdded(part) => {
+                json!({"type":"response.reasoning_summary_part.added","sequence_number":n,"item_id":"rs_0","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":part.text}})
+            }
+            ResponseEvent::ReasoningSummaryDelta(delta) => {
+                json!({"type":"response.reasoning_summary_text.delta","sequence_number":n,"item_id":"rs_0","output_index":0,"summary_index":0,"delta":delta})
+            }
+            ResponseEvent::ReasoningSummaryDone(part) => {
+                json!({"type":"response.reasoning_summary_text.done","sequence_number":n,"item_id":"rs_0","output_index":0,"summary_index":0,"text":part.text})
+            }
+            ResponseEvent::ReasoningDone(reasoning) => {
+                json!({"type":"response.output_item.done","sequence_number":n,"item":project_output_item(&ResponseOutputItem::Reasoning(reasoning)),"output_index":0})
             }
             ResponseEvent::ContentPartAdded(p) => {
                 json!({"type":"response.content_part.added","sequence_number":n,"item_id":"msg_0","output_index":message_index,"content_index":0,"part":project_part(&p)})
@@ -693,6 +819,8 @@ mod tests {
             tools: tools.clone(),
             tool_choice: tool_choice.clone(),
             buffer_output: false,
+            expose_reasoning: false,
+            strip_reasoning: false,
             web_search_call: None,
             lineage_revision: 0,
         });
@@ -712,5 +840,58 @@ mod tests {
         let created: Value = serde_json::from_str(first_row.trim_start_matches("data: ")).unwrap();
         assert_eq!(created["response"]["tools"], json!(tools));
         assert_eq!(created["response"]["tool_choice"], tool_choice);
+    }
+
+    #[test]
+    fn native_reasoning_is_separated_only_at_the_leading_channel_marker() {
+        assert_eq!(
+            split_native_reasoning("<think>\nprivate work\n</think>\nFinal answer"),
+            (Some("private work"), "Final answer")
+        );
+        assert_eq!(
+            split_native_reasoning("<think>unfinished private work"),
+            (Some("unfinished private work"), "")
+        );
+        assert_eq!(
+            split_native_reasoning("<think>\n</think>\nhello"),
+            (None, "hello")
+        );
+        assert_eq!(
+            split_native_reasoning("Literal <think> tag"),
+            (None, "Literal <think> tag")
+        );
+    }
+
+    #[test]
+    fn reasoning_projection_buffers_native_tokens_before_completion() {
+        let mut projection = ResponseProjection::new("m".into()).with_request(StreamResponse {
+            model: "m".into(),
+            owner: "owner".into(),
+            store: false,
+            previous_response_id: None,
+            input: vec![],
+            tools: vec![],
+            tool_choice: json!("auto"),
+            buffer_output: true,
+            expose_reasoning: true,
+            web_search_call: None,
+            strip_reasoning: true,
+            lineage_revision: 0,
+        });
+        let started = projection.project(StreamEvent::Started {
+            request_id: "resp_1".into(),
+            context_id: crate::ContextId::new(),
+            correlation_id: "corr_1".into(),
+            inference_id: "infer_1".into(),
+            execution_session_id: "session_1".into(),
+        });
+        assert!(started.contains("response.created"));
+        assert_eq!(
+            projection.project(StreamEvent::Token {
+                token: "<think>private".into(),
+                index: 1,
+            }),
+            ""
+        );
     }
 }

@@ -122,16 +122,16 @@ struct MappedState {
     physical: PhysicalManager,
     model_epoch: ModelEpoch,
     resident: HashMap<EvaluatedPrefixId, ResidentMapping>,
-    metrics: MappedMetrics,
+    spill_dir: Option<PathBuf>,
+    spill_capacity: usize,
     spill_bytes: usize,
+    metrics: MappedMetrics,
 }
 
 pub struct MappedEngine {
     profile: ExecutionProfile,
     model_path: String,
     context_capacity: usize,
-    spill_dir: Option<PathBuf>,
-    spill_capacity: usize,
     state: Arc<Mutex<MappedState>>,
 }
 
@@ -209,8 +209,6 @@ impl MappedEngine {
             profile,
             context_capacity: n_ctx as usize,
             model_path,
-            spill_dir,
-            spill_capacity,
             state: Arc::new(Mutex::new(MappedState {
                 executor,
                 root,
@@ -220,9 +218,11 @@ impl MappedEngine {
                     host_bytes,
                 }),
                 resident: HashMap::new(),
+                spill_dir,
+                spill_capacity,
+                spill_bytes: 0,
                 model_epoch,
                 metrics: MappedMetrics::default(),
-                spill_bytes: 0,
             })),
         }))
     }
@@ -232,65 +232,8 @@ impl MappedEngine {
     }
 
     pub fn spill_inactive_mappings(&self) -> Result<usize, Error> {
-        let Some(spill_dir) = &self.spill_dir else {
-            return Ok(0);
-        };
         let mut state = self.state.lock();
-        let active = state.executor.mapping_metrics().active_identity;
-        let candidates = state
-            .resident
-            .iter()
-            .filter_map(|(id, resident)| {
-                resident
-                    .native
-                    .as_ref()
-                    .filter(|native| native.identity() != active)
-                    .cloned()
-                    .map(|native| (*id, native))
-            })
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return Ok(0);
-        }
-        let _ = state.physical.release_binding(EXECUTION_SLOT);
-        let mut spilled = 0;
-        for (id, native) in candidates {
-            let mapping = state
-                .executor
-                .export_mapping(&native)
-                .map_err(state_error)?;
-            if state.spill_bytes.saturating_add(mapping.bytes.len()) > self.spill_capacity {
-                continue;
-            }
-            let name = hex::encode(id.0);
-            let path = spill_dir.join(format!("{name}.seq"));
-            let temporary = path.with_extension("seq.tmp");
-            fs::write(&temporary, &mapping.bytes).map_err(state_error)?;
-            fs::rename(&temporary, &path).map_err(state_error)?;
-            let representations = state
-                .resident
-                .get(&id)
-                .expect("spill candidate remains resident")
-                .representations
-                .clone();
-            for representation in representations {
-                state
-                    .physical
-                    .demote_to_storage(representation)
-                    .map_err(state_error)?;
-            }
-            let bytes = mapping.bytes.len();
-            let resident = state.resident.get_mut(&id).unwrap();
-            resident.native = None;
-            resident.spill = Some(SpilledMapping {
-                path,
-                bytes,
-                position: mapping.position,
-            });
-            state.spill_bytes += bytes;
-            spilled += 1;
-        }
-        Ok(spilled)
+        spill_inactive_mappings(&mut state)
     }
 
     pub fn model_path(&self) -> &str {
@@ -300,6 +243,64 @@ impl MappedEngine {
     pub fn operating_point(&self) -> OperatingPoint {
         self.state.lock().executor.operating_point()
     }
+}
+
+fn spill_inactive_mappings(state: &mut MappedState) -> Result<usize, Error> {
+    let Some(spill_dir) = state.spill_dir.clone() else {
+        return Ok(0);
+    };
+    let active = state.executor.mapping_metrics().active_identity;
+    let candidates = state
+        .resident
+        .iter()
+        .filter_map(|(id, resident)| {
+            resident
+                .native
+                .as_ref()
+                .filter(|native| native.identity() != active)
+                .cloned()
+                .map(|native| (*id, native))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let _ = state.physical.release_binding(EXECUTION_SLOT);
+    let mut spilled = 0;
+    for (id, native) in candidates {
+        let mapping = state.executor.export_mapping(&native).map_err(state_error)?;
+        if state.spill_bytes.saturating_add(mapping.bytes.len()) > state.spill_capacity {
+            continue;
+        }
+        let name = hex::encode(id.0);
+        let path = spill_dir.join(format!("{name}.seq"));
+        let temporary = path.with_extension("seq.tmp");
+        fs::write(&temporary, &mapping.bytes).map_err(state_error)?;
+        fs::rename(&temporary, &path).map_err(state_error)?;
+        let representations = state
+            .resident
+            .get(&id)
+            .expect("spill candidate remains resident")
+            .representations
+            .clone();
+        for representation in representations {
+            state
+                .physical
+                .demote_to_storage(representation)
+                .map_err(state_error)?;
+        }
+        let bytes = mapping.bytes.len();
+        let resident = state.resident.get_mut(&id).unwrap();
+        resident.native = None;
+        resident.spill = Some(SpilledMapping {
+            path,
+            bytes,
+            position: mapping.position,
+        });
+        state.spill_bytes += bytes;
+        spilled += 1;
+    }
+    Ok(spilled)
 }
 
 struct MappedSession {
@@ -462,7 +463,7 @@ impl MappedSession {
                     .as_ref()
                     .expect("prepared mapping exists"),
             )?;
-            self.parent = Some(publish_block(
+            if let Some(published) = publish_block(
                 &mut state,
                 &self.profile,
                 self.logical_context.expect("prepared context exists"),
@@ -470,7 +471,9 @@ impl MappedSession {
                 self.parent,
                 snapshot,
                 self.next.as_ref().expect("decode result exists"),
-            )?);
+            )? {
+                self.parent = Some(published);
+            }
         }
         self.prefill.uncached_prefill_ns = self
             .prefill
@@ -538,7 +541,7 @@ impl MappedSession {
                         .as_ref()
                         .expect("prepared mapping exists"),
                 )?;
-                self.parent = Some(publish_block(
+                if let Some(published) = publish_block(
                     &mut state,
                     &self.profile,
                     self.logical_context.expect("prepared context exists"),
@@ -546,7 +549,9 @@ impl MappedSession {
                     self.parent,
                     snapshot,
                     self.next.as_ref().expect("decode result exists"),
-                )?);
+                )? {
+                    self.parent = Some(published);
+                }
             }
         }
         Ok(SessionStep::Token {
@@ -825,7 +830,7 @@ fn publish_block(
     parent: Option<EvaluatedPrefixId>,
     native: RepresentationHandle,
     continuation: &Decode,
-) -> Result<EvaluatedPrefixId, Error> {
+) -> Result<Option<EvaluatedPrefixId>, Error> {
     let required = profile.required_mask();
     let serialized_bytes = state
         .executor
@@ -847,9 +852,7 @@ fn publish_block(
         .saturating_add(capacity.device_transition_reserved)
         .saturating_add(capacity.device_detached_transfer_reserved);
     if required_bytes > capacity.device_total.saturating_sub(unavailable) {
-        return Err(Error::State(
-            "device capacity cannot publish the completed block".into(),
-        ));
+        return Ok(None);
     }
     let rollback = parent
         .and_then(|id| state.resident.get(&id))
@@ -860,6 +863,14 @@ fn publish_block(
                 .active_representation()
                 .map_err(state_error)?,
         );
+    let host_capacity = state.physical.metrics();
+    if required_bytes > host_capacity.host_total.saturating_sub(host_capacity.host_used) {
+        spill_inactive_mappings(state)?;
+    }
+    let host_capacity = state.physical.metrics();
+    if required_bytes > host_capacity.host_total.saturating_sub(host_capacity.host_used) {
+        return Ok(None);
+    }
     let prepared_publication = state
         .logical
         .prepare_publication(
@@ -963,7 +974,7 @@ fn publish_block(
         );
         state.metrics.published_blocks += 1;
     }
-    Ok(mapping.id)
+    Ok(Some(mapping.id))
 }
 
 fn release_representations(
@@ -1286,25 +1297,26 @@ mod tests {
     }
 
     #[test]
-    fn publication_failure_keeps_the_prior_mapping_reusable() {
-        let engine = MappedEngine::open("mock://deterministic", 4096, 0, 250_000, 1 << 20).unwrap();
-        let model = model();
-        let first = engine
-            .generate_collected(test_request(&model, "a".repeat(40), 1, &[]))
-            .unwrap();
-        let failed = engine.generate_collected(test_request(
-            &model,
-            "b".repeat(25),
-            1,
-            &first.successor_tokens,
-        ));
-        assert!(failed.unwrap_err().to_string().contains("cannot publish"));
-        let resumed = engine
-            .generate_collected(test_request(&model, "c", 1, &first.successor_tokens))
-            .unwrap();
-        assert_eq!(resumed.pieces.len(), 1);
-        assert_eq!(engine.metrics().requests, 2);
-        assert!(engine.metrics().cache_hits >= 1);
+    fn publication_capacity_exhaustion_degrades_to_uncached_execution() {
+        for (device_bytes, host_bytes) in [(250_000, 1 << 20), (1 << 20, 250_000)] {
+            let engine =
+                MappedEngine::open("mock://deterministic", 4096, 0, device_bytes, host_bytes)
+                    .unwrap();
+            let model = model();
+            let first = engine
+                .generate_collected(test_request(&model, "a".repeat(40), 1, &[]))
+                .unwrap();
+            let continued = engine
+                .generate_collected(test_request(
+                    &model,
+                    "b".repeat(25),
+                    1,
+                    &first.successor_tokens,
+                ))
+                .unwrap();
+            assert_eq!(continued.pieces.len(), 1);
+            assert_eq!(engine.metrics().requests, 2);
+        }
     }
 
     #[test]

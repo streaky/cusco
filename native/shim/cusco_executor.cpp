@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -28,6 +29,18 @@ static uint64_t free_accelerator_bytes() {
         available += static_cast<uint64_t>(free);
     }
     return available;
+}
+
+static bool native_debug_enabled = false;
+
+static void cusco_log_callback(
+    enum ggml_log_level level,
+    const char * text,
+    void * debug_enabled) {
+    if (level == GGML_LOG_LEVEL_DEBUG && !*static_cast<const bool *>(debug_enabled)) {
+        return;
+    }
+    fputs(text, stderr);
 }
 
 struct cusco_checkpoint {
@@ -105,6 +118,11 @@ static bool is_mock(const cusco_executor * e) {
 
 static bool abort_decode(void * p) {
     return static_cast<cusco_executor *>(p)->cancel.exchange(false);
+}
+
+void cusco_executor_set_debug_logging(int32_t enabled) {
+    native_debug_enabled = enabled != 0;
+    llama_log_set(cusco_log_callback, &native_debug_enabled);
 }
 
 uint64_t cusco_executor_free_accelerator_bytes(void) {

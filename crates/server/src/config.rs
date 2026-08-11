@@ -87,6 +87,8 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub http_debug: HttpDebugLevel,
     #[serde(default)]
+    pub native_debug: bool,
+    #[serde(default)]
     pub openapi: OpenApiConfig,
     pub paths: DataPaths,
     pub execution: ExecutionConfig,
@@ -350,6 +352,7 @@ mod tests {
             unsafe_public_unauthenticated: false,
             bearer_token: None,
             http_debug: HttpDebugLevel::Off,
+            native_debug: false,
             openapi: OpenApiConfig::default(),
             paths: DataPaths {
                 database: "db".into(),
@@ -381,6 +384,23 @@ mod tests {
             },
         }
     }
+
+    #[test]
+    fn native_debug_defaults_off_and_accepts_explicit_enablement() {
+        let yaml = "version: 1\npaths: {database: db, models: models, spill: spill, user_models: local, user_config: user.yaml}\nexecution: {device_capacity: '1 GiB', host_capacity: '1 GiB', storage_capacity: '2 GiB', context_reserve: '1 GiB'}\n";
+        assert!(
+            !serde_yaml::from_str::<DaemonConfig>(yaml)
+                .unwrap()
+                .native_debug
+        );
+        let yaml = format!("native_debug: true\n{yaml}");
+        assert!(
+            serde_yaml::from_str::<DaemonConfig>(&yaml)
+                .unwrap()
+                .native_debug
+        );
+    }
+
     #[test]
     fn http_debug_overrides_follow_cli_environment_configuration_precedence() {
         let mut config = valid();
