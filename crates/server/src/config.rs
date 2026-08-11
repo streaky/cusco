@@ -87,6 +87,8 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub http_debug: HttpDebugLevel,
     #[serde(default)]
+    pub native_debug: bool,
+    #[serde(default)]
     pub openapi: OpenApiConfig,
     pub paths: DataPaths,
     pub execution: ExecutionConfig,
@@ -96,6 +98,8 @@ pub struct DaemonConfig {
     pub scheduler: SchedulerPolicyConfig,
     #[serde(default)]
     pub vision: VisionConfig,
+    #[serde(default)]
+    pub hosted_tools: HostedToolsConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -110,6 +114,30 @@ pub struct OpenApiConfig {
 pub struct OpenApiDocsUiConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedToolsConfig {
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default = "default_web_search_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_web_search_results")]
+    pub max_results: usize,
+    #[serde(default = "default_web_search_response_bytes")]
+    pub max_response_bytes: usize,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -131,6 +159,8 @@ pub struct ExecutionConfig {
     pub context_reserve: ByteSize,
     #[serde(default = "default_context")]
     pub context_tokens: u32,
+    #[serde(default = "default_publication_interval_tokens")]
+    pub publication_interval_tokens: usize,
     #[serde(default = "default_gpu_layers")]
     pub gpu_layers: i32,
     #[serde(default)]
@@ -169,11 +199,23 @@ impl Default for VisionConfig {
         }
     }
 }
+fn default_web_search_timeout_ms() -> u64 {
+    10_000
+}
+fn default_web_search_results() -> usize {
+    8
+}
+fn default_web_search_response_bytes() -> usize {
+    1 << 20
+}
 fn default_listen() -> SocketAddr {
     "127.0.0.1:8080".parse().expect("static address")
 }
 fn default_context() -> u32 {
     4096
+}
+fn default_publication_interval_tokens() -> usize {
+    32
 }
 fn default_gpu_layers() -> i32 {
     99
@@ -246,9 +288,9 @@ impl DaemonConfig {
                 "context reserve exceeds storage capacity".into(),
             ));
         }
-        if self.execution.context_tokens == 0 {
+        if self.execution.context_tokens == 0 || self.execution.publication_interval_tokens == 0 {
             return Err(ConfigError::Invalid(
-                "context_tokens must be nonzero".into(),
+                "context_tokens and publication_interval_tokens must be nonzero".into(),
             ));
         }
         if self.vision.max_images == 0
@@ -262,6 +304,19 @@ impl DaemonConfig {
         if self.vision.retention_capacity.0 < self.vision.max_decoded_bytes as u64 {
             return Err(ConfigError::Invalid(
                 "vision retention capacity is smaller than one decoded image limit".into(),
+            ));
+        }
+        if self.hosted_tools.web_search.enabled && self.hosted_tools.web_search.endpoint.is_none() {
+            return Err(ConfigError::Invalid(
+                "hosted_tools.web_search.endpoint is required when web search is enabled".into(),
+            ));
+        }
+        if self.hosted_tools.web_search.timeout_ms == 0
+            || self.hosted_tools.web_search.max_results == 0
+            || self.hosted_tools.web_search.max_response_bytes == 0
+        {
+            return Err(ConfigError::Invalid(
+                "hosted web-search limits must be nonzero".into(),
             ));
         }
         Ok(self)
@@ -297,6 +352,7 @@ mod tests {
             unsafe_public_unauthenticated: false,
             bearer_token: None,
             http_debug: HttpDebugLevel::Off,
+            native_debug: false,
             openapi: OpenApiConfig::default(),
             paths: DataPaths {
                 database: "db".into(),
@@ -311,14 +367,40 @@ mod tests {
                 storage_capacity: ByteSize(2),
                 context_reserve: ByteSize(1),
                 context_tokens: 1,
+                publication_interval_tokens: 32,
                 gpu_layers: 0,
                 require_competent: false,
             },
             server: ServerConfig::default(),
             scheduler: SchedulerPolicyConfig::default(),
             vision: VisionConfig::default(),
+            hosted_tools: HostedToolsConfig {
+                web_search: WebSearchConfig {
+                    timeout_ms: default_web_search_timeout_ms(),
+                    max_results: default_web_search_results(),
+                    max_response_bytes: default_web_search_response_bytes(),
+                    ..WebSearchConfig::default()
+                },
+            },
         }
     }
+
+    #[test]
+    fn native_debug_defaults_off_and_accepts_explicit_enablement() {
+        let yaml = "version: 1\npaths: {database: db, models: models, spill: spill, user_models: local, user_config: user.yaml}\nexecution: {device_capacity: '1 GiB', host_capacity: '1 GiB', storage_capacity: '2 GiB', context_reserve: '1 GiB'}\n";
+        assert!(
+            !serde_yaml::from_str::<DaemonConfig>(yaml)
+                .unwrap()
+                .native_debug
+        );
+        let yaml = format!("native_debug: true\n{yaml}");
+        assert!(
+            serde_yaml::from_str::<DaemonConfig>(&yaml)
+                .unwrap()
+                .native_debug
+        );
+    }
+
     #[test]
     fn http_debug_overrides_follow_cli_environment_configuration_precedence() {
         let mut config = valid();
@@ -342,7 +424,7 @@ mod tests {
 
     #[test]
     fn validates_versions_capacities_and_vision_limits() {
-        assert!(valid().validate().is_ok());
+        valid().validate().unwrap();
         let mut config = valid();
         config.version = 2;
         assert!(matches!(config.validate(), Err(ConfigError::Version(2))));
@@ -361,6 +443,9 @@ mod tests {
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
         let mut config = valid();
         config.execution.context_tokens = 0;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        let mut config = valid();
+        config.execution.publication_interval_tokens = 0;
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
         let mut config = valid();
         config.vision.max_images = 0;

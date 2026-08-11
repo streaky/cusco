@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "runner_revision": "1d145321ded86a1cfc7c2852667854957c57c5fb",
+  "runner_revision": "ec5990a76ad7bbe7279bc75fb5af36cb26cd765d",
   "profile": "openai_api",
   "probes": {
     "chat.core.messages": "pass",

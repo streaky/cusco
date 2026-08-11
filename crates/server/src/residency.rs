@@ -27,6 +27,7 @@ pub struct ResidencyConfig {
     pub storage_bytes: u64,
     pub context_reserve_bytes: u64,
     pub n_ctx: u32,
+    pub publication_interval_tokens: usize,
     pub gpu_layers: i32,
     pub require_competent: bool,
 }
@@ -37,6 +38,7 @@ impl ResidencyConfig {
             || self.host_bytes == 0
             || self.storage_bytes == 0
             || self.n_ctx == 0
+            || self.publication_interval_tokens == 0
         {
             return Err(Error::State(
                 "residency budgets and context size must be nonzero".into(),
@@ -81,6 +83,9 @@ trait ModelLoader: Send + Sync {
         model: &ModelRecord,
         config: ResidencyConfig,
     ) -> Result<(Arc<dyn InferenceEngine>, OperatingPoint), Error>;
+    fn free_accelerator_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 struct NativeLoader {
@@ -106,17 +111,14 @@ impl ModelLoader for NativeLoader {
             Some(spill_dir),
             usize::try_from(config.context_reserve_bytes)
                 .map_err(|_| Error::State("context reserve exceeds address space".into()))?,
+            config.publication_interval_tokens,
         )?;
-        if engine.model_architecture() != model.family {
-            return Err(Error::State(format!(
-                "catalog model family {} does not match native architecture {}",
-                model.family,
-                engine.model_architecture()
-            )));
-        }
         let mut point = engine.operating_point();
         point.model_bytes = model.size_bytes;
         Ok((engine, point))
+    }
+    fn free_accelerator_bytes(&self) -> Option<u64> {
+        Some(cusco_executor::free_accelerator_bytes())
     }
 }
 
@@ -282,9 +284,56 @@ impl ResidentEngine {
             .map_err(|error| Error::State(error.to_string()))
     }
 
+    fn model_block_count(model: &ModelRecord) -> Result<u32, Error> {
+        if model.block_count > 0 {
+            return Ok(model.block_count);
+        }
+        cusco_model_registry::probe_gguf(&model.path)
+            .map_err(super::state_err)?
+            .block_count
+            .filter(|count| *count > 0)
+            .ok_or_else(|| Error::State("model GGUF does not declare a block count".into()))
+    }
+
+    fn select_gpu_layers(
+        config: ResidencyConfig,
+        model_bytes: u64,
+        model_layers: u32,
+    ) -> u32 {
+        if config.gpu_layers <= 0 || model_bytes == 0 || model_layers == 0 {
+            return 0;
+        }
+        // Loaded operating points retain five percent allocator headroom. Select
+        // against the same bound so the conservative estimate can pass the
+        // authoritative post-load capacity check.
+        let point_budget = config.device_bytes.saturating_mul(20) / 21;
+        let model_budget = point_budget.saturating_sub(config.context_reserve_bytes);
+        let budget_layers = (u128::from(model_budget) * u128::from(model_layers)
+            / u128::from(model_bytes))
+        .min(u128::from(u32::MAX)) as u32;
+        budget_layers
+            .min(config.gpu_layers as u32)
+            .min(model_layers)
+    }
+
+    fn estimate_device_bytes(model_bytes: u64, model_layers: u32, gpu_layers: u32) -> u64 {
+        if gpu_layers == 0 || model_layers == 0 {
+            return 0;
+        }
+        let numerator = u128::from(model_bytes) * u128::from(gpu_layers);
+        let bytes = numerator.div_ceil(u128::from(model_layers));
+        bytes.min(u128::from(u64::MAX)) as u64
+    }
+
     fn estimate(&self, model: &ModelRecord) -> Result<OperatingPoint, Error> {
+        let mut effective_config = self.config;
+        if let Some(free_bytes) = self.loader.free_accelerator_bytes() {
+            effective_config.device_bytes = effective_config.device_bytes.min(free_bytes);
+        }
         if let Some(profile) = self.cached_profile(model)? {
-            return Ok(profile);
+            if profile.device_bytes <= effective_config.device_bytes {
+                return Ok(profile);
+            }
         }
         let model_bytes = if model.size_bytes == 0 {
             fs::metadata(&model.path).map_err(super::state_err)?.len()
@@ -296,25 +345,31 @@ impl ResidentEngine {
                 "model exceeds the configured storage residency budget".into(),
             ));
         }
-        let (device_bytes, host_bytes) = if self.config.gpu_layers > 0 {
-            (
-                model_bytes.saturating_add(self.config.context_reserve_bytes),
-                0,
-            )
+        let model_layers = Self::model_block_count(model)?;
+        let gpu_layers = Self::select_gpu_layers(effective_config, model_bytes, model_layers);
+        let device_bytes = if gpu_layers == 0 {
+            0
         } else {
-            (
-                0,
-                model_bytes.saturating_add(self.config.context_reserve_bytes),
-            )
+            Self::estimate_device_bytes(model_bytes, model_layers, gpu_layers)
+                .saturating_add(self.config.context_reserve_bytes)
         };
+        let host_bytes = model_bytes.saturating_add(self.config.context_reserve_bytes);
+        let competent = gpu_layers == model_layers;
+        if self.config.require_competent && !competent {
+            return Err(Error::State(
+                "configured residency budgets cannot fit a competent operating point".into(),
+            ));
+        }
         Ok(OperatingPoint {
             model_bytes,
             context_bytes: self.config.context_reserve_bytes,
             device_bytes,
             host_bytes,
-            gpu_layers: self.config.gpu_layers,
-            model_layers: 0,
-            competent: !self.config.require_competent || self.config.gpu_layers > 0,
+            gpu_layers: i32::try_from(gpu_layers)
+                .map_err(|_| Error::State("selected GPU layer count exceeds i32".into()))?,
+            model_layers: i32::try_from(model_layers)
+                .map_err(|_| Error::State("model layer count exceeds i32".into()))?,
+            competent,
         })
     }
     fn fits_with(
@@ -424,7 +479,11 @@ impl ResidentEngine {
             victims
         };
 
-        let loaded = self.loader.load(model, self.config);
+        let selected_config = ResidencyConfig {
+            gpu_layers: estimate.gpu_layers,
+            ..self.config
+        };
+        let loaded = self.loader.load(model, selected_config);
         let (engine, point) = match loaded {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -799,6 +858,10 @@ mod tests {
         failures: Mutex<Vec<String>>,
         blocker: Option<(Arc<Barrier>, Arc<Barrier>)>,
     }
+    struct FreeMemoryLoader {
+        free_bytes: u64,
+    }
+
 
     struct BlockingEngine {
         entered: Arc<Barrier>,
@@ -888,6 +951,20 @@ mod tests {
             Ok((Arc::new(DemotableEngine), self.point))
         }
     }
+    impl ModelLoader for FreeMemoryLoader {
+        fn load(
+            &self,
+            _model: &ModelRecord,
+            _config: ResidencyConfig,
+        ) -> Result<(Arc<dyn InferenceEngine>, OperatingPoint), Error> {
+            unreachable!("free-memory selection test does not load the model")
+        }
+
+        fn free_accelerator_bytes(&self) -> Option<u64> {
+            Some(self.free_bytes)
+        }
+    }
+
 
     impl ModelLoader for FixtureLoader {
         fn load(
@@ -921,10 +998,43 @@ mod tests {
             storage_bytes: capacity,
             context_reserve_bytes: 1,
             n_ctx: 128,
+            publication_interval_tokens: 32,
             gpu_layers: 1,
             require_competent: true,
         }
     }
+    #[test]
+    fn estimate_caps_gpu_layers_to_current_free_accelerator_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let mut residency = config(30 * GIB);
+        residency.device_bytes = 10 * GIB;
+        residency.context_reserve_bytes = 4 * GIB;
+        residency.gpu_layers = 99;
+        residency.require_competent = false;
+        let engine = ResidentEngine::with_loader(
+            residency,
+            Arc::new(FreeMemoryLoader {
+                free_bytes: 5 * GIB,
+            }),
+        );
+        let model = ModelRecord {
+            id: "large".into(),
+            revision: "r".into(),
+            path: PathBuf::from("/model.gguf"),
+            sha256: "abc".into(),
+            aliases: vec![],
+            family: "qwen35moe".into(),
+            size_bytes: 20 * GIB,
+            block_count: 40,
+            epoch: 1,
+        };
+
+        let point = engine.estimate(&model).unwrap();
+
+        assert_eq!(point.gpu_layers, 1);
+        assert!(point.device_bytes <= 5 * GIB);
+    }
+
 
     fn point(bytes: u64) -> OperatingPoint {
         OperatingPoint {
@@ -947,8 +1057,95 @@ mod tests {
             aliases: vec![],
             family: "gemma4".into(),
             size_bytes: bytes,
+            block_count: 1,
             epoch,
         }
+    }
+
+    struct CapturingLoader {
+        gpu_layers: Mutex<Vec<i32>>,
+    }
+
+    impl ModelLoader for CapturingLoader {
+        fn load(
+            &self,
+            model: &ModelRecord,
+            config: ResidencyConfig,
+        ) -> Result<(Arc<dyn InferenceEngine>, OperatingPoint), Error> {
+            self.gpu_layers.lock().push(config.gpu_layers);
+            Ok((
+                Arc::new(DeterministicEngine),
+                OperatingPoint {
+                    model_bytes: model.size_bytes,
+                    context_bytes: config.context_reserve_bytes,
+                    device_bytes: 0,
+                    host_bytes: model
+                        .size_bytes
+                        .saturating_add(config.context_reserve_bytes),
+                    gpu_layers: config.gpu_layers,
+                    model_layers: model.block_count as i32,
+                    competent: config.gpu_layers == model.block_count as i32,
+                },
+            ))
+        }
+    }
+
+    #[test]
+    fn selects_largest_conservative_hybrid_layer_count() {
+        let mut split = config(200);
+        split.device_bytes = 64;
+        split.context_reserve_bytes = 10;
+        split.gpu_layers = 10;
+        split.require_competent = false;
+        assert_eq!(ResidentEngine::select_gpu_layers(split, 100, 10), 5);
+
+        split.gpu_layers = 3;
+        assert_eq!(ResidentEngine::select_gpu_layers(split, 100, 10), 3);
+
+        split.device_bytes = 10;
+        assert_eq!(ResidentEngine::select_gpu_layers(split, 100, 10), 0);
+    }
+
+    #[test]
+    fn passes_selected_hybrid_layer_count_to_loader() {
+        let loader = Arc::new(CapturingLoader {
+            gpu_layers: Mutex::new(Vec::new()),
+        });
+        let mut split = config(200);
+        split.device_bytes = 64;
+        split.context_reserve_bytes = 10;
+        split.gpu_layers = 10;
+        split.require_competent = false;
+        let engine = ResidentEngine::with_loader(split, loader.clone());
+        engine
+            .prepare_model(&ModelRecord {
+                block_count: 10,
+                ..model("hybrid", "r", 1, 100)
+            })
+            .unwrap();
+        assert_eq!(*loader.gpu_layers.lock(), vec![5]);
+        assert_eq!(engine.status()[0].operating_point.gpu_layers, 5);
+    }
+
+    #[test]
+    fn rejects_partial_point_when_competent_execution_is_required() {
+        let loader = Arc::new(CapturingLoader {
+            gpu_layers: Mutex::new(Vec::new()),
+        });
+        let mut required = config(200);
+        required.device_bytes = 64;
+        required.context_reserve_bytes = 10;
+        required.gpu_layers = 10;
+        let engine = ResidentEngine::with_loader(required, loader.clone());
+        assert!(matches!(
+            engine.prepare_model(&ModelRecord {
+                block_count: 10,
+                ..model("competent", "r", 1, 100)
+            }),
+            Err(Error::State(message))
+                if message == "configured residency budgets cannot fit a competent operating point"
+        ));
+        assert!(loader.gpu_layers.lock().is_empty());
     }
 
     #[test]

@@ -2,9 +2,18 @@ version: 1
 listen: 0.0.0.0:8080
 unsafe_public_unauthenticated: false
 http_debug: off
+native_debug: false
 openapi:
   docs_ui:
     enabled: false
+hosted_tools:
+  web_search:
+    enabled: false
+    endpoint: null
+    timeout_ms: 10000
+    max_results: 8
+    max_response_bytes: 1048576
+    allowed_domains: []
 paths:
   database: /data/db/catalog.sqlite
   models: /data/models
@@ -17,6 +26,7 @@ execution:
   storage_capacity: 64 GiB
   context_reserve: 1 GiB
   context_tokens: 4096
+  publication_interval_tokens: 32
   gpu_layers: 99
   require_competent: false
 server:
@@ -46,6 +56,7 @@ scheduler:
   deficit_refill: 1
   prefill_tokens: 32
   promotion_rounds: 64
+  diagnostics_enabled: false
   diagnostic_capacity: 1024
 vision:
   max_images: 8

@@ -9,9 +9,8 @@ pub(crate) struct Message {
 pub(crate) fn apply_chat_template(family: &str, messages: Vec<Message>) -> Result<String, Error> {
     match family {
         "gemma4" => gemma4(messages),
-        _ => Err(Error::BadRequest(format!(
-            "unsupported_capability: model family {family} has no chat template"
-        ))),
+        "qwen35moe" => qwen35moe(messages),
+        _ => Err(unsupported_template(family)),
     }
 }
 pub(crate) fn append_rendered(
@@ -26,18 +25,17 @@ pub(crate) fn append_rendered(
     match family {
         "gemma4" => {
             const GENERATION_PROMPT: &str = "<start_of_turn>model\n";
-            if !prompt.ends_with(GENERATION_PROMPT) {
-                return Err(Error::State(
-                    "rendered Gemma conversation lacks its generation prompt".into(),
-                ));
-            }
-            prompt.truncate(prompt.len() - GENERATION_PROMPT.len());
+            remove_generation_prompt(prompt, GENERATION_PROMPT, "Gemma")?;
             prompt.push_str(continuation);
             Ok(())
         }
-        _ => Err(Error::BadRequest(format!(
-            "unsupported_capability: model family {family} has no chat template"
-        ))),
+        "qwen35moe" => {
+            const GENERATION_PROMPT: &str = "<|im_start|>assistant\n";
+            remove_generation_prompt(prompt, GENERATION_PROMPT, "Qwen")?;
+            prompt.push_str(continuation);
+            Ok(())
+        }
+        _ => Err(unsupported_template(family)),
     }
 }
 pub(crate) fn append_assistant_content(
@@ -48,19 +46,21 @@ pub(crate) fn append_assistant_content(
     match family {
         "gemma4" => {
             const GENERATION_PROMPT: &str = "<start_of_turn>model\n";
-            if !prompt.ends_with(GENERATION_PROMPT) {
-                return Err(Error::State(
-                    "rendered Gemma conversation lacks its generation prompt".into(),
-                ));
-            }
+            require_generation_prompt(prompt, GENERATION_PROMPT, "Gemma")?;
             prompt.push_str(content);
             prompt.push_str("<end_of_turn>\n");
             prompt.push_str(GENERATION_PROMPT);
             Ok(())
         }
-        _ => Err(Error::BadRequest(format!(
-            "unsupported_capability: model family {family} has no chat template"
-        ))),
+        "qwen35moe" => {
+            const GENERATION_PROMPT: &str = "<|im_start|>assistant\n";
+            require_generation_prompt(prompt, GENERATION_PROMPT, "Qwen")?;
+            prompt.push_str(content);
+            prompt.push_str("<|im_end|>\n");
+            prompt.push_str(GENERATION_PROMPT);
+            Ok(())
+        }
+        _ => Err(unsupported_template(family)),
     }
 }
 
@@ -69,27 +69,55 @@ pub(crate) fn insert_generation_instructions(
     prompt: &mut String,
     instructions: &str,
 ) -> Result<(), Error> {
-    match family {
-        "gemma4" => {
-            const GENERATION_SUFFIX: &str = "<end_of_turn>\n<start_of_turn>model\n";
-            let Some(position) = prompt.rfind(GENERATION_SUFFIX) else {
-                return Err(Error::State(
-                    "rendered Gemma conversation lacks its generation suffix".into(),
-                ));
-            };
-            prompt.insert_str(position, instructions);
-            Ok(())
-        }
-        _ => Err(Error::BadRequest(format!(
-            "unsupported_capability: model family {family} has no chat template"
-        ))),
-    }
+    let suffix = match family {
+        "gemma4" => "<end_of_turn>\n<start_of_turn>model\n",
+        "qwen35moe" => "<|im_end|>\n<|im_start|>assistant\n",
+        _ => return Err(unsupported_template(family)),
+    };
+    let Some(position) = prompt.rfind(suffix) else {
+        return Err(Error::State(format!(
+            "rendered conversation for model family {family} lacks its generation suffix"
+        )));
+    };
+    prompt.insert_str(position, instructions);
+    Ok(())
 }
 pub(crate) fn terminal_markers(family: &str) -> &'static [&'static str] {
     match family {
         "gemma4" => &["<end_of_turn>", "</end_of_turn>", "</start_of_turn>"],
+        "qwen35moe" => &["<|im_end|>", "<|endoftext|>"],
         _ => &[],
     }
+}
+
+fn unsupported_template(family: &str) -> Error {
+    Error::BadRequest(format!(
+        "unsupported_capability: model family {family} has no chat template"
+    ))
+}
+
+fn require_generation_prompt(
+    prompt: &str,
+    generation_prompt: &str,
+    family: &str,
+) -> Result<(), Error> {
+    if prompt.ends_with(generation_prompt) {
+        Ok(())
+    } else {
+        Err(Error::State(format!(
+            "rendered {family} conversation lacks its generation prompt"
+        )))
+    }
+}
+
+fn remove_generation_prompt(
+    prompt: &mut String,
+    generation_prompt: &str,
+    family: &str,
+) -> Result<(), Error> {
+    require_generation_prompt(prompt, generation_prompt, family)?;
+    prompt.truncate(prompt.len() - generation_prompt.len());
+    Ok(())
 }
 
 fn gemma4(mut messages: Vec<Message>) -> Result<String, Error> {
@@ -142,6 +170,31 @@ fn gemma4(mut messages: Vec<Message>) -> Result<String, Error> {
     Ok(prompt)
 }
 
+fn qwen35moe(messages: Vec<Message>) -> Result<String, Error> {
+    if messages.is_empty() {
+        return Err(Error::BadRequest("messages must not be empty".into()));
+    }
+    if messages
+        .iter()
+        .any(|message| !matches!(message.role.as_str(), "system" | "user" | "assistant"))
+    {
+        return Err(Error::BadRequest(
+            "Qwen chat supports only system, user, and assistant messages".into(),
+        ));
+    }
+
+    let mut prompt = String::new();
+    for message in messages {
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(&message.role);
+        prompt.push('\n');
+        prompt.push_str(&message.content);
+        prompt.push_str("<|im_end|>\n");
+    }
+    prompt.push_str("<|im_start|>assistant\n");
+    Ok(prompt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +228,48 @@ mod tests {
             "<start_of_turn>user\nBe concise.\n\nHello<end_of_turn>\n<start_of_turn>model\nHi<end_of_turn>\n<start_of_turn>user\nAgain<end_of_turn>\n<start_of_turn>model\n"
         );
         assert_eq!(prompt.matches("<start_of_turn>model\n").count(), 2);
+    }
+
+    #[test]
+    fn applies_qwen_template_and_supports_response_continuation() {
+        let mut prompt = apply_chat_template(
+            "qwen35moe",
+            vec![
+                Message {
+                    role: "system".into(),
+                    content: "Be concise.".into(),
+                },
+                Message {
+                    role: "user".into(),
+                    content: "Hello".into(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            prompt,
+            "<|im_start|>system\nBe concise.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+        );
+
+        append_assistant_content("qwen35moe", &mut prompt, "Hi").unwrap();
+        assert!(prompt.ends_with(
+            "<|im_start|>assistant\nHi<|im_end|>\n<|im_start|>assistant\n"
+        ));
+        insert_generation_instructions("qwen35moe", &mut prompt, "\nUse tools.").unwrap();
+        assert!(prompt.contains("Hi\nUse tools.<|im_end|>"));
+        append_rendered(
+            "qwen35moe",
+            &mut prompt,
+            "<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n",
+        )
+        .unwrap();
+        assert!(prompt.ends_with(
+            "<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n"
+        ));
+        assert_eq!(
+            terminal_markers("qwen35moe"),
+            ["<|im_end|>", "<|endoftext|>"]
+        );
     }
 
     #[test]

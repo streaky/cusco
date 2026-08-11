@@ -28,6 +28,15 @@ fn status(code: i32) -> Result<(), Error> {
         n => Err(Error::Backend(n)),
     }
 }
+pub fn free_accelerator_bytes() -> u64 {
+    // SAFETY: this process-wide query has no pointer arguments or ownership.
+    unsafe { sys::cusco_executor_free_accelerator_bytes() }
+}
+pub fn set_debug_logging(enabled: bool) {
+    // SAFETY: this process-wide setting has no pointer or ownership arguments
+    // and is configured before executor activity begins.
+    unsafe { sys::cusco_executor_set_debug_logging(i32::from(enabled)) }
+}
 
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Capabilities {

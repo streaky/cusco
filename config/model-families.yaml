@@ -1,8 +1,0 @@
-schema_version: 1
-families:
-  - architecture: gemma4
-    block_size: 32
-    required_components:
-      - kv
-      - swa
-      - recurrent

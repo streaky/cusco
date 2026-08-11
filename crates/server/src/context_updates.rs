@@ -196,6 +196,7 @@ mod tests {
                 input_tokens: 1,
                 cached_tokens: 0,
                 output_tokens: 1,
+                reasoning_tokens: 0,
             }),
             metadata: ResponseMetadata::default(),
             lineage_revision: 0,

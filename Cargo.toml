@@ -20,7 +20,8 @@ thiserror = "2.0.17"
 futures-util = "0.3.31"
 http-body-util = "0.1.4"
 parking_lot = "0.12.5"
-ureq = "3.1.4"
+ureq = { version = "=3.0.12", default-features = false, features = ["rustls", "gzip"] }
+url = "2.5.7"
 
 tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 tower = "0.5.2"

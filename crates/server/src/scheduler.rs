@@ -83,6 +83,7 @@ struct DiagnosticLoss {
 }
 
 struct SchedulerDiagnostics {
+    enabled: bool,
     sender: SyncSender<String>,
     emitted: AtomicU64,
     delivered: Arc<AtomicU64>,
@@ -91,14 +92,22 @@ struct SchedulerDiagnostics {
 }
 
 impl SchedulerDiagnostics {
-    fn stderr(capacity: usize) -> Arc<Self> {
-        Self::with_sink(capacity, |line| {
+    fn stderr(capacity: usize, enabled: bool) -> Arc<Self> {
+        Self::with_sink_enabled(capacity, enabled, |line| {
             let mut stderr = std::io::stderr().lock();
             let _ = writeln!(stderr, "{line}");
         })
     }
 
     fn with_sink(capacity: usize, sink: impl Fn(&str) + Send + 'static) -> Arc<Self> {
+        Self::with_sink_enabled(capacity, true, sink)
+    }
+
+    fn with_sink_enabled(
+        capacity: usize,
+        enabled: bool,
+        sink: impl Fn(&str) + Send + 'static,
+    ) -> Arc<Self> {
         let delivered = Arc::new(AtomicU64::new(0));
         let worker_delivered = delivered.clone();
         let (sender, receiver) = mpsc::sync_channel::<String>(capacity);
@@ -112,6 +121,7 @@ impl SchedulerDiagnostics {
             })
             .expect("scheduler diagnostic worker starts");
         Arc::new(Self {
+            enabled,
             sender,
             emitted: AtomicU64::new(0),
             lost: AtomicU64::new(0),
@@ -121,6 +131,9 @@ impl SchedulerDiagnostics {
     }
 
     fn emit<T: Serialize>(&self, kind: &str, record: &T) {
+        if !self.enabled {
+            return;
+        }
         let Ok(line) = serde_json::to_string(record) else {
             self.record_loss("serialization_error");
             return;
@@ -454,7 +467,10 @@ impl WorkloadScheduler {
         let policy = policy.validate()?;
         let diagnostics = match sink {
             Some(sink) => SchedulerDiagnostics::with_sink(policy.diagnostic_capacity, sink),
-            None => SchedulerDiagnostics::stderr(policy.diagnostic_capacity),
+            None => SchedulerDiagnostics::stderr(
+                policy.diagnostic_capacity,
+                policy.diagnostics_enabled,
+            ),
         };
         let counters = Arc::new(SchedulerCounters::default());
         let (events, receiver) = mpsc::channel();
@@ -1236,6 +1252,7 @@ mod tests {
                 aliases: vec![],
                 family: "gemma4".into(),
                 size_bytes: 1,
+                block_count: 1,
                 epoch: 1,
             },
             prompt: std::iter::repeat_n("x", words)
@@ -1365,6 +1382,25 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(scheduler.status().metrics.waiting_for_consumer, 0);
+    }
+
+    #[test]
+    fn scheduler_diagnostics_are_disabled_by_default() {
+        let scheduler = WorkloadScheduler::new(
+            Arc::new(DeterministicEngine),
+            SchedulerPolicyConfig::default(),
+        )
+        .unwrap();
+        let mut session = scheduler
+            .start_session(request(SchedulingClass::Standard, "principal", 1))
+            .unwrap();
+        assert!(matches!(session.step().unwrap(), SessionStep::Token { .. }));
+        session.finish().unwrap();
+        assert!(scheduler.flush_diagnostics(Duration::from_secs(1)));
+        let metrics = scheduler.status().metrics;
+        assert_eq!(metrics.diagnostic_records, 0);
+        assert_eq!(metrics.diagnostic_records_delivered, 0);
+        assert_eq!(metrics.diagnostic_records_lost, 0);
     }
 
     #[test]

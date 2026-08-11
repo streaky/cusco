@@ -28,8 +28,8 @@ services:
     volumes:
       - ./config.yaml:/data/config.yaml:ro
       - ./config/user.yaml:/data/user.yaml:ro
-      - ./data/user-models:/data/user-models:ro
-      - ./data/models:/data/models
+      - "${CUSCO_USER_MODEL_DIR:-./data/user-models}:/data/user-models:ro"
+      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models"
       - ./data/db:/data/db
       - ./data/spill:/data/spill
     deploy:

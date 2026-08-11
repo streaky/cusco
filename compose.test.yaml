@@ -32,9 +32,9 @@ services:
       - fetch
       - hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf
       - --cache
-      - /models/cache
+      - /data/models
     volumes:
-      - "${CUSCO_MODEL_DIR:-./models}:/models"
+      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
       - cargo-target:/work/target
@@ -42,10 +42,11 @@ services:
     build: *test-build
     command: ["sh", "-c", "nvidia-smi --query-gpu=uuid --format=csv,noheader && cargo run -p cusco -- proof 'hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf'"]
     environment:
+      CUSCO_MODEL_CACHE: "/data/models"
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
     volumes:
-      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models:ro"
       - "${CUSCO_RESULT_DIR:-./results}:/results"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
@@ -55,10 +56,11 @@ services:
     build: *test-build
     command: ["sh", "-c", "nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader > /results/mapped-proof-gpu.csv && cargo run -p cusco -- mapped-proof 'hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf'"]
     environment:
+      CUSCO_MODEL_CACHE: "/data/models"
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
     volumes:
-      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models:ro"
       - "${CUSCO_RESULT_DIR:-./results}:/results"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
@@ -68,10 +70,11 @@ services:
     build: *test-build
     command: ["sh", "-c", "nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader > /results/representation-proof-gpu.csv && cargo run -p cusco -- representation-proof 'hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf'"]
     environment:
+      CUSCO_MODEL_CACHE: "/data/models"
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
     volumes:
-      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
+      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models:ro"
       - "${CUSCO_RESULT_DIR:-./results}:/results"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
@@ -96,8 +99,7 @@ services:
       CUSCO_RESULT_DIR: "/results"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
     volumes:
-      - "${CUSCO_MODEL_DIR:-./models}:/models:ro"
-      - "${CUSCO_MODEL_DIR:-./models}/cache:/data/models"
+      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models"
       - "${CUSCO_RESULT_DIR:-./results}:/results"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
@@ -128,8 +130,8 @@ services:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
     volumes:
-      - "${CUSCO_MODEL_DIR:-./models}:/data/user-models"
-      - "${CUSCO_MODEL_DIR:-./models}/cache:/data/models"
+      - "${CUSCO_USER_MODEL_DIR:-./data/user-models}:/data/user-models:ro"
+      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models"
       - "${CUSCO_RESULT_DIR:-./results}:/results"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
@@ -164,8 +166,8 @@ services:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
     volumes:
-      - "${CUSCO_MODEL_DIR:-./models}:/data/user-models"
-      - "${CUSCO_MODEL_DIR:-./models}/cache:/data/models"
+      - "${CUSCO_USER_MODEL_DIR:-./data/user-models}:/data/user-models:ro"
+      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
       - cargo-target:/work/target
@@ -201,6 +203,7 @@ services:
       CANDIDATE_API_KEY: "${CUSCO_OAI_LENS_TOKEN:-smoke-report-token}"
     volumes:
       - ./config/oai-lens.yaml:/config/oai-lens.yaml:ro
+      - ./.tools/oai-lens/fixtures:/app/.venv/lib/python3.12/site-packages/fixtures:ro
       - ./config/oai-lens-expectations.json:/cusco/config/oai-lens-expectations.json:ro
       - ./oai-lens-version.txt:/cusco/oai-lens-version.txt:ro
       - ./tools/oai-lens-gate.py:/cusco/tools/oai-lens-gate.py:ro

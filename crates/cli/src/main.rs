@@ -169,14 +169,15 @@ fn run(command: Command) -> Result<()> {
         Command::Serve { config, http_debug } => {
             use cusco_server::{
                 AnonymousAdmin, AuthProvider, BearerAuth, DaemonConfig, HttpDebugLevel,
-                ModelCatalog, ModelRecord, ResidencyConfig, ResidentEngine, Server,
-                WorkloadScheduler, load_user_models,
+                ModelCatalog, ModelRecord, ResidencyConfig, ResidentEngine, SearxngHostedTools,
+                Server, WebSearchPolicy, WorkloadScheduler, load_user_models,
             };
             let config = DaemonConfig::load(config)?;
             let http_debug = config.resolve_http_debug(
                 http_debug,
                 std::env::var("CUSCO_HTTP_DEBUG").ok().as_deref(),
             )?;
+            cusco_executor::set_debug_logging(config.native_debug);
             let bearer_token = std::env::var("CUSCO_BEARER_TOKEN")
                 .ok()
                 .or_else(|| config.bearer_token.clone());
@@ -193,6 +194,7 @@ fn run(command: Command) -> Result<()> {
                     storage_bytes: config.execution.storage_capacity.0,
                     context_reserve_bytes: config.execution.context_reserve.0,
                     n_ctx: config.execution.context_tokens,
+                    publication_interval_tokens: config.execution.publication_interval_tokens,
                     gpu_layers: config.execution.gpu_layers,
                     require_competent: config.execution.require_competent,
                 },
@@ -210,6 +212,21 @@ fn run(command: Command) -> Result<()> {
             server.configure(config.server)?;
             server.configure_vision(config.vision);
             server.configure_openapi(config.openapi);
+            if config.hosted_tools.web_search.enabled {
+                let search = &config.hosted_tools.web_search;
+                server.configure_hosted_tools(Arc::new(SearxngHostedTools::new(
+                    WebSearchPolicy {
+                        endpoint: search
+                            .endpoint
+                            .clone()
+                            .expect("validated enabled web-search endpoint"),
+                        timeout: Duration::from_millis(search.timeout_ms),
+                        max_results: search.max_results,
+                        max_response_bytes: search.max_response_bytes,
+                        allowed_domains: search.allowed_domains.clone(),
+                    },
+                )?));
+            }
             server.attach_catalog(catalog.clone(), config.paths.models.clone());
             for model in catalog.models()? {
                 server.register_catalog_model(model)?;
@@ -236,6 +253,7 @@ fn run(command: Command) -> Result<()> {
                         aliases: declaration.aliases,
                         family: metadata.architecture,
                         size_bytes: registered.size,
+                        block_count: metadata.block_count.unwrap_or(0),
                         epoch: 0,
                     },
                 )?;
@@ -400,6 +418,7 @@ fn scheduler_proof(
         aliases: Vec::new(),
         family: workload.model_family.clone(),
         size_bytes: model_size,
+        block_count: 0,
         epoch: 1,
     };
     let diagnostics = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -989,12 +1008,9 @@ fn proof(options: ProofOptions) -> Result<()> {
     let capabilities = executor.capabilities();
     let architecture = executor.model_architecture()?;
     ensure!(
-        architecture == "gemma4",
-        "reference model reported unsupported architecture {architecture}"
-    );
-    ensure!(
-        capabilities.global_kv && capabilities.swa && capabilities.recurrent,
-        "model lacks a complete composite checkpoint capability"
+        capabilities.mapped_execution
+            && (capabilities.global_kv || capabilities.swa || capabilities.recurrent),
+        "model lacks the state-component capabilities required for mapped execution"
     );
     let replacement = executor.tokenize(&replacement)?;
     let mut contexts = Vec::new();

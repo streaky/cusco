@@ -7,13 +7,13 @@ use cusco_context_store::{
     PersistentTokenSequence,
 };
 use cusco_executor::{
-    Decode, Executor, MappingState, OperatingPoint, RepresentationHandle, Sampler,
+    Capabilities, Decode, Executor, MappingState, OperatingPoint, RepresentationHandle, Sampler,
 };
 use cusco_physical_manager::{
     Capacity, Component, PhysicalManager, PhysicalRepresentationId, Tier,
 };
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     collections::HashMap,
     fs,
@@ -24,101 +24,64 @@ use std::{
 
 const ADAPTER_EPOCH: AdapterEpoch = AdapterEpoch(0);
 const EXECUTION_SLOT: LogicalContextId = LogicalContextId(u64::MAX);
+const DEFAULT_PUBLICATION_INTERVAL_TOKENS: usize = 32;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct ProfileCatalog {
-    schema_version: u32,
-    families: Vec<ExecutionProfile>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionProfile {
-    pub architecture: String,
-    pub block_size: usize,
-    required_components: Vec<ProfileComponent>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum ProfileComponent {
-    Kv,
-    Swa,
-    Recurrent,
+#[derive(Clone, Copy, Debug)]
+struct ExecutionProfile {
+    publication_interval_tokens: usize,
+    required_components: ComponentMask,
 }
 
 impl ExecutionProfile {
-    pub fn bundled_for_architecture(architecture: &str) -> Result<Self, Error> {
-        let catalog_source = include_str!("../../../config/model-families.yaml");
-        let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../../../config/model-families.schema.json"))
-                .map_err(state_error)?;
-        let catalog_value: serde_json::Value =
-            serde_yaml::from_str(catalog_source).map_err(state_error)?;
-        let validator = jsonschema::JSONSchema::options()
-            .with_draft(jsonschema::Draft::Draft202012)
-            .compile(&schema)
-            .map_err(|error| Error::State(format!("invalid model-family schema: {error}")))?;
-        if let Err(mut errors) = validator.validate(&catalog_value) {
-            let error = errors.next().expect("schema validation returned an error");
-            return Err(Error::State(format!(
-                "invalid model-family catalog: {error}"
-            )));
-        }
-        let catalog: ProfileCatalog = serde_json::from_value(catalog_value).map_err(state_error)?;
-        let mut matches = catalog
-            .families
-            .into_iter()
-            .filter(|profile| profile.architecture == architecture);
-        let profile = matches.next().ok_or_else(|| {
-            Error::State(format!("unsupported model architecture: {architecture}"))
-        })?;
-        if matches.next().is_some() {
-            return Err(Error::State(format!(
-                "multiple execution profiles for model architecture: {architecture}"
-            )));
-        }
-        profile.validate()?;
-        Ok(profile)
-    }
-
-    fn validate(&self) -> Result<(), Error> {
-        if self.architecture.is_empty() || self.block_size == 0 {
-            return Err(Error::State("invalid execution profile".into()));
-        }
-        let required = self.required_mask();
-        if !required.contains(ComponentMask::GLOBAL_KV)
-            || !required.contains(ComponentMask::SWA)
-            || !required.contains(ComponentMask::RECURRENT)
-        {
+    fn from_capabilities(
+        capabilities: &Capabilities,
+        publication_interval_tokens: usize,
+    ) -> Result<Self, Error> {
+        if publication_interval_tokens == 0 {
             return Err(Error::State(
-                "execution profile omits a required component".into(),
+                "prefix publication interval must be nonzero".into(),
             ));
         }
-        Ok(())
+        if !capabilities.mapped_execution {
+            return Err(Error::State(
+                "executor does not support mapped execution".into(),
+            ));
+        }
+        let mut required_components = ComponentMask::EMPTY;
+        if capabilities.global_kv {
+            required_components = required_components.union(ComponentMask::GLOBAL_KV);
+        }
+        if capabilities.swa {
+            required_components = required_components.union(ComponentMask::SWA);
+        }
+        if capabilities.recurrent {
+            required_components = required_components.union(ComponentMask::RECURRENT);
+        }
+        if required_components == ComponentMask::EMPTY {
+            return Err(Error::State(
+                "executor did not report any checkpoint state components".into(),
+            ));
+        }
+        Ok(Self {
+            publication_interval_tokens,
+            required_components,
+        })
     }
 
-    fn required_mask(&self) -> ComponentMask {
+    fn required_mask(self) -> ComponentMask {
         self.required_components
-            .iter()
-            .fold(ComponentMask::EMPTY, |mask, component| {
-                mask.union(match component {
-                    ProfileComponent::Kv => ComponentMask::GLOBAL_KV,
-                    ProfileComponent::Swa => ComponentMask::SWA,
-                    ProfileComponent::Recurrent => ComponentMask::RECURRENT,
-                })
-            })
     }
 
-    fn components(&self) -> impl Iterator<Item = Component> + '_ {
-        self.required_components
-            .iter()
-            .map(|component| match component {
-                ProfileComponent::Kv => Component::GlobalKv,
-                ProfileComponent::Swa => Component::SlidingWindow,
-                ProfileComponent::Recurrent => Component::Recurrent,
-            })
+    fn components(self) -> impl Iterator<Item = Component> {
+        [
+            (ComponentMask::GLOBAL_KV, Component::GlobalKv),
+            (ComponentMask::SWA, Component::SlidingWindow),
+            (ComponentMask::RECURRENT, Component::Recurrent),
+        ]
+        .into_iter()
+        .filter_map(move |(mask, component)| {
+            self.required_components.contains(mask).then_some(component)
+        })
     }
 }
 
@@ -159,23 +122,20 @@ struct MappedState {
     physical: PhysicalManager,
     model_epoch: ModelEpoch,
     resident: HashMap<EvaluatedPrefixId, ResidentMapping>,
-    metrics: MappedMetrics,
+    spill_dir: Option<PathBuf>,
+    spill_capacity: usize,
     spill_bytes: usize,
+    metrics: MappedMetrics,
 }
 
 pub struct MappedEngine {
     profile: ExecutionProfile,
     model_path: String,
     context_capacity: usize,
-    spill_dir: Option<PathBuf>,
-    spill_capacity: usize,
     state: Arc<Mutex<MappedState>>,
 }
 
 impl MappedEngine {
-    pub(crate) fn model_architecture(&self) -> &str {
-        &self.profile.architecture
-    }
     pub fn open(
         model_path: impl AsRef<Path>,
         n_ctx: u32,
@@ -210,6 +170,7 @@ impl MappedEngine {
             model_epoch,
             None,
             0,
+            DEFAULT_PUBLICATION_INTERVAL_TOKENS,
         )
     }
 
@@ -223,6 +184,7 @@ impl MappedEngine {
         model_epoch: ModelEpoch,
         spill_dir: Option<PathBuf>,
         spill_capacity: usize,
+        publication_interval_tokens: usize,
     ) -> Result<Arc<Self>, Error> {
         if let Some(path) = &spill_dir {
             reset_spill_directory(path)?;
@@ -233,18 +195,9 @@ impl MappedEngine {
             .ok_or_else(|| Error::State("model path is not UTF-8".into()))?
             .to_owned();
         let mut executor = Executor::open(&model_path, n_ctx, gpu_layers).map_err(state_error)?;
-        let architecture = executor.model_architecture().map_err(state_error)?;
-        let profile = ExecutionProfile::bundled_for_architecture(&architecture)?;
         let capabilities = executor.capabilities();
-        if !capabilities.mapped_execution
-            || !capabilities.global_kv
-            || !capabilities.swa
-            || !capabilities.recurrent
-        {
-            return Err(Error::State(
-                "executor does not satisfy the execution profile".into(),
-            ));
-        }
+        let profile =
+            ExecutionProfile::from_capabilities(&capabilities, publication_interval_tokens)?;
         if capabilities.training_context_tokens == 0 {
             return Err(Error::State(
                 "executor did not report the model context capacity".into(),
@@ -256,8 +209,6 @@ impl MappedEngine {
             profile,
             context_capacity: n_ctx as usize,
             model_path,
-            spill_dir,
-            spill_capacity,
             state: Arc::new(Mutex::new(MappedState {
                 executor,
                 root,
@@ -267,9 +218,11 @@ impl MappedEngine {
                     host_bytes,
                 }),
                 resident: HashMap::new(),
+                spill_dir,
+                spill_capacity,
+                spill_bytes: 0,
                 model_epoch,
                 metrics: MappedMetrics::default(),
-                spill_bytes: 0,
             })),
         }))
     }
@@ -279,69 +232,8 @@ impl MappedEngine {
     }
 
     pub fn spill_inactive_mappings(&self) -> Result<usize, Error> {
-        let Some(spill_dir) = &self.spill_dir else {
-            return Ok(0);
-        };
         let mut state = self.state.lock();
-        let active = state.executor.mapping_metrics().active_identity;
-        let candidates = state
-            .resident
-            .iter()
-            .filter_map(|(id, resident)| {
-                resident
-                    .native
-                    .as_ref()
-                    .filter(|native| native.identity() != active)
-                    .cloned()
-                    .map(|native| (*id, native))
-            })
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return Ok(0);
-        }
-        let _ = state.physical.release_binding(EXECUTION_SLOT);
-        let mut spilled = 0;
-        for (id, native) in candidates {
-            let mapping = state
-                .executor
-                .export_mapping(&native)
-                .map_err(state_error)?;
-            if state.spill_bytes.saturating_add(mapping.bytes.len()) > self.spill_capacity {
-                continue;
-            }
-            let name = hex::encode(id.0);
-            let path = spill_dir.join(format!("{name}.seq"));
-            let temporary = path.with_extension("seq.tmp");
-            fs::write(&temporary, &mapping.bytes).map_err(state_error)?;
-            fs::rename(&temporary, &path).map_err(state_error)?;
-            let representations = state
-                .resident
-                .get(&id)
-                .expect("spill candidate remains resident")
-                .representations
-                .clone();
-            for representation in representations {
-                state
-                    .physical
-                    .demote_to_storage(representation)
-                    .map_err(state_error)?;
-            }
-            let bytes = mapping.bytes.len();
-            let resident = state.resident.get_mut(&id).unwrap();
-            resident.native = None;
-            resident.spill = Some(SpilledMapping {
-                path,
-                bytes,
-                position: mapping.position,
-            });
-            state.spill_bytes += bytes;
-            spilled += 1;
-        }
-        Ok(spilled)
-    }
-
-    pub fn profile(&self) -> &ExecutionProfile {
-        &self.profile
+        spill_inactive_mappings(&mut state)
     }
 
     pub fn model_path(&self) -> &str {
@@ -351,6 +243,64 @@ impl MappedEngine {
     pub fn operating_point(&self) -> OperatingPoint {
         self.state.lock().executor.operating_point()
     }
+}
+
+fn spill_inactive_mappings(state: &mut MappedState) -> Result<usize, Error> {
+    let Some(spill_dir) = state.spill_dir.clone() else {
+        return Ok(0);
+    };
+    let active = state.executor.mapping_metrics().active_identity;
+    let candidates = state
+        .resident
+        .iter()
+        .filter_map(|(id, resident)| {
+            resident
+                .native
+                .as_ref()
+                .filter(|native| native.identity() != active)
+                .cloned()
+                .map(|native| (*id, native))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let _ = state.physical.release_binding(EXECUTION_SLOT);
+    let mut spilled = 0;
+    for (id, native) in candidates {
+        let mapping = state.executor.export_mapping(&native).map_err(state_error)?;
+        if state.spill_bytes.saturating_add(mapping.bytes.len()) > state.spill_capacity {
+            continue;
+        }
+        let name = hex::encode(id.0);
+        let path = spill_dir.join(format!("{name}.seq"));
+        let temporary = path.with_extension("seq.tmp");
+        fs::write(&temporary, &mapping.bytes).map_err(state_error)?;
+        fs::rename(&temporary, &path).map_err(state_error)?;
+        let representations = state
+            .resident
+            .get(&id)
+            .expect("spill candidate remains resident")
+            .representations
+            .clone();
+        for representation in representations {
+            state
+                .physical
+                .demote_to_storage(representation)
+                .map_err(state_error)?;
+        }
+        let bytes = mapping.bytes.len();
+        let resident = state.resident.get_mut(&id).unwrap();
+        resident.native = None;
+        resident.spill = Some(SpilledMapping {
+            path,
+            bytes,
+            position: mapping.position,
+        });
+        state.spill_bytes += bytes;
+        spilled += 1;
+    }
+    Ok(spilled)
 }
 
 struct MappedSession {
@@ -490,8 +440,8 @@ impl MappedSession {
         }));
         self.request.control.check()?;
         self.activate_owned(&mut state)?;
-        let next_block = ((self.evaluated / self.profile.block_size) + 1)
-            .saturating_mul(self.profile.block_size);
+        let next_block = ((self.evaluated / self.profile.publication_interval_tokens) + 1)
+            .saturating_mul(self.profile.publication_interval_tokens);
         let end = self.tokens.len().min(next_block).min(
             self.evaluated
                 .saturating_add(self.request.prefill_chunk_tokens),
@@ -506,14 +456,14 @@ impl MappedSession {
         self.request.control.check()?;
         state.metrics.decoded_tokens += charged as u64;
         self.evaluated = end;
-        if self.evaluated % self.profile.block_size == 0 {
+        if self.evaluated % self.profile.publication_interval_tokens == 0 {
             let snapshot = snapshot_active_mapping(
                 &mut state.executor,
                 self.active_mapping
                     .as_ref()
                     .expect("prepared mapping exists"),
             )?;
-            self.parent = Some(publish_block(
+            if let Some(published) = publish_block(
                 &mut state,
                 &self.profile,
                 self.logical_context.expect("prepared context exists"),
@@ -521,7 +471,9 @@ impl MappedSession {
                 self.parent,
                 snapshot,
                 self.next.as_ref().expect("decode result exists"),
-            )?);
+            )? {
+                self.parent = Some(published);
+            }
         }
         self.prefill.uncached_prefill_ns = self
             .prefill
@@ -582,14 +534,14 @@ impl MappedSession {
             self.request.control.check()?;
             state.metrics.decoded_tokens += 1;
             self.evaluated += 1;
-            if self.evaluated % self.profile.block_size == 0 {
+            if self.evaluated % self.profile.publication_interval_tokens == 0 {
                 let snapshot = snapshot_active_mapping(
                     &mut state.executor,
                     self.active_mapping
                         .as_ref()
                         .expect("prepared mapping exists"),
                 )?;
-                self.parent = Some(publish_block(
+                if let Some(published) = publish_block(
                     &mut state,
                     &self.profile,
                     self.logical_context.expect("prepared context exists"),
@@ -597,7 +549,9 @@ impl MappedSession {
                     self.parent,
                     snapshot,
                     self.next.as_ref().expect("decode result exists"),
-                )?);
+                )? {
+                    self.parent = Some(published);
+                }
             }
         }
         Ok(SessionStep::Token {
@@ -725,7 +679,7 @@ impl InferenceEngine for MappedEngine {
                 "mapped execution admits only a resident process-owned model".into(),
             ));
         }
-        let profile = self.profile.clone();
+        let profile = self.profile;
         Ok(Box::new(MappedSession {
             profile,
             context_capacity: self.context_capacity,
@@ -876,14 +830,14 @@ fn publish_block(
     parent: Option<EvaluatedPrefixId>,
     native: RepresentationHandle,
     continuation: &Decode,
-) -> Result<EvaluatedPrefixId, Error> {
+) -> Result<Option<EvaluatedPrefixId>, Error> {
     let required = profile.required_mask();
     let serialized_bytes = state
         .executor
         .describe_representation(&native)
         .map_err(state_error)?
         .serialized_bytes;
-    let component_count = profile.required_components.len();
+    let component_count = profile.components().count();
     let bytes_per_component = serialized_bytes
         .checked_add(component_count.saturating_sub(1))
         .and_then(|bytes| bytes.checked_div(component_count))
@@ -898,9 +852,7 @@ fn publish_block(
         .saturating_add(capacity.device_transition_reserved)
         .saturating_add(capacity.device_detached_transfer_reserved);
     if required_bytes > capacity.device_total.saturating_sub(unavailable) {
-        return Err(Error::State(
-            "device capacity cannot publish the completed block".into(),
-        ));
+        return Ok(None);
     }
     let rollback = parent
         .and_then(|id| state.resident.get(&id))
@@ -911,6 +863,14 @@ fn publish_block(
                 .active_representation()
                 .map_err(state_error)?,
         );
+    let host_capacity = state.physical.metrics();
+    if required_bytes > host_capacity.host_total.saturating_sub(host_capacity.host_used) {
+        spill_inactive_mappings(state)?;
+    }
+    let host_capacity = state.physical.metrics();
+    if required_bytes > host_capacity.host_total.saturating_sub(host_capacity.host_used) {
+        return Ok(None);
+    }
     let prepared_publication = state
         .logical
         .prepare_publication(
@@ -932,7 +892,7 @@ fn publish_block(
     let representations = if let Some(resident) = &existing {
         resident.representations.clone()
     } else {
-        registered.reserve(profile.required_components.len());
+        registered.reserve(component_count);
         for component in profile.components() {
             match state.physical.register(
                 mapping_id,
@@ -1014,7 +974,7 @@ fn publish_block(
         );
         state.metrics.published_blocks += 1;
     }
-    Ok(mapping.id)
+    Ok(Some(mapping.id))
 }
 
 fn release_representations(
@@ -1065,6 +1025,7 @@ mod tests {
             aliases: vec![],
             family: "gemma4".into(),
             size_bytes: 1,
+            block_count: 1,
             epoch: 1,
         }
     }
@@ -1116,41 +1077,19 @@ mod tests {
     }
 
     #[test]
-    fn bundled_profile_is_strict_and_complete() {
-        let profile = ExecutionProfile::bundled_for_architecture("gemma4").unwrap();
-        assert_eq!(profile.block_size, 32);
-        assert!(profile.required_mask().contains(ComponentMask::RECURRENT));
-        let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../../../config/model-families.schema.json"))
-                .unwrap();
-        assert_eq!(schema["properties"]["schema_version"]["const"], 1);
-    }
-
-    #[test]
-    fn profile_selection_rejects_unknown_native_architecture() {
-        assert!(matches!(
-            ExecutionProfile::bundled_for_architecture("unknown"),
-            Err(Error::State(message))
-                if message == "unsupported model architecture: unknown"
-        ));
-    }
-
-    #[test]
-    fn profile_rejects_missing_global_kv() {
-        let mut missing_kv = ExecutionProfile::bundled_for_architecture("gemma4").unwrap();
-        missing_kv
-            .required_components
-            .retain(|component| *component != ProfileComponent::Kv);
-        assert!(
-            !missing_kv
-                .required_mask()
-                .contains(ComponentMask::GLOBAL_KV)
+    fn profile_uses_executor_reported_components_and_validates_interval() {
+        let capabilities = Executor::open("mock://deterministic", 128, 0)
+            .unwrap()
+            .capabilities();
+        let profile = ExecutionProfile::from_capabilities(&capabilities, 64).unwrap();
+        assert_eq!(profile.publication_interval_tokens, 64);
+        assert_eq!(
+            profile.required_mask(),
+            ComponentMask::GLOBAL_KV
+                .union(ComponentMask::SWA)
+                .union(ComponentMask::RECURRENT)
         );
-        assert!(matches!(
-            missing_kv.validate(),
-            Err(Error::State(message))
-                if message == "Gemma profile omits a required execution component"
-        ));
+        assert!(ExecutionProfile::from_capabilities(&capabilities, 0).is_err());
     }
 
     #[test]
@@ -1288,6 +1227,7 @@ mod tests {
             ModelEpoch(1),
             Some(spill_dir.clone()),
             1 << 20,
+            DEFAULT_PUBLICATION_INTERVAL_TOKENS,
         )
         .unwrap();
 
@@ -1309,6 +1249,7 @@ mod tests {
             ModelEpoch(1),
             Some(spill_dir.clone()),
             1 << 20,
+            DEFAULT_PUBLICATION_INTERVAL_TOKENS,
         )
         .unwrap();
         let model = model();
@@ -1356,25 +1297,26 @@ mod tests {
     }
 
     #[test]
-    fn publication_failure_keeps_the_prior_mapping_reusable() {
-        let engine = MappedEngine::open("mock://deterministic", 4096, 0, 250_000, 1 << 20).unwrap();
-        let model = model();
-        let first = engine
-            .generate_collected(test_request(&model, "a".repeat(40), 1, &[]))
-            .unwrap();
-        let failed = engine.generate_collected(test_request(
-            &model,
-            "b".repeat(25),
-            1,
-            &first.successor_tokens,
-        ));
-        assert!(failed.unwrap_err().to_string().contains("cannot publish"));
-        let resumed = engine
-            .generate_collected(test_request(&model, "c", 1, &first.successor_tokens))
-            .unwrap();
-        assert_eq!(resumed.pieces.len(), 1);
-        assert_eq!(engine.metrics().requests, 2);
-        assert!(engine.metrics().cache_hits >= 1);
+    fn publication_capacity_exhaustion_degrades_to_uncached_execution() {
+        for (device_bytes, host_bytes) in [(250_000, 1 << 20), (1 << 20, 250_000)] {
+            let engine =
+                MappedEngine::open("mock://deterministic", 4096, 0, device_bytes, host_bytes)
+                    .unwrap();
+            let model = model();
+            let first = engine
+                .generate_collected(test_request(&model, "a".repeat(40), 1, &[]))
+                .unwrap();
+            let continued = engine
+                .generate_collected(test_request(
+                    &model,
+                    "b".repeat(25),
+                    1,
+                    &first.successor_tokens,
+                ))
+                .unwrap();
+            assert_eq!(continued.pieces.len(), 1);
+            assert_eq!(engine.metrics().requests, 2);
+        }
     }
 
     #[test]

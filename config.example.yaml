@@ -23,12 +23,32 @@ bearer_token: null
 # transport metadata. "full" may expose headers, query values, credentials, and
 # request or response bodies, so enable it only in a controlled environment.
 http_debug: off
+# Emit verbose llama.cpp/GGML executor diagnostics. This includes high-frequency
+# messages such as per-token CUDA graph reuse, so leave it off in normal use.
+native_debug: false
+
 
 openapi:
   docs_ui:
     # Serve interactive API documentation backed by the generated OpenAPI
     # document. This is a documentation browser, not a general-purpose web UI.
     enabled: false
+
+# Server-executed tools. Every capability is disabled until an operator selects
+# and bounds a provider; request tool declarations cannot enable capabilities.
+hosted_tools:
+  web_search:
+    enabled: false
+    # SearXNG JSON search endpoint. Required when enabled. Keep credentials out
+    # of this file and place authenticated providers behind an operator-managed
+    # gateway when necessary.
+    endpoint: null
+    timeout_ms: 10000
+    max_results: 8
+    max_response_bytes: 1048576 # 1 MiB
+    # Empty permits any result domain. A non-empty list is an operator ceiling;
+    # request-level allowed_domains may narrow but never expand it.
+    allowed_domains: []
 
 paths:
   # SQLite catalog for persistent model identity, aliases, and lifecycle records.
@@ -43,9 +63,10 @@ paths:
   user_config: /data/user.yaml
 
 execution:
-  # Maximum model and context bytes admitted to GPU/device memory. Set this below
-  # physical VRAM to leave headroom for CUDA, graphs, and transient allocations.
-  device_capacity: 10 GiB
+  # Maximum model and context bytes admitted to GPU/device memory. This is an
+  # operator ceiling: each load is additionally capped by accelerator memory
+  # currently free, with allocator headroom retained for transient allocations.
+  device_capacity: 30 GiB
   # Maximum model and context bytes admitted to system memory.
   host_capacity: 32 GiB
   # Maximum bytes admitted to the persistent storage tier.
@@ -56,6 +77,9 @@ execution:
   # Native context window allocated per resident model. This is the hard token
   # ceiling before request-tied compaction; larger values consume more KV memory.
   context_tokens: 32768
+  # Publish a reusable evaluated-prefix checkpoint at this token interval.
+  # This is Cusco cache policy, independent of llama.cpp context and KV geometry.
+  publication_interval_tokens: 32
   # Maximum model layers requested for GPU offload. This is an absolute,
   # model-relative cap, not a percentage: values above a model's layer count
   # effectively request full offload, while deeper models may still be partial.
@@ -126,7 +150,12 @@ scheduler:
   prefill_tokens: 64
   # Waiting rounds before monotonically promoting work to prevent starvation.
   promotion_rounds: 64
-  # Number of recent scheduler diagnostic events retained in memory.
+  # Emit one structured scheduler decision record per execution quantum.
+  # This is intentionally off by default because token generation can produce
+  # many records. Enable it only while diagnosing scheduling and fairness.
+  diagnostics_enabled: false
+  # Maximum number of pending scheduler diagnostic records before new records
+  # are counted as lost. This applies only when diagnostics are enabled.
   diagnostic_capacity: 4096
 
 vision:
