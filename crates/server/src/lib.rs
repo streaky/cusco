@@ -16,7 +16,6 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
-    future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -33,6 +32,7 @@ mod catalog;
 mod config;
 mod context_strategy;
 mod context_updates;
+mod daemon;
 mod generation;
 mod hosted_tools;
 mod lifecycle;
@@ -44,8 +44,11 @@ pub mod responses;
 mod scheduler;
 mod structured;
 mod vision;
-pub use catalog::{ModelCatalog, load_user_models};
-pub use config::{DaemonConfig, HostedToolsConfig, OpenApiConfig, VisionConfig, WebSearchConfig};
+pub use catalog::{CatalogError, ModelCatalog, load_user_models};
+pub use config::{
+    ConfigError, DaemonConfig, HostedToolsConfig, OpenApiConfig, VisionConfig, WebSearchConfig,
+};
+pub use daemon::{Daemon, DaemonError};
 pub use context_strategy::{
     CompactionDeclaration, CompactionNoMatchFallback, CompactionProposal, CompactionRequest,
     CompactionResult, CompactionResultReason, CompactionStrategyCatalog, CompactionStrategyInfo,
@@ -1508,11 +1511,11 @@ impl Server {
         drop(admission);
         result
     }
-    fn begin_shutdown(&self) {
+    pub(crate) fn begin_shutdown(&self) {
         self.inner.lock().shutting_down = true;
     }
 
-    fn cancel_remaining(&self) {
+    pub(crate) fn cancel_remaining(&self) {
         let mut guard = self.inner.lock();
         for control in guard.controls.values() {
             control.cancel();
@@ -4696,31 +4699,7 @@ pub fn openapi_document() -> Value {
     })
 }
 
-pub async fn serve(
-    server: Server,
-    addr: SocketAddr,
-    _anonymous: bool,
-    _unsafe_public: bool,
-) -> Result<(), Error> {
-    serve_until(server, addr, None, shutdown_signal()).await
-}
-
-pub async fn serve_with_http_debug(
-    server: Server,
-    addr: SocketAddr,
-    _anonymous: bool,
-    _unsafe_public: bool,
-    level: HttpDebugLevel,
-) -> Result<(), Error> {
-    serve_until(
-        server,
-        addr,
-        Some(HttpDebug::stderr(level)),
-        shutdown_signal(),
-    )
-    .await
-}
-
+#[cfg(test)]
 async fn serve_until(
     server: Server,
     addr: SocketAddr,
@@ -4769,22 +4748,6 @@ async fn serve_until(
     }
 }
 
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}
 
 #[cfg(test)]
 mod tests {

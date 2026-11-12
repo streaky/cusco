@@ -3,7 +3,8 @@ name: cusco-test
 services:
   test:
     build: &test-build
-      context: .
+      context: ../..
+      dockerfile: projects/cusco/Dockerfile
       target: development
     command: ["tools/coverage.sh"]
     volumes:
@@ -117,7 +118,7 @@ services:
       - >-
         mkdir -p /data/db /data/spill /data/user-models /data/models &&
         printf 'models: []\n' > /data/user.yaml &&
-        CUSCO_BEARER_TOKEN=smoke-report-token cargo run -p cusco -- serve
+        CUSCO_BEARER_TOKEN=smoke-report-token cusco-service
         --config /work/config/test.yaml &
         server=$$!; trap 'kill $$server' EXIT;
         until curl -sf -H 'Authorization: Bearer smoke-report-token'
@@ -150,7 +151,7 @@ services:
         touch crates/server/src/*.rs crates/cli/src/*.rs &&
         mkdir -p /data/db /data/spill /data/user-models /data/models &&
         printf 'models: []\n' > /data/user.yaml &&
-        CUSCO_BEARER_TOKEN=smoke-report-token cargo run -p cusco -- serve
+        CUSCO_BEARER_TOKEN=smoke-report-token cusco-service
         --config /work/config/test.yaml &
         server=$$!; trap 'kill $$server' EXIT;
         until curl -sf -H 'Authorization: Bearer smoke-report-token'

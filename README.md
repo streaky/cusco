@@ -2,10 +2,10 @@
 
 Cusco is an experimental persistent, tiered, branch-aware model-state server built around llama.cpp. Its goal is to make model execution state a durable resource that can be captured, displaced from scarce accelerator memory, restored later, and continued exactly.
 
-The project separates responsibilities deliberately: Rust manages logical
-contexts, scheduling, storage tiers, and transactional state, while a narrow
-native boundary lets llama.cpp retain ownership of model-specific execution
-details and optimized kernels.
+The project separates responsibilities deliberately: Terrane owns the service
+entrypoint, HTTP application composition, and template-backed web surface. Rust
+retains logical contexts, scheduling, storage tiers, protocol adapters, and
+transactional state; llama.cpp retains model-specific execution and optimized kernels.
 
 ## Features
 
@@ -48,6 +48,18 @@ details and optimized kernels.
 
 ## Architecture
 
+The executable application is `server/package.toml`. Its Terrane `main` loads
+the Rust backend, binds the listener, mounts the existing API router alongside
+Terrane handlers through `packages/http-server`, and coordinates graceful shutdown.
+`packages/template` compiles the HTML templates into the executable. There is no
+second backend process, proxy hop, or JSON bridge between the two languages.
+
+`server/src/site.trn` owns the public `/` and `/health` GET/HEAD handlers.
+Add frontend handlers and templates there; keep inference and state machinery
+in the Rust crates. The existing OpenAI/Cusco endpoints remain Rust protocol
+adapters mounted in-process, including streaming bodies and authentication.
+The homepage and health endpoint expose no private service state.
+
 Rust owns logical contexts, request scheduling, model residency policy,
 admission, persistence, and protocol adapters. A narrow versioned C ABI owns
 llama.cpp model execution, tokenization, sampling, sequence mappings, and
@@ -78,7 +90,7 @@ The workspace is split into focused crates:
 - `model-registry` resolves immutable Hugging Face artifacts and local models;
 - `server` contains inference services, scheduling, residency, persistence, and
   HTTP adapters;
-- `cli` provides proof, model-management, and serving commands.
+- `cli` provides proof and model-management commands; it no longer runs the daemon.
 
 ## Platform support
 
@@ -193,13 +205,58 @@ publish there. Override `CUSCO_LISTEN_ADDRESS`, `CUSCO_PORT`, and
 The entire `data/` tree is ignored by Git and excluded from image build
 contexts.
 
+The build context is the surrounding Terrane checkout, not Cusco alone. Compose
+selects `projects/cusco/Dockerfile`; its Dockerfile-specific ignore rules include
+only the compiler, required packages, and Cusco sources while excluding caches,
+operator configuration, and data. The image installs the hybrid executable as
+`cusco-service`, and the API smoke/acceptance launchers use that same executable.
+Runtime `.state/` directories are excluded at every depth, including package
+database test volumes. Unrelated packages, projects, and tools remain excluded
+when their parent directories are reopened for the source allowlist. Do not
+change database-volume permissions to make them readable by the Docker builder.
+
 ## Run the daemon directly
 
-The daemon accepts one versioned configuration path:
+Build from the Cusco directory in the Terrane checkout, with `terrane` on PATH
+and the sibling `packages/http-server` and `packages/template` checkouts present.
+As with the Rust backend, supply the real executor shim and llama.cpp libraries
+through `CUSCO_NATIVE_LIB_DIR`, `CUSCO_LLAMA_LIB_DIR`, and `LD_LIBRARY_PATH`.
+The Docker build prepares those libraries automatically.
+
+Cusco's native Cargo workspace deliberately inherits the surrounding Terrane
+checkout's `rust-toolchain.toml`; run Cargo from Cusco or the checkout root.
+The Terrane service uses `rust-toolchain = "pinned"`, so its Rust dependencies
+compile with that Terrane version's exact stable compiler too. Docker copies the
+same toolchain file before invoking Cargo instead of maintaining a separate
+stable-version literal. Update Terrane's pin as one toolchain-profile change;
+do not add a divergent Cusco pin. The separately installed nightly is only the
+Rustdoc/projection producer, not the compiler used to build the native service.
 
 ```sh
-cargo run -p cusco -- serve --config ./config.yaml
+artifact="$(terrane build server)"
+"$artifact" --config "$PWD/config.yaml"
 ```
+
+The daemon accepts `--config PATH` (default `/data/config.yaml`), `--http-debug
+off|safe|full`, and `--help`. `cargo run -p cusco -- serve` has been removed.
+SIGINT/SIGTERM stop admission and new connections, allow in-flight responses to
+drain, and cancel remaining inference after `server.shutdown_grace_ms`. Set the
+container/process supervisor's stop timeout longer than that grace period.
+
+For a model-free hybrid boundary check against the built executable:
+
+```sh
+python3 tools/test-hybrid-service.py "$artifact" -v
+```
+
+This uses temporary state and an actual native-linked service without loading a
+model. It checks the Terrane HTML/health routes, authenticated Rust API access,
+context creation/retrieval, startup policy, and SIGTERM exit. Model-backed inference
+and GPU acceptance still use the separate gates above.
+
+No storage migration is part of this cutover: the existing SQLite and file-backed
+stores remain authoritative. `dbkit` is deliberately not introduced until a
+Terrane-owned storage feature needs it.
 
 Unknown, missing, invalid, or unsupported-version configuration is rejected
 before model execution starts. `CUSCO_BEARER_TOKEN` may supply the secret

@@ -1,0 +1,21 @@
+namespace cusco/service
+
+from /core/errors import throwable
+from /streaky/http-server import api
+from /streaky/http-server/annotations import endpoint, route-group
+from /streaky/template import text-value
+from /generated/template/cusco import make-template-engine
+
+# These public endpoints expose no model, configuration, credential or state data.
+# New frontend routes belong here rather than in the Rust inference router.
+@[route-group; prefix = '/', document = false]
+class site uses api
+    @[endpoint; method = 'GET|HEAD', path = '/', content-type = 'text/html']
+    async function home string throws throwable;
+        engine = make-template-engine;
+        engine.assign; 'title', (text-value; 'Cusco')
+        return engine.fetch; 'home.html'
+
+    @[endpoint; method = 'GET|HEAD', path = '/health', content-type = 'text/plain']
+    async function health string;
+        return 'ready\n'

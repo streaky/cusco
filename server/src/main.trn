@@ -1,0 +1,57 @@
+namespace cusco/service
+
+from /core/collections import list
+from /core/errors import throwable
+from /core/networking import listen-tcp
+from /core/process import arguments, cli-schema, parse-command-line
+from /deps/cusco-server import Daemon as native-daemon
+from /streaky/http-server import controller, create-application
+from /streaky/http-server/internal import routes
+from /generated/http-server import mount-annotated
+
+# Retain the existing protocol adapters in-process. Terrane owns composition;
+# Rust still owns authentication, request admission, streaming and inference.
+class backend-controller implements controller
+    private backend native-daemon
+
+    function construct; backend native-daemon
+        this.backend = backend
+
+    consuming function routes routes; registered-routes routes
+        router = move registered-routes.router
+        router = router.merge; (this.backend.router;)
+        return instance routes; move router
+
+async function main throws throwable;
+    schema = instance cli-schema;
+        list; 'flag:--help', 'value:--config', 'value:--http-debug'
+    parsed = parse-command-line; schema, (arguments;)
+    if parsed.diagnostic-messages.length > 0 or parsed.positionals.length > 0
+        throw startup-error; 'Usage: cusco-service [--config PATH] [--http-debug off|safe|full]'
+    if parsed.flags.length > 0
+        print; 'Usage: cusco-service [--config PATH] [--http-debug off|safe|full]'
+        return
+    config-path string = '/data/config.yaml'
+    http-debug string = ''
+    for index = 0; index < parsed.option-names.length; index++
+        value = parsed.option-values[index]
+        if not value.is-text
+            throw startup-error; 'Options must be Unicode text'
+        if parsed.option-names[index] == '--config'
+            config-path = value.text
+        else
+            http-debug = value.text
+    backend = native-daemon::open; config-path, http-debug
+    app = create-application;
+    app = mount-annotated; move app
+    app = app.mount; '/', (instance backend-controller; backend)
+    address = backend.address;
+    listener = await listen-tcp; address
+    shutdown = async function none;
+        await backend.shutdown;
+        return none
+    print; 'Cusco listening on ', listener.local-address
+    try
+        await app.serve-listener-until; move listener, shutdown
+    finally
+        backend.finish_shutdown;

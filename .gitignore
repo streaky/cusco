@@ -25,3 +25,6 @@ data/
 
 # Operator-local daemon configuration copied from config.example.yaml
 config.yaml
+
+# Terrane-generated sources, dependency caches, and native build products.
+.trn/

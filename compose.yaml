@@ -1,13 +1,13 @@
 services:
   server:
     build:
-      context: .
+      context: ../..
+      dockerfile: projects/cusco/Dockerfile
       target: production
       args:
         CUSCO_CUDA_ARCHITECTURES: "${CUSCO_CUDA_ARCHITECTURES:-61;70}"
     command:
-      - /work/target/release/cusco
-      - serve
+      - /usr/local/bin/cusco-service
       - --config
       - /data/config.yaml
     environment:

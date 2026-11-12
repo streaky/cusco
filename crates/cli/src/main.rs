@@ -94,14 +94,6 @@ enum Command {
         #[arg(long, default_value_t = 17_179_869_184)]
         host_bytes: usize,
     },
-    Serve {
-        /// Versioned daemon configuration.
-        #[arg(long, default_value = "/data/config.yaml")]
-        config: PathBuf,
-        /// Override HTTP transport diagnostics (`CUSCO_HTTP_DEBUG` is also supported).
-        #[arg(long)]
-        http_debug: Option<cusco_server::HttpDebugLevel>,
-    },
 }
 fn main() -> Result<()> {
     run(Args::parse().command)
@@ -166,115 +158,6 @@ fn run(command: Command) -> Result<()> {
             device_bytes,
             host_bytes,
         )?,
-        Command::Serve { config, http_debug } => {
-            use cusco_server::{
-                AnonymousAdmin, AuthProvider, BearerAuth, DaemonConfig, HttpDebugLevel,
-                ModelCatalog, ModelRecord, ResidencyConfig, ResidentEngine, SearxngHostedTools,
-                Server, WebSearchPolicy, WorkloadScheduler, load_user_models,
-            };
-            let config = DaemonConfig::load(config)?;
-            let http_debug = config.resolve_http_debug(
-                http_debug,
-                std::env::var("CUSCO_HTTP_DEBUG").ok().as_deref(),
-            )?;
-            cusco_executor::set_debug_logging(config.native_debug);
-            let bearer_token = std::env::var("CUSCO_BEARER_TOKEN")
-                .ok()
-                .or_else(|| config.bearer_token.clone());
-            let anonymous = bearer_token.is_none();
-            let auth: Arc<dyn AuthProvider> = match bearer_token {
-                Some(token) => Arc::new(BearerAuth::new(token)),
-                None => Arc::new(AnonymousAdmin),
-            };
-            let catalog = ModelCatalog::open(&config.paths.database)?;
-            let engine = ResidentEngine::open_with_spill(
-                ResidencyConfig {
-                    device_bytes: config.execution.device_capacity.0,
-                    host_bytes: config.execution.host_capacity.0,
-                    storage_bytes: config.execution.storage_capacity.0,
-                    context_reserve_bytes: config.execution.context_reserve.0,
-                    n_ctx: config.execution.context_tokens,
-                    publication_interval_tokens: config.execution.publication_interval_tokens,
-                    gpu_layers: config.execution.gpu_layers,
-                    require_competent: config.execution.require_competent,
-                },
-                &config.paths.spill,
-            )?;
-            engine.attach_catalog(catalog.clone());
-            let engine = WorkloadScheduler::new(engine, config.scheduler)?;
-            let transient_state = config.paths.database.with_extension("runtime.json");
-            if transient_state.exists() {
-                fs::remove_file(&transient_state).with_context(|| {
-                    format!("discard transient state {}", transient_state.display())
-                })?;
-            }
-            let server = Server::open(&transient_state, auth, engine)?;
-            server.configure(config.server)?;
-            server.configure_vision(config.vision);
-            server.configure_openapi(config.openapi);
-            if config.hosted_tools.web_search.enabled {
-                let search = &config.hosted_tools.web_search;
-                server.configure_hosted_tools(Arc::new(SearxngHostedTools::new(
-                    WebSearchPolicy {
-                        endpoint: search
-                            .endpoint
-                            .clone()
-                            .expect("validated enabled web-search endpoint"),
-                        timeout: Duration::from_millis(search.timeout_ms),
-                        max_results: search.max_results,
-                        max_response_bytes: search.max_response_bytes,
-                        allowed_domains: search.allowed_domains.clone(),
-                    },
-                )?));
-            }
-            server.attach_catalog(catalog.clone(), config.paths.models.clone());
-            for model in catalog.models()? {
-                server.register_catalog_model(model)?;
-            }
-            let declared = load_user_models(&config.paths.user_config, &config.paths.user_models)?;
-            for declaration in declared.models {
-                let registered = register_local(
-                    &declaration.path,
-                    &declaration.name,
-                    declaration.sha256.as_deref(),
-                )?;
-                let metadata = cusco_model_registry::probe_gguf(&registered.path)?;
-                server.register_model_with(
-                    |model| {
-                        catalog
-                            .publish(model)
-                            .map_err(|error| cusco_server::Error::State(error.to_string()))
-                    },
-                    ModelRecord {
-                        id: declaration.name,
-                        revision: registered.sha256.clone(),
-                        path: registered.path,
-                        sha256: registered.sha256,
-                        aliases: declaration.aliases,
-                        family: metadata.architecture,
-                        size_bytes: registered.size,
-                        block_count: metadata.block_count.unwrap_or(0),
-                        epoch: 0,
-                    },
-                )?;
-            }
-            let runtime = tokio::runtime::Runtime::new()?;
-            match http_debug {
-                HttpDebugLevel::Off => runtime.block_on(cusco_server::serve(
-                    server,
-                    config.listen,
-                    anonymous,
-                    config.unsafe_public_unauthenticated,
-                ))?,
-                level => runtime.block_on(cusco_server::serve_with_http_debug(
-                    server,
-                    config.listen,
-                    anonymous,
-                    config.unsafe_public_unauthenticated,
-                    level,
-                ))?,
-            }
-        }
     }
     Ok(())
 }
@@ -1096,16 +979,14 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     #[test]
-    fn serve_cli_accepts_only_versioned_configuration_path() {
-        let args = Args::try_parse_from(["cusco", "serve", "--config", "operator.yaml"]).unwrap();
-        let Command::Serve { config, http_debug } = args.command else {
-            panic!("serve command expected")
-        };
-        assert_eq!(config, PathBuf::from("operator.yaml"));
-        assert_eq!(http_debug, None);
-        assert!(Args::try_parse_from(["cusco", "serve", "model.gguf"]).is_err());
+    fn serve_is_not_a_cli_command() {
+        assert!(Args::try_parse_from(["cusco", "serve"]).is_err());
+        assert!(
+            Args::command()
+                .get_subcommands()
+                .all(|command| command.get_name() != "serve")
+        );
     }
-
     #[test]
     fn scheduler_proof_cli_parses_versioned_workload_inputs() {
         let args = Args::try_parse_from([
@@ -1137,35 +1018,7 @@ mod tests {
         assert_eq!(percentile(&[40, 10, 30, 20], 95), 30);
     }
 
-    #[test]
-    fn serve_config_path_has_production_default() {
-        // The default config path remains production-oriented.
-        let args = Args::try_parse_from(["cusco", "serve"]).unwrap();
-        let Command::Serve { config, http_debug } = args.command else {
-            panic!("serve command expected")
-        };
-        assert_eq!(config, PathBuf::from("/data/config.yaml"));
-        assert_eq!(http_debug, None);
-    }
 
-    #[test]
-    fn http_debug_cli_override_is_parsed() {
-        use cusco_server::HttpDebugLevel;
-
-        let args = Args::try_parse_from(["cusco", "serve", "--http-debug", "full"]).unwrap();
-        let Command::Serve { http_debug, .. } = args.command else {
-            panic!("serve command expected")
-        };
-        assert_eq!(http_debug, Some(HttpDebugLevel::Full));
-        let command = Args::command();
-        let serve = command
-            .get_subcommands()
-            .find(|command| command.get_name() == "serve")
-            .unwrap();
-        assert!(serve.get_arguments().all(|argument| {
-            matches!(argument.get_id().as_str(), "config" | "http_debug" | "help")
-        }));
-    }
 
     #[test]
     fn commands_and_proof_execute_model_free() {
