@@ -150,8 +150,8 @@ pub fn probe_gguf(path: impl AsRef<Path>) -> Result<ModelMetadata, Error> {
             skip_value(&mut reader, kind)?;
         }
     }
-    let architecture =
-        architecture.ok_or_else(|| Error::InvalidMetadata("general.architecture is absent".into()))?;
+    let architecture = architecture
+        .ok_or_else(|| Error::InvalidMetadata("general.architecture is absent".into()))?;
     let block_count = match block_count {
         Some((key, value)) if key == format!("{architecture}.block_count") => Some(
             u32::try_from(value)

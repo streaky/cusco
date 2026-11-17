@@ -248,7 +248,9 @@ mod tests {
         });
         let lifecycle = ModelLifecycleService::new(engine.clone());
 
-        let registered = lifecycle.register(model("installed", 0), |_| Ok(())).unwrap();
+        let registered = lifecycle
+            .register(model("installed", 0), |_| Ok(()))
+            .unwrap();
         assert_eq!(registered.epoch, 1);
         assert_eq!(
             lifecycle
