@@ -28,3 +28,5 @@ config.yaml
 
 # Terrane-generated sources, dependency caches, and native build products.
 .trn/
+
+*.profraw
