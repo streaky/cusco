@@ -106,6 +106,18 @@ fn parse_web_search_selection(text: &str) -> Result<WebSearchSelection, Error> {
     Ok(selection)
 }
 
+struct SelectionTaskGuard {
+    control: std::sync::Arc<crate::RequestControl>,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for SelectionTaskGuard {
+    fn drop(&mut self) {
+        self.control.cancel();
+        self.abort.abort();
+    }
+}
+
 pub(crate) async fn execute_hosted_web_search(
     server: &Server,
     model: &ModelRecord,
@@ -113,6 +125,8 @@ pub(crate) async fn execute_hosted_web_search(
     tools: &[NativeToolDefinition],
     choice: &NativeToolChoice,
     principal: &str,
+    control: &std::sync::Arc<crate::RequestControl>,
+    deadline: std::time::Instant,
 ) -> Result<Option<HostedWebSearchExecution>, Error> {
     let Some(tool) = tools
         .iter()
@@ -126,6 +140,8 @@ pub(crate) async fn execute_hosted_web_search(
     ) {
         return Ok(None);
     }
+    control.check()?;
+    let selection_budget = control.remaining_until(deadline)?;
     let required = matches!(choice, NativeToolChoice::Required);
     let mut selection_prompt = prompt.to_owned();
     let selection_instruction = if required {
@@ -141,16 +157,25 @@ pub(crate) async fn execute_hosted_web_search(
     let selection_server = server.clone();
     let selection_model = model.id.clone();
     let selection_principal = principal.to_owned();
+    let selection_deadline_ms = u64::try_from(selection_budget.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
     let selection_id = format!("web-search-select-{}", uuid::Uuid::new_v4());
-    let selection = tokio::task::spawn_blocking(move || {
-        selection_server.infer(
+    let selection_control = std::sync::Arc::new(crate::RequestControl::new());
+    let selection_cancellation = selection_control.link_parent(control);
+    let task_control = selection_control.clone();
+    let cancellation = std::sync::Arc::new(tokio::sync::Notify::new());
+    let signal = cancellation.clone();
+    let _registration = control.register_abort(std::sync::Arc::new(move || signal.notify_one()));
+    let task = tokio::task::spawn_blocking(move || {
+        selection_server.infer_with_control(
             &selection_id,
             InferRequest {
                 model: selection_model,
                 prompt: selection_prompt,
                 max_tokens: 128,
                 context_id: None,
-                deadline_ms: None,
+                deadline_ms: Some(selection_deadline_ms),
                 stop: Vec::new(),
                 raw_continuation: false,
                 compaction: None,
@@ -163,10 +188,33 @@ pub(crate) async fn execute_hosted_web_search(
                     ..SchedulingMetadata::default()
                 },
             },
+            selection_control,
         )
-    })
-    .await
-    .map_err(|error| Error::State(error.to_string()))??;
+    });
+    // Cancel the child before unlinking it when the preparation future is
+    // dropped; dropping a JoinHandle alone would detach its blocking worker.
+    let _task_guard = SelectionTaskGuard {
+        control: task_control,
+        abort: task.abort_handle(),
+    };
+    let selection_result = tokio::select! {
+        result = task => result.map_err(|error| selection_error(control, Error::State(error.to_string())))?,
+        _ = cancellation.notified() => {
+            control.check()?;
+            return Err(Error::Cancelled);
+        }
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            control.remaining_until(deadline)?;
+            return Err(Error::Deadline);
+        }
+    };
+    let selection = match selection_result {
+        Ok(selection) => selection,
+        Err(error) => return Err(selection_error(control, error)),
+    };
+    drop(selection_cancellation);
+    control.check()?;
+    control.remaining_until(deadline)?;
     let selection = parse_web_search_selection(&selection.0.text)?;
     if !selection.use_search {
         return Ok(None);
@@ -175,16 +223,45 @@ pub(crate) async fn execute_hosted_web_search(
         query: selection.query.trim().to_owned(),
         allowed_domains: tool.allowed_domains.clone(),
         max_results: usize::MAX,
+        control: control.clone(),
+        deadline,
     };
     let executor = server.hosted_tools.lock().clone();
-    let results = tokio::task::spawn_blocking(move || executor.web_search(&request))
-        .await
-        .map_err(|error| Error::State(error.to_string()))?
-        .map_err(|error| Error::State(error.to_string()))?;
+    let results = await_hosted_search(&executor, &request, control, deadline).await?;
     Ok(Some(HostedWebSearchExecution {
         query: selection.query,
         results,
     }))
+}
+
+fn selection_error(control: &crate::RequestControl, error: Error) -> Error {
+    control.check().err().unwrap_or(error)
+}
+
+async fn await_hosted_search(
+    executor: &std::sync::Arc<dyn crate::HostedToolExecutor>,
+    request: &WebSearchRequest,
+    control: &std::sync::Arc<crate::RequestControl>,
+    deadline: std::time::Instant,
+) -> Result<Vec<WebSearchResult>, Error> {
+    let cancellation = std::sync::Arc::new(tokio::sync::Notify::new());
+    let signal = cancellation.clone();
+    let _registration =
+        control.register_abort(std::sync::Arc::new(move || signal.notify_one()));
+    let result = tokio::select! {
+        result = executor.web_search(request) => result,
+        _ = cancellation.notified() => {
+            control.check()?;
+            return Err(Error::Cancelled);
+        }
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            control.remaining_until(deadline)?;
+            return Err(Error::Deadline);
+        }
+    };
+    control.check()?;
+    control.remaining_until(deadline)?;
+    result.map_err(|error| Error::State(error.to_string()))
 }
 
 pub(crate) fn append_web_search_evidence(
@@ -245,5 +322,74 @@ pub(crate) fn response_format_grammar(
             .map(crate::structured::finish_schema_grammar)
             .map(Some)
             .map_err(|error| Error::BadRequest(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+
+    struct StalledHostedTools;
+
+    impl crate::HostedToolExecutor for StalledHostedTools {
+        fn web_search<'a>(
+            &'a self,
+            _request: &'a WebSearchRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<WebSearchResult>, crate::HostedToolError>> + Send + 'a>> {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(Vec::new())
+            })
+        }
+    }
+
+    fn request(control: Arc<crate::RequestControl>, deadline: std::time::Instant) -> WebSearchRequest {
+        WebSearchRequest {
+            query: "query".into(),
+            allowed_domains: Vec::new(),
+            max_results: 1,
+            control,
+            deadline,
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_provider_future_is_dropped_on_parent_cancellation() {
+        let control = Arc::new(crate::RequestControl::new());
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let request = request(control.clone(), deadline);
+        let executor: Arc<dyn crate::HostedToolExecutor> = Arc::new(StalledHostedTools);
+        let task_control = control.clone();
+        let task = tokio::spawn(async move {
+            await_hosted_search(&executor, &request, &task_control, deadline).await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        control.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancellation should stop the provider future promptly")
+            .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn hosted_provider_future_is_dropped_at_deadline() {
+        let control = Arc::new(crate::RequestControl::new());
+        let deadline = std::time::Instant::now() + Duration::from_millis(10);
+        let request = request(control.clone(), deadline);
+        let executor: Arc<dyn crate::HostedToolExecutor> = Arc::new(StalledHostedTools);
+        let result = await_hosted_search(&executor, &request, &control, deadline).await;
+        assert!(matches!(result, Err(Error::Deadline)));
+    }
+
+    #[test]
+    fn parent_deadline_wins_over_linked_selector_cancellation() {
+        let control = crate::RequestControl::new();
+        control.expire();
+        assert!(matches!(
+            selection_error(&control, Error::Cancelled),
+            Error::Deadline
+        ));
     }
 }

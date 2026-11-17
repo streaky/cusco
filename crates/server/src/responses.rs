@@ -249,11 +249,8 @@ impl ResponseService {
     }
 
     pub fn complete(&self, params: CompleteResponse<'_>) -> ResponseResource {
-        let (reasoning, text) = if params.strip_reasoning {
-            split_native_reasoning(params.text)
-        } else {
-            (None, params.text)
-        };
+        let reasoning = params.reasoning;
+        let text = params.text;
         let message = || {
             let annotations = params.web_search_call.map_or_else(Vec::new, |call| {
                 call.action
@@ -407,6 +404,7 @@ pub struct CompleteResponse<'a> {
     pub model: &'a str,
     pub created_at: Option<u64>,
     pub text: &'a str,
+    pub reasoning: Option<&'a str>,
     pub reason: FinishReason,
     pub usage: &'a Usage,
     pub store: bool,
@@ -417,7 +415,6 @@ pub struct CompleteResponse<'a> {
     pub input: &'a [ResponseInputItem],
     pub function_call: Option<ResponseFunctionCall>,
     pub expose_reasoning: bool,
-    pub strip_reasoning: bool,
     pub web_search_call: Option<&'a ResponseWebSearchCall>,
 }
 
@@ -469,7 +466,7 @@ pub(crate) fn now() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-fn split_native_reasoning(text: &str) -> (Option<&str>, &str) {
+pub(crate) fn split_native_reasoning(text: &str) -> (Option<&str>, &str) {
     let trimmed = text.trim_start();
     let Some(reasoning) = trimmed.strip_prefix("<think>") else {
         return (None, text);

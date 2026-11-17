@@ -18,6 +18,7 @@ sha2 = "0.10.9"
 thiserror = "2.0.17"
 parking_lot = "0.12.5"
 ureq = { version = "=3.0.12", default-features = false, features = ["rustls", "gzip"] }
+reqwest = { version = "0.12.9", default-features = false, features = ["json", "rustls-tls"] }
 url = "2.5.7"
 
 tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

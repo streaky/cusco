@@ -642,7 +642,7 @@ impl InferenceEngine for WorkloadScheduler {
         let control = request.control.clone();
         let id = self
             .next_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
             .map_err(|_| Error::State("scheduler session id space exhausted".into()))?;
         let (response, receiver) = mpsc::channel();
         self.commands

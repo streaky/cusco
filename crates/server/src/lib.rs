@@ -1,7 +1,9 @@
 use cusco_executor::SamplingConfig;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
@@ -415,13 +417,13 @@ const CONTROL_COMPLETE: u8 = 3;
 
 pub struct RequestControl {
     state: AtomicU8,
-    abort: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    abort: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
 }
 impl RequestControl {
     pub fn new() -> Self {
         Self {
             state: AtomicU8::new(CONTROL_RUNNING),
-            abort: Mutex::new(None),
+            abort: Mutex::new(Vec::new()),
         }
     }
 
@@ -431,6 +433,23 @@ impl RequestControl {
             CONTROL_DEADLINE => Err(Error::Deadline),
             _ => Err(Error::Cancelled),
         }
+    }
+
+
+    pub fn remaining_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<std::time::Duration, Error> {
+        self.check()?;
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                self.expire();
+                Error::Deadline
+            })?;
+        self.check()?;
+        Ok(remaining)
     }
 
     pub fn cancel(&self) {
@@ -476,17 +495,31 @@ impl RequestControl {
         self.state.load(Ordering::Acquire) == CONTROL_COMPLETE
     }
 
-    fn register_abort(&self, abort: Arc<dyn Fn() + Send + Sync>) -> AbortRegistration<'_> {
-        *self.abort.lock() = Some(abort.clone());
+    pub(crate) fn link_parent<'a>(
+        self: &Arc<Self>,
+        parent: &'a Arc<Self>,
+    ) -> AbortRegistration<'a> {
+        let child = self.clone();
+        parent.register_abort(Arc::new(move || child.cancel()))
+    }
+
+    pub(crate) fn register_abort(
+        &self,
+        abort: Arc<dyn Fn() + Send + Sync>,
+    ) -> AbortRegistration<'_> {
+        let mut aborts = self.abort.lock();
+        aborts.push(abort.clone());
+        drop(aborts);
         if self.check().is_err() {
             abort();
         }
-        AbortRegistration { control: self }
+        AbortRegistration { control: self, abort }
     }
 
+
     fn abort(&self) {
-        let abort = self.abort.lock().clone();
-        if let Some(abort) = abort {
+        let aborts = self.abort.lock().clone();
+        for abort in aborts {
             abort();
         }
     }
@@ -498,13 +531,17 @@ impl Default for RequestControl {
     }
 }
 
-struct AbortRegistration<'a> {
+pub(crate) struct AbortRegistration<'a> {
     control: &'a RequestControl,
+    abort: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Drop for AbortRegistration<'_> {
     fn drop(&mut self) {
-        self.control.abort.lock().take();
+        let mut aborts = self.control.abort.lock();
+        if let Some(index) = aborts.iter().position(|abort| Arc::ptr_eq(abort, &self.abort)) {
+            aborts.swap_remove(index);
+        }
     }
 }
 
@@ -1224,7 +1261,14 @@ impl Server {
         request_id: &str,
         req: InferRequest,
     ) -> Result<(InferResponse, Vec<StreamEvent>), Error> {
-        let control = Arc::new(RequestControl::new());
+        self.infer_with_control(request_id, req, Arc::new(RequestControl::new()))
+    }
+    pub fn infer_with_control(
+        &self,
+        request_id: &str,
+        req: InferRequest,
+        control: Arc<RequestControl>,
+    ) -> Result<(InferResponse, Vec<StreamEvent>), Error> {
         let admission = self.try_admit(request_id, control)?;
         let result = self.infer_reserved(request_id, req);
         drop(admission);
@@ -1268,6 +1312,7 @@ impl Server {
         events.push(terminal);
         Ok((response, events))
     }
+    #[cfg(test)]
     async fn infer_stream_reserved(
         &self,
         request_id: String,
@@ -1739,6 +1784,24 @@ mod tests {
         })
         .unwrap();
         (s, d)
+    }
+
+    #[test]
+    fn cancellation_registration_drop_preserves_other_callbacks() {
+        let parent = Arc::new(RequestControl::new());
+        let first = Arc::new(RequestControl::new());
+        let second = Arc::new(RequestControl::new());
+        let first_link = first.link_parent(&parent);
+        let second_link = second.link_parent(&parent);
+        drop(first_link);
+        parent.cancel();
+        assert!(first.check().is_ok());
+        assert!(matches!(second.check(), Err(Error::Cancelled)));
+        drop(second_link);
+        assert!(parent.abort.lock().is_empty());
+        let late = Arc::new(RequestControl::new());
+        let _late_link = late.link_parent(&parent);
+        assert!(matches!(late.check(), Err(Error::Cancelled)));
     }
 
     #[test]

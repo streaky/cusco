@@ -4,6 +4,7 @@ use crate::responses::{
 };
 use crate::{Error, FinishReason, RequestControl};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

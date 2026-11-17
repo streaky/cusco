@@ -38,6 +38,7 @@ pub(crate) fn append_rendered(
         _ => Err(unsupported_template(family)),
     }
 }
+#[cfg(test)]
 pub(crate) fn append_assistant_content(
     family: &str,
     prompt: &mut String,

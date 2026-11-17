@@ -123,7 +123,7 @@ pub struct HostedToolsConfig {
     pub web_search: WebSearchConfig,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebSearchConfig {
     #[serde(default)]
@@ -138,6 +138,19 @@ pub struct WebSearchConfig {
     pub max_response_bytes: usize,
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            timeout_ms: default_web_search_timeout_ms(),
+            max_results: default_web_search_results(),
+            max_response_bytes: default_web_search_response_bytes(),
+            allowed_domains: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -338,6 +351,16 @@ mod tests {
     fn rejects_unknown_configuration_fields() {
         let yaml = "version: 1\nlisten: 127.0.0.1:8080\npaths: {database: db, models: models, spill: spill, user_models: local, user_config: user.yaml}\nexecution: {device_capacity: '1 GiB', host_capacity: '1 GiB', storage_capacity: '2 GiB', context_reserve: '1 GiB', surprise: true}\n";
         assert!(serde_yaml::from_str::<DaemonConfig>(yaml).is_err());
+    }
+    #[test]
+    fn hosted_tool_defaults_keep_omitted_sections_valid() {
+        let yaml = "version: 1\npaths: {database: db, models: models, spill: spill, user_models: local, user_config: user.yaml}\nexecution: {device_capacity: '1 GiB', host_capacity: '1 GiB', storage_capacity: '2 GiB', context_reserve: '1 GiB'}\n";
+        let omitted: DaemonConfig = serde_yaml::from_str(yaml).unwrap();
+        let omitted = omitted.validate().unwrap();
+        assert_eq!(omitted.hosted_tools.web_search.timeout_ms, default_web_search_timeout_ms());
+        let empty: DaemonConfig = serde_yaml::from_str(&format!("hosted_tools: {{}}\n{yaml}")).unwrap();
+        let empty = empty.validate().unwrap();
+        assert_eq!(empty.hosted_tools.web_search.max_results, default_web_search_results());
     }
 
     #[test]

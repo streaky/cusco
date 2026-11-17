@@ -324,6 +324,13 @@ function generation-normalized-request document-value throws throwable; document
         management-strings; stop
     input = generation-input; document, protocol
     tools = generation-tools; document
+    if protocol == 'chat'
+        tool-index int = 0
+        while tool-index < (tools.length;)
+            tool = (tools.item; tool-index).value
+            if (wire-text; tool, 'kind') != 'function'
+                throw invalid-request-error; 'Chat Completions only supports function tool declarations'
+            tool-index = tool-index + 1
     snapshots = wire-field; document, 'tools'
     if snapshots.kind == 'none'
         snapshots = generation-array; list

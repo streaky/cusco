@@ -1,13 +1,14 @@
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use thiserror::Error;
 use url::Url;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebSearchRequest {
     pub query: String,
     pub allowed_domains: Vec<String>,
     pub max_results: usize,
+    pub control: Arc<crate::RequestControl>,
+    pub deadline: std::time::Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -28,21 +29,21 @@ pub enum HostedToolError {
 }
 
 pub trait HostedToolExecutor: Send + Sync {
-    fn web_search(
-        &self,
-        request: &WebSearchRequest,
-    ) -> Result<Vec<WebSearchResult>, HostedToolError>;
+    fn web_search<'a>(
+        &'a self,
+        request: &'a WebSearchRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<WebSearchResult>, HostedToolError>> + Send + 'a>>;
 }
 
 #[derive(Default)]
 pub struct DisabledHostedTools;
 
 impl HostedToolExecutor for DisabledHostedTools {
-    fn web_search(
-        &self,
-        _request: &WebSearchRequest,
-    ) -> Result<Vec<WebSearchResult>, HostedToolError> {
-        Err(HostedToolError::Disabled)
+    fn web_search<'a>(
+        &'a self,
+        _request: &'a WebSearchRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<WebSearchResult>, HostedToolError>> + Send + 'a>> {
+        Box::pin(async { Err(HostedToolError::Disabled) })
     }
 }
 
@@ -144,7 +145,7 @@ fn validate_url(url: &str, domains: &[String]) -> Result<Url, HostedToolError> {
 }
 
 pub struct SearxngHostedTools {
-    agent: ureq::Agent,
+    client: reqwest::Client,
     policy: WebSearchPolicy,
 }
 
@@ -163,14 +164,11 @@ impl SearxngHostedTools {
                 "web-search limits must be nonzero".into(),
             ));
         }
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(policy.timeout))
-            .max_redirects(0)
-            .build();
-        Ok(Self {
-            agent: config.into(),
-            policy,
-        })
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| HostedToolError::Provider(error.to_string()))?;
+        Ok(Self { client, policy })
     }
 
     fn effective_domains(&self, requested: &[String]) -> Result<Vec<String>, HostedToolError> {
@@ -204,63 +202,94 @@ struct SearxngResult {
     snippet: String,
 }
 
+fn bounded_request_timeout(
+    policy_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<Duration, HostedToolError> {
+    if request_timeout.is_zero() {
+        return Err(HostedToolError::InvalidRequest(
+            "web-search timeout must be nonzero".into(),
+        ));
+    }
+    Ok(policy_timeout.min(request_timeout))
+}
+
 impl HostedToolExecutor for SearxngHostedTools {
-    fn web_search(
-        &self,
-        request: &WebSearchRequest,
-    ) -> Result<Vec<WebSearchResult>, HostedToolError> {
-        let query = request.query.trim();
-        if query.is_empty() {
-            return Err(HostedToolError::InvalidRequest(
-                "web-search query must not be empty".into(),
-            ));
-        }
-        let domains = self.effective_domains(&request.allowed_domains)?;
-        let query = if domains.is_empty() {
-            query.to_owned()
-        } else {
-            format!(
-                "{} {}",
-                query,
-                domains
-                    .iter()
-                    .map(|domain| format!("site:{domain}"))
-                    .collect::<Vec<_>>()
-                    .join(" OR ")
-            )
-        };
-        let limit = request.max_results.min(self.policy.max_results);
-        if limit == 0 {
-            return Err(HostedToolError::InvalidRequest(
-                "web-search max_results must be nonzero".into(),
-            ));
-        }
-        let mut response = self
-            .agent
-            .get(&self.policy.endpoint)
-            .query("q", &query)
-            .query("format", "json")
-            .call()
-            .map_err(|error| HostedToolError::Provider(error.to_string()))?;
-        let decoded: SearxngResponse = response
-            .body_mut()
-            .with_config()
-            .limit(self.policy.max_response_bytes as u64)
-            .read_json()
-            .map_err(|error| HostedToolError::Provider(error.to_string()))?;
-        Ok(decoded
-            .results
-            .into_iter()
-            .filter_map(|result| {
-                let parsed = validate_url(&result.url, &domains).ok()?;
-                Some(WebSearchResult {
-                    title: result.title,
-                    url: parsed.into(),
-                    snippet: result.snippet,
+    fn web_search<'a>(
+        &'a self,
+        request: &'a WebSearchRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<WebSearchResult>, HostedToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            let query = request.query.trim();
+            if query.is_empty() {
+                return Err(HostedToolError::InvalidRequest(
+                    "web-search query must not be empty".into(),
+                ));
+            }
+            let domains = self.effective_domains(&request.allowed_domains)?;
+            let query = if domains.is_empty() {
+                query.to_owned()
+            } else {
+                format!(
+                    "{} {}",
+                    query,
+                    domains
+                        .iter()
+                        .map(|domain| format!("site:{domain}"))
+                        .collect::<Vec<_>>()
+                        .join(" OR ")
+                )
+            };
+            let limit = request.max_results.min(self.policy.max_results);
+            if limit == 0 {
+                return Err(HostedToolError::InvalidRequest(
+                    "web-search max_results must be nonzero".into(),
+                ));
+            }
+            let remaining = request
+                .control
+                .remaining_until(request.deadline)
+                .map_err(|error| HostedToolError::Provider(error.to_string()))?;
+            let timeout = bounded_request_timeout(self.policy.timeout, remaining)?;
+            let mut response = self
+                .client
+                .get(&self.policy.endpoint)
+                .query(&[("q", query.as_str()), ("format", "json")])
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(|error| HostedToolError::Provider(error.to_string()))?
+                .error_for_status()
+                .map_err(|error| HostedToolError::Provider(error.to_string()))?;
+            let mut body = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| HostedToolError::Provider(error.to_string()))?
+            {
+                if body.len().saturating_add(chunk.len()) > self.policy.max_response_bytes {
+                    return Err(HostedToolError::Provider(
+                        "web-search response exceeds configured size limit".into(),
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let decoded: SearxngResponse = serde_json::from_slice(&body)
+                .map_err(|error| HostedToolError::Provider(error.to_string()))?;
+            Ok(decoded
+                .results
+                .into_iter()
+                .filter_map(|result| {
+                    let parsed = validate_url(&result.url, &domains).ok()?;
+                    Some(WebSearchResult {
+                        title: result.title,
+                        url: parsed.into(),
+                        snippet: result.snippet,
+                    })
                 })
-            })
-            .take(limit)
-            .collect())
+                .take(limit)
+                .collect())
+        })
     }
 }
 
@@ -312,8 +341,58 @@ mod tests {
             query: "test".into(),
             allowed_domains: vec![],
             max_results: usize::MAX,
+            control: Arc::new(crate::RequestControl::new()),
+            deadline: std::time::Instant::now() + Duration::from_secs(2),
         };
 
         assert_eq!(request.max_results.min(executor.policy.max_results), 3);
+        assert_eq!(
+            bounded_request_timeout(executor.policy.timeout, Duration::from_secs(2)).unwrap(),
+            Duration::from_secs(2)
+        );
+        assert!(bounded_request_timeout(executor.policy.timeout, Duration::ZERO).is_err());
+        assert_eq!(
+            bounded_request_timeout(executor.policy.timeout, Duration::from_secs(20)).unwrap(),
+            executor.policy.timeout
+        );
+    }
+    #[tokio::test]
+    async fn async_provider_accepts_responses_slower_than_short_poll_intervals() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = br#"{"results":[]}"#;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            std::thread::sleep(Duration::from_millis(200));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let executor = SearxngHostedTools::new(WebSearchPolicy {
+            endpoint: format!("http://{address}/search"),
+            timeout: Duration::from_secs(2),
+            ..WebSearchPolicy::default()
+        })
+        .unwrap();
+        let request = WebSearchRequest {
+            query: "slow provider".into(),
+            allowed_domains: vec![],
+            max_results: 5,
+            control: Arc::new(crate::RequestControl::new()),
+            deadline: std::time::Instant::now() + Duration::from_secs(3),
+        };
+        let started = std::time::Instant::now();
+        let results = executor.web_search(&request).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(results.is_empty());
+        server.join().unwrap();
     }
 }

@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::Arc, thread, time::Duration};
+use std::{future::Future, fs, path::PathBuf, pin::Pin, sync::Arc, thread, time::Duration};
 
 use cusco_server::{
     DaemonConfig, DeterministicEngine, EngineOutput, EngineRequest, Error, ExecutionSession,
@@ -64,16 +64,20 @@ impl ExecutionSession for ReplySession {
 struct FixtureHostedTools;
 
 impl HostedToolExecutor for FixtureHostedTools {
-    fn web_search(
-        &self,
-        request: &WebSearchRequest,
-    ) -> Result<Vec<WebSearchResult>, HostedToolError> {
-        assert_eq!(request.query, "rust ownership");
-        Ok(vec![WebSearchResult {
-            title: "Rust ownership".into(),
-            url: "https://example.com/result".into(),
-            snippet: "Ownership documentation".into(),
-        }])
+    fn web_search<'a>(
+        &'a self,
+        request: &'a WebSearchRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<WebSearchResult>, HostedToolError>> + Send + 'a>>
+    {
+        let query = request.query.clone();
+        Box::pin(async move {
+            assert_eq!(query, "rust ownership");
+            Ok(vec![WebSearchResult {
+                title: "Rust ownership".into(),
+                url: "https://example.com/result".into(),
+                snippet: "Ownership documentation".into(),
+            }])
+        })
     }
 }
 
@@ -91,7 +95,10 @@ impl InferenceEngine for FixtureEngine {
                         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
             });
         let control = Arc::clone(&request.control);
-        let reply = if request.prompt.contains("Output only JSON") {
+
+        let reply = if request.prompt.contains("fixture:inspect-chat-tool-prompt") {
+            Some(format!("PROMPT={}", request.prompt))
+        } else if request.prompt.contains("Output only JSON") {
             Some(r#"{"use_search":true,"query":"rust ownership"}"#.to_owned())
         } else if request.prompt.contains("Hosted web search completed") {
             Some("Answer https://example.com/result".to_owned())

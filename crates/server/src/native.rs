@@ -32,11 +32,39 @@ fn sampling_config(
         .transpose()
         .map_err(|_| Error::BadRequest("seed must be at most 4294967295".into()))?
         .unwrap_or(u32::MAX);
+    let temperature = temperature.unwrap_or(1.0);
+    if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+        return Err(Error::BadRequest(
+            "temperature must be finite and between 0 and 2".into(),
+        ));
+    }
+
+    let top_p = top_p.unwrap_or(1.0);
+    if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
+        return Err(Error::BadRequest(
+            "top_p must be finite and in (0, 1]".into(),
+        ));
+    }
     Ok(crate::SamplingConfig {
-        temperature: temperature.unwrap_or(1.0),
-        top_p: top_p.unwrap_or(1.0),
+        temperature,
+        top_p,
         seed,
     })
+}
+
+#[cfg(test)]
+mod sampling_tests {
+    use super::sampling_config;
+
+    #[test]
+    fn sampling_ranges_reject_invalid_values() {
+        for temperature in [Some(-0.1), Some(2.1), Some(f32::NAN), Some(f32::INFINITY)] {
+            assert!(sampling_config(temperature, None, None).is_err());
+        }
+        for top_p in [Some(0.0), Some(-0.1), Some(1.1), Some(f32::NAN)] {
+            assert!(sampling_config(None, top_p, None).is_err());
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Deserialize)]
@@ -250,12 +278,19 @@ impl NativePermit {
 }
 struct CancellationOnDrop {
     control: Arc<RequestControl>,
+    planning: Option<(Server, String)>,
     armed: bool,
 }
 impl Drop for CancellationOnDrop {
     fn drop(&mut self) {
         if self.armed {
             self.control.cancel();
+            if let Some((server, request_id)) = &self.planning {
+                let mut inner = server.inner.lock();
+                if inner.controls.get(request_id).is_some_and(|control| Arc::ptr_eq(control, &self.control)) {
+                    inner.controls.remove(request_id);
+                }
+            }
         }
     }
 }
@@ -387,6 +422,34 @@ impl Server {
             retained_bytes,
         } = request;
         let model_record = self.model(&model)?.clone();
+        let config = self.config();
+        let sampling = sampling_config(options.temperature, options.top_p, options.seed)?;
+        let deadline = std::time::Instant::now()
+            + Duration::from_millis(
+                options
+                    .deadline_ms
+                    .unwrap_or(config.wall_time_ms)
+                    .min(config.wall_time_ms),
+            );
+        let control = Arc::new(RequestControl::new());
+        {
+            let mut inner = self.inner.lock();
+            if inner.shutting_down {
+                return Err(Error::ShuttingDown);
+            }
+            inner.controls.insert(request_id.clone(), control.clone());
+        }
+        let mut cancellation = CancellationOnDrop {
+            control: control.clone(),
+            planning: Some((self.clone(), request_id.clone())),
+            armed: true,
+        };
+        let wall_remaining = control.remaining_until(deadline)?;
+        start_deadline_watchdogs(
+            &control,
+            wall_remaining,
+            Duration::from_millis(config.active_time_ms),
+        );
         let mut plan = crate::generation_plan::prepare(
             self,
             &request_id,
@@ -394,6 +457,8 @@ impl Server {
             &model_record,
             input,
             options.semantics,
+            control.clone(),
+            deadline,
         )
         .await?;
         let grammar = match (options.grammar, plan.grammar) {
@@ -413,26 +478,12 @@ impl Server {
         } else {
             None
         };
-        let deadline = Duration::from_millis(
-            options
-                .deadline_ms
-                .unwrap_or(config.wall_time_ms)
-                .min(config.wall_time_ms),
-        );
-        let control = Arc::new(RequestControl::new());
-        let waiting_since = std::time::Instant::now();
         drop(permit.take());
+        let wall_remaining = control.remaining_until(deadline)?;
         let admission = self
-            .reserve_admission(&request_id, control.clone(), retained_bytes, deadline)
+            .reserve_admission(&request_id, control.clone(), retained_bytes, wall_remaining)
             .await?;
-        let wall_remaining = deadline
-            .checked_sub(waiting_since.elapsed())
-            .ok_or(Error::Deadline)?;
-        start_deadline_watchdogs(
-            &control,
-            wall_remaining,
-            Duration::from_millis(config.active_time_ms),
-        );
+        let wall_remaining = control.remaining_until(deadline)?;
         let mut req = InferRequest {
             model,
             prompt: plan.prompt,
@@ -446,7 +497,7 @@ impl Server {
             stop: options.stop,
             raw_continuation: options.raw_continuation,
             compaction: options.compaction,
-            sampling: sampling_config(options.temperature, options.top_p, options.seed)?,
+            sampling,
             grammar,
             scheduling: Default::default(),
         };
@@ -497,6 +548,7 @@ impl Server {
             buffer_output,
             response,
         };
+        cancellation.armed = false;
         Ok(GenerationSession {
             inner: Arc::new(GenerationSessionInner {
                 started: tokio::sync::Mutex::new(Some(started)),
@@ -564,6 +616,7 @@ impl Server {
         let control = Arc::new(RequestControl::new());
         let mut cancellation = CancellationOnDrop {
             control: control.clone(),
+            planning: None,
             armed: true,
         };
         let config = self.config();

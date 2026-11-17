@@ -232,15 +232,29 @@ void cusco_executor_close(cusco_executor * executor) {
     delete executor;
 }
 
+static constexpr uint32_t model_component_mask_from_flags(bool recurrent, bool hybrid, bool has_swa) {
+    return ((!recurrent || hybrid) ? 1u : 0u)
+        | (has_swa ? 2u : 0u)
+        | ((recurrent || hybrid) ? 4u : 0u);
+}
+
+static_assert(model_component_mask_from_flags(false, false, false) == 1u);
+static_assert(model_component_mask_from_flags(false, false, true) == 3u);
+static_assert(model_component_mask_from_flags(true, false, false) == 4u);
+static_assert(model_component_mask_from_flags(true, false, true) == 6u);
+static_assert(model_component_mask_from_flags(false, true, false) == 5u);
+static_assert(model_component_mask_from_flags(false, true, true) == 7u);
+static_assert(model_component_mask_from_flags(true, true, false) == 5u);
+static_assert(model_component_mask_from_flags(true, true, true) == 7u);
+
 static uint32_t model_component_mask(const cusco_executor * executor) {
     if (is_mock(executor)) {
         return 7;
     }
-    const bool recurrent = llama_model_is_recurrent(executor->model);
-    const bool hybrid = llama_model_is_hybrid(executor->model);
-    return ((!recurrent || hybrid) ? 1u : 0u)
-        | (llama_model_n_swa(executor->model) > 0 ? 2u : 0u)
-        | (recurrent ? 4u : 0u);
+    return model_component_mask_from_flags(
+        llama_model_is_recurrent(executor->model),
+        llama_model_is_hybrid(executor->model),
+        llama_model_n_swa(executor->model) > 0);
 }
 
 cusco_capabilities cusco_executor_capabilities(const cusco_executor * executor) {

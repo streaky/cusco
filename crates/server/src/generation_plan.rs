@@ -89,7 +89,12 @@ impl ResourcePlan {
         response: InferResponse,
         reason: crate::FinishReason,
     ) -> Result<CompletedGeneration, Error> {
-        let function_call = self.function_call(&response.text)?;
+        let (reasoning, text) = if self.strip_reasoning {
+            crate::responses::split_native_reasoning(&response.text)
+        } else {
+            (None, response.text.as_str())
+        };
+        let function_call = self.function_call(text)?;
         let web_search_call = self.hosted_search.as_ref().map(|search| {
             crate::responses::new_web_search_call(
                 search.query.clone(),
@@ -101,7 +106,8 @@ impl ResourcePlan {
             created_at: self.created_at,
             owner: &self.owner,
             model: &self.model,
-            text: &response.text,
+            text,
+            reasoning,
             reason,
             usage: &response.usage,
             store: self.persist && self.store,
@@ -112,13 +118,12 @@ impl ResourcePlan {
             input: &self.input,
             function_call,
             expose_reasoning: self.expose_reasoning,
-            strip_reasoning: self.strip_reasoning,
             web_search_call: web_search_call.as_ref(),
         });
         let output_text = if self.persist {
             String::new()
         } else {
-            response.text
+            text.to_owned()
         };
         let output = generation_output(&resource, output_text);
         let response = if self.persist {
@@ -189,6 +194,19 @@ impl ResourcePlan {
     }
 }
 
+fn render_incremental_ledger(
+    family: &str,
+    messages: Vec<crate::prompt::Message>,
+    has_lineage: bool,
+) -> Result<String, Error> {
+    if messages.is_empty() && has_lineage {
+        return Ok(String::new());
+    }
+    crate::prompt::apply_chat_template(
+        family,
+        crate::responses::normalize_lineage_messages(messages),
+    )
+}
 pub(crate) async fn prepare(
     server: &Server,
     request_id: &str,
@@ -196,6 +214,8 @@ pub(crate) async fn prepare(
     model: &ModelRecord,
     input: GenerationInput,
     semantics: GenerationSemantics,
+    control: std::sync::Arc<crate::RequestControl>,
+    deadline: std::time::Instant,
 ) -> Result<PreparedGeneration, Error> {
     let family = &model.family;
     let continuation_id = semantics
@@ -350,13 +370,9 @@ pub(crate) async fn prepare(
                     }
                 }
             }
-            (
-                crate::prompt::apply_chat_template(
-                    family,
-                    crate::responses::normalize_lineage_messages(messages),
-                )?,
-                input_ledger.clone(),
-            )
+            let input_prompt =
+                render_incremental_ledger(family, messages, previous_response_id.is_some())?;
+            (input_prompt, input_ledger.clone())
         }
     };
     if input_ledger.is_empty() {
@@ -390,19 +406,34 @@ pub(crate) async fn prepare(
     let has_tool_output = input_ledger
         .iter()
         .any(|item| matches!(item, ResponseInputItem::FunctionCallOutput { .. }));
-    let hosted_search =
-        crate::execute_hosted_web_search(server, model, &prompt, &semantics.tools, &choice, owner)
-            .await?;
+    let responses_tools = semantics.record_output;
+    let hosted_search = if responses_tools {
+        crate::execute_hosted_web_search(
+            server,
+            model,
+            &prompt,
+            &semantics.tools,
+            &choice,
+            owner,
+            &control,
+            deadline,
+        )
+        .await?
+    } else {
+        None
+    };
     if let Some(search) = &hosted_search {
         crate::append_web_search_evidence(family, &mut prompt, search)?;
     }
-    crate::append_tool_instructions(
-        family,
-        &mut prompt,
-        &semantics.tools,
-        &choice,
-        has_tool_output,
-    )?;
+    if responses_tools {
+        crate::append_tool_instructions(
+            family,
+            &mut prompt,
+            &semantics.tools,
+            &choice,
+            has_tool_output,
+        )?;
+    }
     let mut grammar: Option<String> = None;
     for format in &semantics.format_constraints {
         if let Some(compiled) = crate::generation_tools::response_format_grammar(format)? {
@@ -420,7 +451,11 @@ pub(crate) async fn prepare(
     let strips_native_reasoning = matches!(family.as_str(), "qwen35moe" | "qwen3moe");
     let strip_reasoning =
         strips_native_reasoning && (semantics.record_output || semantics.expose_reasoning);
-    let tool_names = crate::tool_names(&semantics.tools);
+    let tool_names = if responses_tools {
+        crate::tool_names(&semantics.tools)
+    } else {
+        Vec::new()
+    };
     let buffer_output = !tool_names.is_empty() || hosted_search.is_some() || strip_reasoning;
     let resource_tools = if semantics.tool_snapshot.is_empty() {
         tool_values.clone()
@@ -431,9 +466,7 @@ pub(crate) async fn prepare(
         .tool_choice_snapshot
         .clone()
         .unwrap_or_else(|| tool_choice_value.clone());
-    let resource =
-        (semantics.record_output || !semantics.tools.is_empty() || semantics.expose_reasoning)
-            .then(|| ResourcePlan {
+    let resource = (semantics.record_output || semantics.expose_reasoning).then(|| ResourcePlan {
                 service: server.response_service.clone(),
                 id: request_id.to_owned(),
                 owner: owner.to_owned(),
@@ -463,6 +496,25 @@ pub(crate) async fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn response_test_usage() -> crate::Usage {
+        crate::Usage {
+            input_tokens: 0,
+            generated_tokens: 0,
+            evaluated_tokens: 0,
+            cached_tokens: 0,
+            prefill: Default::default(),
+            model: "model".into(),
+            model_revision: "revision".into(),
+            context_id: crate::ContextId::new(),
+            compaction_result: None,
+            latency_ms: 0,
+            status: "completed".into(),
+            correlation_id: "correlation".into(),
+            inference_id: "inference".into(),
+            execution_session_id: "session".into(),
+        }
+    }
 
     #[test]
     fn generated_function_selection_respects_required_tools() {
@@ -494,15 +546,118 @@ mod tests {
             matches!(plan.function_call(unknown), Err(Error::BadRequest(message))
             if message.contains("undeclared function `describe`"))
         );
-        let call = plan
-            .function_call(r#"{"name":"lookup","arguments":{"query":"rust"}}"#)
-            .unwrap()
-            .unwrap();
+        let (reasoning, visible) = crate::responses::split_native_reasoning(
+            "<think>checking the tool selection</think>\n{\"name\":\"lookup\",\"arguments\":{\"query\":\"rust\"}}",
+        );
+        assert_eq!(reasoning, Some("checking the tool selection"));
+        let call = plan.function_call(visible).unwrap().unwrap();
         assert_eq!(call.name, "lookup");
         assert_eq!(
             serde_json::from_str::<Value>(&call.arguments).unwrap(),
             json!({"query":"rust"})
         );
+        plan.choice = NativeToolChoice::Auto;
+        assert!(plan.function_call(visible).unwrap().is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_incremental_ledger_keeps_existing_lineage_prompt() {
+        assert_eq!(
+            render_incremental_ledger("gemma4", Vec::new(), true).unwrap(),
+            ""
+        );
+        assert!(render_incremental_ledger("gemma4", Vec::new(), false).is_err());
+    }
+
+    #[test]
+    fn complete_parses_tool_json_after_stripping_reasoning() {
+        let root = std::env::temp_dir().join(format!("cusco-reasoning-tool-{}", uuid::Uuid::new_v4()));
+        let store = crate::response_store::FileResponseResourceStore::open(&root).unwrap();
+        let service = crate::responses::ResponseService::new(std::sync::Arc::new(store));
+        for choice in [NativeToolChoice::Auto, NativeToolChoice::Required] {
+            let plan = ResourcePlan {
+                service: service.clone(),
+                id: uuid::Uuid::new_v4().to_string(),
+                owner: "owner".into(),
+                model: "model".into(),
+                created_at: None,
+                store: false,
+                previous_response_id: None,
+                lineage_revision: 0,
+                input: Vec::new(),
+                tools: Vec::new(),
+                tool_choice: json!("auto"),
+                tool_names: vec!["lookup".into()],
+                choice,
+                hosted_search: None,
+                expose_reasoning: true,
+                strip_reasoning: true,
+                persist: true,
+            };
+            let completed = plan
+                .complete(
+                    InferResponse {
+                        id: "inference".into(),
+                        text: "<think>private reasoning</think>\n{\"name\":\"lookup\",\"arguments\":{\"query\":\"rust\"}}".into(),
+                        usage: response_test_usage(),
+                    },
+                    crate::FinishReason::Stop,
+                )
+                .unwrap();
+            let response = completed.response.unwrap();
+            assert_eq!(response.output.len(), 1);
+            assert!(matches!(
+                &response.output[0],
+                crate::responses::ResponseOutputItem::FunctionCall(call)
+                    if call.name == "lookup"
+            ));
+            assert!(completed.output.function_call.is_some());
+            assert!(completed.output.reasoning.is_none());
+            assert!(completed.output.text.is_empty());
+        }
+        let plan = ResourcePlan {
+            service: service.clone(),
+            id: uuid::Uuid::new_v4().to_string(),
+            owner: "owner".into(),
+            model: "model".into(),
+            created_at: None,
+            store: false,
+            previous_response_id: None,
+            lineage_revision: 0,
+            input: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: json!("auto"),
+            tool_names: Vec::new(),
+            choice: NativeToolChoice::Auto,
+            hosted_search: None,
+            expose_reasoning: true,
+            strip_reasoning: true,
+            persist: true,
+        };
+        let completed = plan
+            .complete(
+                InferResponse {
+                    id: "inference".into(),
+                    text: "<think>private reasoning</think>\nvisible answer".into(),
+                    usage: response_test_usage(),
+                },
+                crate::FinishReason::Stop,
+            )
+            .unwrap();
+        let response = completed.response.unwrap();
+        assert_eq!(response.output.len(), 2);
+        assert!(matches!(
+            &response.output[0],
+            crate::responses::ResponseOutputItem::Reasoning(reasoning)
+                if reasoning.summary[0].text == "private reasoning"
+        ));
+        assert!(matches!(
+            &response.output[1],
+            crate::responses::ResponseOutputItem::Message(message)
+                if message.content[0].text == "visible answer"
+                    && !message.content[0].text.contains("<think>")
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 }
