@@ -182,3 +182,114 @@ async fn shutdown_signal() {
         let _ = tokio::signal::ctrl_c().await;
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configured_file() -> (std::path::PathBuf, String) {
+        let root = std::env::temp_dir().join(format!("cusco-daemon-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("db")).unwrap();
+        fs::create_dir_all(root.join("models")).unwrap();
+        fs::create_dir_all(root.join("spill")).unwrap();
+        fs::create_dir_all(root.join("user-models")).unwrap();
+        fs::write(root.join("user.yaml"), "models: []\n").unwrap();
+        let mut config = include_str!("../../../config/test.yaml").to_owned();
+        for (from, to) in [
+            ("/data/db/catalog.sqlite", root.join("db/catalog.sqlite")),
+            ("/data/models", root.join("models")),
+            ("/data/spill", root.join("spill")),
+            ("/data/user-models", root.join("user-models")),
+            ("/data/user.yaml", root.join("user.yaml")),
+        ] {
+            config = config.replace(from, &to.display().to_string());
+        }
+        let path = root.join("config.yaml");
+        fs::write(&path, config).unwrap();
+        (root, path.display().to_string())
+    }
+
+    #[test]
+    fn opens_configured_services_and_exposes_configuration() {
+        let (root, path) = configured_file();
+        let daemon = Daemon::open(&path).unwrap();
+        assert_eq!(daemon.configuration().server.active_requests, 4);
+        assert!(daemon.server().models().is_empty());
+        daemon.finish_shutdown();
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn configured_local_models_are_published_and_restored_on_restart() {
+        let (root, path) = configured_file();
+        let model = root.join("user-models/local.gguf");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        bytes.extend_from_slice(&20_u64.to_le_bytes());
+        bytes.extend_from_slice(b"general.architecture");
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        bytes.extend_from_slice(&6_u64.to_le_bytes());
+        bytes.extend_from_slice(b"gemma4");
+        bytes.extend_from_slice(&18_u64.to_le_bytes());
+        bytes.extend_from_slice(b"gemma4.block_count");
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&62_u32.to_le_bytes());
+        fs::write(&model, bytes).unwrap();
+        fs::write(
+            root.join("user.yaml"),
+            "models:\n  - name: local\n    path: local.gguf\n    aliases: [local-alias]\n",
+        )
+        .unwrap();
+
+        let daemon = Daemon::open(&path).unwrap();
+        let registered = daemon.server().models().pop().unwrap();
+        assert_eq!(registered.id, "local");
+        assert_eq!(registered.path, model);
+        assert_eq!(registered.aliases, ["local-alias"]);
+        assert_eq!(registered.family, "gemma4");
+        assert_eq!(registered.block_count, 62);
+        drop(daemon);
+
+        let restarted = Daemon::open(&path).unwrap();
+        let restored = restarted.server().models();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].sha256, registered.sha256);
+        assert_eq!(restored[0].aliases, registered.aliases);
+        drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_reports_unremovable_transient_state() {
+        let (root, path) = configured_file();
+        let transient = root.join("db/catalog.runtime.json");
+        fs::create_dir_all(&transient).unwrap();
+        assert!(matches!(
+            Daemon::open(&path),
+            Err(DaemonError::Startup(message)) if message.contains("discard transient state")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_watchdog_drop_aborts_owned_task() {
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel::<()>();
+        let watchdog = ShutdownWatchdog(parking_lot::Mutex::new(Some(tokio::spawn(async move {
+            let _sender = dropped_sender;
+            let _ = started_sender.send(());
+            std::future::pending::<()>().await;
+        }))));
+        started_receiver.await.unwrap();
+        drop(watchdog);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), dropped_receiver)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+}

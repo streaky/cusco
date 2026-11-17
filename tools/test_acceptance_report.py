@@ -44,6 +44,42 @@ class AcceptanceReportTests(unittest.TestCase):
         self.assertEqual(rows[0]["executed_tests"], 0)
         self.assertEqual(rows[0]["error"], "Rust test filter executed zero tests")
 
+    def test_execution_totals_include_all_binaries_and_doctests(self):
+        rows, _ = self.invoke(
+            "unit_case: test\nintegration_case: test\ndoc_case: test\n",
+            "running 0 tests\n"
+            "test result: ok. 0 passed; 0 failed; 2 ignored;\n"
+            "test result: ok. 2 passed; 0 failed; 1 ignored;\n"
+            "   Doc-tests example\n"
+            "test result: ok. 1 passed; 0 failed; 0 ignored;\n",
+        )
+        self.assertTrue(rows[0]["passed"])
+        self.assertEqual(rows[0]["matched_tests"], 3)
+        self.assertEqual(rows[0]["executed_tests"], 3)
+
+    def test_failed_results_still_count_executed_tests_across_binaries(self):
+        listed = "unit_case: test\nintegration_case: test\n"
+        output = (
+            "test result: ok. 1 passed; 0 failed; 0 ignored;\n"
+            "test result: FAILED. 2 passed; 1 failed; 3 ignored;\n"
+        )
+
+        def run(command, **kwargs):
+            listing = command[-1] == "--list"
+            return subprocess.CompletedProcess(
+                command, 0 if listing else 101,
+                stdout=listed if listing else output, stderr="",
+            )
+
+        with patch.object(REPORT.subprocess, "run", side_effect=run), patch.object(
+            REPORT, "write_report", side_effect=lambda mode, manifest, gates: gates
+        ):
+            rows = REPORT.model_free({"model_free": [
+                {"crate": "example", "test": "case", "contract": "aggregate"}
+            ]})
+        self.assertFalse(rows[0]["passed"])
+        self.assertEqual(rows[0]["executed_tests"], 4)
+
     def test_protocol_suite_is_invoked_as_an_executable_gate(self):
         calls = []
         command_result = subprocess.CompletedProcess(

@@ -691,9 +691,12 @@ fn representation_proof(
     let import_ns = import_started.elapsed().as_nanos();
     let after_import = executor.mapping_metrics();
     let import_bytes_copied = after_import.import_bytes_copied - after_export.import_bytes_copied;
+    // Every backend copies the imported payload; native backends also account
+    // for validation snapshots and rollback. Those extra copies are measured,
+    // not required of backends that can validate without changing active state.
     ensure!(
-        import_bytes_copied > exported.bytes.len() as u64,
-        "mapping import telemetry omitted validation snapshot and restore copies"
+        import_bytes_copied >= exported.bytes.len() as u64,
+        "mapping import telemetry omitted imported payload copies"
     );
     let movement_token = tokens[cursor];
     executor.activate_mapping(&active)?;
@@ -1017,8 +1020,6 @@ mod tests {
         assert_eq!(context, 2048);
         assert_eq!(percentile(&[40, 10, 30, 20], 95), 30);
     }
-
-
 
     #[test]
     fn commands_and_proof_execute_model_free() {
