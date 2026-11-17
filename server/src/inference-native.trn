@@ -9,6 +9,10 @@ class generation-decode-result
     value native-generation-request|none = none
     message string = ''
 
+# Decode normalized domain requests through borrowed native Serde, not endpoint
+# dispatch JSON. Projected structs lack the source document-decodable contract.
+# Remove this decode family when the core codec can construct these native types
+# directly with the same unknown-field and typed-error behavior.
 function decode-native-generation native-generation-request throws throwable; document ref document-value
     result generation-decode-result = rust
         match document.raw.value() {
@@ -41,6 +45,9 @@ function decode-native-context-update native-context-update throws throwable; do
         return request
     throw invalid-request-error; result.message
 
+# Native session events are typed Rust enums without source document-encodable.
+# Await the event here and serialize its borrowed fields into the core document.
+# Remove this bridge when native enums can use the source codec directly.
 async function next-generation-document document-value throws throwable; session ref native-generation-session
     result document-result = rust
         let event = session.next().await;
@@ -64,6 +71,9 @@ function require-context-result native-context-result throws throwable; result n
         return result
     throw service-error; 'state_error', 'context update returned no result'
 
+# Resources and context results retain typed backend ownership. Their projected
+# structs cannot yet use document-encodable; these concrete Serde bridges can go
+# when the core codec accepts them with the same bounded failure behavior.
 function generation-resource-document document-value throws throwable; resource ref native-response-resource
     result document-result = rust
         let raw = terrane_document_support::serialize_document(resource);

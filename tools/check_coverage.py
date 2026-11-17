@@ -9,5 +9,13 @@ for file in report["data"][0]["files"]:
  percent=float(file["summary"]["lines"]["percent"]);seen.append((str(rel),percent))
  if percent<80.0:failures.append((str(rel),percent))
 for path,percent in sorted(seen):print(f"{percent:6.2f}% {path}")
+required = {
+ "crates/server/src/native.rs",
+ "crates/server/src/management.rs",
+ "crates/server/src/generation_tools.rs",
+ "crates/server/src/daemon.rs",
+}
+missing = required - {path for path, _ in seen}
+if missing:raise SystemExit("coverage report omitted host boundaries: "+", ".join(sorted(missing)))
 if not seen:raise SystemExit("coverage report contained no crate source files")
 if failures:raise SystemExit("per-file line coverage below 80%: "+", ".join(f"{p} ({n:.2f}%)" for p,n in failures))

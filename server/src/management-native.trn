@@ -6,7 +6,12 @@ from /core/errors import throwable
 from /deps/cusco-server/management import Management as native-management
 from /deps/cusco-server import CreateCompactionDeclaration as native-declaration-request
 
-# Concrete Serde boundaries preserve typed domain APIs without accepting endpoint JSON.
+# Typed domain Serde family: convert backend results to exact core documents.
+# Rust is retained because projected domain structs do not implement Terrane's
+# document-encodable protocol and source cannot invoke generic native Serialize.
+# Remove these concrete bridges when native values can use the core document
+# codec directly, preserving typed failures and the 16 MiB boundary budget.
+# A generic source helper would still need that unavailable Serialize bound.
 function require-domain-document document-value throws throwable; result document-result
     if result.failed
         throw service-error; 'state_error', result.message

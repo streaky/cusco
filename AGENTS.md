@@ -21,11 +21,12 @@ The repository currently contains:
 - `crates/executor-sys`: native FFI declarations and linking;
 - `crates/executor`: safe Rust executor, token-piece, and checkpoint wrappers;
 - `crates/model-registry`: immutable Hugging Face resolution and verified local registration;
-- `crates/server`: protocol-neutral inference/model services, durable catalog, scheduler, auth, HTTP adapters, and OpenAPI;
-- `crates/cli`: proof, model-management, and `serve` commands;
+- `crates/server`: HTTP-free inference/model services, durable catalog, scheduler, and typed host APIs;
+- `crates/cli`: proof and model-management commands;
 - `native`: the C ABI header and llama.cpp shim;
 - `executor`: upstream and patch metadata;
 - `tools`: fetch, verification, integration-report, and coverage helpers.
+- `server`: Terrane service startup, authentication, protocol controllers, streaming, diagnostics, and compiled web/OpenAPI templates.
 
 The server dynamically admits and reuses multiple model epochs within configured device, host, and storage budgets. Each resident model currently owns one native execution slot. The scheduler interleaves request-owned prefill and decode quanta with per-principal/class fairness within that slot, while distinct resident models can execute independently. Suspended sessions retain their model reference but release slot occupancy between native quanta; cancellation, deadline, and shutdown callbacks remain registered through each native ownership fence. HTTP transport diagnostics default off and support privacy-safe and fully unredacted levels through configuration; full mode exposes headers, query values, credentials, and body content. Compatibility is intentionally bounded: embeddings await executor support, images are admitted and retained but the current executor does not yet project them, and broader architecture coverage remains prospective.
 
@@ -53,7 +54,7 @@ Select the proof GPU with `CUSCO_GPU_DEVICE_ID`; do not assume a particular host
 ## Testing and verification
 
 - Write behavioral tests alongside permanent changes.
- - Every measured Rust source file must maintain at least 80% line coverage. `tools/coverage.sh` runs the tests and enforces the per-file threshold.
+ - Every measured Rust source file must maintain at least 80% line coverage. `tools/coverage.sh` shares instrumentation across Rust unit tests and the external Terrane protocol fixture, takes test executables from Cargo's artifact stream, explicitly includes the fixture/service executables in the merged report, and enforces the per-file threshold. Keep `native.rs`, `management.rs`, `generation_tools.rs`, and `daemon.rs` visible to the report; moving execution across a language boundary must not silently omit Rust coverage.
  - Run the GPU-less coverage path with `docker compose -f compose.test.yaml run --rm test`.
  - The canonical GPU-less contract gate is `docker compose -f compose.test.yaml run --rm acceptance-model-free`. The canonical real-model/GPU gate is `docker compose -f compose.test.yaml run --rm acceptance`; it replays the versioned `config/acceptance.json` test set and writes `results/acceptance-report.json` with per-gate outcomes and complete available source, model, workload, build, runtime, and device provenance.
  - The focused API smoke, executor, mapped-execution, representation-measurement, and scheduler proofs remain diagnostics when changing those subsystems; they do not replace the canonical acceptance gates.
@@ -61,6 +62,7 @@ Select the proof GPU with `CUSCO_GPU_DEVICE_ID`; do not assume a particular host
 - Changes to `/openai/v1/*` behavior must run the pinned `oai-lens` SDK-conformance gate. Bootstrap it explicitly with `tools/fetch-oai-lens.sh`, then run `docker compose -f compose.test.yaml run --rm oai-lens` against the separately running candidate. Probe failures are advisory until their contracts graduate into blocking acceptance coverage; bootstrap, build, execution, report parsing, and artifact-preservation failures are blocking. Review `results/oai-lens-gate.json` against `config/oai-lens-expectations.json`. Never use a neighboring checkout or modify the ignored `.tools/oai-lens/` source.
 - Real-model tests and proofs use the single canonical artifact `hf://unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q3_K_M.gguf`. Pass that URI directly to proof and smoke interfaces; the model registry resolves its immutable revision, validates or populates the persistent cache under `${CUSCO_MODEL_DIR:-./data/models}`, and supplies the resolved local path only at the executor boundary. Tests must not inspect the cache layout, copy, hard-link, symlink, or independently redownload the artifact. This Gemma model supports vision and tool use, so their real-model acceptance coverage should use the same artifact. Executor-boundary changes require the real model proof, not only deterministic model-free tests, and must write machine-readable evidence under `results/`.
 - Mapped-executor changes require `docker compose -f compose.test.yaml run --rm mapped-proof`; it writes staged-versus-mapped evidence to `results/mapped-proof.json`. Representation changes additionally require `docker compose -f compose.test.yaml run --rm representation-proof`; it replays `config/representation-workload.json` and writes exact-continuation, publication-scaling, copy, state-movement, and graph-telemetry evidence to `results/representation-proof.json`.
+- Component-mask truth tables validate classification, not a model family's checkpoint semantics. Canonical Gemma continuation proofs do not establish Qwen recurrent/hybrid mapped or representation support; do not claim that support without the corresponding real-model evidence and an explicitly approved extension of the canonical-model verification policy.
 - Verify failure behavior transactionally: cancellation, preparation failure, transfer failure, validation failure, and commit failure must leave the prior binding usable.
 - For behavioral work, exercise the changed path end to end. A successful compile alone is not sufficient.
 
@@ -75,7 +77,7 @@ Select the proof GPU with `CUSCO_GPU_DEVICE_ID`; do not assume a particular host
 
 ## Engineering expectations
 
-- Preserve the ownership boundary: Rust owns policy and logical state; llama.cpp owns model-specific tensors, graphs, and kernels.
+- Preserve the ownership boundary: Terrane owns HTTP policy and protocol orchestration; Rust owns logical state, scheduling, persistence, and typed inference preparation; llama.cpp owns model-specific tensors, graphs, and kernels.
 - Prefer transactional prepare/commit operations. Never invalidate a working binding before replacement state is fully prepared and validated.
 - Keep slots disposable. Logical contexts survive requests and slot changes but are disposable on daemon restart in the v1 profile.
 - Use exact comparisons in deterministic checkpoint validation; do not weaken bitwise-logit or token equality into approximate checks.

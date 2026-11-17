@@ -7,6 +7,7 @@ must be available to the process (LD_LIBRARY_PATH on Linux). No model is loaded.
 import http.client
 import json
 import os
+from openai import OpenAI
 from pathlib import Path
 import selectors
 import signal
@@ -41,13 +42,6 @@ class HybridServiceTests(unittest.TestCase):
                 "storage_capacity": "128 MiB", "context_reserve": "1 MiB",
                 "context_tokens": 128, "gpu_layers": 0,
             },
-            # Match the acceptance config's explicit limits: omitting a nested
-            # object does not apply its per-field Serde defaults.
-            "hosted_tools": {"web_search": {
-                "enabled": False, "endpoint": None, "timeout_ms": 10000,
-                "max_results": 8, "max_response_bytes": 1048576,
-                "allowed_domains": [],
-            }},
             "server": {
                 "active_requests": 4, "queue_count": 32, "queue_bytes": 16777216,
                 "request_bytes": 1048576, "pre_queue_concurrency": 16,
@@ -136,9 +130,12 @@ class HybridServiceTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/health")[::2], (200, b"ready\n"))
         self.assertEqual(self.request("HEAD", "/health")[2], b"")
         self.assertEqual(self.request("GET", "/cusco/v1/status")[0], 401)
-        status, _, payload = self.request("GET", "/openai/v1/models", authenticated=True)
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(payload), {"object": "list", "data": []})
+        client = OpenAI(
+            base_url=f"http://{self.host}:{self.port}/openai/v1",
+            api_key="hybrid-test-token",
+            max_retries=0,
+        )
+        self.assertEqual([model.id for model in client.models.list().data], [])
         status, _, payload = self.request("POST", "/cusco/v1/contexts", authenticated=True)
         self.assertEqual(status, 200)
         context = json.loads(payload)

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import urllib.request
 import subprocess
@@ -33,10 +34,10 @@ def capture(command):
         return None
 
 
-def run_gate(name, command, contract=None, artifact=None, workload=None, env=None):
+def run_gate(name, command, contract=None, artifact=None, workload=None, env=None, capture_output=False):
     started_at = dt.datetime.now(dt.timezone.utc).isoformat()
     started = time.monotonic()
-    result = subprocess.run(command, cwd=ROOT, text=True, env=env)
+    result = subprocess.run(command, cwd=ROOT, text=True, env=env, capture_output=capture_output)
     elapsed = round((time.monotonic() - started) * 1000, 3)
     row = {
         "name": name,
@@ -46,6 +47,7 @@ def run_gate(name, command, contract=None, artifact=None, workload=None, env=Non
         "duration_ms": elapsed,
         "exit_code": result.returncode,
         "passed": result.returncode == 0,
+        **({"output": result.stdout + result.stderr} if capture_output else {}),
     }
     if workload:
         row["workload"] = digest(workload)
@@ -142,9 +144,31 @@ def write_report(mode, manifest, gates, model=None):
 def model_free(manifest):
     gates = []
     for item in manifest["model_free"]:
-        command = ["cargo", "test", "-p", item["crate"], item["test"]]
-        gates.append(run_gate(item["test"], command, item["contract"]))
-        if not gates[-1]["passed"]:
+        if "protocol_suite" in item:
+            command = ["python3", item["protocol_suite"]]
+        else:
+            command = ["cargo", "test", "-p", item["crate"], item["test"], "--", "--list"]
+        gate = run_gate(item.get("test", "protocol-suite"), command, item["contract"], capture_output="crate" in item)
+        if "crate" in item and gate["passed"]:
+            listed = gate.pop("output", "")
+            matched = [line for line in listed.splitlines() if line.rstrip().endswith(": test")]
+            gate["matched_tests"] = len(matched)
+            if not matched:
+                gate["passed"] = False
+                gate["error"] = "Rust test filter matched zero tests"
+            else:
+                command = ["cargo", "test", "-p", item["crate"], item["test"]]
+                gate = run_gate(item["test"], command, item["contract"], capture_output=True)
+                output = gate.pop("output", "")
+                print(output, end="")
+                gate["matched_tests"] = len(matched)
+                counts = re.findall(r"test result: [^.]+\. (\d+) passed; (\d+) failed;", output)
+                gate["executed_tests"] = sum(int(passed) + int(failed) for passed, failed in counts)
+                if gate["passed"] and not gate["executed_tests"]:
+                    gate["passed"] = False
+                    gate["error"] = "Rust test filter executed zero tests"
+        gates.append(gate)
+        if not gate["passed"]:
             break
     return write_report("model-free", manifest, gates)
 def api_smoke_gate(semantic_workload):

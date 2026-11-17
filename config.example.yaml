@@ -22,6 +22,8 @@ bearer_token: null
 # HTTP diagnostic logging: off, safe, or full. "safe" records privacy-preserving
 # transport metadata. "full" may expose headers, query values, credentials, and
 # request or response bodies, so enable it only in a controlled environment.
+# A failed stderr sink stops capture but does not interrupt in-flight requests;
+# the saved failure makes the process exit nonzero after graceful shutdown.
 http_debug: off
 # Emit verbose llama.cpp/GGML executor diagnostics. This includes high-frequency
 # messages such as per-token CUDA graph reuse, so leave it off in normal use.
@@ -36,6 +38,7 @@ openapi:
 
 # Server-executed tools. Every capability is disabled until an operator selects
 # and bounds a provider; request tool declarations cannot enable capabilities.
+# Omitting hosted_tools or web_search uses these same disabled, nonzero defaults.
 hosted_tools:
   web_search:
     enabled: false

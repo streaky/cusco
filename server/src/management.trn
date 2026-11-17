@@ -68,6 +68,9 @@ function management-bool bool throws throwable; object document-value, name stri
         throw invalid-request-error; name + ' must be a boolean'
     return value.scalar == 'true'
 
+# Await the typed pull event and encode its native Serde fields. The projected
+# event has no source document-encodable implementation; remove this bridge when
+# native event enums can use the core codec directly, retaining terminal errors.
 async function pull-event-document document-value throws throwable; session ref native-pull-session
     result document-result = rust
         let event = session.next().await;

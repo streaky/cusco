@@ -51,6 +51,8 @@ public class service-policy
             this.token = supplied
         this.maximum-headers = settings.server.header-bytes
 
+    # admin is deliberately informational: the configured bearer token grants
+    # both scopes. It is not a distinct admin-authorization enforcement point.
     function authorize string throws throwable; request ref incoming-request, admin bool = false
         context = request.context;
         if (context.header-byte-count;) > this.maximum-headers

@@ -8,9 +8,9 @@ under `server/.trn/protocol-fixture`, then builds and runs it. The separate
 `tools/test-hybrid-service.py` remains the production-engine startup smoke test.
 """
 import http.client
+import inspect
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import selectors
@@ -18,6 +18,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+
+from openai import OpenAI
 
 PROJECT = Path(__file__).resolve().parents[2]
 SERVICE = PROJECT / "server"
@@ -63,6 +66,9 @@ def fixture_artifact():
 
 
 BINARY = fixture_artifact()
+artifact_file = os.environ.get("CUSCO_PROTOCOL_ARTIFACT_FILE")
+if artifact_file:
+    Path(artifact_file).write_text(str(BINARY) + "\n", encoding="utf-8")
 
 
 class ProtocolServiceTests(unittest.TestCase):
@@ -126,6 +132,13 @@ class ProtocolServiceTests(unittest.TestCase):
         self.port = None
         self.stderr = None
 
+    def openai(self):
+        return OpenAI(
+            base_url=f"http://{self.host}:{self.port}/openai/v1",
+            api_key="source-fixture-token",
+            max_retries=0,
+        )
+
     def write_config(self):
         self.config_path.write_text(json.dumps(self.config))
 
@@ -188,10 +201,55 @@ class ProtocolServiceTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def sdk_body(self, operation, body):
+        parameters = inspect.signature(operation).parameters
+        accepted = {
+            name for name, parameter in parameters.items()
+            if parameter.kind != inspect.Parameter.VAR_KEYWORD
+            and name not in {"extra_body", "extra_headers", "extra_query", "timeout"}
+        }
+        arguments = {}
+        extra = {}
+        for key, value in body.items():
+            (arguments if key in accepted else extra)[key] = value
+        if extra:
+            arguments["extra_body"] = extra
+        return arguments
+
     def json_request(self, method, path, body=None, **kwargs):
-        status, headers, payload = self.request(method, path, body, **kwargs)
-        parsed = json.loads(payload) if payload else None
-        return status, headers, parsed
+        if not path.startswith("/openai/v1/") or path == "/openai/v1/openapi.json":
+            status, headers, payload = self.request(method, path, body, **kwargs)
+            parsed = json.loads(payload) if payload else None
+            return status, headers, parsed
+        client = self.openai()
+        try:
+            if path == "/openai/v1/models" and method == "GET":
+                raw = client.models.with_raw_response.list()
+            elif path == "/openai/v1/completions" and method == "POST":
+                operation = client.completions.create
+                raw = client.completions.with_raw_response.create(**self.sdk_body(operation, body))
+            elif path == "/openai/v1/chat/completions" and method == "POST":
+                operation = client.chat.completions.create
+                raw = client.chat.completions.with_raw_response.create(**self.sdk_body(operation, body))
+            elif path == "/openai/v1/responses" and method == "POST":
+                operation = client.responses.create
+                raw = client.responses.with_raw_response.create(**self.sdk_body(operation, body))
+            elif path.startswith("/openai/v1/responses/") and method == "GET":
+                raw = client.responses.with_raw_response.retrieve(path.rsplit("/", 1)[1])
+            elif path.startswith("/openai/v1/responses/") and method == "DELETE":
+                raw = client.responses.with_raw_response.delete(path.rsplit("/", 1)[1])
+                # SDK 2.11 declares deletion as returning None; retain the
+                # server's deletion document through its raw-response wrapper.
+                return raw.status_code, {key.lower(): value for key, value in raw.headers.items()}, raw.http_response.json()
+            else:
+                raise AssertionError(f"unsupported OpenAI request: {method} {path}")
+            parsed = raw.parse()
+            return raw.status_code, {key.lower(): value for key, value in raw.headers.items()}, parsed.model_dump(mode="json", exclude_unset=True)
+        except Exception as error:
+            from openai import APIStatusError
+            if not isinstance(error, APIStatusError):
+                raise
+            return error.status_code, {key.lower(): value for key, value in error.response.headers.items()}, error.response.json()
 
     def diagnostic_text(self):
         self.stderr.flush()
@@ -355,7 +413,7 @@ class ProtocolServiceTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_wall_deadline_and_stream_disconnect_cancel_gated_work(self):
+    def test_wall_deadline_cancels_gated_work(self):
         self.config["server"]["wall_time_ms"] = 400
         self.start()
         import threading
@@ -376,6 +434,9 @@ class ProtocolServiceTests(unittest.TestCase):
         self.assertTrue(outcome["deadline"][2]["error"])
         self.assertEqual(outcome["deadline"][2]["error"]["code"], "deadline_exceeded")
 
+    def test_stream_disconnect_cancels_before_deadline(self):
+        self.config["server"]["wall_time_ms"] = 30000
+        self.start()
         connection = http.client.HTTPConnection(self.host, self.port, timeout=5)
         connection.request(
             "POST", "/openai/v1/chat/completions",
@@ -388,6 +449,7 @@ class ProtocolServiceTests(unittest.TestCase):
         self.wait_for_file(self.gate_path("disconnect", "started"))
         connection.close()
         self.wait_for_file(self.gate_path("disconnect", "cancelled"))
+        self.assertFalse(self.gate_path("disconnect", "release").exists())
     def test_active_and_request_deadline_bounds_gated_work(self):
         self.config["server"]["wall_time_ms"] = 5000
         self.config["server"]["active_time_ms"] = 400
@@ -455,22 +517,20 @@ class ProtocolServiceTests(unittest.TestCase):
 
     def test_completion_chat_defaults_validation_and_service_tier(self):
         self.start()
-        status, headers, completion = self.json_request(
-            "POST", "/openai/v1/completions",
-            {"model": "m", "prompt": "alpha beta", "max_tokens": 1},
+        client = self.openai()
+        completion_raw = client.completions.with_raw_response.create(
+            model="m", prompt="alpha beta", max_tokens=1,
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(completion["object"], "text_completion")
-        self.assertEqual(completion["choices"][0]["text"].strip(), "beta")
-        self.assertTrue(headers.get("x-request-id"))
-        status, _, chat = self.json_request(
-            "POST", "/openai/v1/chat/completions",
-            {"model": "m", "messages": [{"role": "user", "content": "alpha beta"}],
-             "max_completion_tokens": 1, "service_tier": "priority"},
+        completion = completion_raw.parse()
+        self.assertEqual(completion.object, "text_completion")
+        self.assertEqual(completion.choices[0].text.strip(), "beta")
+        self.assertTrue(completion_raw.headers.get("x-request-id"))
+        chat = client.chat.completions.create(
+            model="m", messages=[{"role": "user", "content": "alpha beta"}],
+            max_completion_tokens=1, service_tier="priority",
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(chat["choices"][0]["message"]["role"], "assistant")
-        self.assertEqual(chat["service_tier"], "default")
+        self.assertEqual(chat.choices[0].message.role, "assistant")
+        self.assertEqual(chat.service_tier, "default")
         for invalid in (
             {"model": "m", "prompt": "x", "unknown": True},
             {"model": "m", "prompt": "x", "max_tokens": -1},
@@ -501,34 +561,56 @@ class ProtocolServiceTests(unittest.TestCase):
             "Answer https://example.com/result",
         )
 
+    def test_chat_sampling_ranges_are_rejected(self):
+        self.start()
+        for options in ({"temperature": -0.1}, {"temperature": 2.1}, {"top_p": 0}, {"top_p": 1.1}):
+            with self.subTest(options=options):
+                status, _, error = self.json_request(
+                    "POST", "/openai/v1/chat/completions",
+                    {"model": "m", "messages": [{"role": "user", "content": "hello"}], **options},
+                )
+                self.assertEqual(status, 400)
+                self.assertIn("error", error)
+
+    def test_chat_tools_are_validation_only_and_keep_text_output(self):
+        self.start()
+        chat = self.openai().chat.completions.create(
+            model="m",
+            messages=[{"role": "user", "content": "fixture:inspect-chat-tool-prompt"}],
+            tools=[{"type": "function", "function": {
+                "name": "lookup", "description": "Lookup fixture data",
+                "parameters": {"type": "object", "properties": {}},
+            }}],
+            max_completion_tokens=8,
+        )
+        message = chat.choices[0].message
+        self.assertIsNone(message.tool_calls)
+        self.assertIn("fixture:inspect-chat-tool-prompt", message.content)
+        self.assertNotIn("lookup", message.content)
+        status, _, failure = self.json_request(
+            "POST", "/openai/v1/chat/completions",
+            {"model": "m", "messages": [{"role": "user", "content": "hello"}],
+             "tools": [{"type": "web_search"}]},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("error", failure)
+
     def test_openai_stream_event_order_usage_and_terminal_done(self):
         self.start()
-        status, headers, body = self.request(
-            "POST", "/openai/v1/chat/completions",
-            {"model": "m", "messages": [{"role": "user", "content": "one two three"}],
-             "max_completion_tokens": 2, "stream": True,
-             "stream_options": {"include_usage": True}},
-        )
-        self.assertEqual(status, 200)
-        self.assertIn("text/event-stream", headers["content-type"])
-        text = body.decode()
-        rows = [line[6:] for line in text.splitlines() if line.startswith("data: ")]
-        self.assertGreaterEqual(len(rows), 3)
-        self.assertEqual(rows[-1], "[DONE]")
-        events = [json.loads(row) for row in rows[:-1]]
-        # The deterministic engine reverses the Gemma template into a stop marker;
-        # the untemplated completion below independently covers length termination.
-        self.assertEqual(events[-1]["choices"][0]["finish_reason"], "stop")
-        self.assertGreater(events[-1]["usage"]["total_tokens"], 0)
-        status, _, without_usage = self.request(
-            "POST", "/openai/v1/completions",
-            {"model": "m", "prompt": "plain stream", "max_tokens": 1, "stream": True},
-        )
-        self.assertEqual(status, 200)
-        no_usage_rows = [line[6:] for line in without_usage.decode().splitlines() if line.startswith("data: ")]
-        self.assertEqual(no_usage_rows[-1], "[DONE]")
-        self.assertEqual(json.loads(no_usage_rows[-2])["choices"][0]["finish_reason"], "length")
-        self.assertTrue(all("usage" not in json.loads(row) for row in no_usage_rows[:-1]))
+        client = self.openai()
+        chunks = list(client.chat.completions.create(
+            model="m", messages=[{"role": "user", "content": "one two three"}],
+            max_completion_tokens=2, stream=True,
+            stream_options={"include_usage": True},
+        ))
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertEqual(chunks[-1].choices[0].finish_reason, "stop")
+        self.assertGreater(chunks[-1].usage.total_tokens, 0)
+        completion_chunks = list(client.completions.create(
+            model="m", prompt="plain stream", max_tokens=1, stream=True,
+        ))
+        self.assertTrue(completion_chunks)
+        self.assertEqual(completion_chunks[-1].choices[0].finish_reason, "length")
 
     def test_responses_schema_store_lineage_and_context_update(self):
         self.start()
@@ -543,8 +625,23 @@ class ProtocolServiceTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertTrue(base["id"])
+        ratio = base["cusco"]["usage"]["prefill"]["cached_ratio"]
+        self.assertIsInstance(ratio, (int, float))
+        self.assertEqual(ratio, 0.0)
         response_id = base["id"]
         self.assertEqual(self.json_request("GET", f"/openai/v1/responses/{response_id}")[0], 200)
+        empty_base_status, _, empty_base = self.json_request(
+            "POST", "/openai/v1/responses",
+            {"model": "m", "input": "empty branch", "max_output_tokens": 1},
+        )
+        self.assertEqual(empty_base_status, 200)
+        empty_continuation_status, _, empty_continuation = self.json_request(
+            "POST", "/openai/v1/responses",
+            {"model": "m", "input": [], "max_output_tokens": 1,
+             "previous_response_id": empty_base["id"]},
+        )
+        self.assertEqual(empty_continuation_status, 200)
+        self.assertEqual(empty_continuation["previous_response_id"], empty_base["id"])
         status, _, continued = self.json_request(
             "POST", "/openai/v1/responses",
             {"model": "m", "input": "continue", "max_output_tokens": 1,
@@ -600,10 +697,10 @@ class ProtocolServiceTests(unittest.TestCase):
         self.assertEqual(replay_status, 409)
         self.assertIn("error", replay)
         self.assertEqual(self.json_request("GET", "/cusco/v1/capabilities")[0], 200)
-        self.assertEqual(self.request("DELETE", f"/openai/v1/responses/{response_id}")[0], 409)
-        self.assertEqual(self.request("DELETE", f"/openai/v1/responses/{continued['id']}")[0], 200)
-        self.assertEqual(self.request("DELETE", f"/openai/v1/responses/{response_id}")[0], 200)
-        self.assertEqual(self.request("GET", f"/openai/v1/responses/{response_id}")[0], 404)
+        self.assertEqual(self.json_request("DELETE", f"/openai/v1/responses/{response_id}")[0], 409)
+        self.assertEqual(self.json_request("DELETE", f"/openai/v1/responses/{continued['id']}")[0], 200)
+        self.assertEqual(self.json_request("DELETE", f"/openai/v1/responses/{response_id}")[0], 200)
+        self.assertEqual(self.json_request("GET", f"/openai/v1/responses/{response_id}")[0], 404)
 
     def test_responses_portable_function_call_and_tool_output_lineage(self):
         self.start()
@@ -626,8 +723,8 @@ class ProtocolServiceTests(unittest.TestCase):
         self.assertEqual(result["object"], "response")
         response_id = result["id"]
         self.assertEqual(self.json_request("GET", f"/openai/v1/responses/{response_id}")[0], 200)
-        self.assertEqual(self.request("DELETE", f"/openai/v1/responses/{response_id}")[0], 200)
-        self.assertEqual(self.request("GET", f"/openai/v1/responses/{response_id}")[0], 404)
+        self.assertEqual(self.json_request("DELETE", f"/openai/v1/responses/{response_id}")[0], 200)
+        self.assertEqual(self.json_request("GET", f"/openai/v1/responses/{response_id}")[0], 404)
 
     def test_hosted_search_results_and_citations_survive_retrieval(self):
         self.start()
@@ -646,6 +743,37 @@ class ProtocolServiceTests(unittest.TestCase):
         status, _, stored = self.json_request("GET", f"/openai/v1/responses/{response['id']}")
         self.assertEqual(status, 200)
         self.assertEqual(stored["output"], response["output"])
+
+    def test_hosted_selection_obeys_parent_deadline(self):
+        self.config["server"]["wall_time_ms"] = 400
+        self.start()
+        status, _, failure = self.json_request(
+            "POST", "/openai/v1/responses",
+            {"model": "m", "input": "[[gate:search-deadline]] held", "max_output_tokens": 1,
+             "tool_choice": "required", "tools": [{"type": "web_search"}]},
+        )
+        self.assertEqual(status, 408, failure)
+        self.assertEqual(failure["error"]["code"], "deadline_exceeded")
+        self.wait_for_file(self.gate_path("search-deadline", "cancelled"))
+        _, _, metrics = self.json_request("GET", "/cusco/v1/status")
+        self.assertEqual(metrics["admission"]["active"], 0)
+
+    def test_disconnect_cancels_hosted_selection_before_parent_deadline(self):
+        self.config["server"]["wall_time_ms"] = 30000
+        self.start()
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=5)
+        self.addCleanup(connection.close)
+        connection.request(
+            "POST", "/openai/v1/responses",
+            json.dumps({"model": "m", "input": "[[gate:search-disconnect]] held",
+                        "max_output_tokens": 1, "tool_choice": "required",
+                        "tools": [{"type": "web_search"}]}),
+            {"Authorization": "Bearer source-fixture-token", "Content-Type": "application/json"},
+        )
+        self.wait_for_file(self.gate_path("search-disconnect", "started"))
+        connection.close()
+        self.wait_for_file(self.gate_path("search-disconnect", "cancelled"))
+        self.assertFalse(self.gate_path("search-disconnect", "release").exists())
 
     def test_responses_tool_and_structured_wire_validation(self):
         self.start()

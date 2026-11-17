@@ -504,7 +504,7 @@ Downloads, updates, verification, repair, and deletions require per-model coordi
 The CLI should be a first-class client of the same application services, not a test-only wrapper around internal objects. Its command organization should take practical inspiration from Ollama while retaining the project's explicit model, context, and cache semantics:
 
 ```text
-cusco serve
+cusco-service [--config PATH] [--http-debug off|safe|full]
 cusco run <model-reference>
 cusco chat <model-reference>
 cusco complete <model-reference>
@@ -520,7 +520,7 @@ cusco context inspect <context-id>
 
 The CLI defaults to the Ollama-compatible management and Cusco extension APIs, with an explicit local/in-process mode for proofs and recovery. Configured local models are edited declaratively in `data/user.yaml`, not registered imperatively by the CLI. Output supports stable machine-readable JSON and human-readable tables. Destructive operations require confirmation unless a non-interactive flag is supplied.
 
-The CLI provides a direct path for loading a Hub model, running inference, exercising capture and restore, inspecting usage, and managing local artifacts. HTTP adapters and CLI commands share the same application-service contracts.
+The Rust CLI provides a direct path for loading a Hub model, running inference, exercising capture and restore, inspecting usage, and managing local artifacts. The Terrane `cusco-service` executable owns HTTP startup, authentication, controllers, streaming, diagnostics, and templates. Both call the same typed, HTTP-free Rust application services; `cusco serve` is no longer supported.
 
 ## Logical contexts
 
@@ -1396,7 +1396,7 @@ The production container layout must keep mutable data outside image layers and 
 
 All paths are under the ignored `./data` tree. Managed model payloads, read-only operator files, runtime configuration, and transactional metadata remain distinct: database backup and migration do not copy weights, Ollama cannot mutate user-owned files, and a later PostgreSQL backend can replace SQLite without changing either model store. `config.yaml` and `user.yaml` are declarative startup inputs, not mutable database state. The server must validate their versioned schemas before opening listeners, reject unknown or inconsistent fields, and require restart for changes until an explicitly transactional reload contract exists. Environment variables must not form a second field-by-field configuration surface; the initial bootstrap may select the config path through an explicit CLI option, while secrets are supplied by configured file or provider references rather than embedded in ordinary runtime policy.
 
-The production `cusco serve` interface accepts the configuration path plus only process-bootstrap controls that cannot live in that file. Installed and declared models enter and leave residency through the model service and scheduler; startup configuration does not duplicate model metadata derivable from artifacts. Operator policy remains in the versioned `config.yaml`.
+The production Terrane `cusco-service` interface accepts the configuration path plus only process-bootstrap controls that cannot live in that file. Installed and declared models enter and leave residency through the model service and scheduler; startup configuration does not duplicate model metadata derivable from artifacts. Operator policy remains in the versioned `config.yaml`.
 
 Model installation and startup residency are separate. By default, catalogued and declared models are registered but no model is loaded merely because the daemon starts. `config.yaml` provides `residency.pinned_models`, accepting either one model name or a list of names and defaulting to an empty list. After SQLite and `user.yaml` reconciliation, each named model is capacity-admitted, loaded, and held resident irrespective of ordinary idle-unload policy. Explicit removal, replacement, shutdown, or configuration change may retire it through the normal transactional lifecycle. A missing, ambiguous, inadmissible, or failed pinned model prevents readiness and reports the specific model failure; the daemon must not silently weaken the configured pin.
 

@@ -33,6 +33,8 @@ function generation-cusco document-value throws throwable; usage ref document-va
     if total > 0
         cached float64 = generation-count; prefill, 'cached_tokens'
         denominator float64 = total
+        # Exact integer/decimal constructors are disjoint and there is no
+        # general float constructor; this bounded scalar may be 0, 1 or fractional.
         ratio = (parse-wire-json; ('' + (cached / denominator)), 128).value
     details = generation-object; (list; 'total_tokens', 'cached_tokens', 'uncached_tokens', 'cached_ratio', 'tokenization_ns', 'prefix_lookup_ns', 'mapping_activation_ns', 'uncached_prefill_ns', 'total_ns'), (list; (wire-field; prefill, 'total_tokens'), (wire-field; prefill, 'cached_tokens'), (wire-field; prefill, 'uncached_tokens'), ratio, (wire-field; prefill, 'tokenization_ns'), (wire-field; prefill, 'prefix_lookup_ns'), (wire-field; prefill, 'mapping_activation_ns'), (wire-field; prefill, 'uncached_prefill_ns'), (wire-field; prefill, 'total_ns'))
     counts = generation-object; (list; 'input_tokens', 'generated_tokens', 'evaluated_tokens', 'cached_tokens', 'prefill'), (list; (wire-field; usage, 'input_tokens'), (wire-field; usage, 'generated_tokens'), (wire-field; usage, 'evaluated_tokens'), (wire-field; usage, 'cached_tokens'), details)

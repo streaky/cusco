@@ -42,6 +42,9 @@ execution and optimized kernels.
   Responses can also execute an operator-enabled, policy-bounded `web_search`
   tool through a configured SearXNG-compatible provider; it is disabled by
   default and returns standard search-call items and URL citations.
+  Function execution and `tool_choice` are Responses-only. Chat Completions
+  validates function declarations without injecting tool instructions or
+  returning `tool_calls`; hosted search tools are rejected on chat.
 - Deterministic `window_tail` context compaction with transactional successor
   publication and replay metadata.
 - Versioned YAML configuration, bearer authentication, transport diagnostics,
@@ -85,6 +88,13 @@ validation or cancellation before commit leaves the base resource unchanged.
 Clients that do not negotiate the extension continue to use standard stored
 Responses and `previous_response_id`.
 
+Management results, stored Responses and typed session events cross the native
+Serde-to-document boundary with a fixed 16 MiB encoding budget. Oversized values
+fail with `state_error` (HTTP 500 before headers), never truncated success. In
+particular, context listings include token vectors and are not paginated; keep
+their aggregate size within this bound. Pagination or smaller context summaries
+would require a separate API contract change; neither is implemented here.
+
 The workspace is split into focused crates:
 
 - `context-store` provides immutable token branches and evaluated-prefix
@@ -96,6 +106,11 @@ The workspace is split into focused crates:
 - `server` contains HTTP-free inference services, scheduling, residency, persistence,
   and typed host-application APIs;
 - `cli` provides proof and model-management commands; it no longer runs the daemon.
+
+Cached-ratio encoding retains a bounded scalar parse: the exact integer and
+decimal constructors accept disjoint normalized number domains, and the core
+document API does not expose a general float constructor. Substituting the
+decimal constructor alone breaks ordinary ratios of zero or one.
 
 ## Platform support
 
@@ -122,6 +137,13 @@ runs executor continuation, mapped publication, representation scaling,
 sustained scheduler, and API smoke workloads, then writes a provenance-indexed
 `results/acceptance-report.json`. Focused proof services remain useful
 diagnostics, but do not replace the complete gate.
+
+The model-free gate executes the Terrane controller suite through the pinned
+official OpenAI SDK as well as selected Rust contracts. Rust selectors must
+match at least one executable test; an empty filter is a gate failure.
+`docker compose -f compose.test.yaml run --rm test` merges Rust unit-test and
+instrumented protocol-fixture coverage before enforcing the 80% per-file
+threshold. The extracted host-boundary files must appear in that report.
 
 ## Run the OpenAI SDK conformance gate
 
@@ -291,6 +313,11 @@ frames; non-UTF-8 values are represented as hexadecimal. Full mode exposes
 credentials and generated content and must be enabled only in a controlled
 diagnostic environment. Traced responses include the correlation ID in
 `x-request-id`.
+
+If stderr writing fails, further diagnostic capture stops. Requests and graceful
+draining continue; after shutdown, the service reports the saved diagnostic
+failure through a non-zero process exit. This is deliberate for an explicitly
+enabled diagnostic sink, not a claim that every request was captured.
 
 The checked OpenAPI documents are served at `/openai/v1/openapi.json` and
 `/cusco/v1/openapi.json`. OpenAI-compatible inference endpoints live under
