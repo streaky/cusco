@@ -2,10 +2,11 @@
 
 Cusco is an experimental persistent, tiered, branch-aware model-state server built around llama.cpp. Its goal is to make model execution state a durable resource that can be captured, displaced from scarce accelerator memory, restored later, and continued exactly.
 
-The project separates responsibilities deliberately: Terrane owns the service
-entrypoint, HTTP application composition, and template-backed web surface. Rust
-retains logical contexts, scheduling, storage tiers, protocol adapters, and
-transactional state; llama.cpp retains model-specific execution and optimized kernels.
+The project separates responsibilities deliberately: Terrane owns service startup,
+HTTP authentication, request validation, protocol controllers, response encoding,
+streaming, and the template-backed web surface. Rust retains logical contexts,
+scheduling, storage tiers, and transactional state; llama.cpp retains model-specific
+execution and optimized kernels.
 
 ## Features
 
@@ -49,19 +50,23 @@ transactional state; llama.cpp retains model-specific execution and optimized ke
 ## Architecture
 
 The executable application is `server/package.toml`. Its Terrane `main` loads
-the Rust backend, binds the listener, mounts the existing API router alongside
-Terrane handlers through `packages/http-server`, and coordinates graceful shutdown.
-`packages/template` compiles the HTML templates into the executable. There is no
-second backend process, proxy hop, or JSON bridge between the two languages.
+the Rust backend, binds the listener, mounts Terrane protocol controllers through
+`packages/http-server`, and coordinates graceful shutdown. `packages/template`
+compiles the HTML templates into the executable. There is no second backend
+process, proxy hop, or endpoint-dispatch JSON bridge between the two languages.
 
 `server/src/site.trn` owns the public `/` and `/health` GET/HEAD handlers.
-Add frontend handlers and templates there; keep inference and state machinery
-in the Rust crates. The existing OpenAI/Cusco endpoints remain Rust protocol
-adapters mounted in-process, including streaming bodies and authentication.
+`inference*.trn` owns OpenAI completion/chat/Responses and context-update HTTP
+contracts; `management.trn` owns management routes. `policy.trn` owns authorization
+and HTTP errors, and `trace.trn` owns diagnostic redaction. Generic body transport,
+backpressure, disconnect finalization, and frame observation live in the HTTP package.
 The homepage and health endpoint expose no private service state.
 
-Rust owns logical contexts, request scheduling, model residency policy,
-admission, persistence, and protocol adapters. A narrow versioned C ABI owns
+Rust exposes typed generation sessions, admission permits, management operations,
+and domain results without a Rust HTTP router or HTTP request/response types.
+It owns logical contexts, request scheduling, model residency policy,
+admission, persistence, prompt preparation, and semantic generation finalization.
+A narrow versioned C ABI owns
 llama.cpp model execution, tokenization, sampling, sequence mappings, and
 checkpoint import/export.
 
@@ -88,8 +93,8 @@ The workspace is split into focused crates:
   active bindings;
 - `executor-sys` and `executor` expose the native ABI safely to Rust;
 - `model-registry` resolves immutable Hugging Face artifacts and local models;
-- `server` contains inference services, scheduling, residency, persistence, and
-  HTTP adapters;
+- `server` contains HTTP-free inference services, scheduling, residency, persistence,
+  and typed host-application APIs;
 - `cli` provides proof and model-management commands; it no longer runs the daemon.
 
 ## Platform support
@@ -250,9 +255,20 @@ python3 tools/test-hybrid-service.py "$artifact" -v
 ```
 
 This uses temporary state and an actual native-linked service without loading a
-model. It checks the Terrane HTML/health routes, authenticated Rust API access,
+model. It checks the Terrane HTML/health routes, authenticated API access,
 context creation/retrieval, startup policy, and SIGTERM exit. Model-backed inference
 and GPU acceptance still use the separate gates above.
+
+For model-free protocol regressions against the same Terrane controllers, run
+`python3 server/tests/test_protocol_service.py -v`. This builds a fixture using
+a feature-gated deterministic Rust engine; it is not the production engine.
+The driver stages the fixture with the production controller sources under
+`server/.trn/protocol-fixture`; it does not maintain a second route implementation.
+Small temporary copies are acceptable when they keep Terrane straightforward.
+Typed Serde and unsupported projected address operations still need native bridges.
+The fragment-joining helper also retains a preallocated native buffer: its output
+can span the request, and current source `+` lowering allocates a new buffer per
+iteration. Revisit it when source append/builder operations can reuse that buffer.
 
 No storage migration is part of this cutover: the existing SQLite and file-backed
 stores remain authoritative. `dbkit` is deliberately not introduced until a
