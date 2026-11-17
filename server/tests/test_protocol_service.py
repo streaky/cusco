@@ -96,7 +96,7 @@ class ProtocolServiceTests(unittest.TestCase):
                 "context_tokens": 128, "gpu_layers": 0,
             },
             "hosted_tools": {"web_search": {
-                "enabled": False, "endpoint": None, "timeout_ms": 10000,
+                "enabled": True, "endpoint": "http://fixture.invalid", "timeout_ms": 10000,
                 "max_results": 8, "max_response_bytes": 1048576,
                 "allowed_domains": [],
             }},
@@ -515,6 +515,55 @@ class ProtocolServiceTests(unittest.TestCase):
         self.assertEqual(self.request("DELETE", "/cusco/v1/contexts/" + branch["id"])[0], 204)
         self.assertEqual(self.request("DELETE", "/cusco/v1/contexts/" + imported["id"])[0], 204)
 
+    def test_disabled_hosted_search_is_rejected_before_selection(self):
+        del self.config["hosted_tools"]
+        self.start()
+        from openai import BadRequestError
+        with self.assertRaises(BadRequestError) as caught:
+            self.openai().responses.create(
+                model="m", input="[[gate:disabled-search]] find evidence",
+                tools=[{"type": "web_search"}], tool_choice="required",
+            )
+        self.assertEqual(caught.exception.code, "invalid_request")
+        self.assertIn("disabled", caught.exception.message)
+        self.assertFalse(self.gate_path("disabled-search", "started").exists())
+        _, _, status = self.json_request("GET", "/cusco/v1/status")
+        self.assertEqual(status["admission"]["active"], 0)
+        self.assertEqual(status["admission"]["queued"], 0)
+
+    def test_hosted_selection_has_its_own_active_deadline(self):
+        self.config["server"]["active_time_ms"] = 100
+        self.config["server"]["wall_time_ms"] = 10000
+        self.start()
+        from openai import APIStatusError
+        with self.assertRaises(APIStatusError) as caught:
+            self.openai().with_options(timeout=3).responses.create(
+                model="m", input="[[gate:selection-active]] find evidence",
+                tools=[{"type": "web_search"}], tool_choice="required",
+            )
+        self.assertEqual(caught.exception.status_code, 408)
+        self.assertEqual(caught.exception.code, "deadline_exceeded")
+        self.assertTrue(self.gate_path("selection-active", "started").exists())
+        self.assertTrue(self.gate_path("selection-active", "cancelled").exists())
+        self.assertFalse(self.gate_path("selection-active", "release").exists())
+
+    def test_unknown_fields_name_the_rejected_field(self):
+        self.start()
+        from openai import BadRequestError
+        client = self.openai()
+        for name in ("prompt_cache_key", "parallel_tool_calls"):
+            with self.subTest(field=name), self.assertRaises(BadRequestError) as caught:
+                client.responses.create(
+                    model="m", input="hello", extra_body={name: True},
+                )
+            self.assertEqual(caught.exception.code, "invalid_request")
+            self.assertIn("unknown field " + name, caught.exception.message)
+        status, _, payload = self.request("POST", "/openai/v1/responses", [])
+        failure = json.loads(payload)
+        self.assertEqual(status, 400)
+        self.assertEqual(failure["error"]["code"], "invalid_request")
+        self.assertIn("expected an object", failure["error"]["message"])
+
     def test_completion_chat_defaults_validation_and_service_tier(self):
         self.start()
         client = self.openai()
@@ -595,6 +644,41 @@ class ProtocolServiceTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("error", failure)
 
+
+    def test_function_parameter_schemas_are_validated_for_chat_and_responses(self):
+        self.start()
+        invalid_schema = {
+            "type": "object",
+            "properties": {"value": {"type": "not-a-json-schema-type"}},
+        }
+        valid_schema = {
+            "type": "object",
+            "properties": {"value": {"type": ["string", "null"]}},
+        }
+        for path, body in (
+            ("/openai/v1/responses", {"model": "m", "input": "Call broken."}),
+            ("/openai/v1/chat/completions", {
+                "model": "m", "messages": [{"role": "user", "content": "Call broken."}],
+            }),
+        ):
+            with self.subTest(path=path):
+                invalid = dict(body)
+                invalid["tools"] = [{
+                    "type": "function", "name": "broken", "strict": True,
+                    "parameters": invalid_schema,
+                }]
+                status, _, failure = self.json_request("POST", path, invalid)
+                self.assertEqual(status, 400, failure)
+                self.assertEqual(failure["error"]["code"], "invalid_request")
+
+                accepted = dict(body)
+                accepted["tools"] = [{
+                    "type": "function", "name": "union", "strict": True,
+                    "parameters": valid_schema,
+                }]
+                status, _, result = self.json_request("POST", path, accepted)
+                self.assertEqual(status, 200, result)
+
     def test_openai_stream_event_order_usage_and_terminal_done(self):
         self.start()
         client = self.openai()
@@ -611,6 +695,79 @@ class ProtocolServiceTests(unittest.TestCase):
         ))
         self.assertTrue(completion_chunks)
         self.assertEqual(completion_chunks[-1].choices[0].finish_reason, "length")
+        self.assertTrue(all("usage" not in chunk.model_fields_set for chunk in completion_chunks))
+        self.assertTrue(all(chunk.usage is None for chunk in completion_chunks))
+        chat_chunks = list(client.chat.completions.create(
+            model="m", messages=[{"role": "user", "content": "plain chat stream"}],
+            max_completion_tokens=1, stream=True,
+        ))
+        self.assertTrue(chat_chunks)
+        self.assertTrue(all("usage" not in chunk.model_fields_set for chunk in chat_chunks))
+        self.assertTrue(all(chunk.usage is None for chunk in chat_chunks))
+
+    def test_responses_token_exhaustion_is_incomplete_and_survives_retrieval(self):
+        self.start()
+        client = self.openai()
+        response = client.responses.create(
+            model="m", input="a long story", max_output_tokens=1,
+        )
+        self.assertEqual(response.status, "incomplete")
+        self.assertEqual(response.incomplete_details.reason, "max_output_tokens")
+        stored = client.responses.retrieve(response.id)
+        self.assertEqual(stored.status, "incomplete")
+        self.assertEqual(stored.incomplete_details.reason, "max_output_tokens")
+        events = list(client.responses.create(
+            model="m", input="another long story", max_output_tokens=1, stream=True,
+        ))
+        self.assertEqual(events[-1].type, "response.incomplete")
+        self.assertEqual(events[-1].response.status, "incomplete")
+        self.assertEqual(events[-1].response.incomplete_details.reason, "max_output_tokens")
+        self.assertNotIn("response.completed", [event.type for event in events])
+        with client.responses.stream(
+            model="m", input="short answer", max_output_tokens=16,
+        ) as stream:
+            completed_events = []
+            for event in stream:
+                if event.type == "response.created":
+                    self.assertEqual(event.response.output, [])
+                completed_events.append(event)
+            completed = stream.get_final_response()
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(len(completed.output), 1)
+        self.assertEqual(len(completed.output[0].content), 1)
+        self.assertEqual(
+            completed.output_text,
+            "".join(event.delta for event in completed_events if event.type == "response.output_text.delta"),
+        )
+
+    def test_responses_function_stream_accumulates_arguments(self):
+        self.start()
+        client = self.openai()
+        with client.responses.stream(
+            model="m", input="fixture:stream-function", max_output_tokens=64,
+            tools=[{
+                "type": "function", "name": "lookup",
+                "parameters": {"type": "object", "properties": {"key": {"type": "string"}}},
+            }],
+            tool_choice={"type": "function", "name": "lookup"},
+        ) as stream:
+            events = []
+            for event in stream:
+                if event.type == "response.output_item.added":
+                    self.assertEqual(event.item.arguments, "")
+                    self.assertEqual(event.item.status, "in_progress")
+                events.append(event)
+            final = stream.get_final_response()
+        added = next(event for event in events if event.type == "response.output_item.added")
+        delta = next(event for event in events if event.type == "response.function_call_arguments.delta")
+        done = next(event for event in events if event.type == "response.function_call_arguments.done")
+        self.assertEqual(delta.item_id, added.item.id)
+        self.assertEqual(done.item_id, added.item.id)
+        self.assertEqual(done.name, "lookup")
+        self.assertEqual(json.loads(delta.delta), {"key": "value"})
+        self.assertEqual(done.arguments, final.output[0].arguments)
+        self.assertEqual(json.loads(final.output[0].arguments), {"key": "value"})
+        self.assertEqual(events[-1].type, "response.completed")
 
     def test_responses_schema_store_lineage_and_context_update(self):
         self.start()

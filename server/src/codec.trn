@@ -62,9 +62,9 @@ function wire-text string; value ref document-value, name string, fallback strin
         return fallback
     return field.value.scalar
 
-function wire-reject-unknown none throws coercion-error; value ref document-value, allowed list of string
+function wire-reject-unknown none throws invalid-request-error; value ref document-value, allowed list of string
     if value.kind != 'map'
-        throw coercion-error
+        throw invalid-request-error; 'expected an object'
     index int = 0
     while index < (value.length;)
         name = value.key; index
@@ -75,6 +75,6 @@ function wire-reject-unknown none throws coercion-error; value ref document-valu
                 accepted = true
             allowed-index = allowed-index + 1
         if not accepted
-            throw coercion-error
+            throw invalid-request-error; 'unknown field ' + name
         index = index + 1
     return none

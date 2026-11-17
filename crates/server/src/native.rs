@@ -6,19 +6,123 @@ use crate::{
 use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 
+fn start_deadline_watchdog(control: &Arc<RequestControl>, deadline: Duration) {
+    let control = control.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(deadline).await;
+        if !control.is_complete() {
+            control.expire();
+        }
+    });
+}
+
 pub(super) fn start_deadline_watchdogs(
     control: &Arc<RequestControl>,
     wall_remaining: Duration,
     active_limit: Duration,
 ) {
-    for deadline in [wall_remaining, active_limit] {
-        let control = control.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(deadline).await;
-            if !control.is_complete() {
-                control.expire();
-            }
+    start_deadline_watchdog(control, wall_remaining);
+    start_deadline_watchdog(control, active_limit);
+}
+
+pub(super) fn start_active_deadline(control: &Arc<RequestControl>, duration: Duration) {
+    start_deadline_watchdog(control, duration);
+}
+#[cfg(test)]
+mod deadline_tests {
+    use super::{GenerationInput, GenerationOptions, GenerationRequest, Server};
+    use crate::{DeterministicEngine, ModelRecord, RequestControl, ServerConfig};
+    use sha2::Digest;
+    use std::{fs, sync::Arc, time::Duration};
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_wait_longer_than_active_budget_does_not_expire_generation() {
+        let dir =
+            std::env::temp_dir().join(format!("cusco-native-deadline-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let model_path = dir.join("model.gguf");
+        fs::write(&model_path, b"model").unwrap();
+        let server = Server::open(dir.join("state.json"), Arc::new(DeterministicEngine)).unwrap();
+        server
+            .register_model(ModelRecord {
+                id: "model".into(),
+                revision: "r1".into(),
+                path: model_path,
+                sha256: format!("{:x}", sha2::Sha256::digest(b"model")),
+                aliases: vec![],
+                family: "gemma4".into(),
+                size_bytes: 5,
+                block_count: 1,
+                epoch: 0,
+            })
+            .unwrap();
+        server
+            .configure(ServerConfig {
+                active_requests: 1,
+                active_time_ms: 100,
+                wall_time_ms: 5_000,
+                ..ServerConfig::default()
+            })
+            .unwrap();
+
+        let holder = server
+            .reserve_admission(
+                "holder",
+                Arc::new(RequestControl::new()),
+                1,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let request_server = server.clone();
+        let request = tokio::spawn(async move {
+            let permit = request_server.acquire_prequeue_permit().await.unwrap();
+            request_server
+                .prepare_generation(
+                    GenerationRequest {
+                        model: "model".into(),
+                        input: GenerationInput::Prompt("hello".into()),
+                        options: GenerationOptions::default(),
+                        principal: "test".into(),
+                        request_id: "queued-generation".into(),
+                        retained_bytes: 1,
+                    },
+                    permit,
+                )
+                .await
         });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.admission_metrics().queued == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+        drop(holder);
+
+        let session = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            session.next().await,
+            Some(super::GenerationEvent::Started(_))
+        ));
+        loop {
+            match session.next().await {
+                Some(super::GenerationEvent::Finished(_)) => break,
+                Some(super::GenerationEvent::Error(error)) => panic!("{}", error.message),
+                None => panic!("generation stream ended before completion"),
+                _ => {}
+            }
+        }
+        drop(session);
+        drop(server);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
 
@@ -261,6 +365,12 @@ pub struct GenerationFinished {
     pub response: Option<crate::responses::ResponseResource>,
     pub output: Option<GenerationOutput>,
 }
+// These terminal payloads cross the typed host boundary once per session.
+// Keep them inline rather than allocating another box solely for enum size.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "avoid an extra allocation per session"
+)]
 #[derive(Clone, Debug, serde::Serialize)]
 pub enum GenerationEvent {
     Started(GenerationStarted),
@@ -287,7 +397,11 @@ impl Drop for CancellationOnDrop {
             self.control.cancel();
             if let Some((server, request_id)) = &self.planning {
                 let mut inner = server.inner.lock();
-                if inner.controls.get(request_id).is_some_and(|control| Arc::ptr_eq(control, &self.control)) {
+                if inner
+                    .controls
+                    .get(request_id)
+                    .is_some_and(|control| Arc::ptr_eq(control, &self.control))
+                {
                     inner.controls.remove(request_id);
                 }
             }
@@ -445,22 +559,19 @@ impl Server {
             armed: true,
         };
         let wall_remaining = control.remaining_until(deadline)?;
-        start_deadline_watchdogs(
-            &control,
-            wall_remaining,
-            Duration::from_millis(config.active_time_ms),
-        );
-        let mut plan = crate::generation_plan::prepare(
-            self,
-            &request_id,
-            &principal,
-            &model_record,
-            input,
-            options.semantics,
-            control.clone(),
-            deadline,
-        )
-        .await?;
+        start_deadline_watchdog(&control, wall_remaining);
+        let mut plan =
+            crate::generation_plan::prepare(crate::generation_plan::GenerationPlanRequest {
+                server: self,
+                request_id: &request_id,
+                owner: &principal,
+                model: &model_record,
+                input,
+                semantics: options.semantics,
+                control: control.clone(),
+                deadline,
+            })
+            .await?;
         let grammar = match (options.grammar, plan.grammar) {
             (Some(_), Some(_)) => {
                 return Err(Error::BadRequest(
@@ -483,6 +594,7 @@ impl Server {
         let admission = self
             .reserve_admission(&request_id, control.clone(), retained_bytes, wall_remaining)
             .await?;
+        start_active_deadline(&control, Duration::from_millis(config.active_time_ms));
         let wall_remaining = control.remaining_until(deadline)?;
         let mut req = InferRequest {
             model,

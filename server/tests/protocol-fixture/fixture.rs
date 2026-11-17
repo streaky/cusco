@@ -21,6 +21,7 @@ struct FixtureSession {
 struct ReplySession {
     request: EngineRequest,
     reply: Option<String>,
+    sent_stop: bool,
 }
 
 impl ExecutionSession for ReplySession {
@@ -31,6 +32,22 @@ impl ExecutionSession for ReplySession {
                 id: -1,
                 piece: reply.into_bytes(),
                 terminal_or_control: false,
+                observation: QuantumObservation {
+                    kind: QuantumKind::Decode,
+                    charged_tokens: 1,
+                    context_placement: "model_free".into(),
+                    executor_slot_occupied: false,
+                    transition_cost_bytes: 0,
+                    capacity_reserved_bytes: 0,
+                },
+            });
+        }
+        if !self.sent_stop {
+            self.sent_stop = true;
+            return Ok(SessionStep::Token {
+                id: -1,
+                piece: Vec::new(),
+                terminal_or_control: true,
                 observation: QuantumObservation {
                     kind: QuantumKind::Decode,
                     charged_tokens: 1,
@@ -98,6 +115,8 @@ impl InferenceEngine for FixtureEngine {
 
         let reply = if request.prompt.contains("fixture:inspect-chat-tool-prompt") {
             Some(format!("PROMPT={}", request.prompt))
+        } else if request.prompt.contains("fixture:stream-function") {
+            Some(r#"{"name":"lookup","arguments":{"key":"value"}}"#.to_owned())
         } else if request.prompt.contains("Output only JSON") {
             Some(r#"{"use_search":true,"query":"rust ownership"}"#.to_owned())
         } else if request.prompt.contains("Hosted web search completed") {
@@ -111,6 +130,7 @@ impl InferenceEngine for FixtureEngine {
             Box::new(ReplySession {
                 request,
                 reply: Some(reply),
+                sent_stop: false,
             })
         } else {
             self.deterministic.start_session(request)?
@@ -176,7 +196,9 @@ pub fn open(config_path: &str) -> Result<(Server, DaemonConfig), String> {
         .configure(settings.server.clone())
         .map_err(|error| error.to_string())?;
     server.configure_vision(settings.vision.clone());
-    server.configure_hosted_tools(Arc::new(FixtureHostedTools));
+    if settings.hosted_tools.web_search.enabled {
+        server.configure_hosted_tools(Arc::new(FixtureHostedTools));
+    }
 
     let catalog =
         ModelCatalog::open(&settings.paths.database).map_err(|error| error.to_string())?;

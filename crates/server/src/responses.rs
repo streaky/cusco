@@ -157,7 +157,6 @@ impl From<&ResponseResource> for ResponseSnapshot {
     }
 }
 
-
 fn schema_version() -> u32 {
     RESPONSE_SCHEMA_VERSION
 }
@@ -172,40 +171,6 @@ pub struct ResponseMetadata {
     pub inference_id: String,
     pub execution_session_id: String,
 }
-pub(crate) fn in_progress_resource(
-    id: &str,
-    owner: &str,
-    model: &str,
-    created_at: u64,
-    store: bool,
-    previous_response_id: Option<&str>,
-    input: &[ResponseInputItem],
-    tools: &[Value],
-    tool_choice: &Value,
-    lineage_revision: u64,
-    metadata: ResponseMetadata,
-) -> ResponseResource {
-    ResponseResource {
-        schema_version: RESPONSE_SCHEMA_VERSION,
-        id: id.to_owned(),
-        owner: owner.to_owned(),
-        model: model.to_owned(),
-        created_at,
-        status: "in_progress".into(),
-        store,
-        previous_response_id: previous_response_id.map(str::to_owned),
-        input: input.to_vec(),
-        output: Vec::new(),
-        tools: tools.to_vec(),
-        tool_choice: tool_choice.clone(),
-        finish_reason: None,
-        usage: None,
-        metadata,
-        lineage_revision,
-        context_update: None,
-    }
-}
-
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContextUpdateMetadata {
@@ -233,7 +198,6 @@ struct TransientResponses {
     insertion_order: VecDeque<String>,
 }
 
-
 #[derive(Clone)]
 pub struct ResponseService {
     store: std::sync::Arc<dyn ResponseResourceStore>,
@@ -251,6 +215,11 @@ impl ResponseService {
     pub fn complete(&self, params: CompleteResponse<'_>) -> ResponseResource {
         let reasoning = params.reasoning;
         let text = params.text;
+        let status = if params.reason == FinishReason::Length {
+            "incomplete"
+        } else {
+            "completed"
+        };
         let message = || {
             let annotations = params.web_search_call.map_or_else(Vec::new, |call| {
                 call.action
@@ -273,7 +242,7 @@ impl ResponseService {
             ResponseOutputItem::Message(ResponseMessage {
                 id: format!("msg_{}", params.id),
                 role: "assistant".into(),
-                status: "completed".into(),
+                status: status.into(),
                 content: vec![ResponseTextPart {
                     text: text.into(),
                     annotations,
@@ -281,13 +250,15 @@ impl ResponseService {
                 }],
             })
         };
-        let reasoning_item = || ResponseOutputItem::Reasoning(ResponseReasoning {
-            id: "rs_0".into(),
-            status: "completed".into(),
-            summary: vec![ResponseReasoningSummaryPart {
-                text: reasoning.unwrap_or_default().into(),
-            }],
-        });
+        let reasoning_item = || {
+            ResponseOutputItem::Reasoning(ResponseReasoning {
+                id: "rs_0".into(),
+                status: "completed".into(),
+                summary: vec![ResponseReasoningSummaryPart {
+                    text: reasoning.unwrap_or_default().into(),
+                }],
+            })
+        };
         let output = if let Some(call) = params.function_call {
             vec![ResponseOutputItem::FunctionCall(call)]
         } else {
@@ -307,7 +278,7 @@ impl ResponseService {
             owner: params.owner.into(),
             model: params.model.into(),
             created_at: params.created_at.unwrap_or_else(now),
-            status: "completed".into(),
+            status: status.into(),
             store: params.store,
             previous_response_id: params.previous_response_id.map(str::to_owned),
             input: params.input.to_vec(),
@@ -479,12 +450,13 @@ pub(crate) fn split_native_reasoning(text: &str) -> (Option<&str>, &str) {
     ((!reasoning.is_empty()).then_some(reasoning), separated.1)
 }
 
-
 pub(crate) fn store_error(error: crate::response_store::StoreError) -> crate::Error {
     match error {
         crate::response_store::StoreError::NotFound(_) => crate::Error::ContextNotFound,
         crate::response_store::StoreError::StaleRevision { .. }
-        | crate::response_store::StoreError::Conflict(_) => crate::Error::Conflict(error.to_string()),
+        | crate::response_store::StoreError::Conflict(_) => {
+            crate::Error::Conflict(error.to_string())
+        }
         other => crate::Error::State(other.to_string()),
     }
 }
@@ -503,24 +475,42 @@ pub(crate) fn lineage_prompt(
         let Some(id) = previous else { break };
         resource = service.retrieve(&id, owner).map_err(store_error)?;
     }
-    if lineage.last().is_some_and(|resource| resource.previous_response_id.is_some()) {
-        return Err(crate::Error::BadRequest("response lineage exceeds 1024 resources".into()));
+    if lineage
+        .last()
+        .is_some_and(|resource| resource.previous_response_id.is_some())
+    {
+        return Err(crate::Error::BadRequest(
+            "response lineage exceeds 1024 resources".into(),
+        ));
     }
     lineage.reverse();
     let mut messages = Vec::new();
     for resource in lineage {
         for item in resource.input {
             match item {
-                ResponseInputItem::Message { role, text } => messages.push(crate::prompt::Message { role, content: text }),
-                ResponseInputItem::FunctionCall { name, arguments, .. } => {
+                ResponseInputItem::Message { role, text } => {
+                    messages.push(crate::prompt::Message {
+                        role,
+                        content: text,
+                    })
+                }
+                ResponseInputItem::FunctionCall {
+                    name, arguments, ..
+                } => {
                     let call = json!({
                         "name": name,
                         "arguments": serde_json::from_str::<Value>(&arguments).unwrap_or(Value::String(arguments)),
                     });
-                    messages.push(crate::prompt::Message { role: "assistant".into(), content: call.to_string() });
+                    messages.push(crate::prompt::Message {
+                        role: "assistant".into(),
+                        content: call.to_string(),
+                    });
                 }
                 ResponseInputItem::FunctionCallOutput { call_id, output } => {
-                    messages.push(crate::prompt::Message { role: "user".into(), content: format!("Tool result for {call_id}: {output}") });
+                    messages.push(crate::prompt::Message {
+                        role: "user".into(),
+                        content: format!("Tool result for {call_id}: {output}"),
+                    });
                 }
             }
         }
@@ -535,7 +525,10 @@ pub(crate) fn lineage_prompt(
                         "name": call.name,
                         "arguments": serde_json::from_str::<Value>(&call.arguments).unwrap_or(Value::String(call.arguments)),
                     });
-                    messages.push(crate::prompt::Message { role: "assistant".into(), content: call.to_string() });
+                    messages.push(crate::prompt::Message {
+                        role: "assistant".into(),
+                        content: call.to_string(),
+                    });
                 }
                 ResponseOutputItem::WebSearchCall(_) | ResponseOutputItem::Reasoning(_) => {}
             }
@@ -544,10 +537,15 @@ pub(crate) fn lineage_prompt(
     crate::prompt::apply_chat_template(family, normalize_lineage_messages(messages))
 }
 
-pub(crate) fn normalize_lineage_messages(messages: Vec<crate::prompt::Message>) -> Vec<crate::prompt::Message> {
+pub(crate) fn normalize_lineage_messages(
+    messages: Vec<crate::prompt::Message>,
+) -> Vec<crate::prompt::Message> {
     let mut normalized: Vec<crate::prompt::Message> = Vec::with_capacity(messages.len());
     for message in messages {
-        if normalized.last().is_some_and(|previous| previous.role == message.role) {
+        if normalized
+            .last()
+            .is_some_and(|previous| previous.role == message.role)
+        {
             let previous = normalized.last_mut().expect("last message was present");
             if !previous.content.is_empty() && !message.content.is_empty() {
                 previous.content.push('\n');
@@ -572,10 +570,14 @@ pub(crate) fn lineage_has_call(
         if resource.output.iter().any(|item| matches!(item, ResponseOutputItem::FunctionCall(call) if call.call_id == call_id)) {
             return Ok(true);
         }
-        let Some(id) = resource.previous_response_id.clone() else { return Ok(false) };
+        let Some(id) = resource.previous_response_id.clone() else {
+            return Ok(false);
+        };
         resource = service.retrieve(&id, owner).map_err(store_error)?;
     }
-    Err(crate::Error::BadRequest("response lineage exceeds 1024 resources".into()))
+    Err(crate::Error::BadRequest(
+        "response lineage exceeds 1024 resources".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -605,8 +607,14 @@ mod tests {
     #[test]
     fn lineage_coalesces_adjacent_assistant_items() {
         let messages = normalize_lineage_messages(vec![
-            crate::prompt::Message { role: "user".into(), content: "question".into() },
-            crate::prompt::Message { role: "assistant".into(), content: "answer".into() },
+            crate::prompt::Message {
+                role: "user".into(),
+                content: "question".into(),
+            },
+            crate::prompt::Message {
+                role: "assistant".into(),
+                content: "answer".into(),
+            },
             crate::prompt::Message {
                 role: "assistant".into(),
                 content: r#"{"name":"lookup","arguments":{}}"#.into(),
@@ -614,7 +622,10 @@ mod tests {
         ]);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].role, "assistant");
-        assert_eq!(messages[1].content, "answer\n{\"name\":\"lookup\",\"arguments\":{}}");
+        assert_eq!(
+            messages[1].content,
+            "answer\n{\"name\":\"lookup\",\"arguments\":{}}"
+        );
         crate::prompt::apply_chat_template("gemma4", messages).unwrap();
     }
 }

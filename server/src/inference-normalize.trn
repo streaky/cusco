@@ -36,6 +36,7 @@ function generation-boolean bool throws throwable; object ref document-value, na
         throw invalid-request-error; name + ' must be a boolean'
     return result.value.scalar == 'true'
 
+
 function generation-integer document-value throws throwable; object ref document-value, name string
     value = wire-field; object, name
     if value.kind != 'none'

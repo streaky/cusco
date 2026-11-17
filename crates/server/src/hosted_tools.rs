@@ -29,6 +29,9 @@ pub enum HostedToolError {
 }
 
 pub trait HostedToolExecutor: Send + Sync {
+    fn is_enabled(&self) -> bool {
+        true
+    }
     fn web_search<'a>(
         &'a self,
         request: &'a WebSearchRequest,
@@ -39,10 +42,15 @@ pub trait HostedToolExecutor: Send + Sync {
 pub struct DisabledHostedTools;
 
 impl HostedToolExecutor for DisabledHostedTools {
+    fn is_enabled(&self) -> bool {
+        false
+    }
+
     fn web_search<'a>(
         &'a self,
         _request: &'a WebSearchRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<WebSearchResult>, HostedToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<WebSearchResult>, HostedToolError>> + Send + 'a>>
+    {
         Box::pin(async { Err(HostedToolError::Disabled) })
     }
 }
@@ -218,7 +226,8 @@ impl HostedToolExecutor for SearxngHostedTools {
     fn web_search<'a>(
         &'a self,
         request: &'a WebSearchRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<WebSearchResult>, HostedToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<WebSearchResult>, HostedToolError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let query = request.query.trim();
             if query.is_empty() {
@@ -394,5 +403,80 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(150));
         assert!(results.is_empty());
         server.join().unwrap();
+    }
+    #[tokio::test]
+    async fn provider_filters_results_to_operator_domains_and_requested_limit() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = br#"{"results":[{"title":"blocked","url":"https://other.test/result","content":"blocked"},{"title":"one","url":"https://docs.example.com/one","content":"one"},{"title":"two","url":"https://docs.example.com/two","content":"two"},{"title":"three","url":"https://docs.example.com/three","content":"three"},{"title":"four","url":"https://docs.example.com/four","content":"four"},{"title":"five","url":"https://docs.example.com/five","content":"five"}]}"#;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let executor = SearxngHostedTools::new(WebSearchPolicy {
+            endpoint: format!("http://{address}/search"),
+            max_results: 4,
+            allowed_domains: vec!["example.com".into()],
+            ..WebSearchPolicy::default()
+        })
+        .unwrap();
+        let request = WebSearchRequest {
+            query: "test".into(),
+            allowed_domains: Vec::new(),
+            max_results: 2,
+            control: Arc::new(crate::RequestControl::new()),
+            deadline: std::time::Instant::now() + Duration::from_secs(3),
+        };
+
+        let results = executor.web_search(&request).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "one");
+        assert_eq!(results[1].title, "two");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_executor_reports_disabled_without_network_access() {
+        let request = WebSearchRequest {
+            query: "query".into(),
+            allowed_domains: Vec::new(),
+            max_results: 1,
+            control: Arc::new(crate::RequestControl::new()),
+            deadline: std::time::Instant::now() + Duration::from_secs(1),
+        };
+        assert!(matches!(
+            DisabledHostedTools.web_search(&request).await,
+            Err(HostedToolError::Disabled)
+        ));
+    }
+
+    #[test]
+    fn provider_rejects_non_http_endpoint_and_zero_limits() {
+        for policy in [
+            WebSearchPolicy {
+                endpoint: "file:///tmp/search".into(),
+                ..WebSearchPolicy::default()
+            },
+            WebSearchPolicy {
+                max_response_bytes: 0,
+                ..WebSearchPolicy::default()
+            },
+            WebSearchPolicy {
+                max_results: 0,
+                ..WebSearchPolicy::default()
+            },
+        ] {
+            assert!(SearxngHostedTools::new(policy).is_err());
+        }
     }
 }
