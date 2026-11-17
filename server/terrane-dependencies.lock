@@ -306,15 +306,12 @@ dependencies = [
 name = "cusco-server"
 version = "0.1.0"
 dependencies = [
- "axum",
  "base64",
  "cusco-context-store",
  "cusco-executor",
  "cusco-model-registry",
  "cusco-physical-manager",
- "futures-util",
  "hex",
- "http-body-util",
  "image",
  "jsonschema",
  "parking_lot",
@@ -326,7 +323,6 @@ dependencies = [
  "sha2",
  "thiserror 2.0.21",
  "tokio",
- "tower",
  "ureq",
  "url",
  "uuid",
@@ -490,17 +486,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
 
 [[package]]
-name = "futures-macro"
-version = "0.3.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.10",
-]
-
-[[package]]
 name = "futures-sink"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -519,7 +504,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
- "futures-macro",
  "futures-sink",
  "futures-task",
  "pin-project-lite",
@@ -1463,9 +1447,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.154"
+version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
  "itoa",
  "memchr",
@@ -1644,6 +1628,7 @@ dependencies = [
  "ipnet",
  "libsqlite3-sys",
  "mime",
+ "pin-project-lite",
  "ppv-lite86",
  "rusqlite",
  "rusqlite_migration",
@@ -1651,6 +1636,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "tower",
  "tower-http",
  "tower-layer",
  "tower-service",

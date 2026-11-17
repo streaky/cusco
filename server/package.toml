@@ -19,7 +19,7 @@ effects = ["build", "filesystem", "networking", "process", "threads"]
 
 [consumers.template]
 tool = "streaky/template::template"
-args = ["--namespace", "generated/template/cusco", "--root", "templates", "--template", "home.html"]
+args = ["--namespace", "generated/template/cusco", "--root", "templates", "--template", "home.html", "--template", "openapi.json", "--template", "openapi.html"]
 declarations = ["/cusco/service::main"]
 
 [consumers.http]

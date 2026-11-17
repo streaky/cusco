@@ -2,7 +2,7 @@ namespace cusco/service
 
 from /core/errors import throwable
 
-class startup-error implements throwable
+public class startup-error implements throwable
     message string = ''
 
     function construct; message string

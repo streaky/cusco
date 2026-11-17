@@ -1,0 +1,80 @@
+namespace cusco/service
+
+from /core/collections import list
+from /core/documents import document-value, document-result, document-map-entries
+from /core/documents import make-document-map, append-document-map-entry
+from /core/documents import make-document-list, make-document-none, make-document-bool
+from /core/documents import make-document-string, make-document-integer
+from /core/documents/json import json-options, default-json-options, parse-json, stringify-json, canonical-json
+from /core/errors import coercion-error
+
+# Decode a request body into the lossless core wire representation. Keep protocol
+# validation in the inference controller so each endpoint can preserve its own
+# unknown-field and normalization rules.
+function parse-wire-json document-result; text string, maximum-bytes int
+    options = default-json-options;
+    options.max-bytes = maximum-bytes
+    return parse-json; text, options
+
+function stringify-wire-json document-result; value document-value
+    options = default-json-options;
+    options.max-bytes = 9223372036854775807
+    options.max-depth = 512
+    return stringify-json; value, options
+
+function canonical-wire-json document-result; value document-value
+    return canonical-json; value
+
+function wire-object document-result throws coercion-error; keys list of string, values list of document-value
+    if keys.length != values.length
+        throw coercion-error
+    entries = instance document-map-entries;
+    index int = 0
+    while index < keys.length
+        entries = append-document-map-entry; entries, keys[index], values[index]
+        index = index + 1
+    return make-document-map; entries
+
+function wire-array document-result; values list of document-value
+    return make-document-list; values
+
+function wire-none document-value;
+    return make-document-none;
+
+function wire-bool document-value; value bool
+    return make-document-bool; value
+
+function wire-string document-value; value string
+    return make-document-string; value
+
+function wire-integer document-result; value string
+    return make-document-integer; value
+
+function wire-field document-value; value ref document-value, name string
+    found = value.field; name
+    if found.failed
+        return make-document-none;
+    return found.value
+
+function wire-text string; value ref document-value, name string, fallback string = ''
+    field = value.field; name
+    if field.failed or field.value.kind == 'none'
+        return fallback
+    return field.value.scalar
+
+function wire-reject-unknown none throws coercion-error; value ref document-value, allowed list of string
+    if value.kind != 'map'
+        throw coercion-error
+    index int = 0
+    while index < (value.length;)
+        name = value.key; index
+        accepted bool = false
+        allowed-index int = 0
+        while allowed-index < allowed.length
+            if allowed[allowed-index] == name
+                accepted = true
+            allowed-index = allowed-index + 1
+        if not accepted
+            throw coercion-error
+        index = index + 1
+    return none

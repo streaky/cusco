@@ -4,23 +4,35 @@ from /core/collections import list
 from /core/errors import throwable
 from /core/networking import listen-tcp
 from /core/process import arguments, cli-schema, parse-command-line
-from /deps/cusco-server import Daemon as native-daemon
-from /streaky/http-server import controller, create-application
-from /streaky/http-server/internal import routes
-from /generated/http-server import mount-annotated
+from /deps/cusco-server import Daemon as native-daemon, DaemonConfig, HttpDebugLevel, SocketAddr as native-socket-addr
+from /streaky/http-server import create-application
 
-# Retain the existing protocol adapters in-process. Terrane owns composition;
-# Rust still owns authentication, request admission, streaming and inference.
-class backend-controller implements controller
-    private backend native-daemon
 
-    function construct; backend native-daemon
-        this.backend = backend
+function effective-http-debug string throws throwable; settings shared ref DaemonConfig, supplied string
+    mode string = 'off'
+    match settings.http-debug
+        case HttpDebugLevel::Safe
+            mode = 'safe'
+        case HttpDebugLevel::Full
+            mode = 'full'
+        case HttpDebugLevel::Off
+            mode = 'off'
+    environment-mode = environment-setting; 'CUSCO_HTTP_DEBUG'
+    if environment-mode != none
+        mode = environment-mode.lower;
+    if supplied != ''
+        mode = supplied.lower;
+    if mode != 'off' and mode != 'safe' and mode != 'full'
+        throw startup-error; 'HTTP debug level must be one of: off, safe, full'
+    return mode
 
-    consuming function routes routes; registered-routes routes
-        router = move registered-routes.router
-        router = router.merge; (this.backend.router;)
-        return instance routes; move router
+function listener-address string; address native-socket-addr
+    return rust
+        address.to_string()
+
+function listener-is-loopback bool; address native-socket-addr
+    return rust
+        address.ip().is_loopback()
 
 async function main throws throwable;
     schema = instance cli-schema;
@@ -41,11 +53,23 @@ async function main throws throwable;
             config-path = value.text
         else
             http-debug = value.text
-    backend = native-daemon::open; config-path, http-debug
-    app = create-application;
-    app = mount-annotated; move app
-    app = app.mount; '/', (instance backend-controller; backend)
-    address = backend.address;
+    backend = native-daemon::open; config-path
+    configuration = backend.configuration;
+    settings = shared ref configuration
+    service-auth = instance service-policy; settings
+    policy = shared ref service-auth
+    address = listener-address; settings.listen
+    if (policy.anonymous;) and not settings.unsafe-public-unauthenticated
+        if not (listener-is-loopback; settings.listen)
+            throw startup-error; 'unsafe unauthenticated listener: ' + address
+    app = mount-service; (create-application;), (backend.server;), settings, policy
+    mode = effective-http-debug; settings, http-debug
+    diagnostics http-diagnostics|none = none
+    if mode != 'off'
+        active-diagnostics = instance http-diagnostics; mode
+        observer = active-diagnostics.callback;
+        diagnostics = active-diagnostics
+        app = app.observe-transport; observer, 65536, mode == 'full'
     listener = await listen-tcp; address
     shutdown = async function none;
         await backend.shutdown;
@@ -55,3 +79,7 @@ async function main throws throwable;
         await app.serve-listener-until; move listener, shutdown
     finally
         backend.finish_shutdown;
+    if diagnostics != none
+        failure = diagnostics.failure;
+        if failure != none
+            throw startup-error; 'HTTP diagnostics: ' + failure

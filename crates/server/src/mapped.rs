@@ -1336,17 +1336,12 @@ mod tests {
 
     #[test]
     fn server_context_persists_native_tokens_and_reports_cache_work() {
-        use crate::{AnonymousAdmin, InferRequest, Server};
+        use crate::{InferRequest, Server};
         let directory =
             std::env::temp_dir().join(format!("cusco-mapped-server-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let engine = MappedEngine::open("mock://deterministic", 4096, 0, 1 << 30, 1 << 30).unwrap();
-        let server = Server::open(
-            directory.join("state.json"),
-            Arc::new(AnonymousAdmin),
-            engine,
-        )
-        .unwrap();
+        let server = Server::open(directory.join("state.json"), engine).unwrap();
         server.register_model(model()).unwrap();
         let first = server
             .infer(
