@@ -321,12 +321,7 @@ pub(crate) fn append_tool_instructions(
         .filter(|tool| matches!(tool.kind, NativeToolKind::Function))
         .map(tool_value)
         .collect::<Vec<_>>();
-    if (functions.is_empty()
-        && !tools
-            .iter()
-            .any(|tool| matches!(tool.kind, NativeToolKind::WebSearch)))
-        || matches!(choice, NativeToolChoice::None)
-    {
+    if functions.is_empty() || matches!(choice, NativeToolChoice::None) {
         return Ok(());
     }
     let definitions = serde_json::to_string(&functions).expect("tool definitions serialize");
@@ -437,7 +432,46 @@ mod tests {
     }
 
     #[test]
-    fn required_web_search_prompt_requires_search() {
+    fn web_search_only_keeps_evidence_without_function_instructions() {
+        let tools = [NativeToolDefinition {
+            kind: NativeToolKind::WebSearch,
+            name: None,
+            description: None,
+            parameters: None,
+            strict: false,
+            allowed_domains: Vec::new(),
+            search_context_size: None,
+        }];
+        for choice in [NativeToolChoice::Auto, NativeToolChoice::Required] {
+            let mut prompt = crate::prompt::apply_chat_template(
+                "gemma4",
+                vec![crate::prompt::Message {
+                    role: "user".into(),
+                    content: "Find the ownership documentation".into(),
+                }],
+            )
+            .unwrap();
+            append_web_search_evidence(
+                "gemma4",
+                &mut prompt,
+                &HostedWebSearchExecution {
+                    query: "rust ownership".into(),
+                    results: vec![WebSearchResult {
+                        title: "Ownership".into(),
+                        url: "https://example.com/ownership".into(),
+                        snippet: "Ownership documentation".into(),
+                    }],
+                },
+            )
+            .unwrap();
+            let evidence_prompt = prompt.clone();
+            append_tool_instructions("gemma4", &mut prompt, &tools, &choice, false).unwrap();
+            assert_eq!(prompt, evidence_prompt);
+        }
+    }
+
+    #[test]
+    fn required_function_tool_adds_call_instructions() {
         let mut prompt = crate::prompt::apply_chat_template(
             "gemma4",
             vec![crate::prompt::Message {

@@ -79,6 +79,8 @@ queue wait does not consume it. Hosted-search selection gets its own active
 allowance, while selection and provider work also retain the parent wall
 deadline and cancellation. Requests invoking hosted search when no provider
 is enabled are rejected as `400 invalid_request` before selection inference.
+Hosted web search supplies evidence and citation guidance for the final answer;
+only declared function tools add function-call JSON instructions.
 
 Unknown request fields are rejected as `400 invalid_request` with the offending
 field name; a non-object request reports that an object is required.
