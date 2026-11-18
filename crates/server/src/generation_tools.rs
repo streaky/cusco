@@ -1,10 +1,11 @@
 use crate::native::{NativeResponseFormat, NativeToolChoice, NativeToolDefinition, NativeToolKind};
 use crate::{
-    Error, InferRequest, ModelRecord, SamplingConfig, SchedulingMetadata, Server, WebSearchRequest,
-    WebSearchResult,
+    Error, HostedToolError, InferRequest, ModelRecord, SamplingConfig, SchedulingMetadata, Server,
+    WebSearchRequest, WebSearchResult,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub(crate) struct HostedWebSearchExecution {
@@ -43,14 +44,21 @@ pub(crate) fn validate_tools(
 ) -> Result<(), Error> {
     for tool in tools {
         match tool.kind {
-            NativeToolKind::Function
+            NativeToolKind::Function => {
                 if tool.name.as_deref().is_none_or(str::is_empty)
                     || tool
                         .parameters
                         .as_ref()
-                        .is_none_or(|value| !value.is_object()) =>
-            {
-                return Err(Error::BadRequest("invalid function tool definition".into()));
+                        .is_none_or(|value| !value.is_object())
+                {
+                    return Err(Error::BadRequest("invalid function tool definition".into()));
+                }
+                let Some(parameters) = tool.parameters.as_ref() else {
+                    return Err(Error::BadRequest("invalid function tool definition".into()));
+                };
+                crate::structured::compile_schema(parameters).map_err(|error| {
+                    Error::BadRequest(format!("invalid function parameters: {error}"))
+                })?;
             }
             NativeToolKind::WebSearch
                 if tool
@@ -118,16 +126,26 @@ impl Drop for SelectionTaskGuard {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct HostedSearchContext<'a> {
+    pub principal: &'a str,
+    pub control: &'a std::sync::Arc<crate::RequestControl>,
+    pub deadline: std::time::Instant,
+}
+
 pub(crate) async fn execute_hosted_web_search(
     server: &Server,
     model: &ModelRecord,
     prompt: &str,
     tools: &[NativeToolDefinition],
     choice: &NativeToolChoice,
-    principal: &str,
-    control: &std::sync::Arc<crate::RequestControl>,
-    deadline: std::time::Instant,
+    context: HostedSearchContext<'_>,
 ) -> Result<Option<HostedWebSearchExecution>, Error> {
+    let HostedSearchContext {
+        principal,
+        control,
+        deadline,
+    } = context;
     let Some(tool) = tools
         .iter()
         .find(|tool| matches!(tool.kind, NativeToolKind::WebSearch))
@@ -141,6 +159,10 @@ pub(crate) async fn execute_hosted_web_search(
         return Ok(None);
     }
     control.check()?;
+    let executor = server.hosted_tools.lock().clone();
+    if !executor.is_enabled() {
+        return Err(Error::BadRequest("hosted web search is disabled".into()));
+    }
     let selection_budget = control.remaining_until(deadline)?;
     let required = matches!(choice, NativeToolChoice::Required);
     let mut selection_prompt = prompt.to_owned();
@@ -168,7 +190,12 @@ pub(crate) async fn execute_hosted_web_search(
     let signal = cancellation.clone();
     let _registration = control.register_abort(std::sync::Arc::new(move || signal.notify_one()));
     let task = tokio::task::spawn_blocking(move || {
-        selection_server.infer_with_control(
+        let admission = selection_server.try_admit(&selection_id, selection_control.clone())?;
+        crate::native::start_active_deadline(
+            &selection_control,
+            std::time::Duration::from_millis(selection_server.config().active_time_ms),
+        );
+        let result = selection_server.infer_reserved(
             &selection_id,
             InferRequest {
                 model: selection_model,
@@ -188,8 +215,9 @@ pub(crate) async fn execute_hosted_web_search(
                     ..SchedulingMetadata::default()
                 },
             },
-            selection_control,
-        )
+        );
+        drop(admission);
+        result
     });
     // Cancel the child before unlinking it when the preparation future is
     // dropped; dropping a JoinHandle alone would detach its blocking worker.
@@ -226,7 +254,6 @@ pub(crate) async fn execute_hosted_web_search(
         control: control.clone(),
         deadline,
     };
-    let executor = server.hosted_tools.lock().clone();
     let results = await_hosted_search(&executor, &request, control, deadline).await?;
     Ok(Some(HostedWebSearchExecution {
         query: selection.query,
@@ -239,15 +266,14 @@ fn selection_error(control: &crate::RequestControl, error: Error) -> Error {
 }
 
 async fn await_hosted_search(
-    executor: &std::sync::Arc<dyn crate::HostedToolExecutor>,
+    executor: &Arc<dyn crate::HostedToolExecutor>,
     request: &WebSearchRequest,
-    control: &std::sync::Arc<crate::RequestControl>,
+    control: &Arc<crate::RequestControl>,
     deadline: std::time::Instant,
 ) -> Result<Vec<WebSearchResult>, Error> {
-    let cancellation = std::sync::Arc::new(tokio::sync::Notify::new());
+    let cancellation = Arc::new(tokio::sync::Notify::new());
     let signal = cancellation.clone();
-    let _registration =
-        control.register_abort(std::sync::Arc::new(move || signal.notify_one()));
+    let _registration = control.register_abort(Arc::new(move || signal.notify_one()));
     let result = tokio::select! {
         result = executor.web_search(request) => result,
         _ = cancellation.notified() => {
@@ -261,7 +287,10 @@ async fn await_hosted_search(
     };
     control.check()?;
     control.remaining_until(deadline)?;
-    result.map_err(|error| Error::State(error.to_string()))
+    result.map_err(|error| match error {
+        HostedToolError::Disabled => Error::BadRequest(error.to_string()),
+        error => Error::State(error.to_string()),
+    })
 }
 
 pub(crate) fn append_web_search_evidence(
@@ -336,7 +365,13 @@ mod tests {
         fn web_search<'a>(
             &'a self,
             _request: &'a WebSearchRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<WebSearchResult>, crate::HostedToolError>> + Send + 'a>> {
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Vec<WebSearchResult>, crate::HostedToolError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
             Box::pin(async {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 Ok(Vec::new())
@@ -344,7 +379,10 @@ mod tests {
         }
     }
 
-    fn request(control: Arc<crate::RequestControl>, deadline: std::time::Instant) -> WebSearchRequest {
+    fn request(
+        control: Arc<crate::RequestControl>,
+        deadline: std::time::Instant,
+    ) -> WebSearchRequest {
         WebSearchRequest {
             query: "query".into(),
             allowed_domains: Vec::new(),
@@ -391,5 +429,277 @@ mod tests {
             selection_error(&control, Error::Cancelled),
             Error::Deadline
         ));
+    }
+
+    #[test]
+    fn web_search_only_keeps_evidence_without_function_instructions() {
+        let tools = [NativeToolDefinition {
+            kind: NativeToolKind::WebSearch,
+            name: None,
+            description: None,
+            parameters: None,
+            strict: false,
+            allowed_domains: Vec::new(),
+            search_context_size: None,
+        }];
+        for choice in [NativeToolChoice::Auto, NativeToolChoice::Required] {
+            let mut prompt = crate::prompt::apply_chat_template(
+                "gemma4",
+                vec![crate::prompt::Message {
+                    role: "user".into(),
+                    content: "Find the ownership documentation".into(),
+                }],
+            )
+            .unwrap();
+            append_web_search_evidence(
+                "gemma4",
+                &mut prompt,
+                &HostedWebSearchExecution {
+                    query: "rust ownership".into(),
+                    results: vec![WebSearchResult {
+                        title: "Ownership".into(),
+                        url: "https://example.com/ownership".into(),
+                        snippet: "Ownership documentation".into(),
+                    }],
+                },
+            )
+            .unwrap();
+            let evidence_prompt = prompt.clone();
+            append_tool_instructions("gemma4", &mut prompt, &tools, &choice, false).unwrap();
+            assert_eq!(prompt, evidence_prompt);
+        }
+    }
+
+    #[test]
+    fn required_function_tool_adds_call_instructions() {
+        let mut prompt = crate::prompt::apply_chat_template(
+            "gemma4",
+            vec![crate::prompt::Message {
+                role: "user".into(),
+                content: "user prompt".into(),
+            }],
+        )
+        .unwrap();
+        let tools = [function_tool("lookup")];
+        append_tool_instructions(
+            "gemma4",
+            &mut prompt,
+            &tools,
+            &NativeToolChoice::Required,
+            false,
+        )
+        .unwrap();
+        assert!(prompt.contains("You must call a tool."));
+        assert!(prompt.contains("\"name\":\"lookup\""));
+        assert!(!prompt.contains("You may choose"));
+    }
+    #[test]
+    fn validates_tool_schema_and_accepts_json_schema_union() {
+        let schema = json!({"anyOf": [{"type": "string"}, {"type": "integer"}]});
+        crate::structured::compile_schema(&schema).unwrap();
+        let tool = NativeToolDefinition {
+            kind: NativeToolKind::Function,
+            name: Some("lookup".into()),
+            description: None,
+            parameters: Some(
+                json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false, "minProperties": -1}),
+            ),
+            strict: false,
+            allowed_domains: Vec::new(),
+            search_context_size: None,
+        };
+        assert!(matches!(
+            validate_tools(&[tool], &NativeToolChoice::Auto),
+            Err(Error::BadRequest(message)) if message.contains("invalid function parameters")
+        ));
+    }
+    fn function_tool(name: &str) -> NativeToolDefinition {
+        NativeToolDefinition {
+            kind: NativeToolKind::Function,
+            name: Some(name.into()),
+            description: Some("description".into()),
+            parameters: Some(
+                json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false}),
+            ),
+            strict: true,
+            allowed_domains: Vec::new(),
+            search_context_size: None,
+        }
+    }
+
+    #[test]
+    fn function_tools_respect_choices_and_prompt_instructions() {
+        let tools = vec![function_tool("lookup")];
+        assert_eq!(tool_names(&tools), vec!["lookup"]);
+        assert_eq!(tool_value(&tools[0])["strict"], true);
+        assert!(validate_tools(&tools, &NativeToolChoice::Required).is_ok());
+        assert!(validate_tools(&[], &NativeToolChoice::Required).is_err());
+        assert!(
+            validate_tools(
+                &tools,
+                &NativeToolChoice::Function {
+                    name: "other".into()
+                }
+            )
+            .is_err()
+        );
+
+        let mut prompt = crate::prompt::apply_chat_template(
+            "gemma4",
+            vec![crate::prompt::Message {
+                role: "user".into(),
+                content: "user prompt".into(),
+            }],
+        )
+        .unwrap();
+        append_tool_instructions(
+            "gemma4",
+            &mut prompt,
+            &tools,
+            &NativeToolChoice::Required,
+            true,
+        )
+        .unwrap();
+        let before = prompt.clone();
+        append_tool_instructions(
+            "gemma4",
+            &mut prompt,
+            &tools,
+            &NativeToolChoice::None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(prompt, before);
+    }
+
+    #[test]
+    fn web_search_selection_requires_query_when_selected() {
+        let selection =
+            parse_web_search_selection("prefix {\"use_search\":true,\"query\":\"weather\"}")
+                .unwrap();
+        assert!(selection.use_search);
+        assert_eq!(selection.query, "weather");
+        assert!(
+            !parse_web_search_selection("{\"use_search\":false}")
+                .unwrap()
+                .use_search
+        );
+        assert!(parse_web_search_selection("no object").is_err());
+        assert!(parse_web_search_selection("{\"use_search\":true,\"query\":\" \"}").is_err());
+    }
+
+    #[test]
+    fn response_format_compiles_schema_and_rejects_unsupported_grammar() {
+        assert!(
+            response_format_grammar(&NativeResponseFormat::JsonObject)
+                .unwrap()
+                .unwrap()
+                .contains("root ::= value")
+        );
+        let schema = NativeResponseFormat::JsonSchema {
+            schema: json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false}),
+        };
+        assert!(
+            response_format_grammar(&schema)
+                .unwrap()
+                .unwrap()
+                .contains("object-")
+        );
+        let unsupported = NativeResponseFormat::JsonSchema {
+            schema: json!({"anyOf": [{"type": "string"}, {"type": "integer"}]}),
+        };
+        assert!(response_format_grammar(&unsupported).is_err());
+    }
+    #[tokio::test]
+    async fn hosted_search_short_circuits_when_unavailable_or_cancelled() {
+        let root =
+            std::env::temp_dir().join(format!("cusco-search-selection-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let server = Server::open(
+            root.join("state.json"),
+            std::sync::Arc::new(crate::DeterministicEngine),
+        )
+        .unwrap();
+        let model = ModelRecord {
+            id: "m".into(),
+            revision: "r".into(),
+            path: root.join("model.gguf"),
+            sha256: "digest".into(),
+            aliases: Vec::new(),
+            family: "gemma4".into(),
+            size_bytes: 1,
+            block_count: 1,
+            epoch: 1,
+        };
+        let control = Arc::new(crate::RequestControl::new());
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let context = HostedSearchContext {
+            principal: "principal",
+            control: &control,
+            deadline,
+        };
+
+        assert!(
+            execute_hosted_web_search(
+                &server,
+                &model,
+                "prompt",
+                &[],
+                &NativeToolChoice::Auto,
+                context,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let web_search = NativeToolDefinition {
+            kind: NativeToolKind::WebSearch,
+            name: None,
+            description: None,
+            parameters: None,
+            strict: false,
+            allowed_domains: vec![],
+            search_context_size: None,
+        };
+        assert!(
+            execute_hosted_web_search(
+                &server,
+                &model,
+                "prompt",
+                std::slice::from_ref(&web_search),
+                &NativeToolChoice::None,
+                context,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let unavailable = execute_hosted_web_search(
+            &server,
+            &model,
+            "prompt",
+            std::slice::from_ref(&web_search),
+            &NativeToolChoice::Auto,
+            context,
+        )
+        .await;
+        assert!(
+            matches!(unavailable, Err(Error::BadRequest(message)) if message.contains("disabled"))
+        );
+        control.cancel();
+        assert!(matches!(
+            execute_hosted_web_search(
+                &server,
+                &model,
+                "prompt",
+                &[web_search],
+                &NativeToolChoice::Auto,
+                context,
+            )
+            .await,
+            Err(Error::Cancelled)
+        ));
+        drop(server);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

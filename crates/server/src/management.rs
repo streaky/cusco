@@ -241,3 +241,108 @@ async fn pull_model(
     let _ = sender.send(PullProgress::Complete).await;
     Ok(())
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn domain_outcomes_preserve_success_and_failure_contracts() {
+        assert_eq!(outcome(Ok(7)).value, Some(7));
+        let failure = outcome::<()>(Err(Error::BadRequest("bad request".into())));
+        assert!(failure.value.is_none());
+        let failure = failure.failure.unwrap();
+        assert_eq!(failure.code, "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn cancelling_pull_session_closes_progress_delivery() {
+        let (sender, receiver) = mpsc::channel(1);
+        let session = PullSession {
+            receiver: Arc::new(Mutex::new(receiver)),
+        };
+        session.cancel();
+        assert!(session.next().await.is_none());
+        drop(sender);
+    }
+    #[test]
+    fn context_and_declaration_management_preserves_domain_results() {
+        let root = std::env::temp_dir().join(format!("cusco-management-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let server = Server::open(
+            root.join("state.json"),
+            Arc::new(crate::DeterministicEngine),
+        )
+        .unwrap();
+        let management = Management::new(&server);
+
+        let created = management.create_context().value.unwrap();
+        assert_eq!(
+            management.context(created.id.0.clone()).value,
+            Some(created.clone())
+        );
+        assert_eq!(management.contexts().len(), 1);
+        let branch = management
+            .branch_context(created.id.0.clone())
+            .value
+            .unwrap();
+        assert!(management.delete_context(branch.id.0).value.unwrap());
+        let declaration = management
+            .declare(
+                "principal",
+                CreateCompactionDeclaration {
+                    context_id: created.id.0.clone(),
+                    strategy_preferences: vec![crate::WINDOW_TAIL_STRATEGY_ID.into()],
+                    target_tokens: Some(8),
+                    expires_in_ms: 1_000,
+                },
+            )
+            .value
+            .unwrap();
+        assert!(
+            management
+                .revoke("principal", &declaration.declaration_id)
+                .value
+                .unwrap()
+        );
+        assert_eq!(management.strategies().strategies.len(), 1);
+        assert!(management.status().residency.is_none());
+        assert!(!management.version().is_empty());
+        management.cancel("no-active-request");
+        assert!(management.delete_context(created.id.0).value.unwrap());
+        assert!(management.model("missing").failure.is_some());
+        assert!(matches!(
+            management.pull("model".into(), None).failure,
+            Some(failure) if failure.code == "state_error"
+        ));
+        drop(management);
+        drop(server);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn failed_pull_publishes_terminal_progress() {
+        let root = std::env::temp_dir().join(format!("cusco-pull-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let server = Server::open(
+            root.join("state.json"),
+            Arc::new(crate::DeterministicEngine),
+        )
+        .unwrap();
+        let catalog = crate::ModelCatalog::open(root.join("catalog.sqlite")).unwrap();
+        server.attach_catalog(catalog.clone(), root.join("models"));
+        let session = Management::new(&server)
+            .pull("invalid".into(), None)
+            .value
+            .unwrap();
+
+        assert!(matches!(session.next().await, Some(PullProgress::Manifest)));
+        assert!(matches!(
+            session.next().await,
+            Some(PullProgress::Failed { code, message })
+                if code == "state_error" && message.contains("invalid")
+        ));
+
+        drop(session);
+        drop(server);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

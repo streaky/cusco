@@ -268,7 +268,10 @@ fn spill_inactive_mappings(state: &mut MappedState) -> Result<usize, Error> {
     let _ = state.physical.release_binding(EXECUTION_SLOT);
     let mut spilled = 0;
     for (id, native) in candidates {
-        let mapping = state.executor.export_mapping(&native).map_err(state_error)?;
+        let mapping = state
+            .executor
+            .export_mapping(&native)
+            .map_err(state_error)?;
         if state.spill_bytes.saturating_add(mapping.bytes.len()) > state.spill_capacity {
             continue;
         }
@@ -456,7 +459,10 @@ impl MappedSession {
         self.request.control.check()?;
         state.metrics.decoded_tokens += charged as u64;
         self.evaluated = end;
-        if self.evaluated % self.profile.publication_interval_tokens == 0 {
+        if self
+            .evaluated
+            .is_multiple_of(self.profile.publication_interval_tokens)
+        {
             let snapshot = snapshot_active_mapping(
                 &mut state.executor,
                 self.active_mapping
@@ -534,7 +540,10 @@ impl MappedSession {
             self.request.control.check()?;
             state.metrics.decoded_tokens += 1;
             self.evaluated += 1;
-            if self.evaluated % self.profile.publication_interval_tokens == 0 {
+            if self
+                .evaluated
+                .is_multiple_of(self.profile.publication_interval_tokens)
+            {
                 let snapshot = snapshot_active_mapping(
                     &mut state.executor,
                     self.active_mapping
@@ -864,11 +873,19 @@ fn publish_block(
                 .map_err(state_error)?,
         );
     let host_capacity = state.physical.metrics();
-    if required_bytes > host_capacity.host_total.saturating_sub(host_capacity.host_used) {
+    if required_bytes
+        > host_capacity
+            .host_total
+            .saturating_sub(host_capacity.host_used)
+    {
         spill_inactive_mappings(state)?;
     }
     let host_capacity = state.physical.metrics();
-    if required_bytes > host_capacity.host_total.saturating_sub(host_capacity.host_used) {
+    if required_bytes
+        > host_capacity
+            .host_total
+            .saturating_sub(host_capacity.host_used)
+    {
         return Ok(None);
     }
     let prepared_publication = state

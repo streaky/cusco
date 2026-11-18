@@ -96,8 +96,11 @@ function project-response document-value throws throwable; resource ref document
         cusco = cusco-override
     text-format = generation-object; (list; 'type'), (list; (wire-string; 'text'))
     text = generation-object; (list; 'format', 'verbosity'), (list; text-format, (wire-string; 'medium'))
+    incomplete-details document-value = wire-none;
+    if (wire-text; resource, 'finish_reason') == 'length'
+        incomplete-details = generation-object; (list; 'reason'), (list; (wire-string; 'max_output_tokens'))
     keys = list; 'id', 'object', 'created_at', 'status', 'background', 'error', 'incomplete_details', 'instructions', 'max_output_tokens', 'metadata', 'model', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'finish_reason', 'cusco'
-    values = list; (wire-field; resource, 'id'), (wire-string; 'response'), (wire-field; resource, 'created_at'), (wire-field; resource, 'status'), (wire-bool; false), (wire-none;), (wire-none;), (wire-none;), (wire-none;), (wire-field; resource, 'metadata'), (wire-field; resource, 'model'), projected-output, (wire-bool; true), (wire-field; resource, 'previous_response_id'), (wire-none;), (wire-none;), (wire-none;), (wire-string; 'default'), (wire-field; resource, 'store'), (wire-integer; '1').value, text, (wire-field; resource, 'tool_choice'), (wire-field; resource, 'tools'), (wire-integer; '0').value, (wire-integer; '1').value, (wire-string; 'disabled'), usage, (wire-field; resource, 'finish_reason'), cusco
+    values = list; (wire-field; resource, 'id'), (wire-string; 'response'), (wire-field; resource, 'created_at'), (wire-field; resource, 'status'), (wire-bool; false), (wire-none;), incomplete-details, (wire-none;), (wire-none;), (wire-field; resource, 'metadata'), (wire-field; resource, 'model'), projected-output, (wire-bool; true), (wire-field; resource, 'previous_response_id'), (wire-none;), (wire-none;), (wire-none;), (wire-string; 'default'), (wire-field; resource, 'store'), (wire-integer; '1').value, text, (wire-field; resource, 'tool_choice'), (wire-field; resource, 'tools'), (wire-integer; '0').value, (wire-integer; '1').value, (wire-string; 'disabled'), usage, (wire-field; resource, 'finish_reason'), cusco
     return generation-object; keys, values
 
 function generation-completed document-value throws throwable; protocol string, id string, text string, finish ref document-value
@@ -155,7 +158,7 @@ class generation-stream-state
             if resource.kind == 'none'
                 throw service-error; 'state_error', 'response generation returned no initial resource'
             part = response-empty-part;
-            message = generation-object; (list; 'id', 'type', 'role', 'status', 'content'), (list; (wire-string; this.message-id), (wire-string; 'message'), (wire-string; 'assistant'), (wire-string; 'in_progress'), (generation-array; (list; part)))
+            message = generation-object; (list; 'id', 'type', 'role', 'status', 'content'), (list; (wire-string; this.message-id), (wire-string; 'message'), (wire-string; 'assistant'), (wire-string; 'in_progress'), (generation-array; list))
             output list of document-value = list;
             prepared = wire-field; resource, 'output'
             index int = 0
@@ -163,7 +166,6 @@ class generation-stream-state
                 item = (prepared.item; index).value
                 output.append; (response-output-item; item)
                 index = index + 1
-            output.append; message
             rows list of document-value = list;
             rows.append; (wire-string; (this.response-row; 'response.created', (list; 'response'), (list; (project-response; resource, (generation-array; output)))))
             if not this.buffered
@@ -237,6 +239,12 @@ class generation-stream-state
                 rows.append; (wire-string; (this.response-row; 'response.output_text.done', (list; 'item_id', 'output_index', 'content_index', 'text', 'logprobs'), (list; item-id, output-index, (wire-integer; '0').value, (wire-field; part, 'text'), (generation-array; list))))
                 rows.append; (wire-string; (this.response-row; 'response.content_part.done', (list; 'item_id', 'output_index', 'content_index', 'part'), (list; item-id, output-index, (wire-integer; '0').value, part)))
                 rows.append; (wire-string; (this.response-row; 'response.output_item.done', (list; 'item', 'output_index'), (list; item, output-index)))
+            else if kind == 'function_call'
+                added = generation-object; (list; 'id', 'type', 'call_id', 'name', 'arguments', 'status'), (list; item-id, (wire-string; 'function_call'), (wire-field; item, 'call_id'), (wire-field; item, 'name'), (wire-string; ''), (wire-string; 'in_progress'))
+                rows.append; (wire-string; (this.response-row; 'response.output_item.added', (list; 'item', 'output_index'), (list; added, output-index)))
+                rows.append; (wire-string; (this.response-row; 'response.function_call_arguments.delta', (list; 'item_id', 'output_index', 'delta'), (list; item-id, output-index, (wire-field; item, 'arguments'))))
+                rows.append; (wire-string; (this.response-row; 'response.function_call_arguments.done', (list; 'item_id', 'output_index', 'arguments', 'name'), (list; item-id, output-index, (wire-field; item, 'arguments'), (wire-field; item, 'name'))))
+                rows.append; (wire-string; (this.response-row; 'response.output_item.done', (list; 'item', 'output_index'), (list; item, output-index)))
             else
                 rows.append; (wire-string; (this.response-row; 'response.output_item.added', (list; 'item', 'output_index'), (list; item, output-index)))
                 if kind == 'reasoning'
@@ -248,7 +256,10 @@ class generation-stream-state
                     rows.append; (wire-string; (this.response-row; 'response.reasoning_summary_text.done', (list; 'item_id', 'output_index', 'summary_index', 'text'), (list; item-id, output-index, (wire-integer; '0').value, (wire-field; summary, 'text'))))
                 rows.append; (wire-string; (this.response-row; 'response.output_item.done', (list; 'item', 'output_index'), (list; item, output-index)))
             index = index + 1
-        rows.append; (wire-string; (this.response-row; 'response.completed', (list; 'response'), (list; (project-response; resource))))
+        terminal = 'response.completed'
+        if (wire-text; resource, 'status') == 'incomplete'
+            terminal = 'response.incomplete'
+        rows.append; (wire-string; (this.response-row; terminal, (list; 'response'), (list; (project-response; resource))))
         frames = generation-array; rows
         return generation-join; frames
 

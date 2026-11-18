@@ -680,10 +680,10 @@ impl ContextStore {
                 self.prefix_index.remove(&key);
             }
             candidate = removed.mapping.parent;
-            if let Some(parent) = candidate {
-                if let Some(entry) = self.mappings.get_mut(&parent) {
-                    entry.references.dependents = entry.references.dependents.saturating_sub(1);
-                }
+            if let Some(parent) = candidate
+                && let Some(entry) = self.mappings.get_mut(&parent)
+            {
+                entry.references.dependents = entry.references.dependents.saturating_sub(1);
             }
         }
     }

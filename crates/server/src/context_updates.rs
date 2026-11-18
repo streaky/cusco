@@ -238,9 +238,7 @@ mod tests {
         assert_eq!(result.response.lineage_revision, 1);
 
         let reopened = FileResponseResourceStore::open(&directory).unwrap();
-        let recovered = reopened
-            .get(&result.response.id)
-            .unwrap();
+        let recovered = reopened.get(&result.response.id).unwrap();
         assert_eq!(recovered.previous_response_id.as_deref(), Some("resp_base"));
         assert_eq!(
             recovered

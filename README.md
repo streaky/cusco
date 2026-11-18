@@ -73,6 +73,18 @@ A narrow versioned C ABI owns
 llama.cpp model execution, tokenization, sampling, sequence mappings, and
 checkpoint import/export.
 
+The wall deadline includes planning, hosted search, queueing and execution.
+Each inference's active-execution allowance starts only after its admission;
+queue wait does not consume it. Hosted-search selection gets its own active
+allowance, while selection and provider work also retain the parent wall
+deadline and cancellation. Requests invoking hosted search when no provider
+is enabled are rejected as `400 invalid_request` before selection inference.
+Hosted web search supplies evidence and citation guidance for the final answer;
+only declared function tools add function-call JSON instructions.
+
+Unknown request fields are rejected as `400 invalid_request` with the offending
+field name; a non-object request reports that an object is required.
+
 The server keeps installed-model and lifecycle metadata in SQLite and currently
 keeps logical context records in its local JSON state. Native executor mappings,
 active requests, queues, and spill contents are process-local and are rebuilt
@@ -87,6 +99,12 @@ message output; stale revisions and competing successors return `409`, while
 validation or cancellation before commit leaves the base resource unchanged.
 Clients that do not negotiate the extension continue to use standard stored
 Responses and `previous_response_id`.
+
+Output-budget exhaustion is retained as `status: incomplete`, including stored
+retrieval and `incomplete_details.reason: max_output_tokens`. Such finished
+partial responses remain valid lineage predecessors. Streaming distinguishes
+`response.incomplete` from `response.completed`; function-call streams announce
+empty arguments before their delta/done events so SDK accumulation is portable.
 
 Management results, stored Responses and typed session events cross the native
 Serde-to-document boundary with a fixed 16 MiB encoding budget. Oversized values
@@ -163,6 +181,18 @@ counts, and changes from `config/oai-lens-expectations.json`. Probe failures
 are initially advisory and leave the gate successful. A runner, configuration,
 reporting, or artifact failure is a blocking harness failure.
 
+Interpret advisory failures by supported contract, not just their total. File
+uploads/search, shell/container tools, encrypted reasoning replay,
+`parallel_tool_calls` and `prompt_cache_key` are not accepted capabilities.
+Requests containing unsupported fields fail before inference; a failed cache
+probe with such a field does not measure cache behavior. Vision projection is
+unavailable at the native executor boundary. Deterministic fixture output is
+not evidence of real-model structured output or function-call behavior.
+Function parameter declarations are checked as Draft 2020-12 JSON Schemas;
+valid declarations are not restricted to the structured-generation grammar
+subset. Reclassify real-model probe output separately before claiming broader
+compatibility, without relaxing the pinned expectations.
+
 ## Run the representation measurement proof
 
 With the validation GGUF and NVIDIA runtime available, run:
@@ -178,6 +208,9 @@ for each boundary. It also verifies export/import continuation and records graph
 recapture telemetry as unsupported when the backend exposes no truthful signal.
 The reusable correctness and performance artifact is written to
 `results/representation-proof.json`.
+Import telemetry includes backend-specific validation and rollback copies.
+The common lower bound is the imported payload size: a backend that validates
+without disturbing active state need not perform a snapshot/restore cycle.
 
 The narrower `mapped-proof` service remains available as a staged-restore versus
 mapped-activation diagnostic. It writes `results/mapped-proof.json` and does not claim

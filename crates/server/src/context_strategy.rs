@@ -234,19 +234,19 @@ pub fn apply_window_tail_strategy(
         retained.extend(turn.iter().cloned());
     }
 
-    if retained.is_empty() {
-        if let Some(turn) = indexed_turns.last() {
-            if selection_budget < COMPACTION_BLOCK_TOKENS {
-                retained.extend(turn.iter().cloned());
-                used_tokens = turn.len();
-            } else {
-                retained.extend(
-                    turn.iter()
-                        .skip(turn.len().saturating_sub(selection_budget))
-                        .cloned(),
-                );
-                used_tokens = retained.len();
-            }
+    if retained.is_empty()
+        && let Some(turn) = indexed_turns.last()
+    {
+        if selection_budget < COMPACTION_BLOCK_TOKENS {
+            retained.extend(turn.iter().cloned());
+            used_tokens = turn.len();
+        } else {
+            retained.extend(
+                turn.iter()
+                    .skip(turn.len().saturating_sub(selection_budget))
+                    .cloned(),
+            );
+            used_tokens = retained.len();
         }
     }
 

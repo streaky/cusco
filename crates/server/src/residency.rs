@@ -295,11 +295,7 @@ impl ResidentEngine {
             .ok_or_else(|| Error::State("model GGUF does not declare a block count".into()))
     }
 
-    fn select_gpu_layers(
-        config: ResidencyConfig,
-        model_bytes: u64,
-        model_layers: u32,
-    ) -> u32 {
+    fn select_gpu_layers(config: ResidencyConfig, model_bytes: u64, model_layers: u32) -> u32 {
         if config.gpu_layers <= 0 || model_bytes == 0 || model_layers == 0 {
             return 0;
         }
@@ -330,10 +326,10 @@ impl ResidentEngine {
         if let Some(free_bytes) = self.loader.free_accelerator_bytes() {
             effective_config.device_bytes = effective_config.device_bytes.min(free_bytes);
         }
-        if let Some(profile) = self.cached_profile(model)? {
-            if profile.device_bytes <= effective_config.device_bytes {
-                return Ok(profile);
-            }
+        if let Some(profile) = self.cached_profile(model)?
+            && profile.device_bytes <= effective_config.device_bytes
+        {
+            return Ok(profile);
         }
         let model_bytes = if model.size_bytes == 0 {
             fs::metadata(&model.path).map_err(super::state_err)?.len()
@@ -507,11 +503,11 @@ impl ResidentEngine {
                 .saturating_add(measured_point.device_bytes / 20),
             ..measured_point
         };
-        if let Some(control) = control {
-            if let Err(error) = control.check() {
-                self.state.lock().metrics.load_failures += 1;
-                return Err(error);
-            }
+        if let Some(control) = control
+            && let Err(error) = control.check()
+        {
+            self.state.lock().metrics.load_failures += 1;
+            return Err(error);
         }
         if self.config.require_competent && !point.competent {
             self.state.lock().metrics.load_failures += 1;
@@ -862,7 +858,6 @@ mod tests {
         free_bytes: u64,
     }
 
-
     struct BlockingEngine {
         entered: Arc<Barrier>,
         release: Arc<Barrier>,
@@ -965,7 +960,6 @@ mod tests {
         }
     }
 
-
     impl ModelLoader for FixtureLoader {
         fn load(
             &self,
@@ -1034,7 +1028,6 @@ mod tests {
         assert_eq!(point.gpu_layers, 1);
         assert!(point.device_bytes <= 5 * GIB);
     }
-
 
     fn point(bytes: u64) -> OperatingPoint {
         OperatingPoint {
@@ -1162,6 +1155,7 @@ mod tests {
         });
         let mut measured_config = config(110);
         measured_config.gpu_layers = 0;
+        measured_config.require_competent = false;
         let measured = ResidentEngine::with_loader(measured_config, loader.clone());
         measured.attach_catalog(catalog.clone());
         let large_declaration = model("profiled", "checksum", 1, 100);
@@ -1170,6 +1164,7 @@ mod tests {
 
         let mut reused_config = config(20);
         reused_config.gpu_layers = 0;
+        reused_config.require_competent = false;
         let reused = ResidentEngine::with_loader(reused_config, loader);
         reused.attach_catalog(catalog);
         assert!(matches!(
@@ -1206,7 +1201,6 @@ mod tests {
 
         let mut required = config(100);
         required.gpu_layers = 0;
-        required.require_competent = true;
         let reused = ResidentEngine::with_loader(required, loader);
         reused.attach_catalog(catalog);
         assert!(matches!(
@@ -1251,7 +1245,7 @@ mod tests {
             failures: Mutex::new(vec!["bad".into()]),
             blocker: None,
         });
-        let engine = ResidentEngine::with_loader(config(21), loader);
+        let engine = ResidentEngine::with_loader(config(22), loader);
         let old = model("m", "old", 1, 10);
         engine.prepare_model(&old).unwrap();
         engine.commit_model(&old, None);
@@ -1280,7 +1274,7 @@ mod tests {
             failures: Mutex::new(vec![]),
             blocker: None,
         });
-        let engine = ResidentEngine::with_loader(config(21), loader);
+        let engine = ResidentEngine::with_loader(config(22), loader);
         let first = model("first", "r", 1, 10);
         let second = model("second", "r", 2, 10);
         let third = model("third", "r", 3, 10);
@@ -1310,7 +1304,7 @@ mod tests {
             failures: Mutex::new(vec![]),
             blocker: None,
         });
-        let engine = ResidentEngine::with_loader(config(11), loader);
+        let engine = ResidentEngine::with_loader(config(12), loader);
         let first = engine.load(&model("first", "r", 1, 10), None).unwrap();
 
         engine.prepare_model(&model("second", "r", 2, 10)).unwrap();
@@ -1328,7 +1322,7 @@ mod tests {
             failures: Mutex::new(vec![]),
             blocker: Some((entered.clone(), release.clone())),
         });
-        let engine = ResidentEngine::with_loader(config(21), loader);
+        let engine = ResidentEngine::with_loader(config(22), loader);
         let old = model("m", "slow", 1, 10);
         engine.prepare_model(&old).unwrap();
         engine.commit_model(&old, None);
@@ -1366,7 +1360,7 @@ mod tests {
             failures: Mutex::new(vec![]),
             blocker: None,
         });
-        let engine = ResidentEngine::with_loader(config(11), loader);
+        let engine = ResidentEngine::with_loader(config(12), loader);
         let old = model("m", "old", 1, 10);
         engine.prepare_model(&old).unwrap();
         engine.commit_model(&old, None);
@@ -1413,6 +1407,7 @@ mod tests {
         let mut limits = config(25);
         limits.storage_bytes = 25;
         limits.gpu_layers = 0;
+        limits.require_competent = false;
         let engine = ResidentEngine::with_loader(limits, Arc::new(DemotableLoader { point }));
 
         engine.prepare_model(&model("first", "r", 1, 10)).unwrap();
@@ -1443,5 +1438,17 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::Cancelled));
         assert!(engine.status().is_empty());
+    }
+    #[test]
+    fn validates_residency_budgets_and_opens_spill_engine() {
+        let mut invalid = config(10);
+        invalid.n_ctx = 0;
+        assert!(invalid.validate().is_err());
+
+        let root = std::env::temp_dir().join(format!("cusco-spill-open-{}", uuid::Uuid::new_v4()));
+        let engine = ResidentEngine::open_with_spill(config(10), &root).unwrap();
+        assert!(engine.status().is_empty());
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
     }
 }

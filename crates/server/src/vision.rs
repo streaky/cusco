@@ -209,10 +209,10 @@ impl ImageAdmission {
         }
         let digest = format!("{:x}", Sha256::digest(&bytes));
         let mut cache = self.cache.lock();
-        if let Some(existing) = cache.values.get(&digest) {
-            if existing.bytes.as_ref() == bytes {
-                return Ok(existing.clone());
-            }
+        if let Some(existing) = cache.values.get(&digest)
+            && existing.bytes.as_ref() == bytes
+        {
+            return Ok(existing.clone());
         }
         let next = cache.bytes.saturating_add(bytes.len() as u64);
         if next > self.config.retention_capacity.0 {

@@ -70,19 +70,25 @@ impl ResourcePlan {
         metadata: crate::responses::ResponseMetadata,
     ) -> ResponseResource {
         self.created_at = Some(created_at);
-        crate::responses::in_progress_resource(
-            &self.id,
-            &self.owner,
-            &self.model,
+        ResponseResource {
+            schema_version: crate::responses::RESPONSE_SCHEMA_VERSION,
+            id: self.id.clone(),
+            owner: self.owner.clone(),
+            model: self.model.clone(),
             created_at,
-            self.store,
-            self.previous_response_id.as_deref(),
-            &self.input,
-            &self.tools,
-            &self.tool_choice,
-            self.lineage_revision,
+            status: "in_progress".into(),
+            store: self.store,
+            previous_response_id: self.previous_response_id.clone(),
+            input: self.input.clone(),
+            output: Vec::new(),
+            tools: self.tools.clone(),
+            tool_choice: self.tool_choice.clone(),
+            finish_reason: None,
+            usage: None,
             metadata,
-        )
+            lineage_revision: self.lineage_revision,
+            context_update: None,
+        }
     }
     pub(crate) fn complete(
         self,
@@ -173,12 +179,12 @@ impl ResourcePlan {
                 }
                 return Ok(None);
             }
-            if let NativeToolChoice::Function { name: required } = &self.choice {
-                if &name != required {
-                    return Err(Error::BadRequest(format!(
-                        "model selected `{name}` instead of required function `{required}`"
-                    )));
-                }
+            if let NativeToolChoice::Function { name: required } = &self.choice
+                && &name != required
+            {
+                return Err(Error::BadRequest(format!(
+                    "model selected `{name}` instead of required function `{required}`"
+                )));
             }
             return Ok(Some(crate::responses::new_function_call(name, arguments)));
         }
@@ -207,16 +213,30 @@ fn render_incremental_ledger(
         crate::responses::normalize_lineage_messages(messages),
     )
 }
+pub(crate) struct GenerationPlanRequest<'a> {
+    pub server: &'a Server,
+    pub request_id: &'a str,
+    pub owner: &'a str,
+    pub model: &'a ModelRecord,
+    pub input: GenerationInput,
+    pub semantics: GenerationSemantics,
+    pub control: std::sync::Arc<crate::RequestControl>,
+    pub deadline: std::time::Instant,
+}
+
 pub(crate) async fn prepare(
-    server: &Server,
-    request_id: &str,
-    owner: &str,
-    model: &ModelRecord,
-    input: GenerationInput,
-    semantics: GenerationSemantics,
-    control: std::sync::Arc<crate::RequestControl>,
-    deadline: std::time::Instant,
+    request: GenerationPlanRequest<'_>,
 ) -> Result<PreparedGeneration, Error> {
+    let GenerationPlanRequest {
+        server,
+        request_id,
+        owner,
+        model,
+        input,
+        semantics,
+        control,
+        deadline,
+    } = request;
     let family = &model.family;
     let continuation_id = semantics
         .continuation
@@ -250,9 +270,9 @@ pub(crate) async fn prepare(
                 "previous_response_id requires a stored response".into(),
             ));
         }
-        if predecessor.status != "completed" {
+        if !matches!(predecessor.status.as_str(), "completed" | "incomplete") {
             return Err(Error::BadRequest(
-                "previous_response_id requires a completed response".into(),
+                "previous_response_id requires a finished response".into(),
             ));
         }
         lineage_revision = predecessor.lineage_revision.saturating_add(1);
@@ -414,9 +434,11 @@ pub(crate) async fn prepare(
             &prompt,
             &semantics.tools,
             &choice,
-            owner,
-            &control,
-            deadline,
+            crate::generation_tools::HostedSearchContext {
+                principal: owner,
+                control: &control,
+                deadline,
+            },
         )
         .await?
     } else {
@@ -467,24 +489,24 @@ pub(crate) async fn prepare(
         .clone()
         .unwrap_or_else(|| tool_choice_value.clone());
     let resource = (semantics.record_output || semantics.expose_reasoning).then(|| ResourcePlan {
-                service: server.response_service.clone(),
-                id: request_id.to_owned(),
-                owner: owner.to_owned(),
-                model: model.id.clone(),
-                created_at: None,
-                store: semantics.store,
-                previous_response_id,
-                lineage_revision,
-                input: input_ledger,
-                tools: resource_tools,
-                tool_choice: resource_tool_choice,
-                tool_names,
-                choice,
-                hosted_search,
-                expose_reasoning: semantics.expose_reasoning && strips_native_reasoning,
-                strip_reasoning,
-                persist: semantics.record_output,
-            });
+        service: server.response_service.clone(),
+        id: request_id.to_owned(),
+        owner: owner.to_owned(),
+        model: model.id.clone(),
+        created_at: None,
+        store: semantics.store,
+        previous_response_id,
+        lineage_revision,
+        input: input_ledger,
+        tools: resource_tools,
+        tool_choice: resource_tool_choice,
+        tool_names,
+        choice,
+        hosted_search,
+        expose_reasoning: semantics.expose_reasoning && strips_native_reasoning,
+        strip_reasoning,
+        persist: semantics.record_output,
+    });
     Ok(PreparedGeneration {
         prompt,
         grammar,
@@ -572,7 +594,8 @@ mod tests {
 
     #[test]
     fn complete_parses_tool_json_after_stripping_reasoning() {
-        let root = std::env::temp_dir().join(format!("cusco-reasoning-tool-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("cusco-reasoning-tool-{}", uuid::Uuid::new_v4()));
         let store = crate::response_store::FileResponseResourceStore::open(&root).unwrap();
         let service = crate::responses::ResponseService::new(std::sync::Arc::new(store));
         for choice in [NativeToolChoice::Auto, NativeToolChoice::Required] {

@@ -115,7 +115,7 @@ server:
   header_bytes: 65536 # 64 KiB
   # Maximum time allowed to receive a request body.
   body_timeout_ms: 30000
-  # End-to-end deadline from admission through completion, including queue time.
+  # End-to-end deadline including planning, hosted search, queueing and execution.
   wall_time_ms: 600000
   # Maximum time spent actively executing after queue admission.
   active_time_ms: 480000

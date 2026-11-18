@@ -467,10 +467,9 @@ impl WorkloadScheduler {
         let policy = policy.validate()?;
         let diagnostics = match sink {
             Some(sink) => SchedulerDiagnostics::with_sink(policy.diagnostic_capacity, sink),
-            None => SchedulerDiagnostics::stderr(
-                policy.diagnostic_capacity,
-                policy.diagnostics_enabled,
-            ),
+            None => {
+                SchedulerDiagnostics::stderr(policy.diagnostic_capacity, policy.diagnostics_enabled)
+            }
         };
         let counters = Arc::new(SchedulerCounters::default());
         let (events, receiver) = mpsc::channel();

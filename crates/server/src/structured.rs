@@ -24,11 +24,30 @@ pub fn json_grammar() -> String {
     JSON_GRAMMAR.into()
 }
 
-pub fn schema_grammar(schema: &Value) -> Result<String, Error> {
-    jsonschema::JSONSchema::options()
-        .with_draft(jsonschema::Draft::Draft202012)
+struct RejectExternalReferences;
+
+impl jsonschema::SchemaResolver for RejectExternalReferences {
+    fn resolve(
+        &self,
+        _root_schema: &Value,
+        url: &url::Url,
+        _original_reference: &str,
+    ) -> Result<std::sync::Arc<Value>, jsonschema::SchemaResolverError> {
+        Err(std::io::Error::other(format!("external schema reference is disabled: {url}")).into())
+    }
+}
+
+pub(crate) fn compile_schema(schema: &Value) -> Result<jsonschema::JSONSchema, Error> {
+    let mut options = jsonschema::JSONSchema::options();
+    options.with_draft(jsonschema::Draft::Draft202012);
+    options.with_resolver(RejectExternalReferences);
+    options
         .compile(schema)
-        .map_err(|error| Error::Invalid(error.to_string()))?;
+        .map_err(|error| Error::Invalid(error.to_string()))
+}
+
+pub fn schema_grammar(schema: &Value) -> Result<String, Error> {
+    compile_schema(schema)?;
     let mut compiler = Compiler {
         rules: vec!["space ::= | \" \" | \"\\n\" [ \\t]{0,20}".into()],
         next_rule: 0,
@@ -225,5 +244,34 @@ mod tests {
             schema_grammar(&json!({"type": "not-a-type"})),
             Err(Error::Invalid(_))
         ));
+    }
+    #[test]
+    fn validation_accepts_valid_schemas_beyond_grammar_subset() {
+        compile_schema(&json!({"type": "string", "minLength": 2})).unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_schema_with_invalid_keyword_value() {
+        assert!(matches!(
+            compile_schema(&json!({"type": "string", "minLength": -1})),
+            Err(Error::Invalid(_))
+        ));
+    }
+    #[test]
+    fn validates_local_references_and_rejects_external_resolution() {
+        let local = compile_schema(&json!({
+            "$defs": {"text": {"type": "string"}},
+            "$ref": "#/$defs/text"
+        }))
+        .unwrap();
+        assert!(local.is_valid(&json!("text")));
+        assert!(!local.is_valid(&json!(1)));
+
+        let path = std::env::temp_dir().join(format!("cusco-schema-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "true").unwrap();
+        let reference = url::Url::from_file_path(&path).unwrap();
+        let external = compile_schema(&json!({"$ref": reference.as_str()})).unwrap();
+        assert!(!external.is_valid(&json!("text")));
+        std::fs::remove_file(path).unwrap();
     }
 }

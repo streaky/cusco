@@ -27,34 +27,34 @@ mod generation_plan;
 mod generation_tools;
 mod hosted_tools;
 mod lifecycle;
-mod mapped;
-mod prompt;
-pub mod native;
 pub mod management;
+mod mapped;
+pub mod native;
+mod prompt;
 mod residency;
 pub mod response_store;
 pub mod responses;
 mod scheduler;
 mod structured;
 mod vision;
-pub(crate) use generation_tools::{
-    HostedWebSearchExecution, append_tool_instructions, append_web_search_evidence,
-    execute_hosted_web_search, tool_names, tool_value, validate_tools,
-};
 pub use catalog::{CatalogError, ModelCatalog, load_user_models};
 pub use config::{
     ConfigError, DaemonConfig, HostedToolsConfig, OpenApiConfig, VisionConfig, WebSearchConfig,
 };
-pub use daemon::{Daemon, DaemonError};
 pub use context_strategy::{
     CompactionDeclaration, CompactionNoMatchFallback, CompactionProposal, CompactionRequest,
     CompactionResult, CompactionResultReason, CompactionStrategyCatalog, CompactionStrategyInfo,
     CompactionTrigger, CreateCompactionDeclaration, WINDOW_TAIL_STRATEGY_ID,
     apply_window_tail_strategy, deterministic_strategy_id, select_strategy, strategy_catalog,
 };
+pub use daemon::{Daemon, DaemonError};
 pub use generation::{
     FinishReason, FrontierControl, GenerationFrontier, MAX_STOP_BYTES, MAX_STOP_SEQUENCES,
     StopAlignment,
+};
+pub(crate) use generation_tools::{
+    HostedWebSearchExecution, append_tool_instructions, append_web_search_evidence,
+    execute_hosted_web_search, tool_names, tool_value, validate_tools,
 };
 pub use hosted_tools::{
     DisabledHostedTools, HostedToolError, HostedToolExecutor, SearxngHostedTools, WebSearchPolicy,
@@ -69,11 +69,16 @@ pub use vision::{AdmittedImage, ImageAdmission, VisionError};
 #[serde(transparent)]
 pub struct ContextId(String);
 impl ContextId {
-    fn new() -> Self { Self(Uuid::new_v4().to_string()) }
-    pub fn from_string(value: impl Into<String>) -> Self { Self(value.into()) }
-    pub fn as_str(&self) -> &str { &self.0 }
+    fn new() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+    pub fn from_string(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
-
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrefillMetrics {
@@ -435,7 +440,6 @@ impl RequestControl {
         }
     }
 
-
     pub fn remaining_until(
         &self,
         deadline: std::time::Instant,
@@ -513,9 +517,11 @@ impl RequestControl {
         if self.check().is_err() {
             abort();
         }
-        AbortRegistration { control: self, abort }
+        AbortRegistration {
+            control: self,
+            abort,
+        }
     }
-
 
     fn abort(&self) {
         let aborts = self.abort.lock().clone();
@@ -539,12 +545,14 @@ pub(crate) struct AbortRegistration<'a> {
 impl Drop for AbortRegistration<'_> {
     fn drop(&mut self) {
         let mut aborts = self.control.abort.lock();
-        if let Some(index) = aborts.iter().position(|abort| Arc::ptr_eq(abort, &self.abort)) {
+        if let Some(index) = aborts
+            .iter()
+            .position(|abort| Arc::ptr_eq(abort, &self.abort))
+        {
             aborts.swap_remove(index);
         }
     }
 }
-
 
 #[derive(Clone)]
 pub struct EngineRequest {
@@ -1319,7 +1327,9 @@ impl Server {
         req: InferRequest,
         admission: AdmissionGuard,
     ) -> Result<(StreamEvent, tokio::sync::mpsc::Receiver<StreamEvent>), Error> {
-        let (started, receiver, _worker) = self.infer_stream_reserved_with_compaction(request_id, req, admission, None).await?;
+        let (started, receiver, _worker) = self
+            .infer_stream_reserved_with_compaction(request_id, req, admission, None)
+            .await?;
         Ok((started, receiver))
     }
     pub(crate) async fn infer_stream_reserved_with_compaction(
@@ -1328,7 +1338,14 @@ impl Server {
         req: InferRequest,
         admission: AdmissionGuard,
         compaction_permit: Option<PrequeuePermit>,
-    ) -> Result<(StreamEvent, tokio::sync::mpsc::Receiver<StreamEvent>, tokio::task::JoinHandle<Result<InferResponse, Error>>), Error> {
+    ) -> Result<
+        (
+            StreamEvent,
+            tokio::sync::mpsc::Receiver<StreamEvent>,
+            tokio::task::JoinHandle<Result<InferResponse, Error>>,
+        ),
+        Error,
+    > {
         let stops = self.effective_stop_sequences(&req)?;
         let frontier =
             GenerationFrontier::new_effective(&stops, req.raw_continuation).map_err(state_err)?;
@@ -1416,10 +1433,10 @@ impl Server {
         active: bool,
     ) {
         let mut guard = self.inner.lock();
-        if let Some(request_id) = request_id {
-            if let Some(control) = guard.controls.remove(&request_id) {
-                control.complete();
-            }
+        if let Some(request_id) = request_id
+            && let Some(control) = guard.controls.remove(&request_id)
+        {
+            control.complete();
         }
         if active {
             guard.active = guard.active.saturating_sub(1);
@@ -1519,22 +1536,22 @@ impl Server {
         mut frontier: GenerationFrontier,
         mut emit: impl FnMut(StreamEvent) -> Result<(), Error>,
     ) -> Result<(InferResponse, StreamEvent), Error> {
-        if let Some(compaction) = req.compaction.as_mut() {
-            if let Some(declaration_id) = compaction.declaration_id.clone() {
-                let declaration =
-                    self.compaction_declaration_for(&req.scheduling.principal, &declaration_id)?;
-                let context_id = req.context_id.as_ref().ok_or_else(|| {
-                    Error::BadRequest("compaction declaration requires context".into())
-                })?;
-                if context_id.0 != declaration.context_id {
-                    return Err(Error::BadRequest(
-                        "compaction declaration context mismatch".into(),
-                    ));
-                }
-                compaction.strategy_preferences = declaration.strategy_preferences;
-                if compaction.target_tokens.is_none() {
-                    compaction.target_tokens = declaration.target_tokens;
-                }
+        if let Some(compaction) = req.compaction.as_mut()
+            && let Some(declaration_id) = compaction.declaration_id.clone()
+        {
+            let declaration =
+                self.compaction_declaration_for(&req.scheduling.principal, &declaration_id)?;
+            let context_id = req.context_id.as_ref().ok_or_else(|| {
+                Error::BadRequest("compaction declaration requires context".into())
+            })?;
+            if context_id.0 != declaration.context_id {
+                return Err(Error::BadRequest(
+                    "compaction declaration context mismatch".into(),
+                ));
+            }
+            compaction.strategy_preferences = declaration.strategy_preferences;
+            if compaction.target_tokens.is_none() {
+                compaction.target_tokens = declaration.target_tokens;
             }
         }
         let started = Instant::now();
@@ -1604,7 +1621,7 @@ impl Server {
                 let proposal = apply_window_tail_strategy(
                     &logical_context_tokens,
                     compaction.target_tokens.unwrap_or(3072),
-                    &[selected.clone()],
+                    std::slice::from_ref(&selected),
                 )
                 .map_err(Error::BadRequest)?;
                 control.check()?;
@@ -1883,7 +1900,6 @@ mod tests {
         }
     }
 
-
     struct SlowEngine {
         started: Arc<tokio::sync::Notify>,
     }
@@ -1953,8 +1969,8 @@ mod tests {
         let context = server.create_context().unwrap();
         server.branch_context(&context.id).unwrap();
         drop(server);
-        let restarted = Server::open(directory.join("state.json"), Arc::new(DeterministicEngine))
-        .unwrap();
+        let restarted =
+            Server::open(directory.join("state.json"), Arc::new(DeterministicEngine)).unwrap();
         assert!(restarted.contexts().is_empty());
         assert!(matches!(
             restarted.context(&context.id),
@@ -2045,8 +2061,7 @@ mod tests {
         ));
         let model = s.model("m").unwrap();
         drop(s);
-        let failing = Server::open(d.join("state.json"), Arc::new(FailingEngine))
-        .unwrap();
+        let failing = Server::open(d.join("state.json"), Arc::new(FailingEngine)).unwrap();
         failing.register_model(model).unwrap();
         assert!(matches!(
             failing.infer(
@@ -2133,7 +2148,9 @@ mod tests {
                 allowed_domains: Vec::new(),
                 search_context_size: None,
             }],
-            &native::NativeToolChoice::Function { name: "lookup".into() },
+            &native::NativeToolChoice::Function {
+                name: "lookup".into(),
+            },
             false,
         )
         .unwrap();
@@ -2658,8 +2675,8 @@ mod tests {
         assert!(matches!(active.control.check(), Err(Error::Cancelled)));
         drop(active);
 
-        let restarted = Server::open(dir.join("state.json"), Arc::new(DeterministicEngine))
-        .unwrap();
+        let restarted =
+            Server::open(dir.join("state.json"), Arc::new(DeterministicEngine)).unwrap();
         assert!(restarted.contexts().is_empty());
         assert!(matches!(
             restarted.context(&context.id),
@@ -2887,7 +2904,10 @@ mod tests {
             .infer("compact-replay", compacting_request(source.id))
             .unwrap();
         let result = response.usage.compaction_result.unwrap();
-        assert_eq!(result.selected_strategy_id.as_deref(), Some("window_tail:v1"));
+        assert_eq!(
+            result.selected_strategy_id.as_deref(),
+            Some("window_tail:v1")
+        );
         assert!(result.success);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2897,7 +2917,10 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let model_path = directory.join("m.gguf");
         fs::write(&model_path, b"model").unwrap();
-        let server = Server::open(directory.join("state.json"), Arc::new(CompactionProofEngine))
+        let server = Server::open(
+            directory.join("state.json"),
+            Arc::new(CompactionProofEngine),
+        )
         .unwrap();
         server
             .register_model(ModelRecord {
@@ -2917,6 +2940,10 @@ mod tests {
                 "<start_of_turn>system".into(),
                 "policy".into(),
                 "<start_of_turn>user".into(),
+                "older question".into(),
+                "<start_of_turn>assistant".into(),
+                "older answer".into(),
+                "<start_of_turn>user".into(),
                 "discard me".into(),
             ])
             .unwrap();
@@ -2927,7 +2954,8 @@ mod tests {
         assert!(response.usage.compaction_result.unwrap().success);
         assert_eq!(successor.native_tokens, vec![41, 42, 43]);
         assert!(successor.tokens.iter().any(|token| token == "policy"));
-        assert_eq!(server.context(&source.id).unwrap(), source);
+        assert_eq!(successor.id, source.id);
+        assert_eq!(successor.revision, source.revision + 1);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2937,7 +2965,10 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let model_path = directory.join("m.gguf");
         fs::write(&model_path, b"model").unwrap();
-        let server = Server::open(directory.join("state.json"), Arc::new(CompactionProofEngine))
+        let server = Server::open(
+            directory.join("state.json"),
+            Arc::new(CompactionProofEngine),
+        )
         .unwrap();
         server
             .register_model(ModelRecord {
@@ -2956,6 +2987,10 @@ mod tests {
             .import_context(vec![
                 "<start_of_turn>system".into(),
                 "policy".into(),
+                "<start_of_turn>user".into(),
+                "older question".into(),
+                "<start_of_turn>assistant".into(),
+                "older answer".into(),
                 "<start_of_turn>user".into(),
                 "discard me".into(),
             ])
@@ -3049,5 +3084,4 @@ mod tests {
     fn semantic_regression_followup_fidelity() {
         assert_semantic_fixture("followup_fidelity");
     }
-
 }

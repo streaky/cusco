@@ -357,10 +357,17 @@ mod tests {
         let yaml = "version: 1\npaths: {database: db, models: models, spill: spill, user_models: local, user_config: user.yaml}\nexecution: {device_capacity: '1 GiB', host_capacity: '1 GiB', storage_capacity: '2 GiB', context_reserve: '1 GiB'}\n";
         let omitted: DaemonConfig = serde_yaml::from_str(yaml).unwrap();
         let omitted = omitted.validate().unwrap();
-        assert_eq!(omitted.hosted_tools.web_search.timeout_ms, default_web_search_timeout_ms());
-        let empty: DaemonConfig = serde_yaml::from_str(&format!("hosted_tools: {{}}\n{yaml}")).unwrap();
+        assert_eq!(
+            omitted.hosted_tools.web_search.timeout_ms,
+            default_web_search_timeout_ms()
+        );
+        let empty: DaemonConfig =
+            serde_yaml::from_str(&format!("hosted_tools: {{}}\n{yaml}")).unwrap();
         let empty = empty.validate().unwrap();
-        assert_eq!(empty.hosted_tools.web_search.max_results, default_web_search_results());
+        assert_eq!(
+            empty.hosted_tools.web_search.max_results,
+            default_web_search_results()
+        );
     }
 
     #[test]

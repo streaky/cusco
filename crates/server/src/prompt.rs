@@ -253,9 +253,7 @@ mod tests {
         );
 
         append_assistant_content("qwen35moe", &mut prompt, "Hi").unwrap();
-        assert!(prompt.ends_with(
-            "<|im_start|>assistant\nHi<|im_end|>\n<|im_start|>assistant\n"
-        ));
+        assert!(prompt.ends_with("<|im_start|>assistant\nHi<|im_end|>\n<|im_start|>assistant\n"));
         insert_generation_instructions("qwen35moe", &mut prompt, "\nUse tools.").unwrap();
         assert!(prompt.contains("Hi\nUse tools.<|im_end|>"));
         append_rendered(
@@ -264,9 +262,7 @@ mod tests {
             "<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n",
         )
         .unwrap();
-        assert!(prompt.ends_with(
-            "<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n"
-        ));
+        assert!(prompt.ends_with("<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n"));
         assert_eq!(
             terminal_markers("qwen35moe"),
             ["<|im_end|>", "<|endoftext|>"]
