@@ -1,0 +1,279 @@
+namespace cusco/service
+
+from /core/collections import list
+from /core/documents import document-value
+from /core/errors import throwable
+from /deps/cusco-server/native import GenerationSession as native-generation-session
+from /streaky/http-server import response-stream
+
+function generation-json string throws throwable; value document-value
+    result = stringify-wire-json; value
+    if result.failed
+        throw service-error; 'state_error', result.message
+    return result.value.encoded
+
+function generation-data string throws throwable; value document-value
+    return 'data: ' + (generation-json; value) + '\n\n'
+
+function generation-count int throws throwable; value ref document-value, name string
+    field = wire-field; value, name
+    if field.kind != 'integer'
+        throw service-error; 'state_error', 'invalid generation count ' + name
+    return field.scalar.radix; 10
+
+function generation-usage document-value throws throwable; usage ref document-value
+    input = generation-count; usage, 'input_tokens'
+    output = generation-count; usage, 'generated_tokens'
+    return generation-object; (list; 'prompt_tokens', 'completion_tokens', 'total_tokens'), (list; (wire-integer; ('' + input)).value, (wire-integer; ('' + output)).value, (wire-integer; ('' + (input + output))).value)
+
+function generation-cusco document-value throws throwable; usage ref document-value
+    prefill = wire-field; usage, 'prefill'
+    ratio document-value = wire-none;
+    total = generation-count; prefill, 'total_tokens'
+    if total > 0
+        cached float64 = generation-count; prefill, 'cached_tokens'
+        denominator float64 = total
+        # Exact integer/decimal constructors are disjoint and there is no
+        # general float constructor; this bounded scalar may be 0, 1 or fractional.
+        ratio = (parse-wire-json; ('' + (cached / denominator)), 128).value
+    details = generation-object; (list; 'total_tokens', 'cached_tokens', 'uncached_tokens', 'cached_ratio', 'tokenization_ns', 'prefix_lookup_ns', 'mapping_activation_ns', 'uncached_prefill_ns', 'total_ns'), (list; (wire-field; prefill, 'total_tokens'), (wire-field; prefill, 'cached_tokens'), (wire-field; prefill, 'uncached_tokens'), ratio, (wire-field; prefill, 'tokenization_ns'), (wire-field; prefill, 'prefix_lookup_ns'), (wire-field; prefill, 'mapping_activation_ns'), (wire-field; prefill, 'uncached_prefill_ns'), (wire-field; prefill, 'total_ns'))
+    counts = generation-object; (list; 'input_tokens', 'generated_tokens', 'evaluated_tokens', 'cached_tokens', 'prefill'), (list; (wire-field; usage, 'input_tokens'), (wire-field; usage, 'generated_tokens'), (wire-field; usage, 'evaluated_tokens'), (wire-field; usage, 'cached_tokens'), details)
+    return generation-object; (list; 'compaction_result', 'correlation_id', 'inference_id', 'execution_session_id', 'usage'), (list; (wire-field; usage, 'compaction_result'), (wire-field; usage, 'correlation_id'), (wire-field; usage, 'inference_id'), (wire-field; usage, 'execution_session_id'), counts)
+
+function response-text-part document-value throws throwable; part ref document-value
+    return generation-object; (list; 'type', 'text', 'annotations', 'logprobs'), (list; (wire-string; 'output_text'), (wire-field; part, 'text'), (wire-field; part, 'annotations'), (wire-field; part, 'logprobs'))
+
+function response-empty-part document-value throws throwable;
+    return generation-object; (list; 'type', 'text', 'annotations', 'logprobs'), (list; (wire-string; 'output_text'), (wire-string; ''), (generation-array; list), (generation-array; list))
+
+function response-output-item document-value throws throwable; item ref document-value
+    kind = wire-text; item, 'type'
+    if kind == 'message'
+        contents list of document-value = list;
+        parts = wire-field; item, 'content'
+        index int = 0
+        while index < (parts.length;)
+            part = (parts.item; index).value
+            contents.append; (response-text-part; part)
+            index = index + 1
+        return generation-object; (list; 'id', 'type', 'role', 'status', 'content'), (list; (wire-field; item, 'id'), (wire-string; 'message'), (wire-field; item, 'role'), (wire-field; item, 'status'), (generation-array; contents))
+    if kind == 'reasoning'
+        summaries list of document-value = list;
+        parts = wire-field; item, 'summary'
+        index int = 0
+        while index < (parts.length;)
+            part = (parts.item; index).value
+            summaries.append; (generation-object; (list; 'type', 'text'), (list; (wire-string; 'summary_text'), (wire-field; part, 'text')))
+            index = index + 1
+        return generation-object; (list; 'id', 'type', 'status', 'summary'), (list; (wire-field; item, 'id'), (wire-string; 'reasoning'), (wire-field; item, 'status'), (generation-array; summaries))
+    if kind == 'function_call'
+        return generation-object; (list; 'id', 'type', 'call_id', 'name', 'arguments', 'status'), (list; (wire-field; item, 'id'), (wire-string; 'function_call'), (wire-field; item, 'call_id'), (wire-field; item, 'name'), (wire-field; item, 'arguments'), (wire-field; item, 'status'))
+    if kind == 'web_search_call'
+        return generation-object; (list; 'id', 'type', 'status', 'action'), (list; (wire-field; item, 'id'), (wire-string; 'web_search_call'), (wire-field; item, 'status'), (wire-field; item, 'action'))
+    throw service-error; 'state_error', 'unknown response output item'
+
+function project-response document-value throws throwable; resource ref document-value, output-override document-value|none = none, cusco-override document-value|none = none
+    output list of document-value = list;
+    items = wire-field; resource, 'output'
+    index int = 0
+    while index < (items.length;)
+        item = (items.item; index).value
+        output.append; (response-output-item; item)
+        index = index + 1
+    projected-output = generation-array; output
+    if output-override != none
+        projected-output = output-override
+    usage document-value = wire-none;
+    raw-usage = wire-field; resource, 'usage'
+    if raw-usage.kind != 'none'
+        input = generation-count; raw-usage, 'input_tokens'
+        generated = generation-count; raw-usage, 'output_tokens'
+        cached = generation-object; (list; 'cached_tokens'), (list; (wire-field; raw-usage, 'cached_tokens'))
+        reasoning = generation-object; (list; 'reasoning_tokens'), (list; (wire-field; raw-usage, 'reasoning_tokens'))
+        usage = generation-object; (list; 'input_tokens', 'input_tokens_details', 'output_tokens', 'output_tokens_details', 'total_tokens'), (list; (wire-field; raw-usage, 'input_tokens'), cached, (wire-field; raw-usage, 'output_tokens'), reasoning, (wire-integer; ('' + (input + generated))).value)
+    cusco = generation-object; (list; 'lineage_revision', 'context_update'), (list; (wire-field; resource, 'lineage_revision'), (wire-field; resource, 'context_update'))
+    if cusco-override != none
+        cusco = cusco-override
+    text-format = generation-object; (list; 'type'), (list; (wire-string; 'text'))
+    text = generation-object; (list; 'format', 'verbosity'), (list; text-format, (wire-string; 'medium'))
+    keys = list; 'id', 'object', 'created_at', 'status', 'background', 'error', 'incomplete_details', 'instructions', 'max_output_tokens', 'metadata', 'model', 'output', 'parallel_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'finish_reason', 'cusco'
+    values = list; (wire-field; resource, 'id'), (wire-string; 'response'), (wire-field; resource, 'created_at'), (wire-field; resource, 'status'), (wire-bool; false), (wire-none;), (wire-none;), (wire-none;), (wire-none;), (wire-field; resource, 'metadata'), (wire-field; resource, 'model'), projected-output, (wire-bool; true), (wire-field; resource, 'previous_response_id'), (wire-none;), (wire-none;), (wire-none;), (wire-string; 'default'), (wire-field; resource, 'store'), (wire-integer; '1').value, text, (wire-field; resource, 'tool_choice'), (wire-field; resource, 'tools'), (wire-integer; '0').value, (wire-integer; '1').value, (wire-string; 'disabled'), usage, (wire-field; resource, 'finish_reason'), cusco
+    return generation-object; keys, values
+
+function generation-completed document-value throws throwable; protocol string, id string, text string, finish ref document-value
+    usage = wire-field; finish, 'usage'
+    cusco = generation-cusco; usage
+    if protocol == 'responses'
+        resource = wire-field; finish, 'response'
+        if resource.kind == 'none'
+            throw service-error; 'state_error', 'response generation returned no resource'
+        return project-response; resource, none, cusco
+    reason = wire-field; finish, 'reason'
+    choice document-value
+    if protocol == 'completion'
+        choice = generation-object; (list; 'text', 'index', 'finish_reason'), (list; (wire-string; text), (wire-integer; '0').value, reason)
+        return generation-object; (list; 'id', 'object', 'choices', 'usage', 'cusco'), (list; (wire-string; id), (wire-string; 'text_completion'), (generation-array; (list; choice)), (generation-usage; usage), cusco)
+    message = generation-object; (list; 'role', 'content'), (list; (wire-string; 'assistant'), (wire-string; text))
+    choice = generation-object; (list; 'message', 'index', 'finish_reason'), (list; message, (wire-integer; '0').value, reason)
+    return generation-object; (list; 'id', 'object', 'service_tier', 'choices', 'usage', 'cusco'), (list; (wire-string; id), (wire-string; 'chat.completion'), (wire-string; 'default'), (generation-array; (list; choice)), (generation-usage; usage), cusco)
+
+class generation-stream-state
+    protocol string
+    initial document-value
+    include-usage bool
+    started bool = false
+    finished bool = false
+    buffered bool = false
+    sequence int = 0
+    message-id string = ''
+
+    function construct; protocol string, initial document-value, include-usage bool
+        this.protocol = protocol
+        this.initial = initial
+        this.include-usage = include-usage
+        this.buffered = protocol == 'responses' and (wire-text; initial, 'buffer_output') == 'true'
+        resource = wire-field; initial, 'response'
+        this.message-id = 'msg_' + (wire-text; resource, 'id')
+
+    mutable function response-row string; name string, keys list of string, values list of document-value
+        fields = list; 'type', 'sequence_number'
+        data = list; (wire-string; name), (wire-integer; ('' + this.sequence)).value
+        index int = 0
+        while index < keys.length
+            fields.append; keys[index]
+            data.append; values[index]
+            index = index + 1
+        this.sequence = this.sequence + 1
+        return generation-data; (generation-object; fields, data)
+
+    mutable function begin string|none;
+        if this.started
+            return none
+        this.started = true
+        if this.protocol == 'responses'
+            resource = wire-field; this.initial, 'response'
+            if resource.kind == 'none'
+                throw service-error; 'state_error', 'response generation returned no initial resource'
+            part = response-empty-part;
+            message = generation-object; (list; 'id', 'type', 'role', 'status', 'content'), (list; (wire-string; this.message-id), (wire-string; 'message'), (wire-string; 'assistant'), (wire-string; 'in_progress'), (generation-array; (list; part)))
+            output list of document-value = list;
+            prepared = wire-field; resource, 'output'
+            index int = 0
+            while index < (prepared.length;)
+                item = (prepared.item; index).value
+                output.append; (response-output-item; item)
+                index = index + 1
+            output.append; message
+            rows list of document-value = list;
+            rows.append; (wire-string; (this.response-row; 'response.created', (list; 'response'), (list; (project-response; resource, (generation-array; output)))))
+            if not this.buffered
+                rows.append; (wire-string; (this.response-row; 'response.output_item.added', (list; 'item', 'output_index'), (list; message, (wire-integer; '0').value)))
+                rows.append; (wire-string; (this.response-row; 'response.content_part.added', (list; 'item_id', 'output_index', 'content_index', 'part'), (list; (wire-string; this.message-id), (wire-integer; '0').value, (wire-integer; '0').value, part)))
+            frames = generation-array; rows
+            return generation-join; frames
+        cusco = generation-object; (list; 'correlation_id', 'inference_id', 'execution_session_id'), (list; (wire-field; this.initial, 'correlation_id'), (wire-field; this.initial, 'inference_id'), (wire-field; this.initial, 'execution_session_id'))
+        if this.protocol == 'completion'
+            return generation-data; (generation-object; (list; 'id', 'object', 'choices', 'cusco'), (list; (wire-field; this.initial, 'request_id'), (wire-string; 'text_completion'), (generation-array; list), cusco))
+        delta = generation-object; (list; 'role'), (list; (wire-string; 'assistant'))
+        choice = generation-object; (list; 'index', 'delta', 'finish_reason'), (list; (wire-integer; '0').value, delta, (wire-none;))
+        return generation-data; (generation-object; (list; 'id', 'object', 'service_tier', 'choices', 'cusco'), (list; (wire-field; this.initial, 'request_id'), (wire-string; 'chat.completion.chunk'), (wire-string; 'default'), (generation-array; (list; choice)), cusco))
+
+    mutable function accept string|none; event document-value
+        error = wire-field; event, 'Error'
+        if error.kind != 'none'
+            this.finished = true
+            message = wire-field; error, 'message'
+            if this.protocol == 'responses'
+                return this.response-row; 'error', (list; 'code', 'message', 'param'), (list; (wire-string; 'server_error'), message, (wire-none;))
+            detail = generation-object; (list; 'message', 'type'), (list; message, (wire-string; 'server_error'))
+            return generation-data; (generation-object; (list; 'error'), (list; detail))
+        token = wire-field; event, 'Token'
+        if token.kind != 'none'
+            text = wire-field; token, 'token'
+            if this.protocol == 'responses'
+                if this.buffered
+                    return none
+                return this.response-row; 'response.output_text.delta', (list; 'item_id', 'output_index', 'content_index', 'delta', 'logprobs'), (list; (wire-string; this.message-id), (wire-integer; '0').value, (wire-integer; '0').value, text, (generation-array; list))
+            if this.protocol == 'completion'
+                choice = generation-object; (list; 'text', 'index', 'finish_reason'), (list; text, (wire-integer; '0').value, (wire-none;))
+                return generation-data; (generation-object; (list; 'object', 'choices'), (list; (wire-string; 'text_completion'), (generation-array; (list; choice))))
+            delta = generation-object; (list; 'content'), (list; text)
+            choice = generation-object; (list; 'delta', 'index', 'finish_reason'), (list; delta, (wire-integer; '0').value, (wire-none;))
+            return generation-data; (generation-object; (list; 'object', 'service_tier', 'choices'), (list; (wire-string; 'chat.completion.chunk'), (wire-string; 'default'), (generation-array; (list; choice))))
+        finish = wire-field; event, 'Finished'
+        if finish.kind == 'none'
+            throw service-error; 'state_error', 'unexpected generation event'
+        this.finished = true
+        if this.protocol == 'responses'
+            return this.complete-response; (wire-field; finish, 'response')
+        choice = generation-object; (list; 'index', 'finish_reason'), (list; (wire-integer; '0').value, (wire-field; finish, 'reason'))
+        keys = list; 'service_tier', 'choices'
+        values = list; (wire-string; 'default'), (generation-array; (list; choice))
+        if this.include-usage
+            keys.append; 'usage'
+            usage = wire-field; finish, 'usage'
+            values.append; (generation-usage; usage)
+        return (generation-data; (generation-object; keys, values)) + 'data: [DONE]\n\n'
+
+    mutable function complete-response string; resource document-value
+        if resource.kind == 'none'
+            throw service-error; 'state_error', 'response generation returned no completed resource'
+        rows list of document-value = list;
+        items = wire-field; resource, 'output'
+        index int = 0
+        while index < (items.length;)
+            raw = (items.item; index).value
+            item = response-output-item; raw
+            kind = wire-text; raw, 'type'
+            item-id = wire-field; raw, 'id'
+            output-index = (wire-integer; ('' + index)).value
+            if kind == 'message'
+                parts = wire-field; item, 'content'
+                part = (parts.item; 0).value
+                if this.buffered
+                    rows.append; (wire-string; (this.response-row; 'response.output_item.added', (list; 'item', 'output_index'), (list; item, output-index)))
+                    rows.append; (wire-string; (this.response-row; 'response.content_part.added', (list; 'item_id', 'output_index', 'content_index', 'part'), (list; item-id, output-index, (wire-integer; '0').value, (response-empty-part;))))
+                    rows.append; (wire-string; (this.response-row; 'response.output_text.delta', (list; 'item_id', 'output_index', 'content_index', 'delta', 'logprobs'), (list; item-id, output-index, (wire-integer; '0').value, (wire-field; part, 'text'), (generation-array; list))))
+                rows.append; (wire-string; (this.response-row; 'response.output_text.done', (list; 'item_id', 'output_index', 'content_index', 'text', 'logprobs'), (list; item-id, output-index, (wire-integer; '0').value, (wire-field; part, 'text'), (generation-array; list))))
+                rows.append; (wire-string; (this.response-row; 'response.content_part.done', (list; 'item_id', 'output_index', 'content_index', 'part'), (list; item-id, output-index, (wire-integer; '0').value, part)))
+                rows.append; (wire-string; (this.response-row; 'response.output_item.done', (list; 'item', 'output_index'), (list; item, output-index)))
+            else
+                rows.append; (wire-string; (this.response-row; 'response.output_item.added', (list; 'item', 'output_index'), (list; item, output-index)))
+                if kind == 'reasoning'
+                    summaries = wire-field; item, 'summary'
+                    summary = (summaries.item; 0).value
+                    empty = generation-object; (list; 'type', 'text'), (list; (wire-string; 'summary_text'), (wire-string; ''))
+                    rows.append; (wire-string; (this.response-row; 'response.reasoning_summary_part.added', (list; 'item_id', 'output_index', 'summary_index', 'part'), (list; item-id, output-index, (wire-integer; '0').value, empty)))
+                    rows.append; (wire-string; (this.response-row; 'response.reasoning_summary_text.delta', (list; 'item_id', 'output_index', 'summary_index', 'delta'), (list; item-id, output-index, (wire-integer; '0').value, (wire-field; summary, 'text'))))
+                    rows.append; (wire-string; (this.response-row; 'response.reasoning_summary_text.done', (list; 'item_id', 'output_index', 'summary_index', 'text'), (list; item-id, output-index, (wire-integer; '0').value, (wire-field; summary, 'text'))))
+                rows.append; (wire-string; (this.response-row; 'response.output_item.done', (list; 'item', 'output_index'), (list; item, output-index)))
+            index = index + 1
+        rows.append; (wire-string; (this.response-row; 'response.completed', (list; 'response'), (list; (project-response; resource))))
+        frames = generation-array; rows
+        return generation-join; frames
+
+class generation-output-stream implements response-stream
+    private session native-generation-session
+    private state shared ref generation-stream-state
+
+    function construct; session native-generation-session, protocol string, initial document-value, include-usage bool
+        this.session = session
+        state = instance generation-stream-state; protocol, initial, include-usage
+        this.state = shared ref state
+
+    async function next-chunk (string|none) throws throwable;
+        state = this.state
+        initial = state.begin;
+        if initial != none
+            return initial
+        while not state.finished
+            event = await next-generation-document; this.session
+            if event.kind == 'none'
+                throw service-error; 'state_error', 'inference ended before a terminal event'
+            chunk = state.accept; event
+            if chunk != none
+                return chunk
+        return none
+
+    function cancel;
+        this.session.cancel;

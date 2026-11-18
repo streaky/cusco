@@ -1,0 +1,370 @@
+namespace cusco/service
+
+from /core/collections import list
+from /core/documents import document-value
+from /core/errors import throwable
+
+function generation-object document-value throws throwable; keys list of string, values list of document-value
+    result = wire-object; keys, values
+    if result.failed
+        throw service-error; 'state_error', result.message
+    return result.value
+
+function generation-array document-value throws throwable; values list of document-value
+    result = wire-array; values
+    if result.failed
+        throw service-error; 'state_error', result.message
+    return result.value
+
+function generation-required-text string throws throwable; object ref document-value, name string
+    result = object.field; name
+    if result.failed or result.value.kind != 'string'
+        throw invalid-request-error; name + ' must be a string'
+    return result.value.scalar
+
+function generation-optional-text document-value throws throwable; object ref document-value, name string
+    value = wire-field; object, name
+    if value.kind != 'none' and value.kind != 'string'
+        throw invalid-request-error; name + ' must be a string'
+    return value
+
+function generation-boolean bool throws throwable; object ref document-value, name string, fallback bool
+    result = object.field; name
+    if result.failed
+        return fallback
+    if result.value.kind != 'bool'
+        throw invalid-request-error; name + ' must be a boolean'
+    return result.value.scalar == 'true'
+
+function generation-integer document-value throws throwable; object ref document-value, name string
+    value = wire-field; object, name
+    if value.kind != 'none'
+        if value.kind != 'integer'
+            throw invalid-request-error; name + ' must be a nonnegative integer'
+        number int = value.scalar.radix; 10
+        if number < 0
+            throw invalid-request-error; name + ' must be a nonnegative integer'
+    return value
+
+function generation-number document-value throws throwable; object ref document-value, name string
+    value = wire-field; object, name
+    if value.kind != 'none' and value.kind != 'integer' and value.kind != 'decimal'
+        throw invalid-request-error; name + ' must be a number'
+    return value
+
+function generation-role string throws throwable; message ref document-value
+    result = message.field; 'role'
+    role string = 'user'
+    if not result.failed
+        if result.value.kind != 'string'
+            throw invalid-request-error; 'role must be a string'
+        role = result.value.scalar
+    if role != 'system' and role != 'user' and role != 'assistant'
+        throw invalid-request-error; 'unsupported message role ' + role
+    return role
+
+# This accumulator can span the request, not just a small temporary string.
+# Source `joined = joined + part` currently allocates a fresh buffer each time.
+# Remove this bridge when source append/builder operations can reuse one buffer.
+function generation-join string; fragments ref document-value
+    return rust
+        let Some(terrane_document_support::Document::List(parts)) = fragments.raw.value() else {
+            unreachable!("validated text fragment list")
+        };
+        let size = parts.iter().map(|part| match part {
+            terrane_document_support::Document::String(text) => text.len(),
+            _ => unreachable!("validated text fragment"),
+        }).sum();
+        let mut joined = String::with_capacity(size);
+        for part in parts {
+            let terrane_document_support::Document::String(text) = part else { unreachable!("validated text fragment") };
+            joined.push_str(text);
+        }
+        joined
+
+class normalized-generation-input
+    value document-value
+    ledger document-value
+
+    function construct; value document-value, ledger document-value
+        this.value = value
+        this.ledger = ledger
+
+function generation-content document-value throws throwable; value document-value, role string, responses bool
+    if value.kind == 'string'
+        return generation-object; (list; 'Text'), (list; value)
+    if value.kind != 'list'
+        throw invalid-request-error; 'message content must be text or an array'
+    parts list of document-value = list;
+    index int = 0
+    while index < (value.length;)
+        part = (value.item; index).value
+        kind = generation-required-text; part, 'type'
+        text-part = kind == 'text' and not responses
+        if responses
+            text-part = kind == 'input_text' or kind == 'output_text'
+        if text-part
+            wire-reject-unknown; part, (list; 'type', 'text')
+            text = generation-required-text; part, 'text'
+            parts.append; (generation-object; (list; 'Text'), (list; (wire-string; text)))
+        else
+            uri string = ''
+            if responses and kind == 'input_image'
+                wire-reject-unknown; part, (list; 'type', 'image_url', 'detail')
+                uri = generation-required-text; part, 'image_url'
+                generation-optional-text; part, 'detail'
+            else if not responses and kind == 'image_url'
+                wire-reject-unknown; part, (list; 'type', 'image_url')
+                image = wire-field; part, 'image_url'
+                wire-reject-unknown; image, (list; 'url')
+                uri = generation-required-text; image, 'url'
+            else
+                throw invalid-request-error; 'unsupported message content part ' + kind
+            if role != 'user'
+                throw invalid-request-error; 'images are accepted only in user messages'
+            parts.append; (generation-object; (list; 'ImageUri'), (list; (wire-string; uri)))
+        index = index + 1
+    return generation-object; (list; 'Parts'), (list; (generation-array; parts))
+
+function generation-input normalized-generation-input throws throwable; document ref document-value, protocol string
+    if protocol == 'completion'
+        prompt = generation-required-text; document, 'prompt'
+        return instance normalized-generation-input; (generation-object; (list; 'Prompt'), (list; (wire-string; prompt))), (generation-array; list)
+    input document-value = wire-none;
+    if protocol == 'chat'
+        input = wire-field; document, 'messages'
+    else
+        input = wire-field; document, 'input'
+        if input.kind == 'string'
+            message = generation-object; (list; 'type', 'role', 'text'), (list; (wire-string; 'message'), (wire-string; 'user'), input)
+            ledger = generation-array; (list; message)
+            return instance normalized-generation-input; (generation-object; (list; 'Ledger'), (list; ledger)), ledger
+    if input.kind != 'list'
+        throw invalid-request-error; 'input must be text or an array of messages'
+    messages list of document-value = list;
+    items list of document-value = list;
+    images bool = false
+    index int = 0
+    while index < (input.length;)
+        item = (input.item; index).value
+        if item.kind != 'map'
+            throw invalid-request-error; 'input items must be objects'
+        content-result = item.field; 'content'
+        if protocol == 'chat' or not content-result.failed
+            if protocol == 'chat'
+                wire-reject-unknown; item, (list; 'role', 'content')
+            role = generation-role; item
+            content = generation-content; (wire-field; item, 'content'), role, protocol == 'responses'
+            messages.append; (generation-object; (list; 'role', 'content'), (list; (wire-string; role), content))
+            text = wire-field; content, 'Text'
+            if text.kind == 'none'
+                fragments list of document-value = list;
+                parts = wire-field; content, 'Parts'
+                part-index int = 0
+                while part-index < (parts.length;)
+                    part = (parts.item; part-index).value
+                    fragment = wire-field; part, 'Text'
+                    if fragment.kind != 'none'
+                        fragments.append; fragment
+                    else
+                        images = true
+                    part-index = part-index + 1
+                text-fragments = generation-array; fragments
+                text = wire-string; (generation-join; text-fragments)
+            items.append; (generation-object; (list; 'type', 'role', 'text'), (list; (wire-string; 'message'), (wire-string; role), text))
+        else
+            call-id = generation-required-text; item, 'call_id'
+            output = item.field; 'output'
+            if not output.failed
+                if output.value.kind != 'string'
+                    throw invalid-request-error; 'function call output must be a string'
+                items.append; (generation-object; (list; 'type', 'call_id', 'output'), (list; (wire-string; 'function_call_output'), (wire-string; call-id), output.value))
+            else
+                name = generation-required-text; item, 'name'
+                arguments = generation-required-text; item, 'arguments'
+                items.append; (generation-object; (list; 'type', 'call_id', 'name', 'arguments'), (list; (wire-string; 'function_call'), (wire-string; call-id), (wire-string; name), (wire-string; arguments)))
+        index = index + 1
+    ledger = generation-array; items
+    if protocol == 'chat' or images
+        return instance normalized-generation-input; (generation-object; (list; 'Messages'), (list; (generation-array; messages))), ledger
+    return instance normalized-generation-input; (generation-object; (list; 'Ledger'), (list; ledger)), ledger
+
+function generation-tools document-value throws throwable; document ref document-value
+    declared = document.field; 'tools'
+    if declared.failed
+        return generation-array; list
+    if declared.value.kind != 'list'
+        throw invalid-request-error; 'tools must be an array'
+    tools list of document-value = list;
+    index int = 0
+    while index < (declared.value.length;)
+        tool = (declared.value.item; index).value
+        kind = generation-required-text; tool, 'type'
+        if kind == 'function'
+            nested = tool.field; 'function'
+            definition document-value = tool
+            if not nested.failed
+                wire-reject-unknown; tool, (list; 'type', 'function')
+                definition = nested.value
+                wire-reject-unknown; definition, (list; 'name', 'description', 'parameters', 'strict')
+            else
+                wire-reject-unknown; tool, (list; 'type', 'name', 'description', 'parameters', 'strict')
+            name = generation-required-text; definition, 'name'
+            parameters = wire-field; definition, 'parameters'
+            if name == '' or parameters.kind != 'map'
+                throw invalid-request-error; 'function tools require a name and parameter schema'
+            description = generation-optional-text; definition, 'description'
+            strict = generation-boolean; definition, 'strict', false
+            tools.append; (generation-object; (list; 'kind', 'name', 'description', 'parameters', 'strict'), (list; (wire-string; 'function'), (wire-string; name), description, parameters, (wire-bool; strict)))
+        else if kind == 'web_search' or kind == 'web_search_preview'
+            wire-reject-unknown; tool, (list; 'type', 'filters', 'search_context_size')
+            domains document-value = generation-array; list
+            filters = wire-field; tool, 'filters'
+            if filters.kind != 'none'
+                wire-reject-unknown; filters, (list; 'allowed_domains')
+                declared-domains = filters.field; 'allowed_domains'
+                if not declared-domains.failed
+                    management-strings; declared-domains.value
+                    domains = declared-domains.value
+            size = generation-optional-text; tool, 'search_context_size'
+            if size.kind != 'none' and size.scalar != 'low' and size.scalar != 'medium' and size.scalar != 'high'
+                throw invalid-request-error; 'unsupported search_context_size'
+            tools.append; (generation-object; (list; 'kind', 'allowed_domains', 'search_context_size'), (list; (wire-string; 'web_search'), domains, size))
+        else
+            throw invalid-request-error; 'unsupported tool type ' + kind
+        index = index + 1
+    return generation-array; tools
+
+function generation-tool-choice document-value throws throwable; document ref document-value
+    choice = wire-field; document, 'tool_choice'
+    if choice.kind == 'none'
+        return wire-string; 'Auto'
+    if choice.kind == 'string'
+        if choice.scalar == 'auto'
+            return wire-string; 'Auto'
+        if choice.scalar == 'none'
+            return wire-string; 'None'
+        if choice.scalar == 'required'
+            return wire-string; 'Required'
+        throw invalid-request-error; 'unsupported tool_choice mode'
+    wire-reject-unknown; choice, (list; 'type', 'name')
+    if (generation-required-text; choice, 'type') != 'function'
+        throw invalid-request-error; 'tool_choice must select a function'
+    name = generation-required-text; choice, 'name'
+    return generation-object; (list; 'Function'), (list; (generation-object; (list; 'name'), (list; (wire-string; name))))
+
+function generation-format document-value throws throwable; format document-value, responses bool
+    if format.kind == 'none'
+        return wire-none;
+    schema document-value = wire-none;
+    if responses
+        wire-reject-unknown; format, (list; 'type', 'name', 'description', 'schema', 'strict')
+        schema = format
+    else
+        wire-reject-unknown; format, (list; 'type', 'json_schema')
+        schema = wire-field; format, 'json_schema'
+        if schema.kind != 'none'
+            wire-reject-unknown; schema, (list; 'name', 'description', 'schema', 'strict')
+            generation-required-text; schema, 'name'
+            if (schema.field; 'schema').failed
+                throw invalid-request-error; 'json_schema.schema is required'
+    if schema.kind != 'none'
+        generation-optional-text; schema, 'description'
+        generation-boolean; schema, 'strict', false
+    kind = generation-required-text; format, 'type'
+    if kind == 'text'
+        return wire-string; 'Text'
+    if kind == 'json_object'
+        return wire-string; 'JsonObject'
+    if kind != 'json_schema'
+        throw invalid-request-error; 'unsupported response format type'
+    name = generation-required-text; schema, 'name'
+    if name == ''
+        throw invalid-request-error; 'schema name is required'
+    value = schema.field; 'schema'
+    if value.failed
+        throw invalid-request-error; 'schema is required'
+    return generation-object; (list; 'JsonSchema'), (list; (generation-object; (list; 'schema'), (list; value.value)))
+
+function generation-normalized-request document-value throws throwable; document ref document-value, protocol string, principal string, request-id string, retained-bytes uint64
+    keys list of string = list;
+    if protocol == 'completion'
+        keys = list; 'model', 'prompt', 'max_tokens', 'stream', 'context_id', 'stop', 'raw_continuation', 'compaction', 'deadline_ms', 'temperature', 'top_p', 'seed', 'stream_options'
+    else if protocol == 'chat'
+        keys = list; 'model', 'messages', 'max_tokens', 'max_completion_tokens', 'service_tier', 'stream', 'context_id', 'stop', 'deadline_ms', 'raw_continuation', 'top_p', 'temperature', 'seed', 'compaction', 'tools', 'response_format', 'reasoning_effort', 'stream_options'
+    else
+        keys = list; 'model', 'input', 'store', 'previous_response_id', 'max_output_tokens', 'service_tier', 'compaction', 'stream', 'temperature', 'top_p', 'seed', 'tools', 'response_format', 'text', 'reasoning_effort', 'reasoning', 'tool_choice'
+    wire-reject-unknown; document, keys
+    model = generation-required-text; document, 'model'
+    generation-boolean; document, 'stream', false
+    service-tier = generation-optional-text; document, 'service_tier'
+    if service-tier.kind != 'none'
+        tier = service-tier.scalar
+        if tier != 'auto' and tier != 'default' and tier != 'flex' and tier != 'scale' and tier != 'priority'
+            throw invalid-request-error; 'unsupported service_tier'
+    stream-options = wire-field; document, 'stream_options'
+    if stream-options.kind != 'none'
+        wire-reject-unknown; stream-options, (list; 'include_usage')
+        generation-boolean; stream-options, 'include_usage', false
+    max-tokens = generation-integer; document, 'max_tokens'
+    if protocol == 'chat'
+        current = generation-integer; document, 'max_completion_tokens'
+        if max-tokens.kind != 'none' and current.kind != 'none' and max-tokens.scalar != current.scalar
+            throw invalid-request-error; 'max_tokens and max_completion_tokens must match when both are provided'
+        if current.kind != 'none'
+            max-tokens = current
+    if protocol == 'responses'
+        max-tokens = generation-integer; document, 'max_output_tokens'
+    stop = wire-field; document, 'stop'
+    if stop.kind == 'none'
+        stop = generation-array; list
+    else if stop.kind == 'string'
+        stop = generation-array; (list; stop)
+    else
+        management-strings; stop
+    input = generation-input; document, protocol
+    tools = generation-tools; document
+    if protocol == 'chat'
+        tool-index int = 0
+        while tool-index < (tools.length;)
+            tool = (tools.item; tool-index).value
+            if (wire-text; tool, 'kind') != 'function'
+                throw invalid-request-error; 'Chat Completions only supports function tool declarations'
+            tool-index = tool-index + 1
+    snapshots = wire-field; document, 'tools'
+    if snapshots.kind == 'none'
+        snapshots = generation-array; list
+    choice = generation-tool-choice; document
+    snapshot-choice = wire-field; document, 'tool_choice'
+    if snapshot-choice.kind == 'none'
+        snapshot-choice = wire-string; 'auto'
+    constraints list of document-value = list;
+    legacy-format = generation-format; (wire-field; document, 'response_format'), false
+    if legacy-format.kind != 'none'
+        constraints.append; legacy-format
+    text = wire-field; document, 'text'
+    if text.kind != 'none' and (wire-field; document, 'response_format').kind != 'none'
+        throw invalid-request-error; 'text and response_format cannot both be supplied'
+    if text.kind != 'none'
+        wire-reject-unknown; text, (list; 'format')
+        format = generation-format; (wire-field; text, 'format'), true
+        if format.kind == 'none'
+            throw invalid-request-error; 'text.format is required'
+        constraints.append; format
+    effort = generation-optional-text; document, 'reasoning_effort'
+    if protocol == 'chat' and effort.kind != 'none' and effort.scalar != 'none'
+        throw invalid-request-error; 'unsupported_capability: selected model does not advertise reasoning levels'
+    expose bool = false
+    reasoning = wire-field; document, 'reasoning'
+    if reasoning.kind != 'none'
+        wire-reject-unknown; reasoning, (list; 'effort', 'summary')
+        nested-effort = generation-optional-text; reasoning, 'effort'
+        if nested-effort.kind != 'none'
+            effort = nested-effort
+        summary = generation-optional-text; reasoning, 'summary'
+        expose = summary.kind != 'none' and summary.scalar != 'none'
+    store = generation-boolean; document, 'store', true
+    previous = generation-optional-text; document, 'previous_response_id'
+    semantics = generation-object; (list; 'tools', 'tool_choice', 'tool_snapshot', 'tool_choice_snapshot', 'format_constraints', 'reasoning_effort', 'store', 'previous_response_id', 'input_items', 'record_output', 'expose_reasoning'), (list; tools, choice, snapshots, snapshot-choice, (generation-array; constraints), effort, (wire-bool; store), previous, input.ledger, (wire-bool; protocol == 'responses'), (wire-bool; expose))
+    options = generation-object; (list; 'max_tokens', 'temperature', 'top_p', 'seed', 'stop', 'context_id', 'deadline_ms', 'raw_continuation', 'compaction', 'semantics'), (list; max-tokens, (generation-number; document, 'temperature'), (generation-number; document, 'top_p'), (generation-integer; document, 'seed'), stop, (generation-optional-text; document, 'context_id'), (generation-integer; document, 'deadline_ms'), (wire-bool; (generation-boolean; document, 'raw_continuation', false)), (wire-field; document, 'compaction'), semantics)
+    return generation-object; (list; 'model', 'input', 'options', 'principal', 'request_id', 'retained_bytes'), (list; (wire-string; model), input.value, options, (wire-string; principal), (wire-string; request-id), (wire-integer; ('' + retained-bytes)).value)

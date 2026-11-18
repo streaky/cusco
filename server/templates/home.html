@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; font: 1rem/1.6 system-ui, sans-serif; }
+    main { max-width: 48rem; margin: 12vh auto; padding: 0 1.5rem; }
+    h1 { font-size: 3rem; line-height: 1.1; letter-spacing: -.04em; }
+    .eyebrow { text-transform: uppercase; letter-spacing: .12em; font-size: .8rem; }
+    nav { display: flex; flex-wrap: wrap; gap: 1rem; margin: 2rem 0; }
+    a { color: inherit; text-underline-offset: .2em; }
+    footer { margin-top: 3rem; border-top: 1px solid; padding-top: 1rem; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">Persistent model-state service</p>
+    <h1>{{ title }}</h1>
+    <p>Durable contexts, branch-aware execution, and OpenAI-compatible inference.</p>
+    <p>The service and web surface run in Terrane. Model execution, scheduling, and persistence remain in Rust.</p>
+    <nav aria-label="Service links">
+      <a href="/openai/v1/openapi.json">OpenAI API schema</a>
+      <a href="/cusco/v1/openapi.json">Cusco API schema</a>
+      <a href="/health">Health</a>
+    </nav>
+    <p>Inference and management endpoints retain their configured authentication. This page does not expose service state or accept credentials.</p>
+    <footer>One service. Terrane at the application boundary; Rust at the execution core.</footer>
+  </main>
+</body>
+</html>

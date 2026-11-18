@@ -1,0 +1,123 @@
+namespace cusco/service
+
+from /core/collections import list
+from /core/documents import document-value, make-document-string
+from /core/documents/json import parse-json, stringify-json, default-json-options
+from /core/errors import throwable, coercion-error, integer-conversion-overflow
+from /core/process import environment
+from /deps/cusco-server import DaemonConfig
+from /streaky/http-server import request-body-limit, request-body-timeout
+from /streaky/http-server/internal import incoming-request, wire-response
+
+# These are application-owned structured error envelopes, not parsed Rust error text.
+class service-error implements throwable
+    message string
+
+    function construct; code string, detail string
+        this.message = service-error-json; code, detail
+
+    function render string;
+        return this.message
+
+class invalid-request-error implements throwable
+    message string
+
+    function construct; detail string
+        this.message = service-error-json; 'invalid_request', detail
+
+    function render string;
+        return this.message
+
+function service-error-json string; code string, detail string
+    encoded = wire-object; (list; 'error'), (list; (wire-object; (list; 'code', 'message'), (list; (make-document-string; code), (make-document-string; detail))).value)
+    return (stringify-json; encoded.value, (default-json-options;)).value.encoded
+
+function environment-setting string|none throws throwable; name string
+    for entry in (environment;)
+        if entry.name.is-text and entry.name.text == name
+            if not entry.value.is-text
+                throw startup-error; name + ' must be Unicode text'
+            return entry.value.text
+    return none
+
+public class service-policy
+    private token string|none = none
+    private maximum-headers int = 32768
+
+    function construct; settings shared ref DaemonConfig
+        this.token = settings.bearer-token
+        supplied = environment-setting; 'CUSCO_BEARER_TOKEN'
+        if supplied != none
+            this.token = supplied
+        this.maximum-headers = settings.server.header-bytes
+
+    # admin is deliberately informational: the configured bearer token grants
+    # both scopes. It is not a distinct admin-authorization enforcement point.
+    function authorize string throws throwable; request ref incoming-request, admin bool = false
+        context = request.context;
+        if (context.header-byte-count;) > this.maximum-headers
+            throw service-error; 'headers_too_large', 'request headers exceed the configured byte limit'
+        token = this.token
+        if token != none
+            supplied = context.header-value; 'authorization'
+            if supplied != none
+                if supplied == 'Bearer ' + token
+                    # The existing single configured bearer credential grants both scopes.
+                    return 'token-user'
+            throw service-error; 'unauthorized', 'unauthorized'
+        return 'anonymous-admin'
+
+    function anonymous bool;
+        return this.token == none
+
+function json-response wire-response; body string, status int = 200
+    return instance wire-response; status, 'application/json', body
+
+function domain-failure-response wire-response; code string, detail string
+    status int = 500
+    if code == 'unauthorized'
+        status = 401
+    else if code == 'forbidden'
+        status = 403
+    else if code == 'model_not_found' or code == 'context_not_found'
+        status = 404
+    else if code == 'deadline_exceeded' or code == 'body_timeout'
+        status = 408
+    else if code == 'cancelled' or code == 'invalid_request'
+        status = 400
+    else if code == 'lineage_conflict'
+        status = 409
+    else if code == 'queue_overloaded'
+        status = 429
+    else if code == 'server_shutting_down'
+        status = 503
+    else if code == 'payload_too_large'
+        status = 413
+    else if code == 'headers_too_large'
+        status = 431
+    response = json-response; (service-error-json; code, detail), status
+    if code == 'queue_overloaded'
+        response.headers.set; 'retry-after', (list; '1')
+    return response
+
+function failure-response wire-response; failure throwable
+    try
+        throw failure
+    catch service-error, invalid-request-error as error
+        parsed = parse-json; error.message, (default-json-options;)
+        if not parsed.failed
+            envelope = parsed.value.field; 'error'
+            if not envelope.failed
+                code = envelope.value.field; 'code'
+                detail = envelope.value.field; 'message'
+                if not code.failed and not detail.failed and code.value.kind == 'string' and detail.value.kind == 'string'
+                    return domain-failure-response; code.value.scalar, detail.value.scalar
+        return domain-failure-response; 'state_error', 'invalid application error envelope'
+    catch request-body-limit as error
+        return domain-failure-response; 'payload_too_large', error.message
+    catch request-body-timeout as error
+        return domain-failure-response; 'body_timeout', error.message
+    catch coercion-error, integer-conversion-overflow as error
+        return domain-failure-response; 'invalid_request', error.message
+    catch as error
+        return domain-failure-response; 'state_error', error.message

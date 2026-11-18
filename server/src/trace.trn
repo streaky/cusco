@@ -1,0 +1,213 @@
+namespace cusco/service
+
+from /core/collections import list, map
+from /core/documents import document-value, make-document-none, make-document-string
+from /core/documents/json import parse-json, default-json-options
+from /core/encodings import utf8
+from /core/streams import stderr, text-writer
+from /core/errors import throwable
+
+function trace-redacted document-value throws throwable; value document-value
+    if value.kind == 'string'
+        if value.scalar == '[DONE]'
+            return value
+        return make-document-string; '[REDACTED]'
+    if value.kind == 'list'
+        values list of document-value = list;
+        index int = 0
+        while index < (value.length;)
+            item = (value.item; index).value
+            values.append; (trace-redacted; item)
+            index = index + 1
+        return (wire-array; values).value
+    if value.kind == 'map'
+        keys list of string = list;
+        values list of document-value = list;
+        index int = 0
+        while index < (value.length;)
+            name = value.key; index
+            keys.append; name
+            normalized = (name.lower;).replace; '-', '_'
+            if normalized == 'authorization' or normalized == 'cookie' or normalized == 'set_cookie' or normalized == 'password' or normalized == 'secret' or normalized == 'api_key' or normalized == 'bearer_token' or normalized == 'access_token' or normalized == 'refresh_token'
+                values.append; (make-document-string; '[REDACTED]')
+            else
+                field = (value.field; name).value
+                values.append; (trace-redacted; field)
+            index = index + 1
+        return (wire-object; keys, values).value
+    return value
+
+function trace-headers document-value throws throwable; headers document-value
+    rows list of document-value = list;
+    index int = 0
+    while index < (headers.length;)
+        entry = (headers.item; index).value
+        captured = wire-field; entry, 'value'
+        encoding = wire-text; captured, 'encoding'
+        data = wire-field; captured, 'data'
+        value = wire-object; (list; encoding), (list; data)
+        row = wire-object; (list; 'name', 'value'), (list; (wire-field; entry, 'name'), value.value)
+        rows.append; row.value
+        index = index + 1
+    return (wire-array; rows).value
+
+function trace-header string|none; headers document-value, name string
+    index int = 0
+    while index < (headers.length;)
+        entry = (headers.item; index).value
+        if (wire-text; entry, 'name') == name
+            value = wire-field; entry, 'value'
+            if (wire-text; value, 'encoding') == 'utf8'
+                return wire-text; value, 'data'
+        index = index + 1
+    return none
+
+function trace-body document-value throws throwable; level string, captured document-value, count document-value, truncated bool, content-type string|none
+    if level == 'full'
+        encoding = wire-text; captured, 'encoding'
+        return (wire-object; (list; 'bytes', encoding), (list; count, (wire-field; captured, 'data'))).value
+    if truncated
+        return (wire-object; (list; 'bytes', 'omitted'), (list; count, (make-document-string; 'body exceeds 65536-byte HTTP debug limit'))).value
+    if count.scalar == '0'
+        return (wire-object; (list; 'bytes'), (list; count)).value
+    if (wire-text; captured, 'encoding') != 'utf8'
+        return (wire-object; (list; 'bytes', 'omitted'), (list; count, (make-document-string; 'non-JSON body'))).value
+    text = wire-text; captured, 'data'
+    if content-type != none
+        if content-type.contains.start; 'text/event-stream'
+            events list of document-value = list;
+            for line in (text.split; '\n')
+                if line.contains.start; 'data:'
+                    data = (line.trim.start; 'data:').trim;
+                    if data == '[DONE]'
+                        events.append; (make-document-string; '[DONE]')
+                    else
+                        decoded = parse-json; data, (default-json-options;)
+                        if decoded.failed
+                            events.append; (wire-object; (list; 'omitted'), (list; (make-document-string; 'non-JSON SSE data'))).value
+                        else
+                            events.append; (trace-redacted; decoded.value)
+            return (wire-object; (list; 'bytes', 'events'), (list; count, (wire-array; events).value)).value
+    decoded = parse-json; text, (default-json-options;)
+    if decoded.failed
+        return (wire-object; (list; 'bytes', 'omitted'), (list; count, (make-document-string; 'non-JSON body'))).value
+    return (wire-object; (list; 'bytes', 'json'), (list; count, (trace-redacted; decoded.value))).value
+
+# A synchronous shared operation owns capture bookkeeping and its stderr handle.
+# No lock is retained across an await or while native inference executes.
+class http-trace-state
+    level string
+    heads map of string, document-value = map;
+    responses map of string, document-value = map;
+    writer text-writer
+    failure string|none = none
+
+    function construct; level string
+        this.level = level
+        this.writer = (stderr;).text; utf8
+
+    mutable function emit; value document-value
+        encoded = stringify-wire-json; value
+        if encoded.failed
+            throw service-error; 'state_error', 'HTTP diagnostic encoding failed'
+        result = this.writer.line; encoded.value.encoded
+        if result.failed
+            this.failure = result.message
+
+    mutable function record; text string
+        if this.failure != none
+            return
+        decoded = parse-json; text, (default-json-options;)
+        if decoded.failed
+            throw service-error; 'state_error', 'invalid generic transport event'
+        event = decoded.value
+        kind = wire-text; event, 'event'
+        id = wire-text; event, 'request_id'
+        if kind == 'request_head'
+            this.heads.set; id, event
+            return
+        if kind == 'response_head'
+            this.responses.set; id, event
+            headers = wire-field; event, 'headers'
+            output-headers = (wire-array; list).value
+            if this.level == 'full'
+                output-headers = trace-headers; headers
+            elapsed int = (wire-text; event, 'elapsed_ns').radix; 10
+            record = wire-object; (list; 'type', 'level', 'direction', 'request_id', 'status', 'duration_ms', 'headers'), (list; (make-document-string; 'http_debug'), (make-document-string; this.level), (make-document-string; 'out'), (make-document-string; id), (wire-field; event, 'status'), (wire-integer; ('' + (elapsed / 1000000))).value, output-headers)
+            this.emit; record.value
+            return
+        if kind == 'request_body_complete' or kind == 'request_body_dropped'
+            head = this.heads.get.checked; id
+            if head != none
+                headers = wire-field; head, 'headers'
+                content-type = trace-header; headers, 'content-type'
+                captured = wire-field; event, 'captured'
+                if captured.kind == 'none'
+                    captured = (wire-object; (list; 'encoding', 'data'), (list; (make-document-string; 'utf8'), (make-document-string; ''))).value
+                count = wire-field; event, 'total_bytes'
+                truncated = (wire-text; event, 'truncated') == 'true' or (kind == 'request_body_dropped' and count.scalar != '0')
+                body = trace-body; this.level, captured, count, truncated, content-type
+                output-headers document-value = make-document-none;
+                uri document-value = make-document-none;
+                if this.level == 'full'
+                    output-headers = trace-headers; headers
+                    uri = wire-field; head, 'target'
+                raw document-value = make-document-none;
+                if this.level == 'full'
+                    if content-type != none
+                        if content-type.contains.start; 'text/plain'
+                            raw = wire-field; captured, 'data'
+                length = trace-header; headers, 'content-length'
+                content-length document-value = make-document-none;
+                content document-value = make-document-none;
+                if length != none
+                    content-length = make-document-string; length
+                if content-type != none
+                    content = make-document-string; content-type
+                record = wire-object; (list; 'type', 'level', 'direction', 'request_id', 'method', 'path', 'content_type', 'content_length', 'headers', 'uri', 'body', 'raw_body'), (list; (make-document-string; 'http_debug'), (make-document-string; this.level), (make-document-string; 'in'), (make-document-string; id), (wire-field; head, 'method'), (wire-field; head, 'path'), content, content-length, output-headers, uri, body, raw)
+                this.emit; record.value
+                this.heads.remove; id
+            return
+        if kind == 'response_data'
+            head = this.responses.get.checked; id
+            content-type string|none = none
+            if head != none
+                content-type = trace-header; (wire-field; head, 'headers'), 'content-type'
+            count = wire-field; event, 'bytes'
+            body = trace-body; this.level, (wire-field; event, 'data'), count, (wire-text; event, 'truncated') == 'true', content-type
+            record = wire-object; (list; 'type', 'level', 'direction', 'request_id', 'chunk_index', 'body'), (list; (make-document-string; 'http_debug'), (make-document-string; this.level), (make-document-string; 'out_body'), (make-document-string; id), (wire-field; event, 'chunk_index'), body)
+            this.emit; record.value
+            return
+        if (kind == 'transport_complete' or kind == 'transport_error' or kind == 'response_dropped') and (wire-text; event, 'direction') == 'response'
+            this.responses.remove; id
+            this.heads.remove; id
+
+    mutable function diagnostic-failure;
+        # Never include parser/error prose here: it could quote a secret payload.
+        result = this.writer.line; '{"type":"http_debug","direction":"error","message":"HTTP diagnostic rendering failed"}'
+        if result.failed
+            this.failure = result.message
+
+class http-diagnostics
+    private state shared ref http-trace-state
+
+    function construct; level string
+        state = instance http-trace-state; level
+        this.state = shared ref state
+
+    function callback (function from string to none);
+        state = this.state
+        callback = function none; event string
+            try
+                state.record; event
+            catch
+                state.diagnostic-failure;
+            return none
+        return callback
+
+    function failure string|none;
+        return this.state.failure
+
+public function make-http-observer (function from string to none); level string
+    diagnostics = instance http-diagnostics; level
+    return diagnostics.callback;

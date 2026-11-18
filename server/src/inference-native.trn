@@ -1,0 +1,87 @@
+namespace cusco/service
+
+from /core/documents import document-value, document-result
+from /core/errors import throwable
+from /deps/cusco-server/native import GenerationRequest as native-generation-request, GenerationSession as native-generation-session, ContextUpdateRequest as native-context-update, ContextUpdateResult as native-context-result
+from /deps/cusco-server/responses import ResponseResource as native-response-resource
+
+class generation-decode-result
+    value native-generation-request|none = none
+    message string = ''
+
+# Decode normalized domain requests through borrowed native Serde, not endpoint
+# dispatch JSON. Projected structs lack the source document-decodable contract.
+# Remove this decode family when the core codec can construct these native types
+# directly with the same unknown-field and typed-error behavior.
+function decode-native-generation native-generation-request throws throwable; document ref document-value
+    result generation-decode-result = rust
+        match document.raw.value() {
+            Some(value) => match terrane_document_support::from_document::<cusco_server::native::GenerationRequest>(value) {
+                Ok(request) => GenerationDecodeResult { value: Some(request), message: String::new() },
+                Err(error) => GenerationDecodeResult { value: None, message: error.to_string() },
+            },
+            None => GenerationDecodeResult { value: None, message: "invalid normalized generation document".into() },
+        }
+    request = result.value
+    if request != none
+        return request
+    throw invalid-request-error; result.message
+
+class context-update-decode-result
+    value native-context-update|none = none
+    message string = ''
+
+function decode-native-context-update native-context-update throws throwable; document ref document-value
+    result context-update-decode-result = rust
+        match document.raw.value() {
+            Some(value) => match terrane_document_support::from_document::<cusco_server::native::ContextUpdateRequest>(value) {
+                Ok(request) => ContextUpdateDecodeResult { value: Some(request), message: String::new() },
+                Err(error) => ContextUpdateDecodeResult { value: None, message: error.to_string() },
+            },
+            None => ContextUpdateDecodeResult { value: None, message: "invalid normalized context update".into() },
+        }
+    request = result.value
+    if request != none
+        return request
+    throw invalid-request-error; result.message
+
+# Native session events are typed Rust enums without source document-encodable.
+# Await the event here and serialize its borrowed fields into the core document.
+# Remove this bridge when native enums can use the source codec directly.
+async function next-generation-document document-value throws throwable; session ref native-generation-session
+    result document-result = rust
+        let event = session.next().await;
+        let raw = terrane_document_support::serialize_document(&event);
+        DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
+    return require-domain-document; result
+
+async function generation-output-text string throws throwable; session ref native-generation-session
+    text = await session.take_output_text;
+    if text != none
+        return text
+    throw service-error; 'state_error', 'inference returned no output text'
+
+function require-response-resource native-response-resource throws throwable; resource native-response-resource|none
+    if resource != none
+        return resource
+    throw service-error; 'state_error', 'response lookup returned no resource'
+
+function require-context-result native-context-result throws throwable; result native-context-result|none
+    if result != none
+        return result
+    throw service-error; 'state_error', 'context update returned no result'
+
+# Resources and context results retain typed backend ownership. Their projected
+# structs cannot yet use document-encodable; these concrete Serde bridges can go
+# when the core codec accepts them with the same bounded failure behavior.
+function generation-resource-document document-value throws throwable; resource ref native-response-resource
+    result document-result = rust
+        let raw = terrane_document_support::serialize_document(resource);
+        DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
+    return require-domain-document; result
+
+function generation-update-document document-value throws throwable; result ref native-context-result
+    document document-result = rust
+        let raw = terrane_document_support::serialize_document(result);
+        DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
+    return require-domain-document; document

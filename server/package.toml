@@ -1,0 +1,31 @@
+package = "cusco/service"
+artifact = "executable"
+executor = "threaded"
+prelude = true
+rust-toolchain = "pinned"
+
+[namespaces]
+"cusco/service" = "src"
+
+[terrane-dependencies.streaky.http-server]
+path = "../../../packages/http-server"
+
+[terrane-dependencies.streaky.template]
+path = "../../../packages/template"
+
+[rust-dependencies.cusco-server]
+version = "=0.1.0"
+effects = ["build", "filesystem", "networking", "process", "threads"]
+
+[consumers.template]
+tool = "streaky/template::template"
+args = ["--namespace", "generated/template/cusco", "--root", "templates", "--template", "home.html", "--template", "openapi.json", "--template", "openapi.html"]
+declarations = ["/cusco/service::main"]
+
+[consumers.http]
+tool = "streaky/http-server::http"
+declarations = [
+  "/cusco/service::site",
+  "/cusco/service::site::home",
+  "/cusco/service::site::health",
+]

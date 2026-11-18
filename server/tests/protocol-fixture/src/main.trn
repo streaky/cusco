@@ -1,0 +1,70 @@
+namespace cusco/protocol-fixture
+
+from /core/errors import throwable
+from /core/networking import listen-tcp
+from /core/process import arguments
+from /core/streams import stdin
+from /core/encodings import utf8
+from /cusco/service import mount-service, service-policy, startup-error, make-http-observer
+from /deps/cusco-server import Server as native-server, DaemonConfig
+from /streaky/http-server import create-application
+
+class fixture-state
+    server native-server
+    settings DaemonConfig
+
+    function construct; server native-server, settings DaemonConfig
+        this.server = server
+        this.settings = settings
+
+class fixture-open-result
+    value fixture-state|none
+    message string
+
+    function construct; value fixture-state|none, message string
+        this.value = value
+        this.message = message
+
+function open-fixture fixture-state throws throwable; config-path string
+    opened fixture-open-result = rust
+        match crate::fixture::open(&config_path) {
+            Ok((server, settings)) => FixtureOpenResult::terrane_construct(
+                Some(FixtureState::terrane_construct(server, settings)), String::new()),
+            Err(error) => FixtureOpenResult::terrane_construct(None, error.to_string()),
+        }
+    state = move opened.value
+    if state != none
+        return state
+    throw startup-error; opened.message
+
+async function main throws throwable;
+    supplied = arguments;
+    if supplied.length < 1 or supplied.length > 2 or not supplied[0].is-text
+        throw startup-error; 'Usage: cusco-protocol-fixture CONFIG [off|safe|full]'
+    config-path = supplied[0].text
+    mode string = 'off'
+    if supplied.length == 2
+        if not supplied[1].is-text
+            throw startup-error; 'diagnostic mode must be text'
+        mode = supplied[1].text
+    if mode != 'off' and mode != 'safe' and mode != 'full'
+        throw startup-error; 'diagnostic mode must be off, safe, or full'
+    fixture = open-fixture; config-path
+    configuration = move fixture.settings
+    settings = shared ref configuration
+    service-auth = instance service-policy; settings
+    policy = shared ref service-auth
+    app = mount-service; (create-application;), move fixture.server, settings, move policy
+    if mode != 'off'
+        app = app.observe-transport; (make-http-observer; mode), 65536, mode == 'full'
+    app = app.with-address; '127.0.0.1:0'
+    app = app.allow-direct; '127.0.0.1'
+    listener = await listen-tcp; '127.0.0.1:0'
+    print; 'Cusco protocol fixture listening on ', listener.local-address
+    shutdown = async function none;
+        source = stdin;
+        reader = source.text; utf8
+        await reader.read-async; 1
+        return none
+    await app.serve-listener-until; move listener, shutdown
+    return

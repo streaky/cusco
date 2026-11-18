@@ -1,0 +1,12 @@
+namespace cusco/service
+
+from /core/errors import throwable
+
+public class startup-error implements throwable
+    message string = ''
+
+    function construct; message string
+        this.message = message
+
+    function render string;
+        return this.message

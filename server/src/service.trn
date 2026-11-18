@@ -1,0 +1,13 @@
+namespace cusco/service
+
+from /core/errors import throwable
+from /deps/cusco-server import Server as native-server, DaemonConfig
+from /deps/cusco-server/management import Management as native-management
+from /streaky/http-server import application
+from /generated/http-server import mount-annotated
+
+public function mount-service application throws throwable; app application, server native-server, settings shared ref DaemonConfig, policy shared ref service-policy
+    app = mount-annotated; move app
+    management = native-management::new; server
+    app = mount-management; move app, management, settings, policy
+    return mount-inference; move app, server, settings, policy

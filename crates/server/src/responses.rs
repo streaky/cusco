@@ -1,5 +1,5 @@
 use crate::response_store::{ResponseResourceStore, StoreError};
-use crate::{FinishReason, StreamEvent, Usage};
+use crate::{FinishReason, Usage};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -18,6 +18,18 @@ pub struct ResponseTextPart {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResponseReasoningSummaryPart {
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResponseReasoning {
+    pub id: String,
+    pub status: String,
+    pub summary: Vec<ResponseReasoningSummaryPart>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ResponseMessage {
     pub id: String,
     pub role: String,
@@ -32,6 +44,26 @@ pub struct ResponseFunctionCall {
     pub name: String,
     pub arguments: String,
     pub status: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResponseWebSearchSource {
+    pub r#type: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResponseWebSearchAction {
+    pub r#type: String,
+    pub query: String,
+    pub sources: Vec<ResponseWebSearchSource>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResponseWebSearchCall {
+    pub id: String,
+    pub status: String,
+    pub action: ResponseWebSearchAction,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -57,6 +89,8 @@ pub enum ResponseInputItem {
 pub enum ResponseOutputItem {
     Message(ResponseMessage),
     FunctionCall(ResponseFunctionCall),
+    Reasoning(ResponseReasoning),
+    WebSearchCall(ResponseWebSearchCall),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -84,6 +118,45 @@ pub struct ResponseResource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_update: Option<ContextUpdateMetadata>,
 }
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResponseSnapshot {
+    pub id: String,
+    pub model: String,
+    pub created_at: u64,
+    pub status: String,
+    pub store: bool,
+    pub previous_response_id: Option<String>,
+    pub output: Vec<ResponseOutputItem>,
+    pub tools: Vec<Value>,
+    pub tool_choice: Value,
+    pub finish_reason: Option<FinishReason>,
+    pub usage: Option<ResponseUsage>,
+    pub metadata: ResponseMetadata,
+    pub lineage_revision: u64,
+    pub context_update: Option<ContextUpdateMetadata>,
+}
+
+impl From<&ResponseResource> for ResponseSnapshot {
+    fn from(resource: &ResponseResource) -> Self {
+        Self {
+            id: resource.id.clone(),
+            model: resource.model.clone(),
+            created_at: resource.created_at,
+            status: resource.status.clone(),
+            store: resource.store,
+            previous_response_id: resource.previous_response_id.clone(),
+            output: resource.output.clone(),
+            tools: resource.tools.clone(),
+            tool_choice: resource.tool_choice.clone(),
+            finish_reason: resource.finish_reason,
+            usage: resource.usage.clone(),
+            metadata: resource.metadata.clone(),
+            lineage_revision: resource.lineage_revision,
+            context_update: resource.context_update.clone(),
+        }
+    }
+}
+
 
 fn schema_version() -> u32 {
     RESPONSE_SCHEMA_VERSION
@@ -99,6 +172,40 @@ pub struct ResponseMetadata {
     pub inference_id: String,
     pub execution_session_id: String,
 }
+pub(crate) fn in_progress_resource(
+    id: &str,
+    owner: &str,
+    model: &str,
+    created_at: u64,
+    store: bool,
+    previous_response_id: Option<&str>,
+    input: &[ResponseInputItem],
+    tools: &[Value],
+    tool_choice: &Value,
+    lineage_revision: u64,
+    metadata: ResponseMetadata,
+) -> ResponseResource {
+    ResponseResource {
+        schema_version: RESPONSE_SCHEMA_VERSION,
+        id: id.to_owned(),
+        owner: owner.to_owned(),
+        model: model.to_owned(),
+        created_at,
+        status: "in_progress".into(),
+        store,
+        previous_response_id: previous_response_id.map(str::to_owned),
+        input: input.to_vec(),
+        output: Vec::new(),
+        tools: tools.to_vec(),
+        tool_choice: tool_choice.clone(),
+        finish_reason: None,
+        usage: None,
+        metadata,
+        lineage_revision,
+        context_update: None,
+    }
+}
+
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContextUpdateMetadata {
@@ -114,6 +221,8 @@ pub struct ResponseUsage {
     pub input_tokens: usize,
     pub cached_tokens: usize,
     pub output_tokens: usize,
+    #[serde(default)]
+    pub reasoning_tokens: usize,
 }
 
 const TRANSIENT_RESPONSE_CAPACITY: usize = 1024;
@@ -124,17 +233,6 @@ struct TransientResponses {
     insertion_order: VecDeque<String>,
 }
 
-pub struct StreamResponse {
-    pub model: String,
-    pub owner: String,
-    pub store: bool,
-    pub previous_response_id: Option<String>,
-    pub input: Vec<ResponseInputItem>,
-    pub tools: Vec<Value>,
-    pub tool_choice: Value,
-    pub buffer_output: bool,
-    pub lineage_revision: u64,
-}
 
 #[derive(Clone)]
 pub struct ResponseService {
@@ -149,35 +247,66 @@ impl ResponseService {
             transient: std::sync::Arc::new(Mutex::new(TransientResponses::default())),
         }
     }
-    pub fn projection(&self, model: String) -> ResponseProjection {
-        ResponseProjection::new(model)
-    }
-    pub fn stream_projection(&self, request: StreamResponse) -> ResponseProjection {
-        ResponseProjection::new(request.model.clone()).with_request(request)
-    }
 
     pub fn complete(&self, params: CompleteResponse<'_>) -> ResponseResource {
-        let output = params.function_call.map_or_else(
-            || {
-                vec![ResponseOutputItem::Message(ResponseMessage {
-                    id: "msg_0".into(),
-                    role: "assistant".into(),
-                    status: "completed".into(),
-                    content: vec![ResponseTextPart {
-                        text: params.text.into(),
-                        annotations: vec![],
-                        logprobs: vec![],
-                    }],
-                })]
-            },
-            |call| vec![ResponseOutputItem::FunctionCall(call)],
-        );
+        let reasoning = params.reasoning;
+        let text = params.text;
+        let message = || {
+            let annotations = params.web_search_call.map_or_else(Vec::new, |call| {
+                call.action
+                    .sources
+                    .iter()
+                    .filter_map(|source| {
+                        let byte_start = text.find(&source.url)?;
+                        let start_index = text[..byte_start].chars().count();
+                        let end_index = start_index + source.url.chars().count();
+                        Some(json!({
+                            "type": "url_citation",
+                            "url": source.url,
+                            "title": source.url,
+                            "start_index": start_index,
+                            "end_index": end_index
+                        }))
+                    })
+                    .collect()
+            });
+            ResponseOutputItem::Message(ResponseMessage {
+                id: format!("msg_{}", params.id),
+                role: "assistant".into(),
+                status: "completed".into(),
+                content: vec![ResponseTextPart {
+                    text: text.into(),
+                    annotations,
+                    logprobs: vec![],
+                }],
+            })
+        };
+        let reasoning_item = || ResponseOutputItem::Reasoning(ResponseReasoning {
+            id: "rs_0".into(),
+            status: "completed".into(),
+            summary: vec![ResponseReasoningSummaryPart {
+                text: reasoning.unwrap_or_default().into(),
+            }],
+        });
+        let output = if let Some(call) = params.function_call {
+            vec![ResponseOutputItem::FunctionCall(call)]
+        } else {
+            let mut output = Vec::new();
+            if params.expose_reasoning && reasoning.is_some() {
+                output.push(reasoning_item());
+            }
+            if let Some(call) = params.web_search_call {
+                output.push(ResponseOutputItem::WebSearchCall(call.clone()));
+            }
+            output.push(message());
+            output
+        };
         ResponseResource {
             schema_version: RESPONSE_SCHEMA_VERSION,
             id: params.id.into(),
             owner: params.owner.into(),
             model: params.model.into(),
-            created_at: now(),
+            created_at: params.created_at.unwrap_or_else(now),
             status: "completed".into(),
             store: params.store,
             previous_response_id: params.previous_response_id.map(str::to_owned),
@@ -273,7 +402,9 @@ pub struct CompleteResponse<'a> {
     pub id: &'a str,
     pub owner: &'a str,
     pub model: &'a str,
+    pub created_at: Option<u64>,
     pub text: &'a str,
+    pub reasoning: Option<&'a str>,
     pub reason: FinishReason,
     pub usage: &'a Usage,
     pub store: bool,
@@ -283,6 +414,8 @@ pub struct CompleteResponse<'a> {
     pub lineage_revision: u64,
     pub input: &'a [ResponseInputItem],
     pub function_call: Option<ResponseFunctionCall>,
+    pub expose_reasoning: bool,
+    pub web_search_call: Option<&'a ResponseWebSearchCall>,
 }
 
 impl From<&Usage> for ResponseUsage {
@@ -291,6 +424,7 @@ impl From<&Usage> for ResponseUsage {
             input_tokens: usage.input_tokens,
             cached_tokens: usage.cached_tokens,
             output_tokens: usage.generated_tokens,
+            reasoning_tokens: 0,
         }
     }
 }
@@ -305,249 +439,143 @@ pub fn new_function_call(name: String, arguments: String) -> ResponseFunctionCal
     }
 }
 
-pub fn project_resource(resource: &ResponseResource) -> Value {
-    let usage = resource.usage.as_ref().map(|u| json!({"input_tokens":u.input_tokens,"input_tokens_details":{"cached_tokens":u.cached_tokens},"output_tokens":u.output_tokens,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":u.input_tokens+u.output_tokens})).unwrap_or(Value::Null);
-    let output = resource
-        .output
-        .iter()
-        .map(project_output_item)
-        .collect::<Vec<_>>();
-    json!({"id":resource.id,"object":"response","created_at":resource.created_at,"status":resource.status,"background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"metadata":resource.metadata,"model":resource.model,"output":output,"parallel_tool_calls":true,"previous_response_id":resource.previous_response_id,"prompt_cache_key":null,"reasoning":null,"safety_identifier":null,"service_tier":"default","store":resource.store,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":resource.tool_choice,"tools":resource.tools,"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":usage,"finish_reason":resource.finish_reason,"cusco":{"lineage_revision":resource.lineage_revision,"context_update":resource.context_update}})
-}
-
-fn project_output_item(item: &ResponseOutputItem) -> Value {
-    match item {
-        ResponseOutputItem::Message(message) => project_message(message),
-        ResponseOutputItem::FunctionCall(call) => {
-            json!({"id":call.id,"type":"function_call","call_id":call.call_id,"name":call.name,"arguments":call.arguments,"status":call.status})
-        }
+pub fn new_web_search_call(
+    query: String,
+    urls: impl IntoIterator<Item = String>,
+) -> ResponseWebSearchCall {
+    ResponseWebSearchCall {
+        id: format!("ws_{}", Uuid::new_v4()),
+        status: "completed".into(),
+        action: ResponseWebSearchAction {
+            r#type: "search".into(),
+            query,
+            sources: urls
+                .into_iter()
+                .map(|url| ResponseWebSearchSource {
+                    r#type: "url".into(),
+                    url,
+                })
+                .collect(),
+        },
     }
 }
-fn project_part(part: &ResponseTextPart) -> Value {
-    json!({"type":"output_text","text":part.text,"annotations":part.annotations,"logprobs":part.logprobs})
-}
-fn project_message(message: &ResponseMessage) -> Value {
-    json!({"id":message.id,"type":"message","role":message.role,"status":message.status,"content":message.content.iter().map(project_part).collect::<Vec<_>>()})
-}
+
 pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum ResponseEvent {
-    Created(ResponseResource),
-    OutputItemAdded(ResponseMessage),
-    FunctionCallAdded(ResponseFunctionCall),
-    ContentPartAdded(ResponseTextPart),
-    TextDelta(String),
-    TextDone(ResponseTextPart),
-    ContentPartDone(ResponseTextPart),
-    OutputItemDone(ResponseMessage),
-    FunctionCallDone(ResponseFunctionCall),
-    Completed(ResponseResource),
-    Error(String),
+pub(crate) fn split_native_reasoning(text: &str) -> (Option<&str>, &str) {
+    let trimmed = text.trim_start();
+    let Some(reasoning) = trimmed.strip_prefix("<think>") else {
+        return (None, text);
+    };
+    let separated = match reasoning.split_once("</think>") {
+        Some((reasoning, answer)) => (reasoning, answer.trim_start_matches(['\r', '\n'])),
+        None => (reasoning, ""),
+    };
+    let reasoning = separated.0.trim();
+    ((!reasoning.is_empty()).then_some(reasoning), separated.1)
 }
 
-pub struct ResponseProjection {
-    resource: ResponseResource,
-    sequence: usize,
-    buffer_output: bool,
-    function_call: Option<ResponseFunctionCall>,
+
+pub(crate) fn store_error(error: crate::response_store::StoreError) -> crate::Error {
+    match error {
+        crate::response_store::StoreError::NotFound(_) => crate::Error::ContextNotFound,
+        crate::response_store::StoreError::StaleRevision { .. }
+        | crate::response_store::StoreError::Conflict(_) => crate::Error::Conflict(error.to_string()),
+        other => crate::Error::State(other.to_string()),
+    }
 }
-impl ResponseProjection {
-    pub fn new(model: String) -> Self {
-        Self {
-            resource: ResponseResource {
-                schema_version: RESPONSE_SCHEMA_VERSION,
-                id: String::new(),
-                owner: String::new(),
-                model,
-                created_at: now(),
-                status: "in_progress".into(),
-                store: false,
-                previous_response_id: None,
-                input: vec![],
-                output: vec![],
-                tools: vec![],
-                tool_choice: default_tool_choice(),
-                finish_reason: None,
-                usage: None,
-                metadata: ResponseMetadata::default(),
-                lineage_revision: 0,
-                context_update: None,
-            },
-            sequence: 0,
-            buffer_output: false,
-            function_call: None,
+
+/// Reconstructs a response lineage into the model family's native chat prompt.
+pub(crate) fn lineage_prompt(
+    service: &ResponseService,
+    mut resource: ResponseResource,
+    owner: &str,
+    family: &str,
+) -> Result<String, crate::Error> {
+    let mut lineage = Vec::new();
+    for _ in 0..1024 {
+        let previous = resource.previous_response_id.clone();
+        lineage.push(resource);
+        let Some(id) = previous else { break };
+        resource = service.retrieve(&id, owner).map_err(store_error)?;
+    }
+    if lineage.last().is_some_and(|resource| resource.previous_response_id.is_some()) {
+        return Err(crate::Error::BadRequest("response lineage exceeds 1024 resources".into()));
+    }
+    lineage.reverse();
+    let mut messages = Vec::new();
+    for resource in lineage {
+        for item in resource.input {
+            match item {
+                ResponseInputItem::Message { role, text } => messages.push(crate::prompt::Message { role, content: text }),
+                ResponseInputItem::FunctionCall { name, arguments, .. } => {
+                    let call = json!({
+                        "name": name,
+                        "arguments": serde_json::from_str::<Value>(&arguments).unwrap_or(Value::String(arguments)),
+                    });
+                    messages.push(crate::prompt::Message { role: "assistant".into(), content: call.to_string() });
+                }
+                ResponseInputItem::FunctionCallOutput { call_id, output } => {
+                    messages.push(crate::prompt::Message { role: "user".into(), content: format!("Tool result for {call_id}: {output}") });
+                }
+            }
         }
-    }
-    fn with_request(mut self, request: StreamResponse) -> Self {
-        self.resource.owner = request.owner;
-        self.resource.store = request.store;
-        self.resource.previous_response_id = request.previous_response_id;
-        self.resource.input = request.input;
-        self.resource.tools = request.tools;
-        self.resource.tool_choice = request.tool_choice;
-        self.resource.lineage_revision = request.lineage_revision;
-        self.buffer_output = request.buffer_output;
-        self
-    }
-    pub fn completed_resource(&self) -> Option<&ResponseResource> {
-        (self.resource.status == "completed").then_some(&self.resource)
-    }
-    pub fn generated_text(&self) -> &str {
-        self.resource
-            .output
-            .first()
-            .and_then(|item| match item {
-                ResponseOutputItem::Message(message) => {
-                    message.content.first().map(|part| part.text.as_str())
+        for item in resource.output {
+            match item {
+                ResponseOutputItem::Message(message) => messages.push(crate::prompt::Message {
+                    role: "assistant".into(),
+                    content: message.content.into_iter().map(|part| part.text).collect(),
+                }),
+                ResponseOutputItem::FunctionCall(call) => {
+                    let call = json!({
+                        "name": call.name,
+                        "arguments": serde_json::from_str::<Value>(&call.arguments).unwrap_or(Value::String(call.arguments)),
+                    });
+                    messages.push(crate::prompt::Message { role: "assistant".into(), content: call.to_string() });
                 }
-                _ => None,
-            })
-            .unwrap_or("")
-    }
-    pub fn set_function_call(&mut self, call: Option<ResponseFunctionCall>) {
-        self.function_call = call;
-    }
-    fn message(&self, status: &str) -> ResponseMessage {
-        ResponseMessage {
-            id: "msg_0".into(),
-            role: "assistant".into(),
-            status: status.into(),
-            content: vec![ResponseTextPart {
-                text: self.generated_text().into(),
-                annotations: vec![],
-                logprobs: vec![],
-            }],
-        }
-    }
-    pub fn project(&mut self, event: StreamEvent) -> String {
-        let events = match event {
-            StreamEvent::Started {
-                request_id,
-                correlation_id,
-                inference_id,
-                execution_session_id,
-                ..
-            } => {
-                self.resource.id = request_id;
-                self.resource.metadata = ResponseMetadata {
-                    correlation_id,
-                    inference_id,
-                    execution_session_id,
-                };
-                let message = self.message("in_progress");
-                self.resource.output = vec![ResponseOutputItem::Message(message.clone())];
-                if self.buffer_output {
-                    vec![ResponseEvent::Created(self.resource.clone())]
-                } else {
-                    vec![
-                        ResponseEvent::Created(self.resource.clone()),
-                        ResponseEvent::OutputItemAdded(message),
-                        ResponseEvent::ContentPartAdded(ResponseTextPart {
-                            text: String::new(),
-                            annotations: vec![],
-                            logprobs: vec![],
-                        }),
-                    ]
-                }
-            }
-            StreamEvent::Token { token, .. } => {
-                if let Some(ResponseOutputItem::Message(message)) = self.resource.output.first_mut()
-                {
-                    message.content[0].text.push_str(&token)
-                }
-                if self.buffer_output {
-                    vec![]
-                } else {
-                    vec![ResponseEvent::TextDelta(token)]
-                }
-            }
-            StreamEvent::Finished { reason, usage } => {
-                self.resource.status = "completed".into();
-                self.resource.finish_reason = Some(reason);
-                self.resource.usage = Some(ResponseUsage::from(usage.as_ref()));
-                if let Some(call) = self.function_call.take() {
-                    self.resource.output = vec![ResponseOutputItem::FunctionCall(call.clone())];
-                    vec![
-                        ResponseEvent::FunctionCallAdded(call.clone()),
-                        ResponseEvent::FunctionCallDone(call),
-                        ResponseEvent::Completed(self.resource.clone()),
-                    ]
-                } else {
-                    let message = self.message("completed");
-                    self.resource.output = vec![ResponseOutputItem::Message(message.clone())];
-                    let part = message.content[0].clone();
-                    let mut events = Vec::new();
-                    if self.buffer_output {
-                        events.push(ResponseEvent::OutputItemAdded(message.clone()));
-                        events.push(ResponseEvent::ContentPartAdded(ResponseTextPart {
-                            text: String::new(),
-                            annotations: vec![],
-                            logprobs: vec![],
-                        }));
-                        events.push(ResponseEvent::TextDelta(part.text.clone()));
-                    }
-                    events.extend([
-                        ResponseEvent::TextDone(part.clone()),
-                        ResponseEvent::ContentPartDone(part),
-                        ResponseEvent::OutputItemDone(message),
-                        ResponseEvent::Completed(self.resource.clone()),
-                    ]);
-                    events
-                }
-            }
-            StreamEvent::Error { message } => vec![ResponseEvent::Error(message)],
-        };
-        events.into_iter().fold(String::new(), |mut rows, event| {
-            use std::fmt::Write as _;
-            let value = self.project_event(event);
-            write!(rows, "data: {value}\n\n").expect("String write");
-            rows
-        })
-    }
-    fn project_event(&mut self, event: ResponseEvent) -> Value {
-        let n = self.sequence;
-        self.sequence += 1;
-        match event {
-            ResponseEvent::Created(r) => {
-                json!({"type":"response.created","sequence_number":n,"response":project_resource(&r)})
-            }
-            ResponseEvent::OutputItemAdded(m) => {
-                json!({"type":"response.output_item.added","sequence_number":n,"item":project_message(&m),"output_index":0})
-            }
-            ResponseEvent::FunctionCallAdded(call) => {
-                json!({"type":"response.output_item.added","sequence_number":n,"item":project_output_item(&ResponseOutputItem::FunctionCall(call)),"output_index":0})
-            }
-            ResponseEvent::ContentPartAdded(p) => {
-                json!({"type":"response.content_part.added","sequence_number":n,"item_id":"msg_0","output_index":0,"content_index":0,"part":project_part(&p)})
-            }
-            ResponseEvent::TextDelta(delta) => {
-                json!({"type":"response.output_text.delta","sequence_number":n,"item_id":"msg_0","output_index":0,"content_index":0,"delta":delta,"logprobs":[]})
-            }
-            ResponseEvent::TextDone(p) => {
-                json!({"type":"response.output_text.done","sequence_number":n,"item_id":"msg_0","output_index":0,"content_index":0,"text":p.text,"logprobs":[]})
-            }
-            ResponseEvent::ContentPartDone(p) => {
-                json!({"type":"response.content_part.done","sequence_number":n,"item_id":"msg_0","output_index":0,"content_index":0,"part":project_part(&p)})
-            }
-            ResponseEvent::OutputItemDone(m) => {
-                json!({"type":"response.output_item.done","sequence_number":n,"item":project_message(&m),"output_index":0})
-            }
-            ResponseEvent::FunctionCallDone(call) => {
-                json!({"type":"response.output_item.done","sequence_number":n,"item":project_output_item(&ResponseOutputItem::FunctionCall(call)),"output_index":0})
-            }
-            ResponseEvent::Completed(r) => {
-                json!({"type":"response.completed","sequence_number":n,"response":project_resource(&r)})
-            }
-            ResponseEvent::Error(message) => {
-                json!({"type":"error","sequence_number":n,"code":"server_error","message":message,"param":null})
+                ResponseOutputItem::WebSearchCall(_) | ResponseOutputItem::Reasoning(_) => {}
             }
         }
     }
+    crate::prompt::apply_chat_template(family, normalize_lineage_messages(messages))
+}
+
+pub(crate) fn normalize_lineage_messages(messages: Vec<crate::prompt::Message>) -> Vec<crate::prompt::Message> {
+    let mut normalized: Vec<crate::prompt::Message> = Vec::with_capacity(messages.len());
+    for message in messages {
+        if normalized.last().is_some_and(|previous| previous.role == message.role) {
+            let previous = normalized.last_mut().expect("last message was present");
+            if !previous.content.is_empty() && !message.content.is_empty() {
+                previous.content.push('\n');
+            }
+            previous.content.push_str(&message.content);
+        } else {
+            normalized.push(message);
+        }
+    }
+    normalized
+}
+
+pub(crate) fn lineage_has_call(
+    service: &ResponseService,
+    previous: Option<&str>,
+    owner: &str,
+    call_id: &str,
+) -> Result<bool, crate::Error> {
+    let Some(id) = previous else { return Ok(false) };
+    let mut resource = service.retrieve(id, owner).map_err(store_error)?;
+    for _ in 0..1024 {
+        if resource.output.iter().any(|item| matches!(item, ResponseOutputItem::FunctionCall(call) if call.call_id == call_id)) {
+            return Ok(true);
+        }
+        let Some(id) = resource.previous_response_id.clone() else { return Ok(false) };
+        resource = service.retrieve(&id, owner).map_err(store_error)?;
+    }
+    Err(crate::Error::BadRequest("response lineage exceeds 1024 resources".into()))
 }
 
 #[cfg(test)]
@@ -555,40 +583,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn response_projections_preserve_requested_tools() {
-        let tools = vec![json!({
-            "type": "function",
-            "name": "lookup",
-            "description": "Look something up",
-            "parameters": {"type": "object"}
-        })];
-        let tool_choice = json!({"type": "function", "name": "lookup"});
-        let mut projection = ResponseProjection::new("m".into()).with_request(StreamResponse {
-            model: "m".into(),
-            owner: "owner".into(),
-            store: false,
-            previous_response_id: None,
-            input: vec![],
-            tools: tools.clone(),
-            tool_choice: tool_choice.clone(),
-            buffer_output: false,
-            lineage_revision: 0,
-        });
+    fn native_reasoning_is_separated_only_at_the_leading_channel_marker() {
+        assert_eq!(
+            split_native_reasoning("<think>\nprivate work\n</think>\nFinal answer"),
+            (Some("private work"), "Final answer")
+        );
+        assert_eq!(
+            split_native_reasoning("<think>unfinished private work"),
+            (Some("unfinished private work"), "")
+        );
+        assert_eq!(
+            split_native_reasoning("<think>\n</think>\nhello"),
+            (None, "hello")
+        );
+        assert_eq!(
+            split_native_reasoning("Literal <think> tag"),
+            (None, "Literal <think> tag")
+        );
+    }
 
-        let projected = project_resource(&projection.resource);
-        assert_eq!(projected["tools"], json!(tools));
-        assert_eq!(projected["tool_choice"], tool_choice);
-
-        let streamed = projection.project(StreamEvent::Started {
-            request_id: "resp_1".into(),
-            context_id: crate::ContextId::new(),
-            correlation_id: "corr_1".into(),
-            inference_id: "infer_1".into(),
-            execution_session_id: "session_1".into(),
-        });
-        let first_row = streamed.split("\n\n").next().unwrap();
-        let created: Value = serde_json::from_str(first_row.trim_start_matches("data: ")).unwrap();
-        assert_eq!(created["response"]["tools"], json!(tools));
-        assert_eq!(created["response"]["tool_choice"], tool_choice);
+    #[test]
+    fn lineage_coalesces_adjacent_assistant_items() {
+        let messages = normalize_lineage_messages(vec![
+            crate::prompt::Message { role: "user".into(), content: "question".into() },
+            crate::prompt::Message { role: "assistant".into(), content: "answer".into() },
+            crate::prompt::Message {
+                role: "assistant".into(),
+                content: r#"{"name":"lookup","arguments":{}}"#.into(),
+            },
+        ]);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, "answer\n{\"name\":\"lookup\",\"arguments\":{}}");
+        crate::prompt::apply_chat_template("gemma4", messages).unwrap();
     }
 }

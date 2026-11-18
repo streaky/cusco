@@ -1,0 +1,2 @@
+[patch.crates-io]
+cusco-server = { path = "../crates/server" }

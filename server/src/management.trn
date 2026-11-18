@@ -1,0 +1,324 @@
+namespace cusco/service
+
+from /core/collections import list
+from /core/documents import document-value, document-result, make-document-none, make-document-string, make-document-bool
+from /core/errors import throwable
+from /deps/cusco-server import DaemonConfig, CreateCompactionDeclaration as native-declaration-request
+from /deps/cusco-server/management import Management as native-management, PullSession as native-pull-session
+from /streaky/http-server import application, response-stream
+from /streaky/http-server/internal import incoming-request, wire-response
+from /generated/template/cusco import make-template-engine
+
+function require-pull-session native-pull-session throws throwable; session native-pull-session|none
+    if session != none
+        return session
+    throw service-error; 'state_error', 'model transfer returned no session'
+
+function management-text string throws throwable; object ref document-value, name string, required bool = true
+    field = object.field; name
+    if field.failed or field.value.kind == 'none'
+        if required
+            throw invalid-request-error; name + ' is required'
+        return ''
+    if field.value.kind != 'string'
+        throw invalid-request-error; name + ' must be a string'
+    return field.value.scalar
+
+function management-strings (list of string) throws throwable; value document-value
+    if value.kind != 'list'
+        throw invalid-request-error; 'expected an array of strings'
+    result list of string = list;
+    index int = 0
+    while index < (value.length;)
+        item = value.item; index
+        if item.failed or item.value.kind != 'string'
+            throw invalid-request-error; 'expected an array of strings'
+        result.append; item.value.scalar
+        index = index + 1
+    return result
+
+function management-model-name string throws throwable; value document-value
+    model = management-text; value, 'model', false
+    name = management-text; value, 'name', false
+    if model != '' and name != '' and model != name
+        throw invalid-request-error; '`model` and `name` must identify the same model'
+    if model != ''
+        return model
+    if name != ''
+        return name
+    throw invalid-request-error; 'one of `model` or `name` is required'
+
+function management-encoded wire-response throws throwable; value document-value
+    encoded = stringify-wire-json; value
+    if encoded.failed
+        throw service-error; 'state_error', encoded.message
+    return json-response; encoded.value.encoded
+
+function management-path-id string throws throwable; request incoming-request
+    id = request.path-value; 'id'
+    if id != none
+        return id
+    throw invalid-request-error; 'missing route identifier'
+
+function management-bool bool throws throwable; object document-value, name string, fallback bool
+    value = wire-field; object, name
+    if value.kind == 'none'
+        return fallback
+    if value.kind != 'bool'
+        throw invalid-request-error; name + ' must be a boolean'
+    return value.scalar == 'true'
+
+# Await the typed pull event and encode its native Serde fields. The projected
+# event has no source document-encodable implementation; remove this bridge when
+# native event enums can use the core codec directly, retaining terminal errors.
+async function pull-event-document document-value throws throwable; session ref native-pull-session
+    result document-result = rust
+        let event = session.next().await;
+        let raw = terrane_document_support::serialize_document(&event);
+        DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
+    return require-domain-document; result
+
+function pull-progress-row document-value throws throwable; event document-value
+    stage = wire-text; event, 'stage'
+    if stage == 'failed'
+        return (wire-object; (list; 'error'), (list; (wire-field; event, 'message'))).value
+    status string = ''
+    if stage == 'manifest'
+        status = 'pulling manifest'
+    else if stage == 'transfer'
+        keys = list; 'status', 'completed'
+        values = list; (make-document-string; 'pulling model'), (wire-field; event, 'completed')
+        total = wire-field; event, 'total'
+        if total.kind != 'none'
+            keys.append; 'total'
+            values.append; total
+        return (wire-object; keys, values).value
+    else if stage == 'verification'
+        return (wire-object; (list; 'status', 'digest'), (list; (make-document-string; 'verifying sha256 digest'), (wire-field; event, 'digest'))).value
+    else if stage == 'publication'
+        status = 'writing manifest'
+    else if stage == 'complete'
+        status = 'success'
+    else
+        throw service-error; 'state_error', 'unknown model transfer stage'
+    return (wire-object; (list; 'status'), (list; (make-document-string; status))).value
+
+class model-pull-stream implements response-stream
+    private session native-pull-session
+
+    function construct; session native-pull-session
+        this.session = session
+
+    async function next-chunk (string|none) throws throwable;
+        event = await pull-event-document; this.session
+        if event.kind == 'none'
+            return none
+        row = stringify-wire-json; (pull-progress-row; event)
+        if row.failed
+            throw service-error; 'state_error', row.message
+        return row.value.encoded + '\n'
+
+    function cancel;
+        this.session.cancel;
+
+class management-documents
+    schema string
+    explorer string
+
+    function construct; schema string, explorer string
+        this.schema = schema
+        this.explorer = explorer
+
+class management-controller
+    private backend native-management
+    private settings shared ref DaemonConfig
+    private policy shared ref service-policy
+    private documents shared ref management-documents
+
+    function construct; backend native-management, settings shared ref DaemonConfig, policy shared ref service-policy, documents shared ref management-documents
+        this.backend = backend
+        this.settings = settings
+        this.policy = policy
+        this.documents = documents
+
+    function invocation management-controller;
+        return instance management-controller; this.backend, this.settings, this.policy, this.documents
+
+    async function handle wire-response throws throwable; request incoming-request, action string
+        try
+            if action == 'openapi'
+                return json-response; this.documents.schema
+            if action == 'explorer'
+                return instance wire-response; 200, 'text/html; charset=utf-8', this.documents.explorer
+            admin = action == 'status' or action == 'pull' or action == 'copy' or action == 'remove'
+            principal = this.policy.authorize; request, admin
+            if action == 'version'
+                return management-encoded; (wire-object; (list; 'version'), (list; (make-document-string; (this.backend.version;)))).value
+            if action == 'tags'
+                models = management-models-document; this.backend
+                return management-encoded; (wire-object; (list; 'models'), (list; models)).value
+            if action == 'models'
+                records = management-models-document; this.backend
+                models list of document-value = list;
+                index int = 0
+                while index < (records.length;)
+                    record = (records.item; index).value
+                    model = wire-object; (list; 'id', 'object', 'created', 'owned_by'), (list; (wire-field; record, 'id'), (make-document-string; 'model'), (wire-integer; '0').value, (make-document-string; 'cusco'))
+                    models.append; model.value
+                    index = index + 1
+                return management-encoded; (wire-object; (list; 'object', 'data'), (list; (make-document-string; 'list'), (wire-array; models).value)).value
+            if action == 'status'
+                return management-encoded; (management-status-document; this.backend)
+            if action == 'ps'
+                return management-encoded; (this.resident-models;)
+            if action == 'contexts'
+                return management-encoded; (management-contexts-document; this.backend)
+            if action == 'create-context'
+                return management-encoded; (unwrap-domain-document; (management-create-context-document; this.backend))
+            if action == 'strategies'
+                return management-encoded; (management-strategies-document; this.backend)
+            if action == 'capabilities'
+                return json-response; '{"object":"cusco.capability_list","data":[{"id":"cusco.context_update.v1","version":1,"endpoint":"/cusco/v1/context-updates","operations":["fold"],"portable_projection":"openai.response"}]}'
+            if action == 'context'
+                return management-encoded; (unwrap-domain-document; (management-context-document; this.backend, (management-path-id; request)))
+            if action == 'branch-context'
+                return management-encoded; (unwrap-domain-document; (management-branch-context-document; this.backend, (management-path-id; request)))
+            if action == 'delete-context'
+                unwrap-domain-document; (management-delete-context-document; this.backend, (management-path-id; request))
+                return instance wire-response; 204, '', ''
+            if action == 'cancel'
+                id = management-path-id; request
+                this.backend.cancel; id
+                return instance wire-response; 202, '', ''
+            if action == 'revoke'
+                unwrap-domain-document; (management-revoke-document; this.backend, principal, (management-path-id; request))
+                return instance wire-response; 204, '', ''
+            document = await request.json-body;
+            if action == 'show' or action == 'remove'
+                wire-reject-unknown; document, (list; 'model', 'name')
+                name = management-model-name; document
+                if action == 'show'
+                    return management-encoded; (unwrap-domain-document; (management-model-document; this.backend, name))
+                unwrap-domain-document; (management-remove-document; this.backend, name)
+                return instance wire-response; 200, '', ''
+            if action == 'copy'
+                wire-reject-unknown; document, (list; 'source', 'destination')
+                unwrap-domain-document; (management-alias-document; this.backend, (management-text; document, 'source'), (management-text; document, 'destination'))
+                return instance wire-response; 200, '', ''
+            if action == 'import-context'
+                wire-reject-unknown; document, (list; 'tokens')
+                tokens = management-strings; (wire-field; document, 'tokens')
+                return management-encoded; (unwrap-domain-document; (management-import-context-document; this.backend, tokens))
+            if action == 'declare'
+                wire-reject-unknown; document, (list; 'context_id', 'strategy_preferences', 'target_tokens', 'expires_in_ms')
+                preferences list of string = list;
+                declared-preferences = wire-field; document, 'strategy_preferences'
+                if declared-preferences.kind != 'none'
+                    preferences = management-strings; declared-preferences
+                target uint64|none = none
+                declared-target = wire-field; document, 'target_tokens'
+                if declared-target.kind != 'none'
+                    if declared-target.kind != 'integer'
+                        throw invalid-request-error; 'target_tokens must be an integer'
+                    target = declared-target.scalar.radix; 10
+                expires = wire-field; document, 'expires_in_ms'
+                if expires.kind != 'integer'
+                    throw invalid-request-error; 'expires_in_ms must be an integer'
+                lifetime uint64 = expires.scalar.radix; 10
+                context-id = management-text; document, 'context_id'
+                declaration = instance native-declaration-request; context-id = context-id, strategy-preferences = preferences, target-tokens = target, expires-in-ms = lifetime
+                return management-encoded; (unwrap-domain-document; (management-declare-document; this.backend, principal, declaration))
+            if action == 'pull'
+                wire-reject-unknown; document, (list; 'name', 'model', 'sha256', 'insecure', 'stream')
+                name = management-model-name; document
+                management-bool; document, 'insecure', false
+                streaming = management-bool; document, 'stream', true
+                hash string|none = none
+                declared-hash = wire-field; document, 'sha256'
+                if declared-hash.kind != 'none'
+                    hash = management-text; document, 'sha256'
+                result = this.backend.pull; name, hash
+                failure = result.failure
+                if failure != none
+                    throw service-error; failure.code, failure.message
+                session = require-pull-session; move result.value
+                if streaming
+                    response = instance wire-response; 200, 'application/x-ndjson', ''
+                    response.stream = instance model-pull-stream; session
+                    return response
+                try
+                    while true
+                        event = await pull-event-document; session
+                        if event.kind == 'none'
+                            throw service-error; 'state_error', 'model transfer ended without a result'
+                        stage = wire-text; event, 'stage'
+                        if stage == 'failed'
+                            throw service-error; (wire-text; event, 'code'), (wire-text; event, 'message')
+                        if stage == 'complete'
+                            return management-encoded; (pull-progress-row; event)
+                finally
+                    session.cancel;
+            throw service-error; 'state_error', 'unknown management operation'
+        catch as caught-failure
+            return failure-response; caught-failure
+
+    function resident-models document-value throws throwable;
+        status = management-status-document; this.backend
+        residency = wire-field; status, 'residency'
+        residents = wire-field; residency, 'models'
+        models list of document-value = list;
+        if residents.kind == 'list'
+            index int = 0
+            while index < (residents.length;)
+                resident = (residents.item; index).value
+                if (wire-text; resident, 'retiring') != 'true'
+                    id = wire-text; resident, 'id'
+                    if id != ''
+                        outcome = management-model-document; this.backend, id
+                        failure = wire-field; outcome, 'failure'
+                        if failure.kind == 'none'
+                            model = wire-field; outcome, 'value'
+                            family = wire-field; model, 'family'
+                            details = wire-object; (list; 'format', 'family', 'families'), (list; (make-document-string; 'gguf'), family, (wire-array; (list; family)).value)
+                            operating-point = wire-field; resident, 'operating_point'
+                            row = wire-object; (list; 'name', 'model', 'size', 'digest', 'details', 'size_vram'), (list; (wire-field; model, 'id'), (wire-field; model, 'id'), (wire-field; model, 'size_bytes'), (wire-field; model, 'sha256'), details.value, (wire-field; operating-point, 'device_bytes'))
+                            models.append; row.value
+                index = index + 1
+        return (wire-object; (list; 'models'), (list; (wire-array; models).value)).value
+
+function register-management application throws throwable; app application, controller shared ref management-controller, method string, path string, action string
+    handler = async function wire-response; request incoming-request
+        invocation = controller.invocation;
+        return await invocation.handle; request, action
+    return app.route; method, path, handler
+
+function mount-management application throws throwable; app application, backend native-management, settings shared ref DaemonConfig, policy shared ref service-policy
+    engine = make-template-engine;
+    assets = instance management-documents; (engine.fetch; 'openapi.json'), (engine.fetch; 'openapi.html')
+    documents = shared ref assets
+    instance-controller = instance management-controller; backend, settings, policy, documents
+    controller = shared ref instance-controller
+    app = register-management; move app, controller, 'GET', '/openai/v1/openapi.json', 'openapi'
+    app = register-management; move app, controller, 'GET', '/cusco/v1/openapi.json', 'openapi'
+    if settings.openapi.docs-ui.enabled
+        app = register-management; move app, controller, 'GET', '/openapi/ui', 'explorer'
+    app = register-management; move app, controller, 'GET', '/openai/v1/models', 'models'
+    app = register-management; move app, controller, 'GET', '/cusco/v1/capabilities', 'capabilities'
+    app = register-management; move app, controller, 'GET', '/cusco/v1/api/version', 'version'
+    app = register-management; move app, controller, 'GET', '/cusco/v1/api/tags', 'tags'
+    app = register-management; move app, controller, 'GET', '/cusco/v1/api/ps', 'ps'
+    app = register-management; move app, controller, 'POST', '/cusco/v1/api/show', 'show'
+    app = register-management; move app, controller, 'POST', '/cusco/v1/api/pull', 'pull'
+    app = register-management; move app, controller, 'POST', '/cusco/v1/api/copy', 'copy'
+    app = register-management; move app, controller, 'DELETE', '/cusco/v1/api/delete', 'remove'
+    app = register-management; move app, controller, 'GET', '/cusco/v1/contexts', 'contexts'
+    app = register-management; move app, controller, 'POST', '/cusco/v1/contexts', 'create-context'
+    app = register-management; move app, controller, 'POST', '/cusco/v1/contexts/import', 'import-context'
+    app = register-management; move app, controller, 'GET', '/cusco/v1/contexts/{id}', 'context'
+    app = register-management; move app, controller, 'DELETE', '/cusco/v1/contexts/{id}', 'delete-context'
+    app = register-management; move app, controller, 'POST', '/cusco/v1/contexts/{id}/branches', 'branch-context'
+    app = register-management; move app, controller, 'DELETE', '/cusco/v1/requests/{id}', 'cancel'
+    app = register-management; move app, controller, 'GET', '/cusco/v1/status', 'status'
+    app = register-management; move app, controller, 'GET', '/cusco/v1/compaction/strategies', 'strategies'
+    app = register-management; move app, controller, 'POST', '/cusco/v1/compaction/declarations', 'declare'
+    return register-management; move app, controller, 'DELETE', '/cusco/v1/compaction/declarations/{id}', 'revoke'

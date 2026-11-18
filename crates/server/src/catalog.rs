@@ -81,7 +81,7 @@ pub struct MeasuredExecutionProfileRecord {
     pub last_used_at: i64,
 }
 
-const PUBLISH_MODEL_SQL: &str = "INSERT INTO models(id,revision,path,sha256,family,size_bytes,epoch,aliases_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,path=excluded.path,sha256=excluded.sha256,family=excluded.family,size_bytes=excluded.size_bytes,epoch=excluded.epoch,aliases_json=excluded.aliases_json";
+const PUBLISH_MODEL_SQL: &str = "INSERT INTO models(id,revision,path,sha256,family,size_bytes,block_count,epoch,aliases_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,path=excluded.path,sha256=excluded.sha256,family=excluded.family,size_bytes=excluded.size_bytes,block_count=excluded.block_count,epoch=excluded.epoch,aliases_json=excluded.aliases_json";
 
 fn publish_model(connection: &Connection, model: &ModelRecord) -> Result<(), CatalogError> {
     if model.epoch == 0 {
@@ -91,6 +91,7 @@ fn publish_model(connection: &Connection, model: &ModelRecord) -> Result<(), Cat
         .map_err(|error| CatalogError::Data(error.to_string()))?;
     let size = i64::try_from(model.size_bytes)
         .map_err(|_| CatalogError::Data("model size exceeds SQLite integer".into()))?;
+    let block_count = i64::from(model.block_count);
     let epoch = i64::try_from(model.epoch)
         .map_err(|_| CatalogError::Data("model epoch exceeds SQLite integer".into()))?;
     connection.execute(
@@ -102,6 +103,7 @@ fn publish_model(connection: &Connection, model: &ModelRecord) -> Result<(), Cat
             model.sha256,
             model.family,
             size,
+            block_count,
             epoch,
             aliases
         ],
@@ -115,6 +117,8 @@ fn migrations() -> Migrations<'static> {
             .down("DROP TABLE lifecycle_operations; DROP TABLE models;"),
         M::up("CREATE TABLE model_execution_profiles (model_identity TEXT NOT NULL, config_hash TEXT NOT NULL, gpu_id TEXT NOT NULL, schema_major INTEGER NOT NULL, measured_data TEXT NOT NULL, measured_at INTEGER NOT NULL DEFAULT (unixepoch()), last_used_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY(model_identity, config_hash, gpu_id));")
             .down("DROP TABLE model_execution_profiles;"),
+        M::up("ALTER TABLE models ADD COLUMN block_count INTEGER NOT NULL DEFAULT 0 CHECK(block_count >= 0);")
+            .down("ALTER TABLE models DROP COLUMN block_count;"),
     ])
 }
 
@@ -136,11 +140,12 @@ impl ModelCatalog {
 
     pub fn models(&self) -> Result<Vec<ModelRecord>, CatalogError> {
         let connection = self.connection.lock();
-        let mut query = connection.prepare("SELECT id, revision, path, sha256, aliases_json, family, size_bytes, epoch FROM models ORDER BY id")?;
+        let mut query = connection.prepare("SELECT id, revision, path, sha256, aliases_json, family, size_bytes, block_count, epoch FROM models ORDER BY id")?;
         let rows = query.query_map([], |row| {
             let aliases: String = row.get(4)?;
             let size: i64 = row.get(6)?;
-            let epoch: i64 = row.get(7)?;
+            let block_count: i64 = row.get(7)?;
+            let epoch: i64 = row.get(8)?;
             Ok(ModelRecord {
                 id: row.get(0)?,
                 revision: row.get(1)?,
@@ -161,9 +166,16 @@ impl ModelCatalog {
                         Box::new(error),
                     )
                 })?,
-                epoch: epoch.try_into().map_err(|error| {
+                block_count: block_count.try_into().map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
                         7,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
+                epoch: epoch.try_into().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
                         rusqlite::types::Type::Integer,
                         Box::new(error),
                     )
@@ -372,6 +384,7 @@ mod tests {
             aliases: vec!["latest".into()],
             family: "gemma".into(),
             size_bytes: 7,
+            block_count: 7,
             epoch: 1,
         };
         catalog.publish(&model).unwrap();
@@ -464,6 +477,7 @@ mod tests {
             aliases: vec![],
             family: "gemma".into(),
             size_bytes: 7,
+            block_count: 7,
             epoch: 1,
         };
         assert!(matches!(
@@ -491,6 +505,7 @@ mod tests {
             aliases: vec!["latest".into()],
             family: "gemma4".into(),
             size_bytes: 7,
+            block_count: 7,
             epoch: 0,
         };
         assert!(matches!(

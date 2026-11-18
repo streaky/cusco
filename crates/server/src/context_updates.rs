@@ -4,6 +4,7 @@ use crate::responses::{
 };
 use crate::{Error, FinishReason, RequestControl};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,7 +50,7 @@ pub struct ContextUpdateResult {
     pub base_response_id: String,
     pub base_revision: u64,
     pub revision: u64,
-    pub response: Value,
+    pub response: crate::responses::ResponseSnapshot,
 }
 
 pub fn apply(
@@ -79,7 +80,7 @@ pub fn apply(
 
     let base = service
         .retrieve(&request.base_response_id, owner)
-        .map_err(crate::response_store_error)?;
+        .map_err(crate::responses::store_error)?;
     if !base.store {
         return Err(Error::BadRequest(
             "context updates require a stored base response".into(),
@@ -151,7 +152,7 @@ pub fn apply(
             request.expected_revision,
             &response,
         )
-        .map_err(crate::response_store_error)?;
+        .map_err(crate::responses::store_error)?;
 
     Ok(ContextUpdateResult {
         capability: CONTEXT_UPDATE_CAPABILITY,
@@ -160,7 +161,7 @@ pub fn apply(
         base_response_id: request.base_response_id,
         base_revision: request.expected_revision,
         revision,
-        response: crate::responses::project_resource(&response),
+        response: crate::responses::ResponseSnapshot::from(&response),
     })
 }
 
@@ -196,6 +197,7 @@ mod tests {
                 input_tokens: 1,
                 cached_tokens: 0,
                 output_tokens: 1,
+                reasoning_tokens: 0,
             }),
             metadata: ResponseMetadata::default(),
             lineage_revision: 0,
@@ -233,11 +235,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.revision, 1);
-        assert_eq!(result.response["cusco"]["lineage_revision"], 1);
+        assert_eq!(result.response.lineage_revision, 1);
 
         let reopened = FileResponseResourceStore::open(&directory).unwrap();
         let recovered = reopened
-            .get(result.response["id"].as_str().unwrap())
+            .get(&result.response.id)
             .unwrap();
         assert_eq!(recovered.previous_response_id.as_deref(), Some("resp_base"));
         assert_eq!(

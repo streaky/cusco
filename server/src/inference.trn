@@ -1,0 +1,185 @@
+namespace cusco/service
+
+from /core/collections import list
+from /core/documents import document-value
+from /core/errors import throwable
+from /deps/cusco-server import Server as native-server, DaemonConfig
+from /deps/cusco-server/native import NativePermit as native-permit, GenerationSession as native-generation-session, new_request_id
+from /streaky/http-server import application
+from /streaky/http-server/internal import incoming-request, wire-response
+
+async function acquire-inference-permit native-permit throws throwable; server ref native-server
+    result = await server.acquire_prequeue_permit_outcome;
+    failure = result.failure
+    if failure != none
+        throw service-error; failure.code, failure.message
+    permit = move result.value
+    if permit != none
+        return permit
+    throw service-error; 'state_error', 'prequeue admission returned no permit'
+
+function require-generation-session native-generation-session throws throwable; session native-generation-session|none
+    if session != none
+        return session
+    throw service-error; 'state_error', 'generation preparation returned no session'
+
+function inference-path-id string throws throwable; request ref incoming-request
+    id = request.path-value; 'id'
+    if id != none
+        return id
+    throw invalid-request-error; 'missing response identifier'
+
+function inference-response-header wire-response; response wire-response, initial ref document-value
+    response.headers.set; 'x-request-id', (list; (wire-text; initial, 'correlation_id'))
+    return response
+
+class inference-controller
+    private server native-server
+    private settings shared ref DaemonConfig
+    private policy shared ref service-policy
+
+    function construct; server native-server, settings shared ref DaemonConfig, policy shared ref service-policy
+        this.server = server
+        this.settings = settings
+        this.policy = policy
+
+    function invocation inference-controller;
+        return instance inference-controller; this.server, this.settings, this.policy
+
+    async function generate wire-response throws throwable; request incoming-request, protocol string
+        try
+            principal = this.policy.authorize; request
+            server = this.server
+            permit = await acquire-inference-permit; server
+            maximum-bytes = this.settings.server.request-bytes
+            timeout-ms = this.settings.server.body-timeout-ms
+            document = await request.json-body; maximum-bytes, timeout-ms, 128
+            request-id = new_request_id;
+            normalized = generation-normalized-request; document, protocol, principal, request-id, (request.body-byte-count;)
+            decoded = decode-native-generation; normalized
+            prepared = await server.prepare_generation_outcome; move decoded, move permit
+            failure = prepared.failure
+            if failure != none
+                throw service-error; failure.code, failure.message
+            session = require-generation-session; move prepared.value
+            event = await next-generation-document; session
+            initial = wire-field; event, 'Started'
+            if initial.kind == 'none'
+                session.cancel;
+                throw service-error; 'state_error', 'generation returned no start event'
+            streaming = generation-boolean; document, 'stream', false
+            include-usage bool = false
+            options = wire-field; document, 'stream_options'
+            if options.kind != 'none'
+                include-usage = generation-boolean; options, 'include_usage', false
+            if streaming
+                response = instance wire-response; 200, 'text/event-stream', ''
+                response.stream = instance generation-output-stream; session, protocol, initial, include-usage
+                return inference-response-header; response, initial
+            try
+                finish document-value = wire-none;
+                while finish.kind == 'none'
+                    next = await next-generation-document; session
+                    if next.kind == 'none'
+                        throw service-error; 'state_error', 'inference ended before a terminal event'
+                    error = wire-field; next, 'Error'
+                    if error.kind != 'none'
+                        throw service-error; (wire-text; error, 'code'), (wire-text; error, 'message')
+                    finish = wire-field; next, 'Finished'
+                text string = ''
+                if protocol != 'responses'
+                    output = wire-field; finish, 'output'
+                    if output.kind != 'none'
+                        text = generation-required-text; output, 'text'
+                    else
+                        text = await generation-output-text; session
+                value = generation-completed; protocol, request-id, text, finish
+                response = json-response; (generation-json; value)
+                return inference-response-header; response, initial
+            finally
+                session.cancel;
+        catch as caught-failure
+            return failure-response; caught-failure
+
+    async function retrieve wire-response throws throwable; request incoming-request
+        try
+            principal = this.policy.authorize; request
+            id = inference-path-id; request
+            result = this.server.retrieve_response; id, principal
+            failure = result.failure
+            if failure != none
+                throw service-error; failure.code, failure.message
+            value = require-response-resource; move result.value
+            resource = generation-resource-document; value
+            return json-response; (generation-json; (project-response; resource))
+        catch as caught-failure
+            return failure-response; caught-failure
+
+    async function delete-response wire-response throws throwable; request incoming-request
+        try
+            principal = this.policy.authorize; request
+            id = inference-path-id; request
+            result = this.server.delete_response; id, principal
+            failure = result.failure
+            if failure != none
+                throw service-error; failure.code, failure.message
+            value = generation-object; (list; 'id', 'object', 'deleted'), (list; (wire-string; id), (wire-string; 'response.deleted'), (wire-bool; true))
+            return json-response; (generation-json; value)
+        catch as caught-failure
+            return failure-response; caught-failure
+
+    async function update-context wire-response throws throwable; request incoming-request
+        try
+            principal = this.policy.authorize; request
+            server = this.server
+            permit = await acquire-inference-permit; server
+            maximum-bytes = this.settings.server.request-bytes
+            timeout-ms = this.settings.server.body-timeout-ms
+            document = await request.json-body; maximum-bytes, timeout-ms, 128
+            wire-reject-unknown; document, (list; 'base_response_id', 'expected_revision', 'operation_id', 'operation')
+            generation-required-text; document, 'base_response_id'
+            revision = generation-integer; document, 'expected_revision'
+            if revision.kind == 'none'
+                throw invalid-request-error; 'expected_revision is required'
+            generation-optional-text; document, 'operation_id'
+            operation = wire-field; document, 'operation'
+            wire-reject-unknown; operation, (list; 'type', 'items')
+            if (generation-required-text; operation, 'type') != 'fold'
+                throw invalid-request-error; 'unsupported context update operation'
+            decoded = decode-native-context-update; document
+            result = await server.apply_context_update_outcome; principal, move decoded, move permit, (request.body-byte-count;)
+            failure = result.failure
+            if failure != none
+                throw service-error; failure.code, failure.message
+            value = require-context-result; move result.value
+            updated = generation-update-document; value
+            resource = wire-field; updated, 'response'
+            response = project-response; resource
+            projected = generation-object; (list; 'capability', 'operation_id', 'correlation_id', 'base_response_id', 'base_revision', 'revision', 'response'), (list; (wire-field; updated, 'capability'), (wire-field; updated, 'operation_id'), (wire-field; updated, 'correlation_id'), (wire-field; updated, 'base_response_id'), (wire-field; updated, 'base_revision'), (wire-field; updated, 'revision'), response)
+            encoded = json-response; (generation-json; projected)
+            encoded.headers.set; 'x-request-id', (list; (wire-text; updated, 'operation_id'))
+            return encoded
+        catch as caught-failure
+            return failure-response; caught-failure
+
+function register-inference application throws throwable; app application, controller shared ref inference-controller, method string, path string, operation string
+    handler = async function wire-response; request incoming-request
+        invocation = controller.invocation;
+        if operation == 'retrieve'
+            return await invocation.retrieve; request
+        if operation == 'delete'
+            return await invocation.delete-response; request
+        if operation == 'update'
+            return await invocation.update-context; request
+        return await invocation.generate; request, operation
+    return app.route; method, path, handler
+
+function mount-inference application throws throwable; app application, server native-server, settings shared ref DaemonConfig, policy shared ref service-policy
+    instance-controller = instance inference-controller; server, settings, policy
+    controller = shared ref instance-controller
+    app = register-inference; move app, controller, 'POST', '/openai/v1/completions', 'completion'
+    app = register-inference; move app, controller, 'POST', '/openai/v1/chat/completions', 'chat'
+    app = register-inference; move app, controller, 'POST', '/openai/v1/responses', 'responses'
+    app = register-inference; move app, controller, 'GET', '/openai/v1/responses/{id}', 'retrieve'
+    app = register-inference; move app, controller, 'DELETE', '/openai/v1/responses/{id}', 'delete'
+    return register-inference; move app, controller, 'POST', '/cusco/v1/context-updates', 'update'
