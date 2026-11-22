@@ -116,7 +116,7 @@ class model-pull-stream implements response-stream
         row = stringify-wire-json; (pull-progress-row; event)
         if row.failed
             throw service-error; 'state_error', row.message
-        return row.value.encoded + '\n'
+        return row.value.encoded + "\n"
 
     function cancel;
         this.session.cancel;

@@ -13,7 +13,7 @@ function generation-json string throws throwable; value document-value
     return result.value.encoded
 
 function generation-data string throws throwable; value document-value
-    return 'data: ' + (generation-json; value) + '\n\n'
+    return 'data: ' + (generation-json; value) + "\n\n"
 
 function generation-count int throws throwable; value ref document-value, name string
     field = wire-field; value, name
@@ -215,7 +215,7 @@ class generation-stream-state
             keys.append; 'usage'
             usage = wire-field; finish, 'usage'
             values.append; (generation-usage; usage)
-        return (generation-data; (generation-object; keys, values)) + 'data: [DONE]\n\n'
+        return (generation-data; (generation-object; keys, values)) + "data: [DONE]\n\n"
 
     mutable function complete-response string; resource document-value
         if resource.kind == 'none'

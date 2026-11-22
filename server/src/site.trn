@@ -18,4 +18,4 @@ class site uses api
 
     @[endpoint; method = 'GET|HEAD', path = '/health', content-type = 'text/plain']
     async function health string;
-        return 'ready\n'
+        return "ready\n"

@@ -76,7 +76,7 @@ function trace-body document-value throws throwable; level string, captured docu
     if content-type != none
         if content-type.contains.start; 'text/event-stream'
             events list of document-value = list;
-            for line in (text.split; '\n')
+            for line in (text.split; "\n")
                 if line.contains.start; 'data:'
                     data = (line.trim.start; 'data:').trim;
                     if data == '[DONE]'
