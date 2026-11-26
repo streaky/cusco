@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 136" role="img" aria-labelledby="title desc">
+  <title id="title">One evaluated prefix, two continuations</title>
+  <desc id="desc">Four shared token positions lead to a checkpoint. Two independent branches extend it with their own tokens.</desc>
+  <rect width="800" height="136" rx="14" fill="#142632"/>
+  <g fill="none" stroke-width="3">
+    <path d="M45 84H352" stroke="#89dad1"/>
+    <path d="M352 84C405 84 395 41 451 41H587" stroke="#ffc078"/>
+    <path d="M352 84C405 84 400 105 451 105H587" stroke="#9fc8ff"/>
+  </g>
+  <g fill="#89dad1"><circle cx="62" cy="84" r="7"/><circle cx="136" cy="84" r="7"/><circle cx="210" cy="84" r="7"/><circle cx="284" cy="84" r="7"/></g>
+  <path d="m352 73 11 11-11 11-11-11z" fill="#fff"/>
+  <g fill="#ffc078"><circle cx="456" cy="41" r="7"/><circle cx="521" cy="41" r="7"/><circle cx="586" cy="41" r="7"/></g>
+  <g fill="#9fc8ff"><circle cx="456" cy="105" r="7"/><circle cx="521" cy="105" r="7"/><circle cx="586" cy="105" r="7"/></g>
+  <g font-family="system-ui, sans-serif" font-size="19" fill="#f3f7fa"><text x="45" y="47">Evaluated prefix</text><text x="614" y="47">Continuation A</text><text x="614" y="111">Continuation B</text><text x="352" y="120" text-anchor="middle" font-size="14">checkpoint</text></g>
+</svg>
