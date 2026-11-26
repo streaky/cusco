@@ -23,84 +23,98 @@ function unwrap-domain-document document-value throws throwable; result document
         throw service-error; (wire-text; failure, 'code'), (wire-text; failure, 'message')
     return wire-field; result, 'value'
 
+# The projected model list cannot use the bounded source document encoder.
 function management-models-document document-value throws throwable; backend ref native-management
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.models());
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# The projected context list cannot use the bounded source document encoder.
 function management-contexts-document document-value throws throwable; backend ref native-management
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.contexts());
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# The projected status record lacks source document-encodable.
 function management-status-document document-value throws throwable; backend ref native-management
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.status());
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# The projected strategy records lack source document-encodable.
 function management-strategies-document document-value throws throwable; backend ref native-management
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.strategies());
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# Preserve the model lookup's native success/failure shape through Serde.
 function management-model-document document-value throws throwable; backend ref native-management, name string
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.model(&name));
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# Preserve the alias operation's native success/failure shape through Serde.
 function management-alias-document document-value throws throwable; backend ref native-management, name string, destination string
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.alias_model(&name, destination));
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# Preserve the removal operation's native success/failure shape through Serde.
 function management-remove-document document-value throws throwable; backend ref native-management, name string
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.remove_model(&name));
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# Preserve the context lookup's native success/failure shape through Serde.
 function management-context-document document-value throws throwable; backend ref native-management, id string
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.context(id));
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# Preserve the context creation result's native success/failure shape through Serde.
 function management-create-context-document document-value throws throwable; backend ref native-management
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.create_context());
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# Transfer the token buffer to Rust and preserve the native import result's Serde shape.
 function management-import-context-document document-value throws throwable; backend ref native-management, tokens list of string
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.import_context(tokens.into_vec()));
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# Preserve the branch result's native success/failure shape through Serde.
 function management-branch-context-document document-value throws throwable; backend ref native-management, id string
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.branch_context(id));
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# Preserve the deletion result's native success/failure shape through Serde.
 function management-delete-context-document document-value throws throwable; backend ref native-management, id string
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.delete_context(id));
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# Preserve the declaration result's native success/failure shape through Serde.
 function management-declare-document document-value throws throwable; backend ref native-management, principal string, request native-declaration-request
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.declare(&principal, request));
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# Preserve the revocation result's native success/failure shape through Serde.
 function management-revoke-document document-value throws throwable; backend ref native-management, principal string, id string
     result document-result = rust
         let raw = terrane_document_support::serialize_document(&backend.revoke(&principal, &id));

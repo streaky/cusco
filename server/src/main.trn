@@ -5,6 +5,7 @@ from /core/errors import throwable
 from /core/networking import listen-tcp
 from /core/process import arguments, cli-schema, parse-command-line
 from /deps/cusco-server import Daemon as native-daemon, DaemonConfig, HttpDebugLevel, SocketAddr as native-socket-addr
+from /deps/client-ip import IpAddr as native-ip-addr
 from /streaky/http-server import create-application
 
 
@@ -26,16 +27,15 @@ function effective-http-debug string throws throwable; settings shared ref Daemo
         throw startup-error; 'HTTP debug level must be one of: off, safe, full'
     return mode
 
-# SocketAddr display and IpAddr loopback inspection are not admitted through the
-# current projected address facade. Keep these scalar native operations until
-# both operations are directly callable from source with IPv4/IPv6 parity.
+# SocketAddr's Display-to-string operation is not exposed as a source method.
+# Keep canonical formatting, including IPv6 brackets and scope IDs, until it is.
 function listener-address string; address native-socket-addr
     return rust
         address.to_string()
 
 function listener-is-loopback bool; address native-socket-addr
-    return rust
-        address.ip().is_loopback()
+    ip native-ip-addr = address.ip;
+    return ip.is_loopback;
 
 async function main throws throwable;
     schema = instance cli-schema;

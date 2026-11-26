@@ -31,6 +31,8 @@ class context-update-decode-result
     value native-context-update|none = none
     message string = ''
 
+# Preserve native context-update decoding and typed errors; the projected
+# request lacks the source document-decodable contract.
 function decode-native-context-update native-context-update throws throwable; document ref document-value
     result context-update-decode-result = rust
         match document.raw.value() {
@@ -45,13 +47,13 @@ function decode-native-context-update native-context-update throws throwable; do
         return request
     throw invalid-request-error; result.message
 
-# Native session events are typed Rust enums without source document-encodable.
-# Await the event here and serialize its borrowed fields into the core document.
-# Remove this bridge when native enums can use the source codec directly.
+# The projected event enum lacks document-encodable. Serialize the borrowed
+# native event with the bounded core codec, including the absent event as null.
 async function next-generation-document document-value throws throwable; session ref native-generation-session
+    event = await session.next;
+    borrowed = ref event
     result document-result = rust
-        let event = session.next().await;
-        let raw = terrane_document_support::serialize_document(&event);
+        let raw = terrane_document_support::serialize_document(borrowed);
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
@@ -80,6 +82,8 @@ function generation-resource-document document-value throws throwable; resource 
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 
+# Preserve the native context-result Serde shape and bounded codec; the
+# projected result does not implement source document-encodable.
 function generation-update-document document-value throws throwable; result ref native-context-result
     document document-result = rust
         let raw = terrane_document_support::serialize_document(result);
