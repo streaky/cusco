@@ -14,11 +14,14 @@ path = "../../../../../packages/http-server"
 [terrane-dependencies.streaky.template]
 path = "../../../../../packages/template"
 
+# Run the real backend with its deterministic engine support enabled for tests.
 [rust-dependencies.cusco-server]
 version = "=0.1.0"
 effects = ["build", "filesystem", "networking", "process", "threads"]
 features = ["test-fixtures"]
 
+# Test-only Rust trait implementations inject deterministic inference and hosted
+# tools into the actual backend; the fixture still serves the Terrane controllers.
 [rust-modules]
 fixture = "fixture.rs"
 

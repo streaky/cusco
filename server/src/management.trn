@@ -68,13 +68,13 @@ function management-bool bool throws throwable; object document-value, name stri
         throw invalid-request-error; name + ' must be a boolean'
     return value.scalar == 'true'
 
-# Await the typed pull event and encode its native Serde fields. The projected
-# event has no source document-encodable implementation; remove this bridge when
-# native event enums can use the core codec directly, retaining terminal errors.
+# The projected pull event lacks document-encodable. Borrow it for native
+# Serde so its tagged shape, terminal errors, and null on exhaustion are kept.
 async function pull-event-document document-value throws throwable; session ref native-pull-session
+    event = await session.next;
+    borrowed = ref event
     result document-result = rust
-        let event = session.next().await;
-        let raw = terrane_document_support::serialize_document(&event);
+        let raw = terrane_document_support::serialize_document(borrowed);
         DocumentResult::terrane_construct(raw.failed, raw.message.clone(), raw.path.clone(), raw.expected.clone(), raw)
     return require-domain-document; result
 

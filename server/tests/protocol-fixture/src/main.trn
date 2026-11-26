@@ -25,12 +25,14 @@ class fixture-open-result
         this.value = value
         this.message = message
 
+# The local Rust fixture module is not a projected dependency. Move its native
+# server and settings into source state and keep startup errors as source errors.
 function open-fixture fixture-state throws throwable; config-path string
     opened fixture-open-result = rust
         match crate::fixture::open(&config_path) {
             Ok((server, settings)) => FixtureOpenResult::terrane_construct(
                 Some(FixtureState::terrane_construct(server, settings)), String::new()),
-            Err(error) => FixtureOpenResult::terrane_construct(None, error.to_string()),
+            Err(error) => FixtureOpenResult::terrane_construct(None, error),
         }
     state = move opened.value
     if state != none

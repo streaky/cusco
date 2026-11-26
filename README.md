@@ -320,7 +320,8 @@ a feature-gated deterministic Rust engine; it is not the production engine.
 The driver stages the fixture with the production controller sources under
 `server/.trn/protocol-fixture`; it does not maintain a second route implementation.
 Small temporary copies are acceptable when they keep Terrane straightforward.
-Typed Serde and unsupported projected address operations still need native bridges.
+Typed Serde and canonical socket-address formatting still need native bridges.
+The anonymous-listener policy uses the projected address's loopback predicate.
 The fragment-joining helper also retains a preallocated native buffer: its output
 can span the request, and current source `+` lowering allocates a new buffer per
 iteration. Revisit it when source append/builder operations can reuse that buffer.

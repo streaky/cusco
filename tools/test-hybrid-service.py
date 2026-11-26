@@ -154,6 +154,13 @@ class HybridServiceTests(unittest.TestCase):
         self.launch("--http-debug", "off")
         self.assertEqual(self.request("GET", "/health")[0], 200)
 
+    def test_anonymous_binding_accepts_ipv4_loopback_range(self):
+        self.environment.pop("CUSCO_BEARER_TOKEN")
+        self.config["listen"] = "127.0.0.2:0"
+        self.launch()
+        self.assertEqual(self.host, "127.0.0.2")
+        self.assertEqual(self.request("GET", "/health")[0], 200)
+
     def test_public_anonymous_binding_is_rejected_before_startup(self):
         self.environment.pop("CUSCO_BEARER_TOKEN")
         self.config["listen"] = "0.0.0.0:0"
@@ -161,7 +168,7 @@ class HybridServiceTests(unittest.TestCase):
         result = subprocess.run([str(BINARY), "--config", str(self.path)], env=self.environment,
                                 capture_output=True, text=True, timeout=10)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unsafe unauthenticated listener", result.stderr)
+        self.assertIn("unsafe unauthenticated listener: 0.0.0.0:0", result.stderr)
         self.assertNotIn("Cusco listening", result.stdout)
 
 

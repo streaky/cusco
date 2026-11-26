@@ -13,6 +13,8 @@ path = "../../../packages/http-server"
 [terrane-dependencies.streaky.template]
 path = "../../../packages/template"
 
+# The in-process backend owns scheduling, persistence, and typed inference;
+# HTTP policy and controllers remain Terrane.
 [rust-dependencies.cusco-server]
 version = "=0.1.0"
 effects = ["build", "filesystem", "networking", "process", "threads"]
