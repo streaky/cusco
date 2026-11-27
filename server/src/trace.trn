@@ -179,8 +179,8 @@ class http-trace-state
             this.emit; record.value
             return
         if (kind == 'transport_complete' or kind == 'transport_error' or kind == 'response_dropped') and (wire-text; event, 'direction') == 'response'
-            this.responses.remove; id
-            this.heads.remove; id
+            this.responses.remove.checked; id
+            this.heads.remove.checked; id
 
     mutable function diagnostic-failure;
         # Never include parser/error prose here: it could quote a secret payload.
