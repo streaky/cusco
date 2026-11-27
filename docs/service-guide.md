@@ -235,27 +235,48 @@ change database-volume permissions to make them readable by the Docker builder.
 
 Build from the Cusco directory in the Terrane checkout, with `terrane` on PATH
 and the sibling `packages/http-server` and `packages/template` checkouts present.
-As with the Rust backend, supply the real executor shim and llama.cpp libraries
-through `CUSCO_NATIVE_LIB_DIR`, `CUSCO_LLAMA_LIB_DIR`, and `LD_LIBRARY_PATH`.
-The Docker build prepares those libraries automatically.
+Install CMake, Ninja, Git, a C++ compiler, and the CUDA development
+toolkit for GPU builds. `./run-host.sh` provisions Terrane's pinned Rust tools,
+fetches the pinned llama.cpp source, and builds llama.cpp and the Cusco shim.
+It runs `terrane fetch server` to prepare locked dependencies for the service
+and its build-time consumers, then builds and starts Cusco. Build outputs stay under `target/` and
+Terrane's `server/.trn/` cache. Subsequent runs rebuild changed inputs only.
+Set `CUSCO_GGML_CUDA=OFF` for an explicit CPU build without the CUDA toolkit,
+or `CUSCO_CUDA_ARCHITECTURES` to override the default native GPU architecture.
+
+When `sccache` is on PATH, the launcher uses it for C, C++, CUDA, and Terrane's
+cacheable Rust compilations. It starts a host daemon on a Unix socket accessible
+to Terrane's isolated Cargo builds. Use this for trusted builds only: the
+daemon runs compiler requests outside the sandbox. Set `TERRANE_SCCACHE=0`
+to disable it. To inspect this daemon's statistics, run
+`SCCACHE_SERVER_UDS="${SCCACHE_SERVER_UDS:-${XDG_RUNTIME_DIR:-$HOME/.cache}/cusco/sccache.sock}" sccache --show-stats`.
 
 Cusco's native Cargo workspace deliberately inherits the surrounding Terrane
 checkout's `rust-toolchain.toml`; run Cargo from Cusco or the checkout root.
 The Terrane service uses `rust-toolchain = "pinned"`, so its Rust dependencies
 compile with that Terrane version's exact stable compiler too. Docker copies the
 same toolchain file before invoking Cargo instead of maintaining a separate
-stable-version literal. Once the CLI is built, Docker runs `terrane toolchain
-install` to provision the projection nightly and its Rust sources. Run the
-same command once for a direct build; `terrane toolchain check` verifies the
-installation offline. Nightly generates Rustdoc metadata, not the native service.
+stable-version literal. The host launcher and Docker both run `terrane toolchain
+install`. Nightly generates Rustdoc metadata, not the native service.
 
-For a direct run, set the paths in your configuration to host paths: Compose's
-`/data` mount does not exist automatically outside the container.
+Install `bubblewrap` (`bwrap`) and stop any other Cusco process using this
+catalog. The launcher runs as your user: the data tree must be writable, even
+if Docker originally created its contents as root. It exposes `./data` (or
+`CUSCO_DATA_DIR`) as `/data` only for the launched process, so existing model
+paths still work and the config does not need translating.
 
 ```sh
-artifact="$(terrane build server)"
-"$artifact" --config "${CUSCO_DATA_DIR:-./data}/config.yaml"
+./run-host.sh
 ```
+
+By default the script builds the service incrementally with the host Terrane
+toolchain and native libraries described above. To skip compilation, set
+`CUSCO_SERVICE_BIN` to a host-compatible executable with its shared libraries
+available to the loader. Flags such as `--http-debug safe` are forwarded.
+Export `CUSCO_BEARER_TOKEN` in the shell; Compose's `.env` and port mapping
+are not applied. The example config binds **all interfaces on port 8080**;
+use `listen: 127.0.0.1:11443` for a loopback-only host service on the usual
+client port.
 
 The daemon accepts `--config PATH` (default `/data/config.yaml`), `--http-debug
 off|safe|full`, and `--help`. `cargo run -p cusco -- serve` has been removed.
@@ -266,7 +287,7 @@ container/process supervisor's stop timeout longer than that grace period.
 For a model-free hybrid boundary check against the built executable:
 
 ```sh
-python3 tools/test-hybrid-service.py "$artifact" -v
+python3 tools/test-hybrid-service.py "$(terrane build server)" -v
 ```
 
 This uses temporary state and an actual native-linked service without loading a

@@ -24,6 +24,8 @@ docker compose up --build --wait server
 
 **Upgrading from separate mounts?** Copy your existing root `config.yaml` into the data directory instead of copying the example. If you use local model declarations, also copy `config/user.yaml` there as `user.yaml`. Existing `./data` subdirectories stay in place; if you used custom model directories, make their contents available under the new data root before restarting.
 
+**Running on the host instead?** Stop the Compose server before sharing its data, then run [`./run-host.sh`](docs/service-guide.md#run-the-daemon-directly). It builds llama.cpp, the executor shim, and Cusco incrementally, then serves `./data/config.yaml` on its configured address. No Docker build is needed.
+
 Check the service before downloading a model. The default host port is **11443**; `8080` is the port *inside* the container.
 
 ```sh

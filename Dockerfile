@@ -27,7 +27,7 @@ ENV CUSCO_NATIVE_LIB_DIR=/opt/cusco-install/lib CUSCO_LLAMA_LIB_DIR=/opt/llama-b
 RUN cargo build --locked --release --manifest-path /terrane/Cargo.toml --bin terrane \
  && install -m 0555 /terrane/target/release/terrane /usr/local/bin/terrane
 RUN terrane toolchain install
-RUN python3 server/prefetch_native.py server/terrane-dependencies.lock /terrane/packages/http-server/consumer/terrane-dependencies.lock \
+RUN terrane fetch server \
  && artifact="$(terrane build --release server)" \
  && install -m 0555 "$artifact" /usr/local/bin/cusco-service
 # Refresh copied inputs for proof jobs using persistent Cargo target volumes.
