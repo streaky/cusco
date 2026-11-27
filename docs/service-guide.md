@@ -194,21 +194,23 @@ mapped-execution Compose proofs remain lower-level engineering diagnostics.
 
 ## Run the production Compose service
 
-Copy the fully documented `config.example.yaml` to the ignored root
-`config.yaml`, configure `config/user.yaml` with local model declarations,
-provide an authentication token, and start the release service:
+Choose a writable host data directory (`./data` by default). Put your daemon
+configuration there as `config.yaml` and, if needed, local model declarations
+as `user.yaml`. For a new installation:
 
 ```sh
-cp config.example.yaml config.yaml
-mkdir -p data/models data/db data/spill data/user-models
+export CUSCO_DATA_DIR="${CUSCO_DATA_DIR:-./data}"
+mkdir -p "$CUSCO_DATA_DIR"
+cp config.example.yaml "$CUSCO_DATA_DIR/config.yaml"
 CUSCO_BEARER_TOKEN='replace-with-a-secret' docker compose up --build -d server
 ```
 
-The production definition mounts the root `config.yaml` read-only, listens on
-`127.0.0.1:11443` on the host by default (port `8080` inside the container), persists the SQLite catalog under
-`data/db`, and uses bounded storage under `data/spill`. Responses with
-`store: true` are atomically published in the file-backed resource store under
-`data/db/responses` and survive daemon restart; retrieval, deletion,
+The production service mounts that single directory at `/data`, reads
+`/data/config.yaml`, and creates missing storage directories. It listens on
+`127.0.0.1:11443` on the host by default (port `8080` inside the container),
+persists the SQLite catalog under `/data/db`, and uses bounded storage under
+`/data/spill`. Responses with `store: true` are atomically published under
+`/data/db/responses` and survive daemon restart; retrieval, deletion,
 `previous_response_id` replay, and typed function-call output continuation use
 those resources. Requests with `store: false` remain stateless and do not
 publish there. Override `CUSCO_LISTEN_ADDRESS`, `CUSCO_PORT`, and
@@ -219,8 +221,11 @@ contexts.
 The build context is the surrounding Terrane checkout, not Cusco alone. Compose
 selects `projects/cusco/Dockerfile`; its Dockerfile-specific ignore rules include
 only the compiler, required packages, and Cusco sources while excluding caches,
-operator configuration, and data. The image installs the hybrid executable as
-`cusco-service`, and the API smoke/acceptance launchers use that same executable.
+operator configuration, and data. Production copies `cusco-service`, llama.cpp,
+ggml, cuBLAS, and NCCL into the matching CUDA base image. The NVIDIA container
+runtime supplies the host driver; no SDK, compiler, checkout, or model
+weights are shipped. The acceptance services use the same executable in the
+development stage, where the build and proof tools remain available.
 Runtime `.state/` directories are excluded at every depth, including package
 database test volumes. Unrelated packages, projects, and tools remain excluded
 when their parent directories are reopened for the source allowlist. Do not
@@ -239,13 +244,17 @@ checkout's `rust-toolchain.toml`; run Cargo from Cusco or the checkout root.
 The Terrane service uses `rust-toolchain = "pinned"`, so its Rust dependencies
 compile with that Terrane version's exact stable compiler too. Docker copies the
 same toolchain file before invoking Cargo instead of maintaining a separate
-stable-version literal. Update Terrane's pin as one toolchain-profile change;
-do not add a divergent Cusco pin. The separately installed nightly is only the
-Rustdoc/projection producer, not the compiler used to build the native service.
+stable-version literal. Once the CLI is built, Docker runs `terrane toolchain
+install` to provision the projection nightly and its Rust sources. Run the
+same command once for a direct build; `terrane toolchain check` verifies the
+installation offline. Nightly generates Rustdoc metadata, not the native service.
+
+For a direct run, set the paths in your configuration to host paths: Compose's
+`/data` mount does not exist automatically outside the container.
 
 ```sh
 artifact="$(terrane build server)"
-"$artifact" --config "$PWD/config.yaml"
+"$artifact" --config "${CUSCO_DATA_DIR:-./data}/config.yaml"
 ```
 
 The daemon accepts `--config PATH` (default `/data/config.yaml`), `--http-debug

@@ -9,8 +9,7 @@ COPY rust-toolchain.toml /terrane/rust-toolchain.toml
 # Cargo installs/selects Terrane's exact stable pin, including its components.
 RUN cargo --version \
  && rustup component add llvm-tools-preview \
- && cargo install cargo-llvm-cov --version 0.6.16 --locked \
- && rustup toolchain install nightly-2026-08-01 --profile minimal --component rust-src
+ && cargo install cargo-llvm-cov --version 0.6.16 --locked
 WORKDIR /terrane/projects/cusco
 # Existing proof workloads use /work; retain that deployment path, not a second source copy.
 RUN ln -s /terrane/projects/cusco /work
@@ -26,12 +25,26 @@ RUN ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
 COPY . /terrane
 ENV CUSCO_NATIVE_LIB_DIR=/opt/cusco-install/lib CUSCO_LLAMA_LIB_DIR=/opt/llama-build/bin LD_LIBRARY_PATH=/opt/llama-build/bin:/usr/local/cuda/lib64/stubs
 RUN cargo build --locked --release --manifest-path /terrane/Cargo.toml --bin terrane \
- && install -m 0555 /terrane/target/release/terrane /usr/local/bin/terrane \
- && python3 server/prefetch_native.py server/terrane-dependencies.lock /terrane/packages/http-server/consumer/terrane-dependencies.lock \
+ && install -m 0555 /terrane/target/release/terrane /usr/local/bin/terrane
+RUN terrane toolchain install
+RUN python3 server/prefetch_native.py server/terrane-dependencies.lock /terrane/packages/http-server/consumer/terrane-dependencies.lock \
  && artifact="$(terrane build --release server)" \
  && install -m 0555 "$artifact" /usr/local/bin/cusco-service
 # Refresh copied inputs for proof jobs using persistent Cargo target volumes.
 RUN touch Cargo.toml native/include/*.h native/shim/*.cpp \
  && find crates -type f \( -name Cargo.toml -o -name build.rs -o -name '*.rs' \) -exec touch {} +
-FROM development AS production
-RUN cargo build --release -p cusco
+
+FROM nvidia/cuda:12.8.1-base-ubuntu24.04@sha256:133c78a0575303be34164d0b90137a042172bdf60696af01a3c424ab402d86e2 AS production
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libgomp1 libstdc++6 && rm -rf /var/lib/apt/lists/*
+# The base supplies libcudart; the host supplies libcuda. Ship the cuBLAS and
+# NCCL versions linked by ggml, not the full CUDA math library collection.
+COPY --from=development /usr/local/cuda/lib64/libcublas*.so.12.* /usr/local/lib/
+COPY --from=development /usr/lib/*-linux-gnu/libnccl.so.2.* /usr/local/lib/
+COPY --from=development /usr/share/doc/libcublas-12-8/copyright /usr/share/doc/libcublas-12-8/copyright
+COPY --from=development /usr/share/doc/libnccl2/copyright /usr/share/doc/libnccl2/copyright
+COPY --from=development /opt/llama.cpp/LICENSE /usr/share/doc/llama.cpp/LICENSE
+# Copy only the real versioned libraries; ldconfig creates their SONAME links.
+COPY --from=development /opt/llama-build/bin/*.so.*.* /usr/local/lib/
+RUN ldconfig
+COPY --from=development /usr/local/bin/cusco-service /usr/local/bin/
+CMD ["/usr/local/bin/cusco-service"]

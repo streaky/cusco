@@ -1,5 +1,5 @@
-# Cusco daemon configuration. Copy this file to ./config.yaml before running
-# Docker Compose, then adjust capacities and paths for the host.
+# Copy this file to config.yaml inside the host data directory (default ./data).
+# Compose mounts that directory at /data. Adjust capacities for the host.
 
 # Configuration schema version. Cusco rejects unsupported versions instead of
 # guessing how an older or newer file should behave.
@@ -60,9 +60,9 @@ paths:
   models: /data/models
   # Persistent storage-tier spill area for physical context representations.
   spill: /data/spill
-  # Read-only directory containing operator-managed local model files.
+  # Directory containing operator-managed local model files.
   user_models: /data/user-models
-  # Operator-managed declarations for models imported at daemon startup.
+  # Optional local model declarations; an absent file means no startup imports.
   user_config: /data/user.yaml
 
 execution:

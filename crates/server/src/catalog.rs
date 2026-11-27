@@ -335,7 +335,13 @@ pub fn load_user_models(
     path: impl AsRef<Path>,
     root: impl AsRef<Path>,
 ) -> Result<UserModels, CatalogError> {
-    let bytes = fs::read(path)?;
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(UserModels { models: Vec::new() });
+        }
+        Err(error) => return Err(error.into()),
+    };
     let mut config: UserModels =
         serde_yaml::from_slice(&bytes).map_err(|error| CatalogError::Data(error.to_string()))?;
     let root = fs::canonicalize(root)?;
