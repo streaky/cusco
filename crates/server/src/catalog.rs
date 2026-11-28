@@ -335,9 +335,14 @@ pub fn load_user_models(
     path: impl AsRef<Path>,
     root: impl AsRef<Path>,
 ) -> Result<UserModels, CatalogError> {
+    let path = path.as_ref();
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "No local model declarations at {}; skipping import.",
+                path.display()
+            );
             return Ok(UserModels { models: Vec::new() });
         }
         Err(error) => return Err(error.into()),

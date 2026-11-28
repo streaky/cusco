@@ -53,17 +53,20 @@ hosted_tools:
     # request-level allowed_domains may narrow but never expand it.
     allowed_domains: []
 
+# Relative paths start in the directory containing the selected config file,
+# regardless of the service's working directory. With /data/config.yaml,
+# db/catalog.sqlite resolves to /data/db/catalog.sqlite. Absolute paths are unchanged.
 paths:
   # SQLite catalog for persistent model identity, aliases, and lifecycle records.
-  database: /data/db/catalog.sqlite
+  database: db/catalog.sqlite
   # Persistent model registry and immutable Hugging Face artifact cache.
-  models: /data/models
+  models: models
   # Persistent storage-tier spill area for physical context representations.
-  spill: /data/spill
+  spill: spill
   # Directory containing operator-managed local model files.
-  user_models: /data/user-models
+  user_models: user-models
   # Optional local model declarations; an absent file means no startup imports.
-  user_config: /data/user.yaml
+  user_config: user.yaml
 
 execution:
   # Maximum model and context bytes admitted to GPU/device memory. This is an

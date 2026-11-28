@@ -35,7 +35,7 @@ services:
       - --cache
       - /data/models
     volumes:
-      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models"
+      - "${CUSCO_DATA_DIR:-./data}/models:/data/models"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
       - cargo-target:/work/target
@@ -47,7 +47,7 @@ services:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
     volumes:
-      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models:ro"
+      - "${CUSCO_DATA_DIR:-./data}/models:/data/models:ro"
       - "${CUSCO_RESULT_DIR:-./results}:/results"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
@@ -61,7 +61,7 @@ services:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
     volumes:
-      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models:ro"
+      - "${CUSCO_DATA_DIR:-./data}/models:/data/models:ro"
       - "${CUSCO_RESULT_DIR:-./results}:/results"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
@@ -75,7 +75,7 @@ services:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
     volumes:
-      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models:ro"
+      - "${CUSCO_DATA_DIR:-./data}/models:/data/models:ro"
       - "${CUSCO_RESULT_DIR:-./results}:/results"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
@@ -100,7 +100,7 @@ services:
       CUSCO_RESULT_DIR: "/results"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
     volumes:
-      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models"
+      - "${CUSCO_DATA_DIR:-./data}/models:/data/models"
       - "${CUSCO_RESULT_DIR:-./results}:/results"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
@@ -131,8 +131,8 @@ services:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
     volumes:
-      - "${CUSCO_USER_MODEL_DIR:-./data/user-models}:/data/user-models:ro"
-      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models"
+      - "${CUSCO_DATA_DIR:-./data}/user-models:/data/user-models:ro"
+      - "${CUSCO_DATA_DIR:-./data}/models:/data/models"
       - "${CUSCO_RESULT_DIR:-./results}:/results"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
@@ -167,8 +167,8 @@ services:
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-1}"
       LD_LIBRARY_PATH: "/opt/llama-build/bin"
     volumes:
-      - "${CUSCO_USER_MODEL_DIR:-./data/user-models}:/data/user-models:ro"
-      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models"
+      - "${CUSCO_DATA_DIR:-./data}/user-models:/data/user-models:ro"
+      - "${CUSCO_DATA_DIR:-./data}/models:/data/models"
       - cargo-registry:/root/.cargo/registry
       - cargo-git:/root/.cargo/git
       - cargo-target:/work/target

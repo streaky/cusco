@@ -1,0 +1,306 @@
+#!/usr/bin/env terrane
+
+# Local development default. Set CUSCO_DATA_DIR to override it for a run.
+constant default-data-dir = './data-dev'
+
+from /core/collections import list, set
+from /core/documents/yaml import default-yaml-options, parse-yaml
+from /core/encodings import utf8
+from /core/errors import throwable
+from /core/filesystem import filesystem-capability, filesystem-canonical, filesystem-exists, filesystem-read-bounded
+from /core/filesystem/paths import path, path-is-absolute, join-path, normalise-path, path-parent
+from /core/process import arguments, environment, environment-entry, environment-pair, native-text, exit, make-exit-status
+from /core/process/child import child-process, child-output-stream, process-error, process-observation, process-options, run-process, spawn-process
+from /core/process-signals import process-signal, process-signals
+from /core/streams import byte-writer, stdout, stderr
+
+function diagnostic; message string
+    errors = stderr;
+    _ = errors.write-all; (('Cusco: ' + message + "\n").encode; utf8)
+    _ = errors.flush;
+
+function fail; message string
+    diagnostic; message
+    exit; (make-exit-status; 1)
+
+function setting string; entries ref list of environment-entry, name string, fallback string = ''
+    for entry in entries
+        if entry.name.text == name
+            if not entry.value.is-text
+                fail; (name + ' must be Unicode text')
+            if entry.value.text != ''
+                return entry.value.text
+    return fallback
+
+function absolute-path path; text string
+    resolved = filesystem-canonical; (filesystem-capability;), (instance path; text)
+    if resolved.failed
+        fail; ('cannot resolve ' + text + ': ' + resolved.message)
+    return resolved.resolved
+
+function status-code int; status process-observation, program string
+    code = status.exit-code
+    if code != none
+        return code
+    diagnostic; (program + ' exited without a normal exit status')
+    return 1
+
+async function relay; reader child-output-stream, writer byte-writer, stream-name string
+    writing bool = true
+    try
+        while true
+            part = await reader.read;
+            if part.data.length > 0 and writing
+                written = await writer.write-all-async; part.data
+                if written.failed
+                    diagnostic; ('cannot relay ' + stream-name + ': ' + written.message)
+                    # A closed destination must not block the child from draining.
+                    writing = false
+            if part.end
+                break
+        if writing
+            flushed = writer.flush;
+            if flushed.failed
+                diagnostic; ('cannot flush ' + stream-name + ': ' + flushed.message)
+    catch process-error as error
+        diagnostic; ('cannot read child ' + stream-name + ': ' + error.message)
+
+async function wait-until-exited process-observation throws process-error; child ref child-process
+    status = await child.wait;
+    while not status.exited
+        status = await child.wait;
+    return status
+
+function check-data throws throwable; data string, config string
+    fs = filesystem-capability;
+    raw = filesystem-read-bounded; fs, (instance path; config), 1048576
+    if raw.failed
+        fail; (config + ': ' + raw.message + ' (for first setup, copy config.host.example.yaml here)')
+    yaml = parse-yaml; (raw.data.decode; utf8), (default-yaml-options;)
+    if yaml.failed
+        fail; (config + ': ' + yaml.message)
+    paths = yaml.value.field; 'paths'
+    database string = ''
+    for key in (list; 'database', 'models', 'spill', 'user_models', 'user_config')
+        field = paths.value.field; key
+        value = field.value.scalar
+        if field.failed or value == ''
+            fail; (config + ': missing paths.' + key)
+        normalized = normalise-path; (instance path; value)
+        if normalized.text == '/data' or (normalized.text.contains.start; '/data/')
+            fail; (config + ': paths.' + key + ' uses a container /data path. Keep this directory for Compose; start a separate host directory using config.host.example.yaml and re-import or pull models there.')
+        if key == 'database'
+            database = value
+    if not (path-is-absolute; (instance path; database))
+        database = data + '/' + database
+    existing = filesystem-exists; fs, (instance path; database)
+    if existing.failed
+        fail; (database + ': ' + existing.message)
+    if existing.exists
+        sql = "SELECT EXISTS(SELECT 1 FROM models WHERE path = '/data' OR path GLOB '/data/*');"
+        check = run-process; 'sqlite3', (list; '-batch', '-readonly', database, sql)
+        code = check.status.exit-code
+        if code != none
+            if code != 0
+                fail; (database + ': cannot inspect existing Cusco catalog: ' + (check.stderr.decode; utf8))
+        else
+            fail; (database + ': catalog inspection interrupted')
+        if check.stdout != b'0\n'
+            fail; (database + ': catalog contains container /data model paths. Keep it for Compose; start a separate host data directory and re-import or pull models there.')
+
+function pair environment-entry; name string, value string
+    return environment-pair; (native-text; name), (native-text; value)
+
+# Send build logs to stderr and retain only bounded stdout for result-bearing commands.
+async function drain bytes throws process-error; reader child-output-stream, mode string
+    retained bytes = b''
+    oversized bool = false
+    errors = stderr;
+    while true
+        part = await reader.read;
+        if mode == 'log' and part.data.length > 0
+            _ = await errors.write-all-async; part.data
+        else if mode == 'capture'
+            if retained.length + part.data.length > 16384
+                oversized = true
+            if not oversized
+                retained = retained.concat; part.data
+        if part.end
+            break
+    if mode == 'log'
+        _ = errors.flush;
+    if oversized
+        fail; 'command returned more than 16 KiB of captured output'
+    return retained
+
+async function command string throws throwable; program string, args list of string, settings process-options, mode string = 'log'
+    child = await spawn-process; program, args, settings
+    await child.close-input;
+    scope = task-scope;
+    errors = scope.spawn; (drain; (child.errors;), 'log')
+    output = await drain; (child.output;), mode
+    joined = await scope.join; errors
+    if joined.error != none
+        fail; ('cannot read stderr from ' + program)
+    status = await wait-until-exited; child
+    code = status-code; status, program
+    if code != 0
+        diagnostic; (program + ' failed')
+        exit; (make-exit-status; code)
+    return (output.decode; utf8).trim.end; "\n"
+
+function pinned-tag string throws throwable;
+    raw = filesystem-read-bounded; (filesystem-capability;), (instance path; 'llama.cpp-version.txt'), 4096
+    if raw.failed
+        fail; ('cannot read llama.cpp-version.txt: ' + raw.message)
+    return (raw.data.decode; utf8).trim.end; "\n"
+
+function checkout-present bool; source string
+    result = filesystem-exists; (filesystem-capability;), (instance path; source + '/.git')
+    if result.failed
+        fail; ('cannot inspect ' + source + ': ' + result.message)
+    return result.exists
+
+function find-sccache string throws throwable;
+    found = run-process; 'which', (list; 'sccache')
+    code = found.status.exit-code
+    if code != none
+        if code == 0
+            launcher-path = absolute-path; ((found.stdout.decode; utf8).trim.end; "\n")
+            return launcher-path.text
+    return ''
+
+class built-service
+    executable string = ''
+    library-directory string = ''
+
+    function construct; executable string, library-directory string
+        this.executable = executable
+        this.library-directory = library-directory
+
+async function build-host built-service throws throwable; entries ref list of environment-entry
+    root-path = absolute-path; '.'
+    root = root-path.text
+    backend = setting; entries, 'CUSCO_GGML_CUDA', 'ON'
+    settings = instance process-options;
+    launcher string = ''
+    if (setting; entries, 'TERRANE_SCCACHE', '1') == '1'
+        launcher = find-sccache;
+        if launcher != ''
+            socket = setting; entries, 'SCCACHE_SERVER_UDS'
+            if socket == ''
+                runtime-dir = setting; entries, 'XDG_RUNTIME_DIR'
+                if runtime-dir == ''
+                    runtime-dir = (setting; entries, 'HOME', '.') + '/.cache'
+                socket = runtime-dir + '/cusco/sccache.sock'
+            parent = path-parent; (instance path; socket)
+            await command; 'mkdir', (list; '-p', '-m', '700', '--', parent.text), settings
+            settings.environment.append; (pair; 'SCCACHE_SERVER_UDS', socket)
+            # A compiler request starts the server; --show-stats does not.
+            warmup = instance process-options;
+            warmup.environment.append; (pair; 'SCCACHE_SERVER_UDS', socket)
+            warmup.environment.append; (pair; 'TMPDIR', '/tmp')
+            await command; launcher, (list; 'cc', '--version'), warmup, 'quiet'
+            settings.environment.append; (pair; 'TERRANE_SCCACHE', '1')
+            settings.environment.append; (pair; 'CARGO_INCREMENTAL', '0')
+
+    await command; 'terrane', (list; 'toolchain', 'install'), settings
+    build = root + '/target/host-' + backend
+    tag = pinned-tag;
+    if tag == '' or (tag.contains.start; '-') or (tag.contains; '/') or (tag.contains; "\n")
+        fail; 'llama.cpp-version.txt must contain a single tag name'
+    tag-ref = 'refs/tags/' + tag
+    await command; 'git', (list; 'check-ref-format', tag-ref), settings
+    source = root + '/target/llama-src/' + tag
+    if not (checkout-present; source)
+        await command; 'git', (list; 'clone', '--filter=blob:none', '--branch', tag, '--depth', '1', 'https://github.com/ggml-org/llama.cpp.git', source), settings
+        await command; 'git', (list; '-C', source, 'checkout', '--detach', tag-ref), settings
+    expected = await command; 'git', (list; '-C', source, 'rev-parse', '--verify', tag-ref + '^{commit}'), settings, 'capture'
+    actual = await command; 'git', (list; '-C', source, 'rev-parse', '--verify', 'HEAD'), settings, 'capture'
+    if actual != expected
+        fail; 'llama.cpp checkout HEAD does not match the pinned tag ' + tag + ': ' + source
+
+    c-launcher = '-DCMAKE_C_COMPILER_LAUNCHER=' + launcher
+    cxx-launcher = '-DCMAKE_CXX_COMPILER_LAUNCHER=' + launcher
+    llama = build + '/llama'
+    shim = build + '/shim'
+    configure = list; '-S', source, '-B', llama, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', c-launcher, cxx-launcher, '-DCMAKE_CUDA_COMPILER_LAUNCHER=' + launcher, '-DGGML_CCACHE=OFF', '-DGGML_CUDA=' + backend, '-DLLAMA_BUILD_TESTS=OFF', '-DLLAMA_BUILD_EXAMPLES=OFF', '-DLLAMA_BUILD_TOOLS=OFF'
+    if backend == 'ON'
+        configure.append; '-DCMAKE_CUDA_ARCHITECTURES=' + (setting; entries, 'CUSCO_CUDA_ARCHITECTURES', 'native')
+    await command; 'cmake', move configure, settings
+    await command; 'cmake', (list; '--build', llama, '--target', 'llama'), settings
+    await command; 'cmake', (list; '-S', 'native', '-B', shim, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', c-launcher, cxx-launcher, '-DLLAMA_SOURCE_DIR=' + source, '-DLLAMA_BUILD_DIR=' + llama), settings
+    await command; 'cmake', (list; '--build', shim, '--target', 'cusco_executor'), settings
+
+    llama-libs = llama + '/bin'
+    settings.environment.append; (pair; 'CUSCO_NATIVE_LIB_DIR', shim)
+    settings.environment.append; (pair; 'CUSCO_LLAMA_LIB_DIR', llama-libs)
+    await command; 'terrane', (list; 'fetch', 'server'), settings
+    inherited-libs = setting; entries, 'LD_LIBRARY_PATH'
+    if inherited-libs == ''
+        settings.environment.append; (pair; 'LD_LIBRARY_PATH', llama-libs)
+    else
+        settings.environment.append; (pair; 'LD_LIBRARY_PATH', llama-libs + ':' + inherited-libs)
+    if launcher != ''
+        # Contained Cargo has a writable /tmp, not arbitrary host temp dirs.
+        settings.environment.append; (pair; 'TMPDIR', '/tmp')
+    result = await command; 'terrane', (list; 'build', '--release', 'server'), settings, 'capture'
+    service-path = absolute-path; result
+    return instance built-service; service-path.text, llama-libs
+
+async function run-service int throws throwable; program string, args list of string, options process-options
+    # Subscribe before spawning; isolating the child prevents duplicate terminal signals.
+    signals = process-signals; (set; (process-signal::interrupt;), (process-signal::terminate;), (process-signal::hangup;))
+    child = await spawn-process; program, args, options
+    await child.close-input;
+    scope = task-scope;
+    output-task = scope.spawn; (relay; (child.output;), (stdout;), 'stdout')
+    error-task = scope.spawn; (relay; (child.errors;), (stderr;), 'stderr')
+    status = child.poll;
+    select
+        case observed = await (wait-until-exited; child)
+            status = observed
+        case await signals.next;
+            try
+                await child.send-signal; (process-signal::terminate;)
+            catch process-error as error
+                # The child can exit between signal delivery and forwarding.
+                after-signal = child.poll;
+                if not after-signal.exited
+                    throw error
+            status = await wait-until-exited; child
+    _ = await scope.join; output-task
+    _ = await scope.join; error-task
+    return status-code; status, 'service'
+
+async function main throws throwable;
+    entries = environment;
+    data = absolute-path; (setting; entries, 'CUSCO_DATA_DIR', default-data-dir)
+    config = join-path; data, (instance path; 'config.yaml')
+    service-args = list; '--config', config.text
+    for argument in (arguments;)
+        if not argument.is-text
+            fail; 'service arguments must be Unicode text'
+        if argument.text == '--config' or (argument.text.contains.start; '--config=')
+            fail; 'set CUSCO_DATA_DIR instead of passing --config'
+        service-args.append; argument.text
+
+    check-data; data.text, config.text
+    diagnostic; ('data directory: ' + data.text)
+    options = instance process-options;
+    options.new-process-group = true
+    service = setting; entries, 'CUSCO_SERVICE_BIN'
+    if service == ''
+        built = await build-host; entries
+        service = built.executable
+        loader-path = built.library-directory
+        inherited = setting; entries, 'LD_LIBRARY_PATH'
+        if inherited != ''
+            loader-path = loader-path + ':' + inherited
+        options.environment.append; (pair; 'LD_LIBRARY_PATH', loader-path)
+    else
+        resolved = absolute-path; service
+        service = resolved.text
+
+    code = await run-service; service, service-args, options
+    exit; (make-exit-status; code)

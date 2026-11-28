@@ -15,16 +15,15 @@ Run these commands from `projects/cusco` in a Terrane checkout containing `packa
 Compose mounts one writable host directory at `/data`. On first setup, put the [example configuration](config.example.yaml) inside that directory as `config.yaml`. Adjust its memory and storage budgets for your machine. Cusco creates `db/`, `models/`, `spill/`, and `user-models/` on startup; it does not generate or overwrite the config.
 
 ```sh
-export CUSCO_DATA_DIR="${CUSCO_DATA_DIR:-./data}"
-mkdir -p "$CUSCO_DATA_DIR"
-cp config.example.yaml "$CUSCO_DATA_DIR/config.yaml"
+mkdir -p "${CUSCO_DATA_DIR:-./data}"
+cp config.example.yaml "${CUSCO_DATA_DIR:-./data}/config.yaml"
 export CUSCO_BEARER_TOKEN="$(openssl rand -hex 32)"
 docker compose up --build --wait server
 ```
 
 **Upgrading from separate mounts?** Copy your existing root `config.yaml` into the data directory instead of copying the example. If you use local model declarations, also copy `config/user.yaml` there as `user.yaml`. Existing `./data` subdirectories stay in place; if you used custom model directories, make their contents available under the new data root before restarting.
 
-**Running on the host instead?** Stop the Compose server before sharing its data, then run [`./run-host.sh`](docs/service-guide.md#run-the-daemon-directly). It builds llama.cpp, the executor shim, and Cusco incrementally, then serves `./data/config.yaml` on its configured address. No Docker build is needed.
+**Developing on the host?** From the Cusco checkout, use [`./run-host.trn`](docs/service-guide.md#run-the-daemon-directly). On first setup, copy `config.host.example.yaml` to `./data-dev/config.yaml`. The host example listens on `127.0.0.1:11443` and uses a separate development catalog. Compose still uses `./data` and starts the compiled `cusco-service` directly.
 
 Check the service before downloading a model. The default host port is **11443**; `8080` is the port *inside* the container.
 

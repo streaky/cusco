@@ -267,7 +267,21 @@ impl FromStr for HttpDebugLevel {
 
 impl DaemonConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let config: Self = serde_yaml::from_slice(&fs::read(path)?)?;
+        let path = std::path::absolute(path)?;
+        let mut config: Self = serde_yaml::from_slice(&fs::read(&path)?)?;
+        let directory = path.parent().expect("a configuration file has a parent");
+        let paths = &mut config.paths;
+        for value in [
+            &mut paths.database,
+            &mut paths.models,
+            &mut paths.spill,
+            &mut paths.user_models,
+            &mut paths.user_config,
+        ] {
+            if value.is_relative() {
+                *value = directory.join(&*value);
+            }
+        }
         config.validate()
     }
     pub fn resolve_http_debug(
@@ -339,6 +353,18 @@ impl DaemonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_paths_follow_the_selected_configuration_file() {
+        let config = DaemonConfig::load("../../config.host.example.yaml").unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert_eq!(config.paths.database, root.join("db/catalog.sqlite"));
+        assert_eq!(config.paths.models, root.join("models"));
+        assert_eq!(config.paths.spill, root.join("spill"));
+        assert_eq!(config.paths.user_models, root.join("user-models"));
+        assert_eq!(config.paths.user_config, root.join("user.yaml"));
+    }
+
     #[test]
     fn byte_sizes_require_units_and_allow_fractions() {
         assert_eq!(
