@@ -264,11 +264,13 @@ class ProtocolServiceTests(unittest.TestCase):
             {"model": "m", "prompt": secret, "max_tokens": 1},
         )
         self.assertEqual(status, 200)
+        self.stop()
         safe = self.diagnostic_text()
         self.assertIn('"level":"safe"', safe)
         self.assertNotIn(secret, safe)
         self.assertNotIn("source-fixture-token", safe)
         self.assertIn("[REDACTED]", safe)
+        self.assertNotIn("HTTP diagnostic rendering failed", safe)
 
     def test_full_transport_diagnostics_capture_credentials_and_content(self):
         secret = "fixture-private-body-value"
@@ -278,10 +280,12 @@ class ProtocolServiceTests(unittest.TestCase):
             {"model": "m", "prompt": secret, "max_tokens": 1},
         )
         self.assertEqual(status, 200)
+        self.stop()
         full = self.diagnostic_text()
         self.assertIn('"level":"full"', full)
         self.assertIn(secret, full)
         self.assertIn("source-fixture-token", full)
+        self.assertNotIn("HTTP diagnostic rendering failed", full)
 
     def test_shutdown_drains_an_inflight_stream(self):
         self.start()

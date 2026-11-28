@@ -50,6 +50,11 @@ pub enum DaemonError {
 impl Daemon {
     pub fn open(config_path: &str) -> Result<Self, DaemonError> {
         let config = DaemonConfig::load(config_path)?;
+        for dir in [&config.paths.models, &config.paths.user_models] {
+            fs::create_dir_all(dir).map_err(|error| {
+                DaemonError::Startup(format!("create directory {}: {error}", dir.display()))
+            })?;
+        }
         cusco_executor::set_debug_logging(config.native_debug);
         let catalog = ModelCatalog::open(&config.paths.database)?;
         let engine = ResidentEngine::open_with_spill(
@@ -188,11 +193,7 @@ mod tests {
 
     fn configured_file() -> (std::path::PathBuf, String) {
         let root = std::env::temp_dir().join(format!("cusco-daemon-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(root.join("db")).unwrap();
-        fs::create_dir_all(root.join("models")).unwrap();
-        fs::create_dir_all(root.join("spill")).unwrap();
-        fs::create_dir_all(root.join("user-models")).unwrap();
-        fs::write(root.join("user.yaml"), "models: []\n").unwrap();
+        fs::create_dir(&root).unwrap();
         let mut config = include_str!("../../../config/test.yaml").to_owned();
         for (from, to) in [
             ("/data/db/catalog.sqlite", root.join("db/catalog.sqlite")),
@@ -214,6 +215,9 @@ mod tests {
         let daemon = Daemon::open(&path).unwrap();
         assert_eq!(daemon.configuration().server.active_requests, 4);
         assert!(daemon.server().models().is_empty());
+        for name in ["db", "models", "spill", "user-models"] {
+            assert!(root.join(name).is_dir(), "missing {name} directory");
+        }
         daemon.finish_shutdown();
         drop(daemon);
         fs::remove_dir_all(root).unwrap();
@@ -222,6 +226,7 @@ mod tests {
     #[test]
     fn configured_local_models_are_published_and_restored_on_restart() {
         let (root, path) = configured_file();
+        fs::create_dir(root.join("user-models")).unwrap();
         let model = root.join("user-models/local.gguf");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"GGUF");

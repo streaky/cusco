@@ -13,7 +13,6 @@ services:
     environment:
       CUSCO_BEARER_TOKEN: "${CUSCO_BEARER_TOKEN:?set CUSCO_BEARER_TOKEN}"
       CUSCO_REQUESTED_HOST_GPU: "${CUSCO_GPU_DEVICE_ID:-0}"
-      LD_LIBRARY_PATH: /opt/llama-build/bin
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent --show-error -H \"Authorization: Bearer $$CUSCO_BEARER_TOKEN\" \"http://127.0.0.1:8080/openai/v1/models\""]
       interval: 30s
@@ -26,12 +25,7 @@ services:
     ports:
       - "${CUSCO_LISTEN_ADDRESS:-127.0.0.1}:${CUSCO_PORT:-11443}:8080"
     volumes:
-      - ./config.yaml:/data/config.yaml:ro
-      - ./config/user.yaml:/data/user.yaml:ro
-      - "${CUSCO_USER_MODEL_DIR:-./data/user-models}:/data/user-models:ro"
-      - "${CUSCO_MODEL_DIR:-./data/models}:/data/models"
-      - ./data/db:/data/db
-      - ./data/spill:/data/spill
+      - "${CUSCO_DATA_DIR:-./data}:/data"
     deploy:
       resources:
         reservations:

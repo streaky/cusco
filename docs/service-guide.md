@@ -194,33 +194,44 @@ mapped-execution Compose proofs remain lower-level engineering diagnostics.
 
 ## Run the production Compose service
 
-Copy the fully documented `config.example.yaml` to the ignored root
-`config.yaml`, configure `config/user.yaml` with local model declarations,
-provide an authentication token, and start the release service:
+Choose a writable host data directory (`./data` by default). Put your daemon
+configuration there as `config.yaml` and, if needed, local model declarations
+as `user.yaml`. For a new installation:
 
 ```sh
-cp config.example.yaml config.yaml
-mkdir -p data/models data/db data/spill data/user-models
+mkdir -p "${CUSCO_DATA_DIR:-./data}"
+cp config.example.yaml "${CUSCO_DATA_DIR:-./data}/config.yaml"
 CUSCO_BEARER_TOKEN='replace-with-a-secret' docker compose up --build -d server
 ```
 
-The production definition mounts the root `config.yaml` read-only, listens on
-`127.0.0.1:11443` on the host by default (port `8080` inside the container), persists the SQLite catalog under
-`data/db`, and uses bounded storage under `data/spill`. Responses with
-`store: true` are atomically published in the file-backed resource store under
-`data/db/responses` and survive daemon restart; retrieval, deletion,
+The production service mounts that single directory at `/data`, reads
+`/data/config.yaml`, and creates missing storage directories. It listens on
+`127.0.0.1:11443` on the host by default (port `8080` inside the container),
+persists the SQLite catalog under `/data/db`, and uses bounded storage under
+`/data/spill`. Responses with `store: true` are atomically published under
+`/data/db/responses` and survive daemon restart; retrieval, deletion,
 `previous_response_id` replay, and typed function-call output continuation use
 those resources. Requests with `store: false` remain stateless and do not
 publish there. Override `CUSCO_LISTEN_ADDRESS`, `CUSCO_PORT`, and
 `CUSCO_GPU_DEVICE_ID` as needed.
-The entire `data/` tree is ignored by Git and excluded from image build
-contexts.
+The default `data/` and `data-dev/` directories are ignored by Git and excluded
+from the Docker build context. Keep custom data directories outside the checkout:
+setting `CUSCO_DATA_DIR` does not create a Docker or Git ignore rule. The test
+stack uses `models/` and `user-models/` under the same Compose data root but
+does not share the production catalog or spill directory.
+
+The single writable mount also makes `user-models/` writable by the service.
+For read-only operator weights, overlay `/data/user-models` with a separate
+read-only bind mount in your Compose override.
 
 The build context is the surrounding Terrane checkout, not Cusco alone. Compose
 selects `projects/cusco/Dockerfile`; its Dockerfile-specific ignore rules include
 only the compiler, required packages, and Cusco sources while excluding caches,
-operator configuration, and data. The image installs the hybrid executable as
-`cusco-service`, and the API smoke/acceptance launchers use that same executable.
+operator configuration, and data. Production copies `cusco-service`, llama.cpp,
+ggml, cuBLAS, and NCCL into the matching CUDA base image. The NVIDIA container
+runtime supplies the host driver; no SDK, compiler, checkout, or model
+weights are shipped. The acceptance services use the same executable in the
+development stage, where the build and proof tools remain available.
 Runtime `.state/` directories are excluded at every depth, including package
 database test volumes. Unrelated packages, projects, and tools remain excluded
 when their parent directories are reopened for the source allowlist. Do not
@@ -228,36 +239,83 @@ change database-volume permissions to make them readable by the Docker builder.
 
 ## Run the daemon directly
 
+`./run-host.trn` is a local development convenience, not a production supervisor
+or a Docker entrypoint. For deployment, use the [production Compose service](#run-the-production-compose-service):
+the image builds the binary ahead of time and starts `cusco-service` directly.
+If the launcher crashes or is killed with SIGKILL, the service can keep
+running: it does not receive TERM automatically. Before restarting, identify
+the service still listening on the configured port, send that process SIGTERM,
+and wait for it to exit. Do not start a second service on the same catalog.
+
 Build from the Cusco directory in the Terrane checkout, with `terrane` on PATH
 and the sibling `packages/http-server` and `packages/template` checkouts present.
-As with the Rust backend, supply the real executor shim and llama.cpp libraries
-through `CUSCO_NATIVE_LIB_DIR`, `CUSCO_LLAMA_LIB_DIR`, and `LD_LIBRARY_PATH`.
-The Docker build prepares those libraries automatically.
+Install CMake, Ninja, Git, a C++ compiler, and the CUDA development
+toolkit for GPU builds. Use a Terrane CLI with child process group and signal
+support. `./run-host.trn` provisions Terrane's pinned Rust tools,
+fetches the pinned llama.cpp source, and builds llama.cpp and the Cusco shim.
+It runs `terrane fetch server` to prepare locked dependencies for the service
+and its build-time consumers, then builds and starts Cusco. Build outputs stay under `target/` and
+Terrane's `server/.trn/` cache. Subsequent runs rebuild changed inputs only.
+Set `CUSCO_GGML_CUDA=OFF` for an explicit CPU build without the CUDA toolkit,
+or `CUSCO_CUDA_ARCHITECTURES` to override the default native GPU architecture.
+
+When `sccache` is on PATH, the launcher uses it for C, C++, CUDA, and Terrane's
+cacheable Rust compilations. It starts a host daemon on a Unix socket accessible
+to Terrane's isolated Cargo builds. Use this for trusted builds only: the
+daemon runs compiler requests outside the sandbox. Set `TERRANE_SCCACHE=0`
+to disable it. To inspect this daemon's statistics, run
+`SCCACHE_SERVER_UDS="${SCCACHE_SERVER_UDS:-${XDG_RUNTIME_DIR:-$HOME/.cache}/cusco/sccache.sock}" sccache --show-stats`.
 
 Cusco's native Cargo workspace deliberately inherits the surrounding Terrane
 checkout's `rust-toolchain.toml`; run Cargo from Cusco or the checkout root.
 The Terrane service uses `rust-toolchain = "pinned"`, so its Rust dependencies
 compile with that Terrane version's exact stable compiler too. Docker copies the
 same toolchain file before invoking Cargo instead of maintaining a separate
-stable-version literal. Update Terrane's pin as one toolchain-profile change;
-do not add a divergent Cusco pin. The separately installed nightly is only the
-Rustdoc/projection producer, not the compiler used to build the native service.
+stable-version literal. The host launcher and Docker both run `terrane toolchain
+install`. Nightly generates Rustdoc metadata, not the native service.
+
+Run the launcher from the Cusco repository root. It passes `./data-dev/config.yaml`
+to the service without changing its working directory or mounting `/data`. Relative
+storage paths resolve from the config file's directory; absolute paths are unchanged.
+`CUSCO_DATA_DIR` selects a different host directory. Install the
+`sqlite3` CLI for the read-only compatibility check on an existing catalog.
+
+**Migrating from the shell launcher?** Keep the original data directory and
+its config intact. If its config or model records refer to `/data`, the
+launcher refuses to start. Choose a fresh directory, copy the host example
+there, then pull or re-import your models using host paths. The launcher does
+not rewrite a Compose catalog. Do not run host and Compose against the same
+database.
+Keep the host development directory outside `/data`; the launcher reserves
+that prefix for container paths, including model paths stored in the catalog.
 
 ```sh
-artifact="$(terrane build server)"
-"$artifact" --config "$PWD/config.yaml"
+mkdir -p data-dev
+cp config.host.example.yaml data-dev/config.yaml  # first setup only
+./run-host.trn
 ```
+
+By default the script builds the service incrementally with the host Terrane
+toolchain and native libraries described above. To skip compilation, set
+`CUSCO_SERVICE_BIN` to a host-compatible executable with its shared libraries
+available to the loader. Relative executable paths resolve from the caller's
+working directory. Flags such as `--http-debug safe` are forwarded.
+Export `CUSCO_BEARER_TOKEN` in the shell; Compose's `.env` and port mapping
+are not applied. The host example binds only `127.0.0.1:11443`.
 
 The daemon accepts `--config PATH` (default `/data/config.yaml`), `--http-debug
 off|safe|full`, and `--help`. `cargo run -p cusco -- serve` has been removed.
 SIGINT/SIGTERM stop admission and new connections, allow in-flight responses to
 drain, and cancel remaining inference after `server.shutdown_grace_ms`. Set the
 container/process supervisor's stop timeout longer than that grace period.
+Ctrl+C, TERM, and terminal hangup request a graceful stop. The launcher waits
+for the service to finish; its stdout and stderr are relayed to the terminal.
+The daemon is noninteractive and receives EOF on stdin.
 
 For a model-free hybrid boundary check against the built executable:
 
 ```sh
-python3 tools/test-hybrid-service.py "$artifact" -v
+python3 tools/test-hybrid-service.py "$(terrane build server)" -v
 ```
 
 This uses temporary state and an actual native-linked service without loading a

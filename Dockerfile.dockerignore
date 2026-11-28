@@ -28,6 +28,7 @@ projects/*
 **/__pycache__
 projects/cusco/.tools
 projects/cusco/data
+projects/cusco/data-dev
 projects/cusco/models
 projects/cusco/results
 projects/cusco/docs

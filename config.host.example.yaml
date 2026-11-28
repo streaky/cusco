@@ -1,0 +1,19 @@
+# Local development only. Relative paths start in the directory containing this
+# config file (CUSCO_DATA_DIR, default ./data-dev, when using run-host.trn).
+# See config.example.yaml for the full set of options and capacity descriptions.
+version: 1
+listen: 127.0.0.1:11443
+paths:
+  database: db/catalog.sqlite
+  models: models
+  spill: spill
+  user_models: user-models
+  user_config: user.yaml
+execution:
+  device_capacity: 30 GiB
+  host_capacity: 32 GiB
+  storage_capacity: 64 GiB
+  context_reserve: 4 GiB
+  context_tokens: 32768
+  publication_interval_tokens: 32
+  gpu_layers: 99
