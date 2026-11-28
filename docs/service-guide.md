@@ -242,6 +242,10 @@ change database-volume permissions to make them readable by the Docker builder.
 `./run-host.trn` is a local development convenience, not a production supervisor
 or a Docker entrypoint. For deployment, use the [production Compose service](#run-the-production-compose-service):
 the image builds the binary ahead of time and starts `cusco-service` directly.
+If the launcher crashes or is killed with SIGKILL, the service can keep
+running: it does not receive TERM automatically. Before restarting, identify
+the service still listening on the configured port, send that process SIGTERM,
+and wait for it to exit. Do not start a second service on the same catalog.
 
 Build from the Cusco directory in the Terrane checkout, with `terrane` on PATH
 and the sibling `packages/http-server` and `packages/template` checkouts present.
@@ -282,6 +286,8 @@ launcher refuses to start. Choose a fresh directory, copy the host example
 there, then pull or re-import your models using host paths. The launcher does
 not rewrite a Compose catalog. Do not run host and Compose against the same
 database.
+Keep the host development directory outside `/data`; the launcher reserves
+that prefix for container paths, including model paths stored in the catalog.
 
 ```sh
 mkdir -p data-dev

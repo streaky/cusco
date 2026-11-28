@@ -274,6 +274,9 @@ async function run-service int throws throwable; program string, args list of st
     return status-code; status, 'service'
 
 async function main throws throwable;
+    marker = filesystem-exists; (filesystem-capability;), (instance path; 'llama.cpp-version.txt')
+    if marker.failed or not marker.exists
+        fail; 'Run this launcher from the Cusco repository root (expected llama.cpp-version.txt).'
     entries = environment;
     data = absolute-path; (setting; entries, 'CUSCO_DATA_DIR', default-data-dir)
     config = join-path; data, (instance path; 'config.yaml')

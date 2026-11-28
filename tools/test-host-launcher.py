@@ -25,6 +25,12 @@ class HostLauncherTests(unittest.TestCase):
         self.config = self.data / 'config.yaml'
         self.config.write_bytes((ROOT / 'config.host.example.yaml').read_bytes())
 
+    def test_wrong_directory_rejected_before_data_lookup(self):
+        env = dict(self.env, CUSCO_DATA_DIR=str(self.data / 'missing'))
+        result = subprocess.run([ROOT / 'run-host.trn'], cwd=self.data, env=env, capture_output=True, timeout=180)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'Run this launcher from the Cusco repository root', result.stderr)
+
     def test_container_catalog_refused_before_start(self):
         db = self.data / 'db/catalog.sqlite'
         db.parent.mkdir()
